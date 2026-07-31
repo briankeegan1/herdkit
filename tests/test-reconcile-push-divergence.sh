@@ -209,7 +209,7 @@ out="$( cd "$PROJ" && HERD_UPDATE_ENGINE_DIR="$ENG" HERD_RELOAD_SKIP_LAUNCH=1 \
 # The update must succeed (not die on ff-only).
 [ $? -eq 0 ] || fail "(4) herd update failed after self-heal: $out"
 # It must warn about the auto-heal.
-printf '%s' "$out" | grep -qi "auto-heal\|regenerable\|HERD-338" \
+grep -qi "auto-heal\|regenerable\|HERD-338" <<< "$out" \
   || fail "(4) herd update did not mention auto-heal: $out"
 # After the self-heal, the engine clone must be at origin (no stranded commits).
 [ "$(ahead_eng)" = "0" ] \

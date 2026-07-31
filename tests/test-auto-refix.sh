@@ -145,11 +145,11 @@ _handle_block_verdict "10" "slug-fa" "sha-fa1" "0"
   || fail "AUTOFIX=false: herdr pane run must not be called (log has $(wc -l < "$PANE_LOG") lines)"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "review blocked" \
+grep -q "review blocked" <<< "$d" \
   || fail "AUTOFIX=false: display should contain 'review blocked' (got: $d)"
 ok
 # Standard message should contain the herd-approve hints.
-printf '%s\n' "$d" | grep -q "herd-approve.sh" \
+grep -q "herd-approve.sh" <<< "$d" \
   || fail "AUTOFIX=false: display should show herd-approve.sh override hint"
 ok
 ! refix_attempted "10" "sha-fa1" || fail "AUTOFIX=false: no refix should be recorded"
@@ -169,10 +169,10 @@ ok
   || fail "AUTOFIX=true wake-on-first: pane run should be called exactly once (got $(wc -l < "$PANE_LOG"))"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "refixing" \
+grep -q "refixing" <<< "$d" \
   || fail "AUTOFIX=true wake-on-first: display should show 'refixing' (got: $d)"
 ok
-printf '%s\n' "$d" | grep -q "round 1/3" \
+grep -q "round 1/3" <<< "$d" \
   || fail "AUTOFIX=true: display should show 'round 1/3' (got: $d)"
 ok
 refix_attempted "20" "sha-b1" || fail "AUTOFIX=true: refix should be recorded after bounce"
@@ -195,7 +195,7 @@ while IFS= read -r logged_pane; do
 done < "$PANE_LOG"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "auto-refix failed" \
+grep -q "auto-refix failed" <<< "$d" \
   || fail "AUTOFIX=true never-wakes: display should show 'auto-refix failed' (got: $d)"
 ok
 
@@ -213,7 +213,7 @@ _handle_block_verdict "40" "slug-d" "sha-d1" "0"    # second call, SAME sha → 
   || fail "refix-once: second call with same sha should NOT call herdr pane run (log: $(wc -l < "$PANE_LOG") lines)"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "awaiting push" \
+grep -q "awaiting push" <<< "$d" \
   || fail "refix-once: second call should show 'awaiting push' (got: $d)"
 ok
 
@@ -234,13 +234,13 @@ export STUB_AGENT_NAME="slug-stuck" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID=
 printf '1\n1\n' > "$STUB_WAIT_FILE"      # neither wake attempt succeeds
 DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
 _handle_block_verdict "60" "slug-stuck" "sha-s1" "0"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "auto-refix failed" \
+grep -q "auto-refix failed" <<< "${DISPLAY[0]:-}" \
   || fail "(6b) tick 1 must escalate a failed wake (got: ${DISPLAY[0]:-})"
 runs_before="$(wc -l < "$PANE_LOG")"
 DISPLAY=(); _handle_block_verdict "60" "slug-stuck" "sha-s1" "0"     # tick 2 — the sha has not changed
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "fix in progress" \
+grep -q "fix in progress" <<< "${DISPLAY[0]:-}" \
   && fail "(6b) tick 2 must NOT claim a fix is in flight (got: ${DISPLAY[0]:-})"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "needs you" \
+grep -q "needs you" <<< "${DISPLAY[0]:-}" \
   || fail "(6b) tick 2 must keep saying 'needs you' (got: ${DISPLAY[0]:-})"
 [ "$(wc -l < "$PANE_LOG")" -eq "$runs_before" ] \
   || fail "(6b) the once-guard must still block a re-bounce on tick 2"
@@ -261,10 +261,10 @@ _handle_block_verdict "50" "slug-e" "sha-e4" "0"
   || fail "round cap: 4th bounce should be suppressed (got $(wc -l < "$PANE_LOG") pane run calls)"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "refix limit" \
+grep -q "refix limit" <<< "$d" \
   || fail "round cap: display should show 'refix limit' (got: $d)"
 ok
-printf '%s\n' "$d" | grep -q "needs you" \
+grep -q "needs you" <<< "$d" \
   || fail "round cap: display should show 'needs you' (got: $d)"
 ok
 
@@ -278,7 +278,7 @@ _handle_block_verdict "60" "slug-f" "sha-f1" "0"
 ok
 d="${DISPLAY[0]:-}"
 # Dry-run falls through to the REVIEW_AUTOFIX=false path: shows standard "review blocked" message.
-printf '%s\n' "$d" | grep -q "review blocked" \
+grep -q "review blocked" <<< "$d" \
   || fail "DRYRUN: display should show 'review blocked' (got: $d)"
 ok
 ! refix_attempted "60" "sha-f1" \

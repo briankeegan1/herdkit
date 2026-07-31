@@ -104,8 +104,8 @@ printf '1..168\nok 1 a\nok 2 b\nok 3 c\nnot ok 4 d\n' > "$(_health_log_file "601
 _HC_RESULT=""; DISPLAY=()
 _healthcheck_gate 601 slug-prog "$T/wt" 0 shaPROG
 [ "$_HC_RESULT" = "RUNNING" ] || fail "(2) an in-flight suite should read RUNNING (got '$_HC_RESULT')"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q 'running' || fail "(2) the running row must say 'running'"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q 'test 4/168' || fail "(2) the running row must show live progress 'test 4/168' (got: ${DISPLAY[0]:-})"
+grep -q 'running' <<< "${DISPLAY[0]:-}" || fail "(2) the running row must say 'running'"
+grep -q 'test 4/168' <<< "${DISPLAY[0]:-}" || fail "(2) the running row must show live progress 'test 4/168' (got: ${DISPLAY[0]:-})"
 kill "$PP" 2>/dev/null || true
 rm -f "$INF" "$(_health_log_file "601-shaPROG")" 2>/dev/null || true
 ok
@@ -130,7 +130,7 @@ _marker_write "$INF2" "$PP2"
 _HC_RESULT=""; DISPLAY=()
 _healthcheck_gate 603 slug-empty "$T/wt" 0 shaEMPTY
 [ "$_HC_RESULT" = "RUNNING" ] || fail "(2b) an in-flight empty-log suite should read RUNNING (got '$_HC_RESULT')"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q 'no output yet' || fail "(2b) the running row must surface 'no output yet' for an empty log (got: ${DISPLAY[0]:-})"
+grep -q 'no output yet' <<< "${DISPLAY[0]:-}" || fail "(2b) the running row must surface 'no output yet' for an empty log (got: ${DISPLAY[0]:-})"
 kill "$PP2" 2>/dev/null || true
 rm -f "$INF2" "$(_health_log_file "603-shaEMPTY")" 2>/dev/null || true
 ok

@@ -120,8 +120,8 @@ WT="$T/trees/slug-a"; mkdir -p "$WT"
 reset_state
 unset STALE_BASE_AUTOFIX
 _handle_stale_dup 10 slug-a shaA 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'needs you' || fail "(1) off-mode must read 'needs you' (got: $(row))"
-row | grep -q 'stale/duplicate (stale-base)' || fail "(1) off-mode must name stale-base (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(1) off-mode must read 'needs you' (got: $(row))"
+grep -q 'stale/duplicate (stale-base)' <<< "$(row)" || fail "(1) off-mode must name stale-base (got: $(row))"
 [ "$(runs)" = "0" ] || fail "(1) off-mode must never pane-run"
 [ "$(rslv)" = "0" ] || fail "(1) off-mode must never spawn a resolver"
 [ "$(refix_round_count 10)" = "0" ] || fail "(1) off-mode must not consume a refix round"
@@ -144,15 +144,15 @@ grep -q 'git merge origin/main' "$STUB_PANE_RUN_LOG" || fail "(2) prompt must as
 grep -q 'STALE BASE' "$STUB_PANE_RUN_LOG" || fail "(2) prompt must name STALE BASE"
 refix_attempted 20 shaC stale || fail "(2) bounce must be recorded kind=stale"
 [ "$(refix_round_count 20)" = "1" ] || fail "(2) must consume exactly one refix round"
-row | grep -q 'rebasing · awaiting push' || fail "(2) row must read 'rebasing · awaiting push' (got: $(row))"
-row | grep -q 'needs you' && fail "(2) 'needs you' is BANNED after a successful bounce (got: $(row))"
+grep -q 'rebasing · awaiting push' <<< "$(row)" || fail "(2) row must read 'rebasing · awaiting push' (got: $(row))"
+grep -q 'needs you' <<< "$(row)" && fail "(2) 'needs you' is BANNED after a successful bounce (got: $(row))"
 grep -q '"event":"stale_refix_bounce"' "$JOURNAL_FILE" || fail "(2) bounce must be journaled"
 ok "(2) live builder bounces with merge prompt + awaiting-push row"
 
 # ── (3) once-guard: same sha re-enters → no second bounce ─────────────────────────────────────
 _handle_stale_dup 20 slug-a shaC 0 "$WT" feat/a stale-base "$REASON"
 [ "$(runs)" = "1" ] || fail "(3) second call for same sha must not re-bounce (got $(runs))"
-row | grep -q 'rebasing · awaiting push' || fail "(3) once-guard row must still say rebasing · awaiting push"
+grep -q 'rebasing · awaiting push' <<< "$(row)" || fail "(3) once-guard row must still say rebasing · awaiting push"
 ok "(3) sha-keyed once-guard holds"
 
 # New sha is eligible.
@@ -176,7 +176,7 @@ _handle_stale_dup 30 slug-a shaS3 0 "$WT" feat/a stale-base "$REASON"
 [ "$(runs)" = "3" ] || fail "(4) three stale rounds should all bounce (got $(runs))"
 _handle_stale_dup 30 slug-a shaS4 0 "$WT" feat/a stale-base "$REASON"
 [ "$(runs)" = "3" ] || fail "(4b) bounce past the cap must not be delivered (got $(runs))"
-row | grep -q 'needs you · refix limit (3 rounds) reached' \
+grep -q 'needs you · refix limit (3 rounds) reached' <<< "$(row)" \
   || fail "(4b) cap row must read 'needs you · refix limit' (got: $(row))"
 grep -q '"event":"stale_refix_escalated"' "$JOURNAL_FILE" || fail "(4b) cap must journal an escalation"
 ok "(4) per-rail budget + cap escalation"
@@ -191,8 +191,8 @@ _handle_stale_dup 40 slug-a shaE 0 "$WT" feat/a stale-base "$REASON"
 [ "$(rslv)" = "1" ] || fail "(5) no-builder path must dispatch the resolver exactly once (got $(rslv))"
 grep -q '^slug-a 40 feat/a shaE$' "$RESOLVE_LOG" || fail "(5) resolver args must be slug/pr/branch/sha (got: $(cat "$RESOLVE_LOG"))"
 refix_attempted 40 shaE stale || fail "(5) resolver dispatch must burn the stale once-guard"
-row | grep -q 'rebasing · awaiting push' || fail "(5) resolver path must read 'rebasing · awaiting push' (got: $(row))"
-row | grep -q 'needs you' && fail "(5) 'needs you' is BANNED when the resolver was dispatched (got: $(row))"
+grep -q 'rebasing · awaiting push' <<< "$(row)" || fail "(5) resolver path must read 'rebasing · awaiting push' (got: $(row))"
+grep -q 'needs you' <<< "$(row)" && fail "(5) 'needs you' is BANNED when the resolver was dispatched (got: $(row))"
 grep -q '"event":"stale_refix_resolver"' "$JOURNAL_FILE" || fail "(5) resolver dispatch must be journaled"
 # Re-entry must not double-dispatch.
 _handle_stale_dup 40 slug-a shaE 0 "$WT" feat/a stale-base "$REASON"
@@ -215,7 +215,7 @@ export STUB_AGENT_EMPTY=1
 STUB_LIVENESS=missing
 _handle_stale_dup 42 slug-a shaG 0 "$T/no-such-wt" feat/a stale-base "$REASON"
 [ "$(rslv)" = "0" ] || fail "(5d) missing worktree must not spawn a resolver"
-row | grep -q 'needs you' || fail "(5d) missing worktree must escalate to needs-you (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(5d) missing worktree must escalate to needs-you (got: $(row))"
 ok "(5d) no builder + no worktree escalates"
 
 # ── (6) DUPLICATE always human, even with autofix ON ──────────────────────────────────────────
@@ -227,8 +227,8 @@ _handle_stale_dup 50 slug-a shaH 0 "$WT" feat/a duplicate \
 [ "$(runs)" = "0" ] || fail "(6) duplicate must never bounce"
 [ "$(rslv)" = "0" ] || fail "(6) duplicate must never spawn a resolver"
 [ "$(refix_round_count 50)" = "0" ] || fail "(6) duplicate must not consume a refix round"
-row | grep -q 'needs you' || fail "(6) duplicate must read 'needs you' (got: $(row))"
-row | grep -q 'stale/duplicate (duplicate)' || fail "(6) row must name the duplicate flavor (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(6) duplicate must read 'needs you' (got: $(row))"
+grep -q 'stale/duplicate (duplicate)' <<< "$(row)" || fail "(6) row must name the duplicate flavor (got: $(row))"
 ok "(6) DUPLICATE flavor stays human"
 
 # ── (7) dry-run never bounces ─────────────────────────────────────────────────────────────────
@@ -238,7 +238,7 @@ DRYRUN=1 _handle_stale_dup 60 slug-a shaI 0 "$WT" feat/a stale-base "$REASON"
 [ "$(runs)" = "0" ] || fail "(7) dry-run must never bounce"
 [ "$(rslv)" = "0" ] || fail "(7) dry-run must never spawn a resolver"
 [ "$(refix_round_count 60)" = "0" ] || fail "(7) dry-run must not consume a round"
-row | grep -q 'needs you' || fail "(7) dry-run must fall through to needs-you (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(7) dry-run must fall through to needs-you (got: $(row))"
 ok "(7) dry-run is inert"
 
 # ── (8) kind isolation: stale bounce does not satisfy the review once-guard ───────────────────
@@ -263,10 +263,10 @@ reset_state
 export STALE_BASE_AUTOFIX=on STUB_AGENT_STATUS=idle
 printf '1\n1\n' > "$STUB_WAIT_FILE"   # both wake checks fail: the builder never wakes
 _handle_stale_dup 80 slug-a shaK 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'needs you' || fail "(10) tick1: failed wake must read needs-you (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(10) tick1: failed wake must read needs-you (got: $(row))"
 _handle_stale_dup 80 slug-a shaK 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'needs you' || fail "(10) tick2: once-guard must NOT flip to rebasing (got: $(row))"
-row | grep -q 'stalled' || fail "(10) tick2 must carry the stalled reason (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(10) tick2: once-guard must NOT flip to rebasing (got: $(row))"
+grep -q 'stalled' <<< "$(row)" || fail "(10) tick2 must carry the stalled reason (got: $(row))"
 ok "(10) failed wake escalates durably (no rebasing lie)"
 
 # ── (11) agent dies AFTER a good wake → stalled row, never a permanent 'rebasing' lie (round-6) ──
@@ -274,12 +274,12 @@ reset_state
 export STALE_BASE_AUTOFIX=on STUB_AGENT_STATUS=idle STUB_LIVENESS=alive
 printf '0\n' > "$STUB_WAIT_FILE"                       # wake SUCCEEDS: record written, no stuck marker
 _handle_stale_dup 90 slug-a shaL 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'rebasing' || fail "(11) tick1: good wake reads rebasing (got: $(row))"
+grep -q 'rebasing' <<< "$(row)" || fail "(11) tick1: good wake reads rebasing (got: $(row))"
 export STUB_LIVENESS=dead                              # builder session dies before pushing
 _handle_stale_dup 90 slug-a shaL 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'needs you' || fail "(11) tick2: dead-after-wake must escalate, not claim rebasing (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(11) tick2: dead-after-wake must escalate, not claim rebasing (got: $(row))"
 _handle_stale_dup 90 slug-a shaL 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'needs you' || fail "(11) tick3: escalation is durable (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(11) tick3: escalation is durable (got: $(row))"
 ok "(11) died-after-wake escalates durably (round-6 triple disproof)"
 
 # ── (12) live RESOLVER keeps an honest in-progress row ────────────────────────────────────────
@@ -288,10 +288,10 @@ export STALE_BASE_AUTOFIX=on STUB_LIVENESS=missing STUB_RESOLVER_ALIVE=1
 printf '0\n' > "$STUB_WAIT_FILE"
 record_refix 95 shaM slug-a stale                       # heal already dispatched (resolver path)
 _handle_stale_dup 95 slug-a shaM 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'resolver working' || fail "(12) live resolver must read as working (got: $(row))"
+grep -q 'resolver working' <<< "$(row)" || fail "(12) live resolver must read as working (got: $(row))"
 export STUB_RESOLVER_ALIVE=0
 _handle_stale_dup 95 slug-a shaM 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'needs you' || fail "(12) dead resolver must escalate (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(12) dead resolver must escalate (got: $(row))"
 ok "(12) resolver liveness consulted before claiming progress"
 
 # ── (13) WORKING builder → heal deferred, never a resolver into the live worktree (round-7) ────
@@ -301,7 +301,7 @@ _handle_stale_dup 100 slug-a shaN 0 "$WT" feat/a stale-base "$REASON"
 [ "$(runs)" = "0" ] || fail "(13) working builder must not be bounced"
 [ "$(rslv)" = "0" ] || fail "(13) working builder must NEVER get a resolver in its worktree"
 refix_attempted 100 shaN stale && fail "(13) once-guard must NOT be burned on defer"
-row | grep -q 'builder busy' || fail "(13) row must read deferred (got: $(row))"
+grep -q 'builder busy' <<< "$(row)" || fail "(13) row must read deferred (got: $(row))"
 ok "(13) working builder defers the heal (no two-agents-one-worktree)"
 
 # ── (14) resolver already in flight → no second dispatch ──────────────────────────────────────
@@ -325,7 +325,7 @@ _agent_status() {  # pop one status per call: guard sees idle, dispatch-site re-
 export STUB_AGENT_STATUS=working   # herdr-level: pane lookup excludes working → empty pane id
 _handle_stale_dup 120 slug-a shaQ 0 "$WT" feat/a stale-base "$REASON"
 [ "$(rslv)" = "0" ] || fail "(15) mid-tick flip must NEVER dispatch a resolver into the live worktree"
-row | grep -q 'builder busy' || fail "(15) row must read deferred (got: $(row))"
+grep -q 'builder busy' <<< "$(row)" || fail "(15) row must read deferred (got: $(row))"
 eval "$_agent_status_real_15"
 ok "(15) TOCTOU flip defers — no resolver into a live worktree"
 
@@ -344,7 +344,7 @@ printf '%s\n' "$$" > "$(suite_marker "70-shaS")"        # a LIVE suite (this she
 _handle_stale_dup 70 slug-a shaS 0 "$WT" feat/a stale-base "$REASON"
 [ "$(runs)" = "0" ]  || fail "(16) live suite: must NOT pane-bounce into a worktree under a running suite"
 [ "$(rslv)" = "0" ]  || fail "(16) live suite: must NOT spawn a resolver into a worktree under a running suite"
-row | grep -q 'waiting for suite' || fail "(16) row must read deferred (got: $(row))"
+grep -q 'waiting for suite' <<< "$(row)" || fail "(16) row must read deferred (got: $(row))"
 grep -q 'refix_deferred_suite' "$JOURNAL_FILE" || fail "(16) the defer must be journaled"
 [ "$(refix_round_count 70)" = "0" ] || fail "(16) a deferred heal must not spend a refix round"
 refix_attempted 70 shaS stale && fail "(16) a deferred heal must not burn the once-guard"
@@ -355,7 +355,7 @@ ok "(16) live suite defers the stale-base heal — no bounce, no resolver, no bu
 rm -f "$(suite_marker "70-shaS")"
 _handle_stale_dup 70 slug-a shaS 0 "$WT" feat/a stale-base "$REASON"
 [ "$(runs)" = "1" ] || fail "(17) after the suite collects, the bounce must fire (got $(runs) pane-runs)"
-row | grep -q 'rebasing' || fail "(17) row must read rebasing (got: $(row))"
+grep -q 'rebasing' <<< "$(row)" || fail "(17) row must read rebasing (got: $(row))"
 [ "$(refix_round_count 70)" = "1" ] || fail "(17) the healed round must now be recorded"
 ok "(17) suite collects → next tick bounces normally (once-guard survived the defer)"
 
@@ -377,9 +377,9 @@ reset_state
 unset STALE_BASE_AUTOFIX
 export STUB_AGENT_STATUS=working
 _handle_stale_dup 90 slug-a shaW 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'fix in progress · builder working' \
+grep -q 'fix in progress · builder working' <<< "$(row)" \
   || fail "(19) a working builder must render fix-in-progress (got: $(row))"
-row | grep -q 'needs you' && fail "(19) a working builder must never render needs-you (got: $(row))"
+grep -q 'needs you' <<< "$(row)" && fail "(19) a working builder must never render needs-you (got: $(row))"
 [ "$(runs)" = "0" ] || fail "(19) off-mode must still never pane-run"
 [ "$(rslv)" = "0" ] || fail "(19) off-mode must still never spawn a resolver"
 [ "$(refix_round_count 90)" = "0" ] || fail "(19) a row-truth render must not consume a refix round"
@@ -391,14 +391,14 @@ reset_state
 unset STALE_BASE_AUTOFIX
 export STUB_AGENT_STATUS=idle
 _handle_stale_dup 92 slug-a shaI 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'needs you · stale/duplicate (stale-base)' \
+grep -q 'needs you · stale/duplicate (stale-base)' <<< "$(row)" \
   || fail "(19b) an idle builder's off-mode row must be byte-identical needs-you (got: $(row))"
 # …and a BLIND agent roster (no positive signal at all) fails toward asking the human, never silence.
 reset_state
 unset STALE_BASE_AUTOFIX
 export STUB_AGENT_EMPTY=1
 _handle_stale_dup 93 slug-a shaB 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'needs you' || fail "(19c) a blind agent roster must fall through to needs-you (got: $(row))"
+grep -q 'needs you' <<< "$(row)" || fail "(19c) a blind agent roster must fall through to needs-you (got: $(row))"
 ok "(19b/c) idle + blind rosters keep the unchanged needs-you row"
 
 # ── (20) DUPLICATE stays human even while the builder works — it is a judgment call, not a rebase ───
@@ -406,7 +406,7 @@ reset_state
 unset STALE_BASE_AUTOFIX
 export STUB_AGENT_STATUS=working
 _handle_stale_dup 94 slug-a shaD2 0 "$WT" feat/a duplicate "$REASON"
-row | grep -q 'needs you · stale/duplicate (duplicate)' \
+grep -q 'needs you · stale/duplicate (duplicate)' <<< "$(row)" \
   || fail "(20) DUPLICATE must stay needs-you regardless of agent activity (got: $(row))"
 ok "(20) DUPLICATE is unaffected by the activity check"
 
@@ -414,7 +414,7 @@ ok "(20) DUPLICATE is unaffected by the activity check"
 reset_state
 export STALE_BASE_AUTOFIX=on DRYRUN=1 STUB_AGENT_STATUS=working
 _handle_stale_dup 95 slug-a shaDR 0 "$WT" feat/a stale-base "$REASON"
-row | grep -q 'fix in progress · builder working' || fail "(21) dry-run must render the honest row (got: $(row))"
+grep -q 'fix in progress · builder working' <<< "$(row)" || fail "(21) dry-run must render the honest row (got: $(row))"
 [ "$(runs)" = "0" ] || fail "(21) dry-run must never bounce"
 ok "(21) dry-run + working builder → fix in progress, still no bounce"
 

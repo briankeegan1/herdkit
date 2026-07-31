@@ -78,7 +78,7 @@ cat > "$N/src/config.js" <<'EOF'
 const region = process.env.AWS_REGION;
 EOF
 NO="$T/node.md"; gen "$N" "$NO"
-head -1 "$NO" | grep -qF -- '# node codemap'                          || fail "node: wrong title: $(head -1 "$NO")"
+grep -qF -- '# node codemap' <<< "$(head -1 "$NO")" || fail "node: wrong title: $(head -1 "$NO")"
 grep -qF "a native scan of this project's node source tree" "$NO"  || fail "node: missing mode/lang banner"
 grep -qF -- '## Who imports whom'                                     "$NO" || fail "node: not project mode (no imports section)"
 grep -qF -- '## Who sources whom'                                     "$NO" && fail "node: leaked the ENGINE 'sources whom' section"
@@ -115,7 +115,7 @@ import os
 q = os.getenv("QUEUE_URL")
 EOF
 PO="$T/py.md"; gen "$P" "$PO"
-head -1 "$PO" | grep -qF -- '# py codemap'                            || fail "py: wrong title"
+grep -qF -- '# py codemap' <<< "$(head -1 "$PO")" || fail "py: wrong title"
 grep -qF "a native scan of this project's python source tree" "$PO" || fail "py: missing python banner"
 grep -qF -- '- `pkg/worker.py` — background job runner.'              "$PO" || fail "py: missing multi-line docstring role"
 grep -qF -- '- `app.py` — CLI entrypoint for the demo service.'       "$PO" || fail "py: missing one-line docstring role"
@@ -149,7 +149,7 @@ import "os"
 func Env() string { return os.Getenv("GO_MODE") + os.Getenv("REGION") }
 EOF
 GO="$T/go.md"; gen "$G" "$GO"
-head -1 "$GO" | grep -qF -- '# go codemap'                            || fail "go: wrong title"
+grep -qF -- '# go codemap' <<< "$(head -1 "$GO")" || fail "go: wrong title"
 grep -qF -- '- `main.go` — program entrypoint.'                       "$GO" || fail "go: missing module role"
 grep -qF -- '- `main.go` → `util`'                                    "$GO" || fail "go: missing module-local import edge"
 grep -qF -- '- `GO_MODE` → `util/env.go`'                             "$GO" || fail "go: missing os.Getenv key"
@@ -174,7 +174,7 @@ use std::env;
 pub fn load() -> String { env::var("RUST_ENDPOINT").unwrap_or_default() }
 EOF
 RO="$T/rs.md"; gen "$R" "$RO"
-head -1 "$RO" | grep -qF -- '# rs codemap'                            || fail "rust: wrong title"
+grep -qF -- '# rs codemap' <<< "$(head -1 "$RO")" || fail "rust: wrong title"
 grep -qF -- '- `src/main.rs` — binary entrypoint.'                    "$RO" || fail "rust: missing //! doc-comment role"
 grep -qF -- '- `src/main.rs` → `crate::config::load`, `mod config`'   "$RO" || fail "rust: missing use/mod import edges"
 grep -qF -- '- `RUST_ENDPOINT` → `src/config.rs`'                     "$RO" || fail "rust: missing env::var key"
@@ -203,7 +203,7 @@ public class Config {
 }
 EOF
 JO="$T/java.md"; gen "$J" "$JO"
-head -1 "$JO" | grep -qF -- '# java codemap'                          || fail "java: wrong title"
+grep -qF -- '# java codemap' <<< "$(head -1 "$JO")" || fail "java: wrong title"
 grep -qF -- '- `src/com/demo/App.java` — application entrypoint.'     "$JO" || fail "java: missing module role"
 grep -qF -- '- `src/com/demo/App.java` → `com.demo.Config`'           "$JO" || fail "java: missing declared-package import edge"
 grep -qF -- '- `JAVA_HOME_X` → `src/com/demo/Config.java`'            "$JO" || fail "java: missing System.getenv key"
@@ -288,7 +288,7 @@ EOF
 printf 'name\tkind\tdescription\twhen_to_surface\nFIX_KEY\tconfig\tA fixture key\tWhen fixture\n' \
   > "$E/templates/capabilities.tsv"
 EO="$T/engine.md"; gen "$E" "$EO"
-head -1 "$EO" | grep -qF -- '# herdkit codemap'           || fail "engine: wrong title (mode not engine): $(head -1 "$EO")"
+grep -qF -- '# herdkit codemap' <<< "$(head -1 "$EO")" || fail "engine: wrong title (mode not engine): $(head -1 "$EO")"
 grep -qF -- '## Who sources whom'    "$EO"                || fail "engine: missing engine 'sources whom' section"
 grep -qF -- '## Who imports whom'    "$EO"                && fail "engine: leaked the PROJECT 'imports whom' section"
 grep -qF -- '- `alpha.sh` — the alpha module.'  "$EO"    || fail "engine: missing module role"
@@ -305,7 +305,7 @@ RO_REAL="$T/real.md"
 _real_engine="$(cd "$(dirname "$CODEMAP")/../.." && pwd -P)"
 HERD_CODEMAP_ROOT="$_real_engine" HERD_CODEMAP_OUT="$RO_REAL" bash "$CODEMAP" </dev/null >/dev/null 2>&1 \
   || fail "real-repo codemap failed"
-head -1 "$RO_REAL" | grep -qF -- '# herdkit codemap' || fail "real repo no longer maps as ENGINE"
+grep -qF -- '# herdkit codemap' <<< "$(head -1 "$RO_REAL")" || fail "real repo no longer maps as ENGINE"
 grep -qF -- '## Who sources whom' "$RO_REAL"          || fail "real repo lost its engine 'sources whom' section"
 ok
 echo "PASS real herdkit repo still maps as ENGINE"

@@ -83,7 +83,7 @@ ok
 [ "$(_field "$JOURNAL_FILE" 0 model)" = "claude-opus-4-8" ] || fail "model field wrong"
 ok
 # ts present and ISO-8601-ish (YYYY-MM-DDTHH:MM:SSZ).
-printf '%s' "$(_field "$JOURNAL_FILE" 0 ts)" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
+grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<< "$(_field "$JOURNAL_FILE" 0 ts)" \
   || fail "ts should be ISO-8601 UTC (got '$(_field "$JOURNAL_FILE" 0 ts)')"
 ok
 # pid/pr are ints in JSON; model/sha are strings.
@@ -245,18 +245,18 @@ JNL
 
 # ── (6) herd why <pr> — chronological, PR-scoped, excludes other PRs ──
 why_out="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" why 54 2>&1)"
-printf '%s\n' "$why_out" | grep -q "PR #54" || fail "herd why: header should name PR #54"
+grep -q "PR #54" <<< "$why_out" || fail "herd why: header should name PR #54"
 ok
-printf '%s\n' "$why_out" | grep -q "review dispatched" || fail "herd why: should list review dispatch"
+grep -q "review dispatched" <<< "$why_out" || fail "herd why: should list review dispatch"
 ok
-printf '%s\n' "$why_out" | grep -q "PASS (reviewer)" || fail "herd why: should show verdict + provenance"
+grep -q "PASS (reviewer)" <<< "$why_out" || fail "herd why: should show verdict + provenance"
 ok
-printf '%s\n' "$why_out" | grep -q "MERGED" || fail "herd why: should show the merge"
+grep -q "MERGED" <<< "$why_out" || fail "herd why: should show the merge"
 ok
-printf '%s\n' "$why_out" | grep -q "reaped worktree" || fail "herd why: should show the reap"
+grep -q "reaped worktree" <<< "$why_out" || fail "herd why: should show the reap"
 ok
 # PR 55's events must NOT bleed into PR 54's history.
-printf '%s\n' "$why_out" | grep -q "BLOCK" && fail "herd why 54: must not include PR #55's BLOCK"
+grep -q "BLOCK" <<< "$why_out" && fail "herd why 54: must not include PR #55's BLOCK"
 ok
 # Chronological order: dispatch line appears before the merge line.
 disp_ln="$(printf '%s\n' "$why_out" | grep -n "review dispatched" | head -1 | cut -d: -f1)"
@@ -266,14 +266,14 @@ merge_ln="$(printf '%s\n' "$why_out" | grep -n "MERGED" | head -1 | cut -d: -f1)
 ok
 # A PR with no journal entries reports cleanly (never errors).
 why_none="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" why 999 2>&1)"
-printf '%s\n' "$why_none" | grep -q "no journal entries" || fail "herd why: unknown PR should report no entries"
+grep -q "no journal entries" <<< "$why_none" || fail "herd why: unknown PR should report no entries"
 ok
 
 # ── (7) herd log --pr N filters to a single PR ──
 log_out="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" log --pr 55 2>&1)"
-printf '%s\n' "$log_out" | grep -q "pr=55" || fail "herd log --pr 55 should show PR 55 events"
+grep -q "pr=55" <<< "$log_out" || fail "herd log --pr 55 should show PR 55 events"
 ok
-printf '%s\n' "$log_out" | grep -q "pr=54" && fail "herd log --pr 55 must not show PR 54 events"
+grep -q "pr=54" <<< "$log_out" && fail "herd log --pr 55 must not show PR 54 events"
 ok
 # herd log with no journal → friendly message, exit 0.
 EMPTYP="$T/emptyproj"; mkdir -p "$EMPTYP/.herd"
@@ -285,7 +285,7 @@ CFG
 log_empty="$(cd "$EMPTYP" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" log 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "herd log with no journal should exit 0"
 ok
-printf '%s\n' "$log_empty" | grep -q "no engine journal yet" || fail "herd log: empty case should say so"
+grep -q "no engine journal yet" <<< "$log_empty" || fail "herd log: empty case should say so"
 ok
 
 # ── (8) timestamp invariants: ONE UTC writer, injectable clock, monotone-nondecreasing (HERD-137) ──
@@ -314,7 +314,7 @@ ok
 type _journal_ts >/dev/null 2>&1 || fail "_journal_ts helper not defined after sourcing journal.sh"
 ok
 now_ts="$(_journal_ts)"
-printf '%s' "$now_ts" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' \
+grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' <<< "$now_ts" \
   || fail "_journal_ts must emit ISO-8601 UTC (got '$now_ts')"
 ok
 ref_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

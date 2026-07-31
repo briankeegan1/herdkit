@@ -135,7 +135,7 @@ case "$row" in *"needs-you"*"gh pr ready"*) : ;; *) fail "the needs-you row must
 case "$row" in *"12m"*) : ;; *) fail "the row must carry its age, got: $row" ;; esac
 case "$row" in *"#77"*) : ;; *) fail "the row must carry the PR suffix, got: $row" ;; esac
 case "$row" in *"✅"*) fail "must NEVER render as a success" ;; esac
-printf '%s' "$row" | grep -qw 'idle' && fail "the row leaked the banned 'idle' word: $row"
+grep -qw 'idle' <<< "$row" && fail "the row leaked the banned 'idle' word: $row"
 ok
 
 # ── _reconcile_draft_stall: ship-dormant when FINISH_STALL_MIN is unset ────────────────────────────
@@ -305,7 +305,7 @@ while [ "$_t" -lt "$((3 * _FINISH_STALL_SCAN_INTERVAL))" ]; do
   HERD_NOW_EPOCH="$((NOW + _t * (GRACE + 1)))" _live_tick
 done
 grep -q '"event":"finish_stall_scan"' "$JOURNAL_FILE" || fail "live loop: finish_stall_scan was never journaled at all: $(cat "$JOURNAL_FILE")"
-grep '"event":"finish_stall_scan"' "$JOURNAL_FILE" | grep -q '"result":"eligible"\|"result":"escalated"' \
+grep -q '"result":"eligible"\|"result":"escalated"' <<< "$(grep '"event":"finish_stall_scan"' "$JOURNAL_FILE")" \
   || fail "live loop: finish_stall_scan must report eligible/escalated for the idle draft-PR builder, never only 'empty': $(grep '"event":"finish_stall_scan"' "$JOURNAL_FILE")"
 grep -q '"event":"finish_stall_detected".*"reason":"draft_pr"' "$JOURNAL_FILE" \
   || fail "live loop: expected a finish_stall_detected(reason=draft_pr) event for feat/draft-slug"

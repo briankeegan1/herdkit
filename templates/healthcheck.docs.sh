@@ -62,7 +62,7 @@ $(grep -oE '\]\([^) ]+\)' "$f" 2>/dev/null | sed -E 's/^\]\((.*)\)$/\1/')
 EOF
 
   # 3. template-conformance lint — the doc must open with a level-1 heading.
-  if ! head -n 5 "$f" | grep -qE '^# '; then
+  if ! grep -qE '^# ' <<< "$(head -n 5 "$f")"; then
     add_err "$f: no level-1 heading ('# Title') in the first 5 lines"
   fi
 done

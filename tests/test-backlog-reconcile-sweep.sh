@@ -67,15 +67,15 @@ export HERD_SWEEP_COMMITS_FILE="$T/commits.tsv"
 
 # ── (1)+(2) default report: shipped items detected, unrelated ones excluded ────
 out="$(bash "$SCRIPT")" || fail "default run exited non-zero"
-printf '%s\n' "$out" | grep -q 'Auto-refix resumes a done builder' \
+grep -q 'Auto-refix resumes a done builder' <<< "$out" \
   || fail "sweep did not detect the shipped-but-🔜 auto-refix item ($out)"
-printf '%s\n' "$out" | grep -qi 'HIGH' \
+grep -qi 'HIGH' <<< "$out" \
   || fail "sweep did not mark the auto-refix item HIGH-confidence ($out)"
-printf '%s\n' "$out" | grep -q 'PR #71' \
+grep -q 'PR #71' <<< "$out" \
   || fail "sweep did not cite the matching PR #71 ($out)"
 # The unrelated items must NOT be flagged as candidates.
-printf '%s\n' "$out" | grep -q 'CSV importer'  && fail "sweep false-flagged the unrelated CSV importer item"
-printf '%s\n' "$out" | grep -q 'Dark mode'     && fail "sweep false-flagged the unrelated dark-mode item"
+grep -q 'CSV importer' <<< "$out" && fail "sweep false-flagged the unrelated CSV importer item"
+grep -q 'Dark mode' <<< "$out" && fail "sweep false-flagged the unrelated dark-mode item"
 pass
 
 # ── (3a) default run must NOT touch the scribe seam ────────────────────────────
@@ -93,7 +93,7 @@ pass
 # Both 🔜 items that match merged PRs (#71, #80) are HIGH; the two unrelated items are excluded.
 out="$(HERD_RECONCILE_SCRIBE="$T/fake-scribe.sh" bash "$SCRIPT" --enqueue)" \
   || fail "--enqueue run exited non-zero"
-printf '%s\n' "$out" | grep -q 'enqueued 2 scribe reconcile request' \
+grep -q 'enqueued 2 scribe reconcile request' <<< "$out" \
   || fail "--enqueue did not report enqueuing the two HIGH candidates ($out)"
 reqs=( "$REQDIR"/*.txt )
 [ "${#reqs[@]}" -eq 2 ] || fail "expected exactly TWO scribe requests (one per HIGH item), got ${#reqs[@]}"
@@ -119,7 +119,7 @@ B
 rm -f "$REQDIR"/*.txt
 out="$(HERD_RECONCILE_SCRIBE="$T/fake-scribe.sh" bash "$SCRIPT" --enqueue)" \
   || fail "--enqueue (no matches) exited non-zero"
-printf '%s\n' "$out" | grep -qi 'no probably-shipped\|no HIGH-confidence candidates to enqueue' \
+grep -qi 'no probably-shipped\|no HIGH-confidence candidates to enqueue' <<< "$out" \
   || fail "no-match run should report nothing to reconcile/enqueue ($out)"
 [ -z "$(ls -A "$REQDIR" 2>/dev/null)" ] || fail "no-match run must NOT enqueue anything"
 pass
@@ -159,23 +159,23 @@ export HERD_SWEEP_EXACT_PRS_FILE="$T/prs-full.tsv"
 export HERD_SWEEP_COMMITS_FILE="$T/commits.tsv"   # bookkeeping/merge noise, matches nothing here
 
 out="$(bash "$SCRIPT")" || fail "exact-ref default run exited non-zero ($out)"
-printf '%s\n' "$out" | grep -q 'Add exact-ref pass before fuzzy title matching' \
+grep -q 'Add exact-ref pass before fuzzy title matching' <<< "$out" \
   || fail "exact pass did not surface the HERD-49 item ($out)"
-printf '%s\n' "$out" | grep -qi 'exact' \
+grep -qi 'exact' <<< "$out" \
   || fail "exact pass did not mark the HERD-49 item as an exact-ref match ($out)"
-printf '%s\n' "$out" | grep -q 'PR #185' \
+grep -q 'PR #185' <<< "$out" \
   || fail "exact pass did not cite the OLD matching PR #185 ($out)"
-printf '%s\n' "$out" | grep -q 'HERD-49' \
+grep -q 'HERD-49' <<< "$out" \
   || fail "exact pass did not name the matched tracker id HERD-49 ($out)"
 # The item with no matching PR must be left untouched.
-printf '%s\n' "$out" | grep -q 'quantum widgets' && fail "exact pass false-flagged the unmatched HERD-77 item"
+grep -q 'quantum widgets' <<< "$out" && fail "exact pass false-flagged the unmatched HERD-77 item"
 pass
 
 # ── (7) EXACT-REF --enqueue: one verify-first request citing PR #185 ───────────
 rm -f "$REQDIR"/*.txt "$JOURNAL"
 out="$(HERD_RECONCILE_SCRIBE="$T/fake-scribe.sh" bash "$SCRIPT" --enqueue)" \
   || fail "exact-ref --enqueue run exited non-zero ($out)"
-printf '%s\n' "$out" | grep -q 'enqueued 1 scribe reconcile request' \
+grep -q 'enqueued 1 scribe reconcile request' <<< "$out" \
   || fail "exact --enqueue did not report enqueuing the single exact candidate ($out)"
 reqs=( "$REQDIR"/*.txt )
 [ "${#reqs[@]}" -eq 1 ] || fail "expected exactly ONE scribe request (the exact-ref item), got ${#reqs[@]}"

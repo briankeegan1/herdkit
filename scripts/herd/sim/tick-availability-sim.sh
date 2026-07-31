@@ -351,7 +351,7 @@ wait
 [ "$(jgrep '"event":"spawn_launched"')" = "1" ] \
   && ok "spawn_launched exactly once — the drain's event stream is unchanged" \
   || bad "spawn_launched journaled $(jgrep '"event":"spawn_launched"')× (want 1)"
-ls "$TREESD/spawn-queue" 2>/dev/null | grep -q . \
+grep -q . <<< "$(ls "$TREESD/spawn-queue" 2>/dev/null)" \
   && bad "the healthy drain left the queue non-empty" \
   || ok "the healthy drain consumed its intent"
 

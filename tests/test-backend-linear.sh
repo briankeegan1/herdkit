@@ -95,8 +95,8 @@ run() {
 # 1. add_item → issueCreate mutation carrying the title/body/teamId; returns DONE + the issue URL.
 : > "$GQLLOG"
 out="$(run _backend_add_item REQ1 "add a dark-mode toggle")"
-echo "$out" | grep -q "RESULT=DONE" || fail "add_item did not report DONE ($out)"
-echo "$out" | grep -q "https://linear.app/acme/issue/ENG-42" || fail "add_item did not surface the created issue URL"
+grep -q "RESULT=DONE" <<< "$out" || fail "add_item did not report DONE ($out)"
+grep -q "https://linear.app/acme/issue/ENG-42" <<< "$out" || fail "add_item did not surface the created issue URL"
 grep -q "issueCreate" "$GQLLOG" || fail "add_item did not issue an 'issueCreate' mutation"
 grep -q "add a dark-mode toggle" "$GQLLOG" || fail "add_item did not pass the request text as the issue title/body"
 grep -q "team_xyz" "$GQLLOG" || fail "add_item did not target the configured team (teamId)"
@@ -110,7 +110,7 @@ pass
 : > "$GQLLOG"
 BIG="$(python3 -c 'print("Add a really important feature " + "x"*470)')"   # 501 chars, no newline
 out="$(run _backend_add_item REQ2 "$BIG")"
-echo "$out" | grep -q "RESULT=DONE" || fail "add_item (long) did not report DONE ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "add_item (long) did not report DONE ($out)"
 python3 - "$GQLLOG" <<'PY' || fail "add_item (long) title/description lengths wrong"
 import sys, json, re
 log = open(sys.argv[1]).read()           # one issueCreate round-trip; QUERY text is multi-line
@@ -147,8 +147,8 @@ open="$(run _backend_list_open)"
 grep -q "issues(" "$GQLLOG" || fail "list_open did not issue an 'issues' query"
 grep -q 'team: { id: { eq: $team }' "$GQLLOG" || fail "list_open (team set) did not scope the query to the team"
 grep -q "team_xyz" "$GQLLOG" || fail "list_open (team set) did not pass the team id in variables"
-echo "$open" | grep -q "^#ENG-7 first open issue$"  || fail "list_open missing '#ENG-7 first open issue' ($open)"
-echo "$open" | grep -q "^#ENG-9 second open issue$" || fail "list_open missing '#ENG-9 second open issue'"
+grep -q "^#ENG-7 first open issue$" <<< "$open" || fail "list_open missing '#ENG-7 first open issue' ($open)"
+grep -q "^#ENG-9 second open issue$" <<< "$open" || fail "list_open missing '#ENG-9 second open issue'"
 pass
 
 # 2b. list_open (team scoped OFF) → no team filter, so it spans every team the key can see.
@@ -156,7 +156,7 @@ pass
 open2="$( unset LINEAR_TEAM_ID; run _backend_list_open )"
 grep -q "issues(" "$GQLLOG" || fail "list_open (no team) did not issue an 'issues' query"
 grep -q 'team: { id:' "$GQLLOG" && fail "list_open (no team) must NOT scope by team — it leaked a team filter"
-echo "$open2" | grep -q "^#ENG-7 first open issue$" || fail "list_open (no team) missing '#ENG-7 first open issue' ($open2)"
+grep -q "^#ENG-7 first open issue$" <<< "$open2" || fail "list_open (no team) missing '#ENG-7 first open issue' ($open2)"
 pass
 
 # 2c. list_open_rich → same open filter as list_open but also requests state {name type} +
@@ -172,9 +172,9 @@ grep -q "assignee { displayName }" "$GQLLOG" || fail "list_open_rich did not req
 grep -q 'team: { id: { eq: $team }' "$GQLLOG" || fail "list_open_rich (team set) did not scope the query to the team"
 echo "$rich" | grep '^#' | head -n1 | grep -q "^#ENG-9" \
   || fail "list_open_rich did not sort the started (in-progress) issue first ($rich)"
-echo "$rich" | grep -q "^#ENG-9${TAB}started${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase${TAB}https://linear.app/acme/issue/ENG-9$" \
+grep -q "^#ENG-9${TAB}started${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase${TAB}https://linear.app/acme/issue/ENG-9$" <<< "$rich" \
   || fail "list_open_rich TSV shape wrong for ENG-9 (assignee Chase 6th field, url 7th field) ($rich)"
-echo "$rich" | grep -q "^#ENG-7${TAB}unstarted${TAB}Todo${TAB}first open issue${TAB}first open issue Details for seven.${TAB}${TAB}https://linear.app/acme/issue/ENG-7$" \
+grep -q "^#ENG-7${TAB}unstarted${TAB}Todo${TAB}first open issue${TAB}first open issue Details for seven.${TAB}${TAB}https://linear.app/acme/issue/ENG-7$" <<< "$rich" \
   || fail "list_open_rich did not flatten desc / place empty assignee then url; ENG-7 shape wrong ($rich)"
 pass
 
@@ -184,16 +184,16 @@ pass
 det="$(run _backend_show_item "#ENG-7")"
 grep -q "issueSearch" "$GQLLOG" && fail "show_item must NOT use the deprecated issueSearch endpoint"
 grep -q '"n": 7' "$GQLLOG" || fail "show_item did not resolve by the parsed issue number"
-echo "$det" | grep -q "^#ENG-7 · In Progress (started)$" || fail "show_item missing the id · state header ($det)"
-echo "$det" | grep -q "Full spec body here." || fail "show_item did not print the full description body"
-echo "$det" | grep -q "linear.app/acme/issue/ENG-7 · updated 2026-07-06" || fail "show_item missing url + updated date"
+grep -q "^#ENG-7 · In Progress (started)$" <<< "$det" || fail "show_item missing the id · state header ($det)"
+grep -q "Full spec body here." <<< "$det" || fail "show_item did not print the full description body"
+grep -q "linear.app/acme/issue/ENG-7 · updated 2026-07-06" <<< "$det" || fail "show_item missing url + updated date"
 pass
 
 # 2e. show_item on an unparseable ref → loud stderr, no network round-trip. (Exit code is not
 #     asserted: `run` wraps the op in a subshell that always appends its RESULT/ITEM_STATE report.)
 : > "$GQLLOG"
 err="$(run _backend_show_item "nodashhere" 2>&1 >/dev/null || true)"
-echo "$err" | grep -q "not a TEAMKEY-NUMBER" || fail "show_item on an unparseable ref should say so on stderr ($err)"
+grep -q "not a TEAMKEY-NUMBER" <<< "$err" || fail "show_item on an unparseable ref should say so on stderr ($err)"
 grep -q "issues(" "$GQLLOG" && fail "show_item on an unparseable ref should not issue any query"
 pass
 
@@ -201,7 +201,7 @@ pass
 #    comments the PR link, then moves it to the resolved Done state.
 : > "$GQLLOG"
 ship="$(run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/3)"
-echo "$ship" | grep -q "RESULT=DONE" || fail "mark_shipped did not report DONE ($ship)"
+grep -q "RESULT=DONE" <<< "$ship" || fail "mark_shipped did not report DONE ($ship)"
 grep -q "issues(filter" "$GQLLOG"  || fail "mark_shipped did not resolve the issue via issues(filter:)"
 grep -q "issueSearch" "$GQLLOG"    && fail "mark_shipped must NOT use the deprecated issueSearch endpoint"
 grep -q 'number: { eq: $n }' "$GQLLOG" || fail "mark_shipped did not look the issue up by parsed number"
@@ -220,14 +220,14 @@ pass
 # 3b. mark_shipped with an unparseable slug (no number) → NOCHANGE, no resolve round-trip.
 : > "$GQLLOG"
 ship2="$(run _backend_mark_shipped nodashhere https://github.com/acme/widgets/pull/9 2>/dev/null)"
-echo "$ship2" | grep -q "RESULT=NOCHANGE" || fail "mark_shipped on an unparseable slug should be NOCHANGE ($ship2)"
+grep -q "RESULT=NOCHANGE" <<< "$ship2" || fail "mark_shipped on an unparseable slug should be NOCHANGE ($ship2)"
 grep -q "issues(" "$GQLLOG" && fail "mark_shipped on an unparseable slug should not issue any query"
 pass
 
 # 4. item_state → resolves via issues(filter:) reading state.type; maps completed → closed.
 : > "$GQLLOG"
 out="$(run _backend_item_state "provider-lib#ENG-7")"
-echo "$out" | grep -q "ITEM_STATE=closed" || fail "_backend_item_state did not return ITEM_STATE=closed ($out)"
+grep -q "ITEM_STATE=closed" <<< "$out" || fail "_backend_item_state did not return ITEM_STATE=closed ($out)"
 grep -q "issues(filter" "$GQLLOG" || fail "_backend_item_state did not resolve via issues(filter:)"
 grep -q "issueSearch" "$GQLLOG"   && fail "_backend_item_state must NOT use the deprecated issueSearch endpoint"
 grep -q "state { type }" "$GQLLOG" || fail "_backend_item_state did not request the issue state.type"
@@ -253,11 +253,11 @@ guard_state() {   # env G_TYPE/G_UPD drive the mocked state.type + updatedAt; pr
     printf 'ITEM_STATE=%s\nITEM_UPDATED=%s\n' "${ITEM_STATE:-}" "${ITEM_UPDATED:-}" )
 }
 out="$(G_TYPE=completed G_UPD="2026-07-08T21:51:00.000Z" guard_state)"
-echo "$out" | grep -q "ITEM_STATE=closed"       || fail "guard precondition: completed issue must read closed ($out)"
-echo "$out" | grep -q "ITEM_UPDATED=2026-07-08" || fail "guard precondition: last-updated (day) evidence not surfaced ($out)"
+grep -q "ITEM_STATE=closed" <<< "$out" || fail "guard precondition: completed issue must read closed ($out)"
+grep -q "ITEM_UPDATED=2026-07-08" <<< "$out" || fail "guard precondition: last-updated (day) evidence not surfaced ($out)"
 grep -q "updatedAt" "$GQLLOG"                   || fail "guard precondition: state read did not request updatedAt evidence"
 out="$(G_TYPE=canceled G_UPD="2026-07-01T00:00:00.000Z" guard_state)"
-echo "$out" | grep -q "ITEM_STATE=closed"       || fail "guard precondition: canceled issue must also read closed ($out)"
+grep -q "ITEM_STATE=closed" <<< "$out" || fail "guard precondition: canceled issue must also read closed ($out)"
 pass
 
 # 4b. CROSS-TEAM (the dep-watcher case): with LINEAR_TEAM_ID set, an identifier from a DIFFERENT team
@@ -278,7 +278,7 @@ pass
 #     state change is not a new item (the gh #139 junk-issue bug this closes).
 : > "$GQLLOG"
 us="$(run _backend_update_state ENG-7 done)"
-echo "$us" | grep -q "RESULT=DONE" || fail "update_state did not report DONE ($us)"
+grep -q "RESULT=DONE" <<< "$us" || fail "update_state did not report DONE ($us)"
 grep -q "issues(filter" "$GQLLOG"          || fail "update_state did not resolve via issues(filter:)"
 grep -q "issueSearch" "$GQLLOG"            && fail "update_state must NOT use the deprecated issueSearch endpoint"
 grep -q 'type: { eq: "completed" }' "$GQLLOG" || fail "update_state (done) did not map to the completed workflow-state type"
@@ -299,7 +299,7 @@ pass
 # 4e. update_state with an UNKNOWN target state → NOCHANGE, and no round-trip at all (files nothing).
 : > "$GQLLOG"
 us2="$(run _backend_update_state ENG-7 frobnicate 2>/dev/null)"
-echo "$us2" | grep -q "RESULT=NOCHANGE" || fail "update_state on an unknown state should be NOCHANGE ($us2)"
+grep -q "RESULT=NOCHANGE" <<< "$us2" || fail "update_state on an unknown state should be NOCHANGE ($us2)"
 grep -q "issues(" "$GQLLOG" && fail "update_state on an unknown state should issue no query"
 pass
 
@@ -308,7 +308,7 @@ pass
 : > "$GQLLOG"
 us3="$(run _backend_update_state "first open issue" done)"
 grep -q "containsIgnoreCase" "$GQLLOG" || fail "update_state (no identifier) did not fall back to a title match"
-echo "$us3" | grep -q "RESULT=DONE"    || fail "update_state title match did not transition the unique match ($us3)"
+grep -q "RESULT=DONE" <<< "$us3" || fail "update_state title match did not transition the unique match ($us3)"
 pass
 
 # 4g. gh #169: a workspace with MULTIPLE started-type states must resolve 'in-progress' to the state
@@ -317,7 +317,7 @@ pass
 : > "$GQLLOG"
 us4="$( STATES_NODES='[{"id":"st_review","name":"In Review","position":2},{"id":"st_progress","name":"In Progress","position":1}]' \
         run _backend_update_state ENG-7 in-progress )"
-echo "$us4" | grep -q "RESULT=DONE" || fail "update_state (multi started) did not report DONE ($us4)"
+grep -q "RESULT=DONE" <<< "$us4" || fail "update_state (multi started) did not report DONE ($us4)"
 grep -q "issueUpdate" "$GQLLOG" || fail "update_state (multi started) did not move the issue"
 grep -q "st_progress" "$GQLLOG" || fail "update_state (multi started) did not pick the 'In Progress' state by NAME (gh #169)"
 grep -q "st_review"  "$GQLLOG" && fail "update_state (multi started) picked 'In Review' — the exact gh #169 regression"
@@ -328,7 +328,7 @@ pass
 : > "$GQLLOG"
 us5="$( STATES_NODES='[{"id":"st_review","name":"In Review","position":2},{"id":"st_doing","name":"Doing","position":1}]' \
         run _backend_update_state ENG-7 in-progress )"
-echo "$us5" | grep -q "RESULT=DONE" || fail "update_state (position fallback) did not report DONE ($us5)"
+grep -q "RESULT=DONE" <<< "$us5" || fail "update_state (position fallback) did not report DONE ($us5)"
 grep -q "st_doing" "$GQLLOG" || fail "update_state (position fallback) did not pick the LOWEST-position started state (gh #169)"
 grep -q "st_review" "$GQLLOG" && fail "update_state (position fallback) picked the higher-position 'In Review' — gh #169 regression"
 pass
@@ -338,7 +338,7 @@ pass
 : > "$GQLLOG"
 us6="$( STATES_NODES='[{"id":"st_dup","name":"Duplicate","position":2},{"id":"st_done","name":"Done","position":1}]' \
         run _backend_update_state ENG-7 done )"
-echo "$us6" | grep -q "RESULT=DONE" || fail "update_state (multi completed) did not report DONE ($us6)"
+grep -q "RESULT=DONE" <<< "$us6" || fail "update_state (multi completed) did not report DONE ($us6)"
 grep -q "st_done" "$GQLLOG" || fail "update_state (multi completed) did not pick the 'Done' state by NAME (gh #169)"
 grep -q "st_dup"  "$GQLLOG" && fail "update_state (multi completed) picked 'Duplicate' — gh #169 regression"
 pass
@@ -349,7 +349,7 @@ pass
 #     scribe retry instead of journaling a false verified transition (the PR #187/HERD-67 incident).
 : > "$GQLLOG"
 usf="$( ISSUEUPDATE_SUCCESS=false run _backend_update_state ENG-7 done 2>/dev/null )"
-echo "$usf" | grep -q "RESULT=NOCHANGE" || fail "update_state must return NOCHANGE when issueUpdate is not confirmed ($usf)"
+grep -q "RESULT=NOCHANGE" <<< "$usf" || fail "update_state must return NOCHANGE when issueUpdate is not confirmed ($usf)"
 grep -q "issueUpdate" "$GQLLOG" || fail "update_state (failed mutation) should still ATTEMPT the issueUpdate before reporting NOCHANGE"
 grep -q "issueCreate" "$GQLLOG" && fail "update_state (failed mutation) must NOT fall back to filing a new issue"
 pass
@@ -358,7 +358,7 @@ pass
 #     never a false 'shipped', even though the PR-link comment already posted.
 : > "$GQLLOG"
 shipf="$( ISSUEUPDATE_SUCCESS=false run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null )"
-echo "$shipf" | grep -q "RESULT=NOCHANGE" || fail "mark_shipped must return NOCHANGE when the Done-move issueUpdate is not confirmed ($shipf)"
+grep -q "RESULT=NOCHANGE" <<< "$shipf" || fail "mark_shipped must return NOCHANGE when the Done-move issueUpdate is not confirmed ($shipf)"
 grep -q "commentCreate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still post the PR-link comment"
 grep -q "issueUpdate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still ATTEMPT the Done-move issueUpdate"
 pass
@@ -370,12 +370,12 @@ pass
 HERD_COMPONENT=reconcile HERD_TW_PR=42 run _backend_update_state ENG-7 done >/dev/null
 [ "$(grep -c '^tracker_write ' "$JLOG")" = "1" ] || fail "update_state must journal EXACTLY ONE tracker_write event ($(cat "$JLOG"))"
 tw="$(grep '^tracker_write ' "$JLOG")"
-echo "$tw" | grep -q "ref ENG-7"           || fail "tracker_write missing 'ref ENG-7' ($tw)"
-echo "$tw" | grep -q "requested done"      || fail "tracker_write missing 'requested done' ($tw)"
-echo "$tw" | grep -q "component reconcile" || fail "tracker_write did not attribute the component from HERD_COMPONENT ($tw)"
-echo "$tw" | grep -q "result DONE"         || fail "tracker_write did not record the verified result ($tw)"
-echo "$tw" | grep -q "backend linear"      || fail "tracker_write missing the backend field ($tw)"
-echo "$tw" | grep -q "pr 42"               || fail "tracker_write did not carry the PR from HERD_TW_PR ($tw)"
+grep -q "ref ENG-7" <<< "$tw" || fail "tracker_write missing 'ref ENG-7' ($tw)"
+grep -q "requested done" <<< "$tw" || fail "tracker_write missing 'requested done' ($tw)"
+grep -q "component reconcile" <<< "$tw" || fail "tracker_write did not attribute the component from HERD_COMPONENT ($tw)"
+grep -q "result DONE" <<< "$tw" || fail "tracker_write did not record the verified result ($tw)"
+grep -q "backend linear" <<< "$tw" || fail "tracker_write missing the backend field ($tw)"
+grep -q "pr 42" <<< "$tw" || fail "tracker_write did not carry the PR from HERD_TW_PR ($tw)"
 pass
 
 # 7b. Attribution defaults to 'manual' when no HERD_COMPONENT is set (a hand-run backend op), and
@@ -383,9 +383,9 @@ pass
 : > "$JLOG"
 ( unset HERD_COMPONENT HERD_TW_PR; run _backend_update_state ENG-7 in-progress ) >/dev/null
 tw="$(grep '^tracker_write ' "$JLOG")"
-echo "$tw" | grep -q "component manual"  || fail "tracker_write did not default the component to 'manual' ($tw)"
-echo "$tw" | grep -q "requested in-progress" || fail "tracker_write did not record the requested in-progress state ($tw)"
-echo "$tw" | grep -q " pr "               && fail "tracker_write must omit the pr field when no PR is known ($tw)"
+grep -q "component manual" <<< "$tw" || fail "tracker_write did not default the component to 'manual' ($tw)"
+grep -q "requested in-progress" <<< "$tw" || fail "tracker_write did not record the requested in-progress state ($tw)"
+grep -q " pr " <<< "$tw" && fail "tracker_write must omit the pr field when no PR is known ($tw)"
 pass
 
 # 7c. A NON-confirmed write (issueUpdate success:false) still journals — with result NOCHANGE — so a
@@ -393,17 +393,17 @@ pass
 : > "$JLOG"
 HERD_COMPONENT=scribe ISSUEUPDATE_SUCCESS=false run _backend_update_state ENG-7 done >/dev/null 2>&1
 tw="$(grep '^tracker_write ' "$JLOG")"
-echo "$tw" | grep -q "component scribe" || fail "tracker_write did not attribute the scribe component ($tw)"
-echo "$tw" | grep -q "result NOCHANGE"  || fail "an unconfirmed write must journal result NOCHANGE ($tw)"
+grep -q "component scribe" <<< "$tw" || fail "tracker_write did not attribute the scribe component ($tw)"
+grep -q "result NOCHANGE" <<< "$tw" || fail "an unconfirmed write must journal result NOCHANGE ($tw)"
 pass
 
 # 7d. mark_shipped journals a tracker_write with the PR link and requested 'shipped'.
 : > "$JLOG"
 HERD_COMPONENT=reconcile run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/3 >/dev/null
 tw="$(grep '^tracker_write ' "$JLOG")"
-echo "$tw" | grep -q "requested shipped" || fail "mark_shipped tracker_write missing 'requested shipped' ($tw)"
-echo "$tw" | grep -q "pr https://github.com/acme/widgets/pull/3" || fail "mark_shipped tracker_write did not carry the PR ($tw)"
-echo "$tw" | grep -q "component reconcile" || fail "mark_shipped did not attribute the component ($tw)"
+grep -q "requested shipped" <<< "$tw" || fail "mark_shipped tracker_write missing 'requested shipped' ($tw)"
+grep -q "pr https://github.com/acme/widgets/pull/3" <<< "$tw" || fail "mark_shipped tracker_write did not carry the PR ($tw)"
+grep -q "component reconcile" <<< "$tw" || fail "mark_shipped did not attribute the component ($tw)"
 pass
 
 # 7e. FAIL-SOFT: when journal_append is UNDEFINED (journal.sh never sourced), the write still succeeds
@@ -423,7 +423,7 @@ out="$(
   _backend_update_state ENG-7 done
   printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
 )"
-echo "$out" | grep -q "RESULT=DONE" || fail "update_state must still succeed with journal_append undefined ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "update_state must still succeed with journal_append undefined ($out)"
 [ ! -s "$JLOG" ] || fail "no tracker_write should be written when journal_append is undefined ($(cat "$JLOG"))"
 pass
 
@@ -433,7 +433,7 @@ pass
 #    a first-class Linear assignee in every client, not only via `herd backlog queued`.
 : > "$GQLLOG"
 q="$(run _backend_queue_item ENG-7 alice ENG-9)"
-echo "$q" | grep -q "RESULT=DONE" || fail "queue_item did not report DONE ($q)"
+grep -q "RESULT=DONE" <<< "$q" || fail "queue_item did not report DONE ($q)"
 grep -q "commentCreate" "$GQLLOG" || fail "queue_item did not post the marker via commentCreate"
 grep -q "queued by alice" "$GQLLOG" || fail "queue_item marker did not name the operator (who)"
 grep -q "sequenced after ENG-9" "$GQLLOG" || fail "queue_item marker did not record the blocker"
@@ -447,14 +447,14 @@ pass
 # 8a. queue_item with NO blocker → marker says "sequenced next", still DONE.
 : > "$GQLLOG"
 qn="$(run _backend_queue_item ENG-7 alice "")"
-echo "$qn" | grep -q "RESULT=DONE" || fail "queue_item (no blocker) did not report DONE ($qn)"
+grep -q "RESULT=DONE" <<< "$qn" || fail "queue_item (no blocker) did not report DONE ($qn)"
 grep -q "sequenced next" "$GQLLOG" || fail "queue_item (no blocker) did not fall back to 'sequenced next'"
 pass
 
 # 8b. queue_item on an unparseable ref → NOCHANGE, no commentCreate (nothing to mark).
 : > "$GQLLOG"
 qbad="$(run _backend_queue_item nodashhere alice ENG-9 2>/dev/null)"
-echo "$qbad" | grep -q "RESULT=NOCHANGE" || fail "queue_item on an unparseable ref should be NOCHANGE ($qbad)"
+grep -q "RESULT=NOCHANGE" <<< "$qbad" || fail "queue_item on an unparseable ref should be NOCHANGE ($qbad)"
 grep -q "commentCreate" "$GQLLOG" && fail "queue_item on an unparseable ref should post no comment"
 pass
 
@@ -463,9 +463,9 @@ pass
 : > "$GQLLOG"
 lq="$(run _backend_list_queued)"
 grep -q "comments { nodes { body } }" "$GQLLOG" || fail "list_queued did not request per-issue comment bodies"
-echo "$lq" | grep -q "^#ENG-7${TAB}alice${TAB}sequenced after ENG-9${TAB}1700000000$" \
+grep -q "^#ENG-7${TAB}alice${TAB}sequenced after ENG-9${TAB}1700000000$" <<< "$lq" \
   || fail "list_queued did not emit the parsed marker TSV for ENG-7 ($lq)"
-echo "$lq" | grep -q "^#ENG-9" && fail "list_queued surfaced ENG-9 which carries no 📌 marker ($lq)"
+grep -q "^#ENG-9" <<< "$lq" && fail "list_queued surfaced ENG-9 which carries no 📌 marker ($lq)"
 pass
 
 # 8d. unqueue_item → resolves the issue's comments and commentDelete's ONLY the 📌 marker (cmt_mark),
@@ -474,7 +474,7 @@ pass
 #     still assigned to the viewer on a non-started state (plan dropped before claim).
 : > "$GQLLOG"
 uq="$(run _backend_unqueue_item ENG-7 alice)"
-echo "$uq" | grep -q "RESULT=DONE" || fail "unqueue_item did not report DONE ($uq)"
+grep -q "RESULT=DONE" <<< "$uq" || fail "unqueue_item did not report DONE ($uq)"
 grep -q "commentDelete" "$GQLLOG" || fail "unqueue_item did not delete the marker via commentDelete"
 grep -q '"id": "cmt_mark"' "$GQLLOG" || fail "unqueue_item did not target the 📌 marker comment (cmt_mark)"
 grep -q '"id": "cmt_other"' "$GQLLOG" && fail "unqueue_item deleted a non-marker comment (cmt_other)"
@@ -519,7 +519,7 @@ uq_started="$(
   _backend_unqueue_item ENG-7 alice
   printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
 )"
-echo "$uq_started" | grep -q "RESULT=DONE" || fail "unqueue on started issue should still clear the 📌 ($uq_started)"
+grep -q "RESULT=DONE" <<< "$uq_started" || fail "unqueue on started issue should still clear the 📌 ($uq_started)"
 grep -q "commentDelete" "$GQLLOG" || fail "unqueue on started issue should still commentDelete"
 grep -q "issueUpdate" "$GQLLOG" && fail "unqueue on started issue must NOT clear the claim assignee via issueUpdate"
 pass
@@ -531,10 +531,10 @@ pass
 ic="$(run _backend_list_inbox_comments)"
 grep -q 'assignee: { isMe: { eq: true }' "$GQLLOG" || fail "list_inbox_comments did not scope to the viewer's own assigned items"
 grep -q "comments(first: 50)" "$GQLLOG" || fail "list_inbox_comments did not request per-issue comments with author + id"
-echo "$ic" | grep -q "^#ENG-7${TAB}Dana${TAB}cin_1${TAB}please rebase before we merge$" \
+grep -q "^#ENG-7${TAB}Dana${TAB}cin_1${TAB}please rebase before we merge$" <<< "$ic" \
   || fail "list_inbox_comments did not emit the cross-operator comment TSV ($ic)"
-echo "$ic" | grep -q "cin_self" && fail "list_inbox_comments surfaced the viewer's OWN comment ($ic)"
-echo "$ic" | grep -q "cin_mark" && fail "list_inbox_comments surfaced a 📌 planned marker ($ic)"
+grep -q "cin_self" <<< "$ic" && fail "list_inbox_comments surfaced the viewer's OWN comment ($ic)"
+grep -q "cin_mark" <<< "$ic" && fail "list_inbox_comments surfaced a 📌 planned marker ($ic)"
 pass
 
 # 8e. HERD-85 attribution — a queue write journals ONE tracker_write with requested 'queued' and the
@@ -542,9 +542,9 @@ pass
 : > "$JLOG"
 HERD_COMPONENT=plan run _backend_queue_item ENG-7 alice ENG-9 >/dev/null
 tw="$(grep '^tracker_write ' "$JLOG")"
-echo "$tw" | grep -q "requested queued"   || fail "queue_item tracker_write missing 'requested queued' ($tw)"
-echo "$tw" | grep -q "component plan"      || fail "queue_item did not attribute the 'plan' component ($tw)"
-echo "$tw" | grep -q "result DONE"         || fail "queue_item did not record the result ($tw)"
+grep -q "requested queued" <<< "$tw" || fail "queue_item tracker_write missing 'requested queued' ($tw)"
+grep -q "component plan" <<< "$tw" || fail "queue_item did not attribute the 'plan' component ($tw)"
+grep -q "result DONE" <<< "$tw" || fail "queue_item did not record the result ($tw)"
 pass
 
 # 5. absent key degrades loudly (no silent success), even with a fake curl available.

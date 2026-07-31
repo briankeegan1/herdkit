@@ -76,11 +76,11 @@ SCRIBE_BACKEND="github"
 CFG
 run "$P" config set SCRIBE_BACKEND changelog
 [ "$RC" -eq 0 ] || fail "(a) set failed unexpectedly ($OUT)"
-printf '%s\n' "$OUT" | grep -qi 'shadowed by' \
+grep -qi 'shadowed by' <<< "$OUT" \
   || fail "(a) no shadow warning when config.local pins the key ($OUT)"
-printf '%s\n' "$OUT" | grep -qi 'config.local' \
+grep -qi 'config.local' <<< "$OUT" \
   || fail "(a) shadow warning does not mention config.local ($OUT)"
-printf '%s\n' "$OUT" | grep -qi -- '--local' \
+grep -qi -- '--local' <<< "$OUT" \
   || fail "(a) shadow warning does not suggest --local ($OUT)"
 ok
 
@@ -91,7 +91,7 @@ WORKSPACE_NAME="local-ws"
 CFG
 run "$P2" config set SCRIBE_BACKEND changelog
 [ "$RC" -eq 0 ] || fail "(b) set failed unexpectedly ($OUT)"
-printf '%s\n' "$OUT" | grep -qi 'shadowed' \
+grep -qi 'shadowed' <<< "$OUT" \
   && fail "(b) shadow warning fired for a key NOT in config.local ($OUT)"
 ok
 
@@ -102,7 +102,7 @@ SCRIBE_BACKEND="github"
 CFG
 run "$P3" config set --local SCRIBE_BACKEND linear
 [ "$RC" -eq 0 ] || fail "(c) --local set failed ($OUT)"
-printf '%s\n' "$OUT" | grep -qi 'shadowed' \
+grep -qi 'shadowed' <<< "$OUT" \
   && fail "(c) shadow warning fired incorrectly for a --local write ($OUT)"
 ok
 
@@ -111,7 +111,7 @@ P4="$T/p4"; mkdir "$P4"; _make_project "$P4"
 [ ! -f "$P4/.herd/config.local" ] || fail "(d) fixture unexpectedly has a config.local"
 run "$P4" config set SCRIBE_BACKEND changelog
 [ "$RC" -eq 0 ] || fail "(d) set failed unexpectedly ($OUT)"
-printf '%s\n' "$OUT" | grep -qi 'shadowed' \
+grep -qi 'shadowed' <<< "$OUT" \
   && fail "(d) shadow warning fired with no config.local present ($OUT)"
 ok
 

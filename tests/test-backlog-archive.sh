@@ -54,7 +54,7 @@ grep -q 'Ship 12' "$T/BACKLOG.md" && fail "BACKLOG.md still holds overflow entry
 grep -q 'Ship 11' "$ARCHIVE" || fail "archive missing rotated entry Ship 11"
 grep -q 'Ship 12' "$ARCHIVE" || fail "archive missing rotated entry Ship 12"
 # One-line header explaining the file.
-head -1 "$ARCHIVE" | grep -q 'backlog archive' || fail "archive missing its explanatory header line"
+grep -q 'backlog archive' <<< "$(head -1 "$ARCHIVE")" || fail "archive missing its explanatory header line"
 
 # ── (2) format preservation: unrelated section + heading + open item survive ──
 grep -q '^# herdkit — backlog$'        "$T/BACKLOG.md" || fail "top title lost"

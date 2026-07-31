@@ -120,7 +120,7 @@ p="$(mkreq 210 "note on cache")"
 step "$BACKENDS" file amend "$p" "Improve the cache" "this note must be skipped"
 [ "$RC" -eq 0 ]                                             || fail "2: exited $RC ($OUT)"
 [ "$(cat "$REPO/BACKLOG.md")" = "$before" ]                || fail "2: ambiguous amend wrote to BACKLOG.md"
-printf '%s\n' "$OUT" | grep -qi 'more than one'            || fail "2: no loud ambiguity reason on stderr ($OUT)"
+grep -qi 'more than one' <<< "$OUT" || fail "2: no loud ambiguity reason on stderr ($OUT)"
 grep -qi 'SKIPPED' "$INBOX"                                || fail "2: no SKIP line in the scribe report"
 grep -q '"requested":"amend"' "$JF"                        || fail "2: ambiguous amend still journals the attempt ($(cat "$JF"))"
 [ ! -e "$p" ]                                              || fail "2: claimed file not cleaned up"
@@ -132,7 +132,7 @@ p="$(mkreq 300 "note on a ghost")"
 step "$BACKENDS" file amend "$p" "HERD-999" "note for a nonexistent item"
 [ "$RC" -eq 0 ]                                            || fail "3: exited $RC ($OUT)"
 [ "$(cat "$REPO/BACKLOG.md")" = "$before" ]               || fail "3: unmatched amend wrote to BACKLOG.md"
-printf '%s\n' "$OUT" | grep -qi 'no backlog item matching' || fail "3: no loud not-found reason ($OUT)"
+grep -qi 'no backlog item matching' <<< "$OUT" || fail "3: no loud not-found reason ($OUT)"
 ok
 
 # ══ 4. GITHUB adapter (stubbed gh): posts an issue comment + journals amend, never a state change ══
@@ -215,7 +215,7 @@ before="$(cat "$REPO/BACKLOG.md")"
 p="$(mkreq 600 "note for changelog")"
 step "$BACKENDS" changelog amend "$p" "HERD-30" "a note the changelog cannot attach"
 [ "$RC" -eq 0 ]                                            || fail "6: changelog amend exited $RC ($OUT)"
-printf '%s\n' "$OUT" | grep -qi 'has no amend op'         || fail "6: unsupported backend did not print a soft note ($OUT)"
+grep -qi 'has no amend op' <<< "$OUT" || fail "6: unsupported backend did not print a soft note ($OUT)"
 grep -qi 'SKIPPED' "$INBOX"                               || fail "6: unsupported backend did not record a SKIP"
 [ "$(cat "$REPO/BACKLOG.md")" = "$before" ]               || fail "6: unsupported backend must not touch BACKLOG.md"
 [ ! -e "$p" ]                                             || fail "6: claimed file not cleaned up"
@@ -258,7 +258,7 @@ ok
 
 # ══ 8. usage line documents the new amend verb ═══════════════════════════════════════════════════
 step "$BACKENDS" file bogus-verb
-printf '%s\n' "$OUT" | grep -q 'amend' || fail "8: usage does not mention amend ($OUT)"
+grep -q 'amend' <<< "$OUT" || fail "8: usage does not mention amend ($OUT)"
 ok
 
 # ══ 9. DISPATCH: FIELDS: prefix parsed → _AMEND_FIELDS exported, body stripped (HERD-312) ══════

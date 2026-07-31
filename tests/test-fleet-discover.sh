@@ -59,10 +59,10 @@ ROOT="$T/roots"
 
 # ── 1. discover LISTS the two herd projects under the root; ignores the non-herd dirs ─────────────
 out="$(bash "$HERD" fleet discover "$ROOT")"
-printf '%s' "$out" | grep -q "alpha" || fail "discover missed alpha under root"
-printf '%s' "$out" | grep -q "beta"  || fail "discover missed beta under root"
-if printf '%s' "$out" | grep -q "gamma-norc"; then fail "discover should NOT list a git repo without .herd/config"; fi
-printf '%s' "$out" | grep -q "2 project(s) found" || fail "discover count should be 2"
+grep -q "alpha" <<< "$out" || fail "discover missed alpha under root"
+grep -q "beta" <<< "$out" || fail "discover missed beta under root"
+if grep -q "gamma-norc" <<< "$out"; then fail "discover should NOT list a git repo without .herd/config"; fi
+grep -q "2 project(s) found" <<< "$out" || fail "discover count should be 2"
 ok
 
 # ── 2. dry-run default writes NOTHING (registry file must not be created) ──────────────────────────
@@ -70,7 +70,7 @@ if [ -f "$HERD_FLEET_FILE" ]; then fail "dry-run discover must not create the re
 ok
 
 # ── 3. everything is `new` when the registry is empty ─────────────────────────────────────────────
-printf '%s' "$out" | grep -q "2 new" || fail "with an empty registry both projects should be 'new'"
+grep -q "2 new" <<< "$out" || fail "with an empty registry both projects should be 'new'"
 # Isolate alpha's row (color codes make a positional regex fragile — match the word plainly).
 printf '%s' "$out" | grep '^alpha' | grep -q "new" || fail "alpha should be marked new"
 ok
@@ -86,18 +86,18 @@ ok
 
 # ── 5. DEDUP: re-running discover marks the now-registered projects, none are 'new' ───────────────
 out="$(bash "$HERD" fleet discover "$ROOT")"
-printf '%s' "$out" | grep -q "2 project(s) found" || fail "re-discover should still find 2 projects"
-printf '%s' "$out" | grep -q "0 new" || fail "already-registered projects should not be counted as new"
-printf '%s' "$out" | grep -q "2 already registered" || fail "both projects should be marked already registered"
+grep -q "2 project(s) found" <<< "$out" || fail "re-discover should still find 2 projects"
+grep -q "0 new" <<< "$out" || fail "already-registered projects should not be counted as new"
+grep -q "2 already registered" <<< "$out" || fail "both projects should be marked already registered"
 printf '%s' "$out" | grep '^alpha' | grep -q "registered" || fail "alpha should show status 'registered'"
 ok
 
 # ── 6. DEDUP is per-project: a fresh project mixed with registered ones is the only 'new' one ─────
 DELTA="$(_make_project delta)"
 out="$(bash "$HERD" fleet discover "$ROOT")"
-printf '%s' "$out" | grep -q "3 project(s) found" || fail "discover should now find 3 projects"
-printf '%s' "$out" | grep -q "1 new" || fail "only the fresh project (delta) should be new"
-printf '%s' "$out" | grep -q "2 already registered" || fail "alpha+beta should stay deduped"
+grep -q "3 project(s) found" <<< "$out" || fail "discover should now find 3 projects"
+grep -q "1 new" <<< "$out" || fail "only the fresh project (delta) should be new"
+grep -q "2 already registered" <<< "$out" || fail "alpha+beta should stay deduped"
 # --register only adds the new one; it must not duplicate the already-registered rows.
 bash "$HERD" fleet discover --register "$ROOT" >/dev/null
 grep -q "^delta|" "$HERD_FLEET_FILE" || fail "--register did not add the new project delta"
@@ -114,8 +114,8 @@ ok
 # ── 8. DEFAULT ROOTS: a bare `discover` (no <root>) uses HERD_FLEET_DISCOVER_ROOTS ────────────────
 out="$(HERD_FLEET_FILE="$T/reg-default/fleet" HERD_FLEET_DISCOVER_ROOTS="$ROOT" \
         bash "$HERD" fleet discover)"
-printf '%s' "$out" | grep -q "alpha" || fail "default-roots discover missed alpha"
-printf '%s' "$out" | grep -q "beta"  || fail "default-roots discover missed beta"
+grep -q "alpha" <<< "$out" || fail "default-roots discover missed alpha"
+grep -q "beta" <<< "$out" || fail "default-roots discover missed beta"
 ok
 
 # ── 9. a non-directory root is handled gracefully (warn, not fatal) ───────────────────────────────
@@ -123,13 +123,13 @@ set +e
 out="$(bash "$HERD" fleet discover "$T/does-not-exist" 2>&1)"; rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "a missing root should not be fatal (rc=$rc)"
-printf '%s' "$out" | grep -qi "not a directory\|skipping" || fail "a missing root should warn"
+grep -qi "not a directory\|skipping" <<< "$out" || fail "a missing root should warn"
 ok
 
 # ── 10. a root with NO herd projects reports a friendly note, not a crash ─────────────────────────
 mkdir -p "$T/empty-root"
 out="$(bash "$HERD" fleet discover "$T/empty-root")"
-printf '%s' "$out" | grep -qi "no herd projects found" || fail "an empty root should report none found"
+grep -qi "no herd projects found" <<< "$out" || fail "an empty root should report none found"
 ok
 
 echo "ALL PASS ($pass checks)"

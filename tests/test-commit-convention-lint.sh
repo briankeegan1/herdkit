@@ -87,36 +87,36 @@ add_commit "$T/vio/repo" "did some stuff without a type prefix"
 # ── 1a. scan prints a violation line for the non-conforming subject ────────────────────────────────
 out="$(run_conv_scan "$T/vio/repo" "$CONV")"
 [ -n "$out" ] || fail "(1a) scan of non-conforming commit must print a violation; got empty"
-echo "$out" | grep -qF "did some stuff without a type prefix" \
+grep -qF "did some stuff without a type prefix" <<< "$out" \
   || fail "(1a) violation line must name the offending subject; got: $out"
 pass
 
 # ── 1b. violation line includes the commit sha (12-char prefix) ────────────────────────────────────
 sha="$(cd "$T/vio/repo" && git log --format="%H" origin/main..HEAD | head -1)"
 short="$(printf '%.12s' "$sha")"
-echo "$out" | grep -qF "$short" \
+grep -qF "$short" <<< "$out" \
   || fail "(1b) violation must name the offending sha ($short); got: $out"
 pass
 
 # ── 1c. healthcheck exits 1 and names the sha, the subject, and the pattern ────────────────────────
 hc_out="$(run_healthcheck "$T/vio/repo" "$CONV")"; hc_rc=$?
 [ "$hc_rc" -eq 1 ] || fail "(1c) healthcheck must exit 1 on non-conforming subject; got rc=$hc_rc"
-echo "$hc_out" | grep -qi "commit convention" \
+grep -qi "commit convention" <<< "$hc_out" \
   || fail "(1c) healthcheck output must mention the commit convention lint; got: $hc_out"
-echo "$hc_out" | grep -qF "$short" \
+grep -qF "$short" <<< "$hc_out" \
   || fail "(1c) healthcheck output must name the offending sha ($short); got: $hc_out"
-echo "$hc_out" | grep -qF "did some stuff without a type prefix" \
+grep -qF "did some stuff without a type prefix" <<< "$hc_out" \
   || fail "(1c) healthcheck output must name the offending subject; got: $hc_out"
-echo "$hc_out" | grep -qF "$CONV" \
+grep -qF "$CONV" <<< "$hc_out" \
   || fail "(1c) healthcheck output must name the pattern; got: $hc_out"
 pass
 
 # ── 1d. a conforming commit ALONGSIDE the violation is not flagged (only the bad one) ──────────────
 add_commit "$T/vio/repo" "feat(core): add a properly formatted subject"
 out2="$(run_conv_scan "$T/vio/repo" "$CONV")"
-echo "$out2" | grep -qF "add a properly formatted subject" \
+grep -qF "add a properly formatted subject" <<< "$out2" \
   && fail "(1d) a conforming subject must NOT be flagged; got: $out2"
-echo "$out2" | grep -qF "did some stuff without a type prefix" \
+grep -qF "did some stuff without a type prefix" <<< "$out2" \
   || fail "(1d) the non-conforming subject must still be flagged; got: $out2"
 pass
 
@@ -135,7 +135,7 @@ pass
 # ── 2b. healthcheck exits 0 and confirms the lint clean ────────────────────────────────────────────
 hc2_out="$(run_healthcheck "$T/clean/repo" "$CONV")"; hc2_rc=$?
 [ "$hc2_rc" -eq 0 ] || fail "(2b) healthcheck must exit 0 for conforming history; got rc=$hc2_rc (out: $hc2_out)"
-echo "$hc2_out" | grep -qi "commit convention lint clean" \
+grep -qi "commit convention lint clean" <<< "$hc2_out" \
   || fail "(2b) healthcheck output must confirm the commit convention lint clean; got: $hc2_out"
 pass
 
@@ -149,7 +149,7 @@ add_commit "$T/off/repo" "totally freeform subject line"
 # ── 3a. empty COMMIT_CONVENTION does not flag the non-conforming repo ──────────────────────────────
 hc3_out="$(run_healthcheck "$T/off/repo" "")"; hc3_rc=$?
 [ "$hc3_rc" -eq 0 ] || fail "(3a) COMMIT_CONVENTION='' must not flag a non-conforming repo; got rc=$hc3_rc"
-echo "$hc3_out" | grep -qi "commit convention" \
+grep -qi "commit convention" <<< "$hc3_out" \
   && fail "(3a) COMMIT_CONVENTION='' output must not mention the lint; got: $hc3_out"
 pass
 
@@ -177,9 +177,9 @@ make_repo "$T/bad"
 add_commit "$T/bad/repo" "anything at all"
 hc4_out="$(run_healthcheck "$T/bad/repo" "(feat")"; hc4_rc=$?
 [ "$hc4_rc" -eq 0 ] || fail "(4) invalid regex must fail soft (exit 0), never red; got rc=$hc4_rc (out: $hc4_out)"
-echo "$hc4_out" | grep -qi "invalid COMMIT_CONVENTION regex" \
+grep -qi "invalid COMMIT_CONVENTION regex" <<< "$hc4_out" \
   || fail "(4) invalid regex must surface a warning naming it; got: $hc4_out"
-echo "$hc4_out" | grep -qi "commit convention lint clean" \
+grep -qi "commit convention lint clean" <<< "$hc4_out" \
   && fail "(4) invalid regex must NOT report a clean lint (it was skipped); got: $hc4_out"
 pass
 

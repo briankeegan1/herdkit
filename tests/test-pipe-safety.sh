@@ -42,8 +42,8 @@ if [ "$real_rc" -ne 0 ]; then
   printf '%s\n' "$real_out" | grep '^PIPE-UNSAFE' >&2
   fail "(1) real tree has EPIPE-unsafe pipes — grep files/here-strings directly, or annotate '# pipe-ok: <why>'"
 fi
-printf '%s\n' "$real_out" | grep -q '^PIPE-UNSAFE' && fail "(1) PIPE-UNSAFE lines present despite clean exit"
-printf '%s\n' "$real_out" | grep -q '^ADVISORY:' || fail "(1) advisory summary line missing"
+grep -q '^PIPE-UNSAFE' <<< "$real_out" && fail "(1) PIPE-UNSAFE lines present despite clean exit"
+grep -q '^ADVISORY:' <<< "$real_out" || fail "(1) advisory summary line missing"
 pass
 echo "PASS (1) real tree: every live '| grep -q/-m/head' is swept or '# pipe-ok'-annotated"
 
@@ -59,7 +59,7 @@ make_script() {
 TR="$T/anti"; make_script "$TR" 'if cat "$f" | grep -q needle; then echo hit; fi'
 out="$(herd_pipe_safety_lint "$TR")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(2) '<producer> | grep -q' must red (exit 1, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'PIPE-UNSAFE .*probe.sh:2' \
+grep -q 'PIPE-UNSAFE .*probe.sh:2' <<< "$out" \
   || fail "(2) should print a PIPE-UNSAFE line for probe.sh:2 (got: $out)"
 pass
 echo "PASS (2) '<producer> | grep -q' → guard reds and emits a PIPE-UNSAFE line"
@@ -69,7 +69,7 @@ TOK="$T/optout"; make_script "$TOK" 'if cat "$f" | grep -q needle; then echo hit
 out="$(herd_pipe_safety_lint "$TOK")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(3) an annotated line must be clean (exit 0, got $rc): $out"
 printf '%s\n' "$out" | grep -q 'PIPE-UNSAFE' && fail "(3) no PIPE-UNSAFE expected after '# pipe-ok' (got: $out)"
-printf '%s\n' "$out" | grep -qE 'ADVISORY:.*1 opted-out' || fail "(3) advisory should count 1 opted-out (got: $out)"
+grep -qE 'ADVISORY:.*1 opted-out' <<< "$out" || fail "(3) advisory should count 1 opted-out (got: $out)"
 pass
 echo "PASS (3) '# pipe-ok' annotation → guard is clean and counts the opt-out"
 
@@ -79,7 +79,7 @@ TSAFE="$T/safe"; make_script "$TSAFE" \
   'grep -q needle <<< "$var" && echo b'
 out="$(herd_pipe_safety_lint "$TSAFE")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(4) 'grep -q PAT FILE' and here-string forms must be clean (exit 0, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'PIPE-UNSAFE' && fail "(4) safe forms must not be flagged (got: $out)"
+grep -q 'PIPE-UNSAFE' <<< "$out" && fail "(4) safe forms must not be flagged (got: $out)"
 pass
 echo "PASS (4) 'grep -q PAT FILE' and 'grep -q PAT <<< \"\$v\"' → not flagged (no producer pipe)"
 
@@ -91,10 +91,10 @@ TM="$T/variants"; make_script "$TM" \
   'printf "%s\n" "$x" | grep -o needle'
 out="$(herd_pipe_safety_lint "$TM")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(5) grep -m / head must red (exit 1, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'probe.sh:2' || fail "(5) grep -m1 (line 2) must be flagged (got: $out)"
-printf '%s\n' "$out" | grep -q 'probe.sh:3' || fail "(5) head -1 (line 3) must be flagged (got: $out)"
-printf '%s\n' "$out" | grep -q 'probe.sh:4' && fail "(5) grep -c (line 4) must NOT be flagged — it reads all input (got: $out)"
-printf '%s\n' "$out" | grep -q 'probe.sh:5' && fail "(5) grep -o (line 5) must NOT be flagged — it reads all input (got: $out)"
+grep -q 'probe.sh:2' <<< "$out" || fail "(5) grep -m1 (line 2) must be flagged (got: $out)"
+grep -q 'probe.sh:3' <<< "$out" || fail "(5) head -1 (line 3) must be flagged (got: $out)"
+grep -q 'probe.sh:4' <<< "$out" && fail "(5) grep -c (line 4) must NOT be flagged — it reads all input (got: $out)"
+grep -q 'probe.sh:5' <<< "$out" && fail "(5) grep -o (line 5) must NOT be flagged — it reads all input (got: $out)"
 pass
 echo "PASS (5) grep -m/head flagged; grep -c/-o (no early exit) not flagged"
 
@@ -102,7 +102,7 @@ echo "PASS (5) grep -m/head flagged; grep -c/-o (no early exit) not flagged"
 TC="$T/comment"; make_script "$TC" '# never do  cat "$f" | grep -q needle  — it EPIPEs under pipefail'
 out="$(herd_pipe_safety_lint "$TC")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(6) a pure-comment line documenting the pattern must be clean (exit 0, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'PIPE-UNSAFE' && fail "(6) a comment line must not be flagged (got: $out)"
+grep -q 'PIPE-UNSAFE' <<< "$out" && fail "(6) a comment line must not be flagged (got: $out)"
 pass
 echo "PASS (6) a '#'-led comment documenting the pattern is never flagged"
 
@@ -119,7 +119,7 @@ TB="$T/block"; mkdir -p "$TB/scripts/herd"
 # last physical line of the same logical command.
 out="$(herd_pipe_safety_lint "$TB")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(7) a '# pipe-ok' anywhere in a '\\'-continued command must opt out the whole block (exit 0, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'PIPE-UNSAFE' && fail "(7) block-annotated pipeline must not be flagged (got: $out)"
+grep -q 'PIPE-UNSAFE' <<< "$out" && fail "(7) block-annotated pipeline must not be flagged (got: $out)"
 # And WITHOUT the annotation the same block reds — prove the opt-out, not a matching miss.
 TB2="$T/block-bare"; mkdir -p "$TB2/scripts/herd"
 {
@@ -163,7 +163,7 @@ TP="$T/bigfile"; mkdir -p "$TP/scripts/herd"
   || fail "(9) fixture probe.sh must exceed 64KB to exercise the pipe-buffer boundary"
 out="$(herd_pipe_safety_check "$TP/scripts/herd/probe.sh")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(9) a late offending line in a >64KB file must still be detected under pipefail (exit 1, got $rc): last of out: $(printf '%s\n' "$out" | tail -1)"
-printf '%s\n' "$out" | grep -q '^PIPE-UNSAFE' || fail "(9) the late offending line must be reported (got advisory only)"
+grep -q '^PIPE-UNSAFE' <<< "$out" || fail "(9) the late offending line must be reported (got advisory only)"
 pass
 echo "PASS (9) detector is pipefail-safe: a >64KB fixture's late offending line is still caught"
 
@@ -172,7 +172,7 @@ TCLEAN="$T/clean"; make_script "$TCLEAN" 'grep -q needle "$f" && echo ok'
 out="$(herd_pipe_safety_check "$TCLEAN/scripts/herd/probe.sh")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(10) a clean fixture must exit 0 (got $rc): $out"
 [ "$(printf '%s\n' "$out" | grep -c '^PIPE-UNSAFE')" -eq 0 ] || fail "(10) clean fixture must emit zero PIPE-UNSAFE lines (got: $out)"
-printf '%s\n' "$out" | grep -qE '^ADVISORY: 0 pipe-unsafe' || fail "(10) clean advisory must report 0 pipe-unsafe (got: $out)"
+grep -qE '^ADVISORY: 0 pipe-unsafe' <<< "$out" || fail "(10) clean advisory must report 0 pipe-unsafe (got: $out)"
 pass
 echo "PASS (10) clean fixture → only the ADVISORY summary, zero PIPE-UNSAFE lines"
 

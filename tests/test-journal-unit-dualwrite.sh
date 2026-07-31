@@ -144,7 +144,7 @@ log_before="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" log --pr 54 2
 # Sanity: the fallback dump actually renders pr_restale's non-pr fields, so this fixture would have
 # caught a regression that leaks `unit=` into it (if it doesn't, the byte-identical diff below is
 # vacuous for the exact gap this test exists to close).
-printf '%s\n' "$why_before" | grep -q 'kind=health' || fail "fixture sanity: pr_restale must hit herd why's fallback dump"
+grep -q 'kind=health' <<< "$why_before" || fail "fixture sanity: pr_restale must hit herd why's fallback dump"
 ok
 
 # Fixture B: same events, dual-written (unit= additive on every line) — what journal_append now emits.

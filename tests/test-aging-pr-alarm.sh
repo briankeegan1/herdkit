@@ -129,16 +129,16 @@ _aging_decorate_row 0 "$PR" "$SHA" console-idle UNSTABLE "$CISUM"
 export HERD_FAKE_NOW=103600
 DISPLAY=("$BASE")
 _aging_decorate_row 0 "$PR" "$SHA" console-idle UNSTABLE "$CISUM"
-printf '%s' "${DISPLAY[0]}" | grep -q 'aging' || fail "(a) a crossed PR must grow an 'aging' line: ${DISPLAY[0]}"
-printf '%s' "${DISPLAY[0]}" | grep -q 'engine-approved' || fail "(a) the aging line must say engine-approved"
-printf '%s' "${DISPLAY[0]}" | grep -q 'macos-latest' || fail "(a) the aging line must name the blocking check"
+grep -q 'aging' <<< "${DISPLAY[0]}" || fail "(a) a crossed PR must grow an 'aging' line: ${DISPLAY[0]}"
+grep -q 'engine-approved' <<< "${DISPLAY[0]}" || fail "(a) the aging line must say engine-approved"
+grep -q 'macos-latest' <<< "${DISPLAY[0]}" || fail "(a) the aging line must name the blocking check"
 [ "$(jcount '"event":"pr_aging"')" -eq 1 ] || fail "(a) crossing the TTL must journal pr_aging exactly once"
 
 # Next tick, still aged: the row re-paints but pr_aging stays ONCE (sha-keyed once-guard).
 export HERD_FAKE_NOW=103700
 DISPLAY=("$BASE")
 _aging_decorate_row 0 "$PR" "$SHA" console-idle UNSTABLE "$CISUM"
-printf '%s' "${DISPLAY[0]}" | grep -q 'aging' || fail "(a) the aging line must persist while the PR stays blocked"
+grep -q 'aging' <<< "${DISPLAY[0]}" || fail "(a) the aging line must persist while the PR stays blocked"
 [ "$(jcount '"event":"pr_aging"')" -eq 1 ] || fail "(a) pr_aging must fire ONCE per (pr,sha), not per tick"
 ok "(a) an engine-approved PR blocked past the TTL grows a loud aging row + journals pr_aging exactly once"
 
@@ -151,7 +151,7 @@ export HERD_FAKE_NOW=204000                                      # +4000 ≥ TTL
 export GH_ROLLUP='{"statusCheckRollup":[{"__typename":"CheckRun","name":"required-e2e","status":"COMPLETED","conclusion":"FAILURE"}]}'
 DISPLAY=("$BASE")
 _aging_decorate_row 0 501 blockedsha console-idle BLOCKED ""
-printf '%s' "${DISPLAY[0]}" | grep -q 'required-e2e' || fail "(a) BLOCKED path must probe + name the failing check: ${DISPLAY[0]}"
+grep -q 'required-e2e' <<< "${DISPLAY[0]}" || fail "(a) BLOCKED path must probe + name the failing check: ${DISPLAY[0]}"
 [ "$(jcount '"event":"pr_aging"')" -eq 1 ] || fail "(a) BLOCKED path must journal pr_aging once"
 unset GH_ROLLUP
 ok "(a) the BLOCKED path probes the rollup for the check name only once the PR has aged"
@@ -215,7 +215,7 @@ RUNS='[{"headSha":"'"$HEAD_SHA"'","status":"COMPLETED","conclusion":"FAILURE","w
        {"headSha":"other","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI"}]'
 CL="$(printf '%s' "$RUNS" | _main_ci_classify "$HEAD_SHA")"
 [ "${CL%%$'\t'*}" = fail ] || fail "(b) classify must bucket the current-HEAD FAILURE run as fail (got '$CL')"
-printf '%s' "$CL" | grep -q 'CI' || fail "(b) classify must name the workflow"
+grep -q 'CI' <<< "$CL" || fail "(b) classify must name the workflow"
 INPROG='[{"headSha":"'"$HEAD_SHA"'","status":"IN_PROGRESS","conclusion":"","workflowName":"CI"}]'
 [ -z "$(printf '%s' "$INPROG" | _main_ci_classify "$HEAD_SHA")" ] || fail "(b) an in-progress run must yield no verdict"
 OTHER='[{"headSha":"stale","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI"}]'
@@ -227,8 +227,8 @@ _main_health_ci_leg
 [ -s "$TREES_DIR/.agent-watch-main-health" ] || fail "(b) a failing branch-CI run must set the MAIN RED state"
 [ "$(ncount 'MAIN RED')" -eq 1 ] || fail "(b) MAIN RED must notify exactly once"
 ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
-printf '%s' "$ROW" | grep -q 'MAIN RED' || fail "(b) build_main_health must render the row"
-printf '%s' "$ROW" | grep -q 'CI'       || fail "(b) the MAIN RED row must name the failing CI: $ROW"
+grep -q 'MAIN RED' <<< "$ROW" || fail "(b) build_main_health must render the row"
+grep -q 'CI' <<< "$ROW" || fail "(b) the MAIN RED row must name the failing CI: $ROW"
 _main_health_ci_leg                                   # second tick, unchanged CI verdict
 [ "$(jcount '"result":"red"')" -eq 1 ] || fail "(b) an unchanged CI red must NOT re-journal (dedupe per sha+conclusion)"
 [ "$(ncount 'MAIN RED')" -eq 1 ] || fail "(b) an unchanged CI red must NOT re-notify"

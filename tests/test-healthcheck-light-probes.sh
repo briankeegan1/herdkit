@@ -74,7 +74,7 @@ clear_diff
 printf 'if then fi\n' > "$WT/src/broken.sh"
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 1 ] || fail "(2) broken .sh must be caught red (exit 1, got $rc): $out"
-printf '%s' "$out" | grep -q 'SYNTAX ERROR' || fail "(2) broken .sh should report a SYNTAX ERROR"
+grep -q 'SYNTAX ERROR' <<< "$out" || fail "(2) broken .sh should report a SYNTAX ERROR"
 ok
 
 # ── (3) FLAG-THE-ABSENCE — an unprobed-language-only diff is flagged ⚠️, never a confident ✅ ──
@@ -84,18 +84,18 @@ printf 'pub fn also() {}\n'             > "$WT/src/more.rs"
 printf 'class A {}\n'                   > "$WT/src/A.java"
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(3) unprobed-only diff is a warning, not a code error (exit 0, got $rc): $out"
-printf '%s' "$out" | grep -q 'UNCHECKED FILE TYPES' || fail "(3) should flag UNCHECKED FILE TYPES (got: $out)"
-printf '%s' "$out" | grep -q 'no light probe'       || fail "(3) should say 'no light probe' (got: $out)"
-printf '%s' "$out" | grep -q '2 rs'                 || fail "(3) should count 2 rs files (got: $out)"
-printf '%s' "$out" | grep -q '1 java'               || fail "(3) should count 1 java file (got: $out)"
-printf '%s' "$out" | grep -q 'LIGHT CHECK CLEAN'    && fail "(3) MUST NOT emit a confident '✅ LIGHT CHECK CLEAN' for unchecked types"
+grep -q 'UNCHECKED FILE TYPES' <<< "$out" || fail "(3) should flag UNCHECKED FILE TYPES (got: $out)"
+grep -q 'no light probe' <<< "$out" || fail "(3) should say 'no light probe' (got: $out)"
+grep -q '2 rs' <<< "$out" || fail "(3) should count 2 rs files (got: $out)"
+grep -q '1 java' <<< "$out" || fail "(3) should count 1 java file (got: $out)"
+grep -q 'LIGHT CHECK CLEAN' <<< "$out" && fail "(3) MUST NOT emit a confident '✅ LIGHT CHECK CLEAN' for unchecked types"
 ok
 oneout="$(run_hc --oneline)"; orc=$?
 [ "$orc" -eq 0 ] || fail "(3) oneline unchecked should exit 0 (got $orc)"
 [ "$(nlines "$oneout")" -eq 1 ] || fail "(3) oneline must be exactly one line (got: $oneout)"
-printf '%s' "$oneout" | grep -q '⚠️'          || fail "(3) oneline should carry a ⚠️ (got: $oneout)"
-printf '%s' "$oneout" | grep -q 'no light probe' || fail "(3) oneline should say 'no light probe' (got: $oneout)"
-printf '%s' "$oneout" | grep -q '✅'          && fail "(3) oneline must not claim ✅ for unchecked types (got: $oneout)"
+grep -q '⚠️' <<< "$oneout" || fail "(3) oneline should carry a ⚠️ (got: $oneout)"
+grep -q 'no light probe' <<< "$oneout" || fail "(3) oneline should say 'no light probe' (got: $oneout)"
+grep -q '✅' <<< "$oneout" && fail "(3) oneline must not claim ✅ for unchecked types (got: $oneout)"
 ok
 
 # ── (4) GO PROBE — with a (stubbed) gofmt present: clean *.go passes, broken *.go is caught red ──
@@ -118,19 +118,19 @@ clear_diff
 printf 'package greet\n\nfunc Hello() string { return "hi" }\n' > "$WT/src/ok.go"
 out="$(PATH="$STUBBIN:$PATH" run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(4) clean .go with gofmt present should exit 0 (got $rc): $out"
-printf '%s' "$out" | grep -q 'go:.*gofmt -e ok' || fail "(4) clean .go should report 'go … gofmt -e ok' (got: $out)"
-printf '%s' "$out" | grep -q 'LIGHT CHECK CLEAN' || fail "(4) clean sh/py/go should stay a confident clean (got: $out)"
+grep -q 'go:.*gofmt -e ok' <<< "$out" || fail "(4) clean .go should report 'go … gofmt -e ok' (got: $out)"
+grep -q 'LIGHT CHECK CLEAN' <<< "$out" || fail "(4) clean sh/py/go should stay a confident clean (got: $out)"
 ok
 oneout="$(PATH="$STUBBIN:$PATH" run_hc --oneline)"; orc=$?
 [ "$orc" -eq 0 ] || fail "(4) oneline clean .go should exit 0 (got $orc)"
-printf '%s' "$oneout" | grep -q '1 go ok' || fail "(4) oneline should note '1 go ok' (got: $oneout)"
+grep -q '1 go ok' <<< "$oneout" || fail "(4) oneline should note '1 go ok' (got: $oneout)"
 ok
 clear_diff
 printf 'package greet\n\nfunc broken( {  // GO_SYNTAX_ERR\n' > "$WT/src/bad.go"
 out="$(PATH="$STUBBIN:$PATH" run_hc)"; rc=$?
 [ "$rc" -eq 1 ] || fail "(4) a REAL .go parse error (gofmt present) must be caught red (exit 1, got $rc): $out"
-printf '%s' "$out" | grep -q 'SYNTAX ERROR' || fail "(4) broken .go should report a SYNTAX ERROR (got: $out)"
-printf '%s' "$out" | grep -qi 'gofmt' || fail "(4) broken .go error should cite gofmt (got: $out)"
+grep -q 'SYNTAX ERROR' <<< "$out" || fail "(4) broken .go should report a SYNTAX ERROR (got: $out)"
+grep -qi 'gofmt' <<< "$out" || fail "(4) broken .go error should cite gofmt (got: $out)"
 ok
 
 # ── (5) MISSING TOOLCHAIN — *.go with gofmt absent → data/env ⚠️, never red, never confident ✅ ──
@@ -146,15 +146,15 @@ clear_diff
 printf 'package greet\n\nfunc Hello() {}\n' > "$WT/src/nogofmt.go"
 out="$(PATH="$CBIN" bash "$HC" "$WT" --light)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(5) missing gofmt is data/env, not a code error (exit 0, got $rc): $out"
-printf '%s' "$out" | grep -q 'gofmt not found' || fail "(5) should surface 'gofmt not found' (got: $out)"
-printf '%s' "$out" | grep -qi 'data/env'       || fail "(5) missing toolchain should read as data/env (got: $out)"
-printf '%s' "$out" | grep -q 'LIGHT CHECK CLEAN' && fail "(5) MUST NOT claim a confident clean when it could not check the .go"
+grep -q 'gofmt not found' <<< "$out" || fail "(5) should surface 'gofmt not found' (got: $out)"
+grep -qi 'data/env' <<< "$out" || fail "(5) missing toolchain should read as data/env (got: $out)"
+grep -q 'LIGHT CHECK CLEAN' <<< "$out" && fail "(5) MUST NOT claim a confident clean when it could not check the .go"
 ok
 oneout="$(PATH="$CBIN" bash "$HC" "$WT" --light --oneline)"; orc=$?
 [ "$orc" -eq 0 ] || fail "(5) oneline missing-gofmt should exit 0 (got $orc)"
 [ "$(nlines "$oneout")" -eq 1 ] || fail "(5) oneline must be exactly one line (got: $oneout)"
-printf '%s' "$oneout" | grep -q '⚠️' || fail "(5) oneline missing-gofmt should carry a ⚠️ (got: $oneout)"
-printf '%s' "$oneout" | grep -q '✅' && fail "(5) oneline must not claim ✅ when the .go went unchecked (got: $oneout)"
+grep -q '⚠️' <<< "$oneout" || fail "(5) oneline missing-gofmt should carry a ⚠️ (got: $oneout)"
+grep -q '✅' <<< "$oneout" && fail "(5) oneline must not claim ✅ when the .go went unchecked (got: $oneout)"
 ok
 
 echo "ALL PASS ($pass checks) — light-profile per-language probes flag the absence, never false-green."

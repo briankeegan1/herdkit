@@ -333,7 +333,7 @@ fi
 # do_merge's REAL `git worktree remove` reaped the adopted worktree: the dir is gone AND it is no
 # longer registered in the repo's worktree list.
 _still_registered=0
-git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $DISC_DIR" && _still_registered=1
+grep -qxF "worktree $DISC_DIR" <<< "$(git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null)" && _still_registered=1
 if [ ! -d "$CWT" ] && [ "$_still_registered" -eq 0 ]; then
   checkpoint reaped pass "config worktree reaped (dir removed + unregistered from git worktree list)"
 else

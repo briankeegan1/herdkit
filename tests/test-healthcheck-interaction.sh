@@ -94,9 +94,9 @@ write_cfg "" "$T/it-pass.sh"
 clear_diff; set_app_diff; : > "$IT_LOG"
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "disabled: expected rc 0 (got $rc)"
-printf '%s' "$out" | grep -qi 'interaction' && fail "disabled: output must not mention the interaction gate"
+grep -qi 'interaction' <<< "$out" && fail "disabled: output must not mention the interaction gate"
 [ -s "$IT_LOG" ] && fail "disabled: interaction cmd must NOT run when APP_SURFACE_GLOB is empty"
-printf '%s' "$out" | grep -q 'render smoke ok' || fail "disabled: main profile output should still pass through"
+grep -q 'render smoke ok' <<< "$out" || fail "disabled: main profile output should still pass through"
 ok
 
 # ── (2) GATE PASS — glob matches + cmd exits 0 ───────────────────────────────
@@ -104,7 +104,7 @@ write_cfg "^app/" "$T/it-pass.sh"
 clear_diff; set_app_diff; : > "$IT_LOG"
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "pass: expected rc 0 (got $rc)"
-printf '%s' "$out" | grep -q 'INTERACTION TESTS CLEAN' || fail "pass: full output should show INTERACTION TESTS CLEAN"
+grep -q 'INTERACTION TESTS CLEAN' <<< "$out" || fail "pass: full output should show INTERACTION TESTS CLEAN"
 [ -s "$IT_LOG" ] || fail "pass: interaction cmd should have been invoked"
 ok
 
@@ -113,13 +113,13 @@ write_cfg "^app/" "$T/it-fail.sh"
 clear_diff; set_app_diff
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 1 ] || fail "fail: a code-error interaction test must gate (rc 1, got $rc)"
-printf '%s' "$out" | grep -q 'INTERACTION TESTS FAILED' || fail "fail: should show INTERACTION TESTS FAILED"
-printf '%s' "$out" | grep -q 'slider no longer affects output' || fail "fail: should carry the cmd's reason"
+grep -q 'INTERACTION TESTS FAILED' <<< "$out" || fail "fail: should show INTERACTION TESTS FAILED"
+grep -q 'slider no longer affects output' <<< "$out" || fail "fail: should carry the cmd's reason"
 ok
 oneout="$(run_hc --oneline)"; orc=$?
 [ "$orc" -eq 1 ] || fail "fail --oneline: expected rc 1 (got $orc)"
 [ "$(nlines "$oneout")" -eq 1 ] || fail "fail --oneline: watcher needs exactly one line (got: $oneout)"
-printf '%s' "$oneout" | grep -q '❌ interaction —' || fail "fail --oneline: expected '❌ interaction —' prefix (got: $oneout)"
+grep -q '❌ interaction —' <<< "$oneout" || fail "fail --oneline: expected '❌ interaction —' prefix (got: $oneout)"
 ok
 
 # ── (4) DATA/ENV — glob matches + cmd exits 2 → tolerated, not red ───────────
@@ -127,8 +127,8 @@ write_cfg "^app/" "$T/it-env.sh"
 clear_diff; set_app_diff
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "dataenv: exit-2 must be tolerated (rc 0, got $rc)"
-printf '%s' "$out" | grep -qi 'data/env' || fail "dataenv: should surface a data/env note"
-printf '%s' "$out" | grep -q 'INTERACTION TESTS FAILED' && fail "dataenv: must not be reported as a failure"
+grep -qi 'data/env' <<< "$out" || fail "dataenv: should surface a data/env note"
+grep -q 'INTERACTION TESTS FAILED' <<< "$out" && fail "dataenv: must not be reported as a failure"
 ok
 
 # ── (5) WARN — glob matches + cmd EMPTY → loud absence warning, never red ────
@@ -136,15 +136,15 @@ write_cfg "^app/" ""
 clear_diff; set_app_diff
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "warn: a missing declaration must NOT fail the gate (rc 0, got $rc)"
-printf '%s' "$out" | grep -q 'no interaction tests declared' || fail "warn: missing the absence warning"
-printf '%s' "$out" | grep -q 'render smoke cannot see widget→output causality' || fail "warn: missing the causality phrase"
-printf '%s' "$out" | grep -q 'INTERACTION TESTS FAILED' && fail "warn: absence is a warning, not a failure"
+grep -q 'no interaction tests declared' <<< "$out" || fail "warn: missing the absence warning"
+grep -q 'render smoke cannot see widget→output causality' <<< "$out" || fail "warn: missing the causality phrase"
+grep -q 'INTERACTION TESTS FAILED' <<< "$out" && fail "warn: absence is a warning, not a failure"
 ok
 oneout="$(run_hc --oneline)"; orc=$?
 [ "$orc" -eq 0 ] || fail "warn --oneline: expected rc 0 (got $orc)"
 [ "$(nlines "$oneout")" -eq 1 ] || fail "warn --oneline: must be exactly one line (got: $oneout)"
-printf '%s' "$oneout" | grep -q '⚠️' || fail "warn --oneline: expected a ⚠️ prefix (got: $oneout)"
-printf '%s' "$oneout" | grep -q 'no interaction tests declared' || fail "warn --oneline: expected the warning text (got: $oneout)"
+grep -q '⚠️' <<< "$oneout" || fail "warn --oneline: expected a ⚠️ prefix (got: $oneout)"
+grep -q 'no interaction tests declared' <<< "$oneout" || fail "warn --oneline: expected the warning text (got: $oneout)"
 ok
 
 # ── (6) NO MATCH — glob set but the diff misses the app surface → nothing fires ──────────────
@@ -152,7 +152,7 @@ write_cfg "^app/" ""            # empty cmd: a bare 'diff missed' must not even 
 clear_diff; set_nonapp_diff
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "nomatch: expected rc 0 (got $rc)"
-printf '%s' "$out" | grep -q 'no interaction tests declared' && fail "nomatch: must NOT warn when the diff misses the app surface"
+grep -q 'no interaction tests declared' <<< "$out" && fail "nomatch: must NOT warn when the diff misses the app surface"
 ok
 write_cfg "^app/" "$T/it-pass.sh"   # cmd set: a diff that misses the app surface must not run it
 clear_diff; set_nonapp_diff; : > "$IT_LOG"

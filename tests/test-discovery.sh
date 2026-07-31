@@ -106,7 +106,7 @@ BATS
   bats --formatter tap "$D6/herd.bats" </dev/null >"$_e2e_out" 2>&1; e2e_rc=$?
   e2e="$(cat "$_e2e_out")"
   [ "$e2e_rc" -ne 0 ] || fail "(6) an empty-suite discovery file must FAIL under bats (rc=$e2e_rc):\n$e2e"
-  printf '%s\n' "$e2e" | grep -q 'not ok .* discovery matched zero' \
+grep -q 'not ok .* discovery matched zero' <<< "$e2e" \
     || fail "(6) bats should report the loud zero-match test as failing:\n$e2e"
   pass
   echo "PASS (6) end-to-end: an empty suite registers a single LOUD failing bats test"

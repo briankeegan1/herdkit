@@ -58,7 +58,7 @@ for tok in 01 02 03 04; do
 done
 [ -z "$(git -C "$ST/repo" branch --list 'bench/*')" ] || fail "(a) builder branches not torn down"
 [ -z "$(git -C "$ST/repo" status --porcelain)" ]      || fail "(a) main tree not clean after drain"
-grep -cE '^- ✅ \*\*Item' "$ST/repo/BACKLOG.md" | grep -qx 4 || fail "(a) not all 4 backlog items marked ✅"
+grep -qx 4 <<< "$(grep -cE '^- ✅ \*\*Item' "$ST/repo/BACKLOG.md")" || fail "(a) not all 4 backlog items marked ✅"
 echo "PASS (a)+(b) happy drain + scorecard shape"
 
 # ── (c) RESTART SURVIVAL — kill mid-drain, resume from durable state, 0 duplicates ──────────────

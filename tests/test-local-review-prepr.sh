@@ -158,36 +158,36 @@ run_local(){  # <slug> ; sets LR_OUT / LR_RC (claude behavior comes from STUB_LO
 # ── B1 — local PASS → REVIEW: PASS, exit 0 ────────────────────────────────────────────────────────
 STUB_LOCAL_MODE=verdict STUB_LOCAL_VERDICT="REVIEW: PASS" run_local slug-pass
 [ "$LR_RC" -eq 0 ] || fail "B1: local PASS should exit 0 (got $LR_RC)"$'\n'"$LR_OUT"
-printf '%s\n' "$LR_OUT" | grep -q '^REVIEW: PASS' || fail "B1: should print REVIEW: PASS (got: $LR_OUT)"
+grep -q '^REVIEW: PASS' <<< "$LR_OUT" || fail "B1: should print REVIEW: PASS (got: $LR_OUT)"
 ok
 
 # ── B2 — local BLOCK → REVIEW: BLOCK, exit 1 ──────────────────────────────────────────────────────
 STUB_LOCAL_MODE=verdict STUB_LOCAL_VERDICT="REVIEW: BLOCK — off-by-one in the accumulation loop" run_local slug-block
 [ "$LR_RC" -eq 1 ] || fail "B2: local BLOCK should exit 1 (got $LR_RC)"$'\n'"$LR_OUT"
-printf '%s\n' "$LR_OUT" | grep -q '^REVIEW: BLOCK' || fail "B2: should print REVIEW: BLOCK (got: $LR_OUT)"
+grep -q '^REVIEW: BLOCK' <<< "$LR_OUT" || fail "B2: should print REVIEW: BLOCK (got: $LR_OUT)"
 ok
 
 # ── B3 — reviewer prints no verdict line → INFRA-FAIL, exit 2 (never a BLOCK) ─────────────────────
 STUB_LOCAL_MODE=noverdict run_local slug-noverdict
 [ "$LR_RC" -eq 2 ] || fail "B3: rc0-no-verdict should exit 2 INFRA-FAIL (got $LR_RC)"$'\n'"$LR_OUT"
-printf '%s\n' "$LR_OUT" | grep -q '^REVIEW: INFRA-FAIL' || fail "B3: should print REVIEW: INFRA-FAIL (got: $LR_OUT)"
-printf '%s\n' "$LR_OUT" | grep -q 'REVIEW: BLOCK' && fail "B3: no-verdict must NOT be a BLOCK"
+grep -q '^REVIEW: INFRA-FAIL' <<< "$LR_OUT" || fail "B3: should print REVIEW: INFRA-FAIL (got: $LR_OUT)"
+grep -q 'REVIEW: BLOCK' <<< "$LR_OUT" && fail "B3: no-verdict must NOT be a BLOCK"
 ok
 
 # ── B4 — empty reviewer output → INFRA-FAIL, exit 2 ──────────────────────────────────────────────
 STUB_LOCAL_MODE=empty run_local slug-empty
 [ "$LR_RC" -eq 2 ] || fail "B4: empty output should exit 2 INFRA-FAIL (got $LR_RC)"$'\n'"$LR_OUT"
-printf '%s\n' "$LR_OUT" | grep -q '^REVIEW: INFRA-FAIL' || fail "B4: empty output should print INFRA-FAIL"
+grep -q '^REVIEW: INFRA-FAIL' <<< "$LR_OUT" || fail "B4: empty output should print INFRA-FAIL"
 ok
 
 # ── B5 — local mode reviews the LOCAL diff (git diff), NOT a PR (no gh pr diff / no PR comment) ───
 STUB_LOCAL_MODE=verdict STUB_LOCAL_VERDICT="REVIEW: PASS" run_local slug-diff
 # The reviewer prompt claude received must instruct a LOCAL diff read and must NOT reference a PR.
-tr '\0' '\n' < "$CLAUDE_ARGS_LOG" | grep -Fq 'git diff origin/main...HEAD' \
+grep -Fq 'git diff origin/main...HEAD' <<< "$(tr '\0' '\n' < "$CLAUDE_ARGS_LOG")" \
   || fail "B5: local prompt should tell the reviewer to run 'git diff origin/main...HEAD'"$'\n'"$(tr '\0' '\n' < "$CLAUDE_ARGS_LOG")"
-tr '\0' '\n' < "$CLAUDE_ARGS_LOG" | grep -Fq 'gh pr diff' \
+grep -Fq 'gh pr diff' <<< "$(tr '\0' '\n' < "$CLAUDE_ARGS_LOG")" \
   && fail "B5: local prompt must NOT reference 'gh pr diff' (there is no PR yet)"
-tr '\0' '\n' < "$CLAUDE_ARGS_LOG" | grep -Fq 'gh pr comment' \
+grep -Fq 'gh pr comment' <<< "$(tr '\0' '\n' < "$CLAUDE_ARGS_LOG")" \
   && fail "B5: local prompt must NOT ask for a 'gh pr comment' (there is no PR yet)"
 ok
 

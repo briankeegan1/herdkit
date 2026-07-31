@@ -73,14 +73,14 @@ grep -qE '^NEW_FEATURE_FLAG="on" .*# enables the shiny new feature' "$CFG" || fa
 [ "$(count_key "$CFG" DEPLOY_TOKEN)" -eq 0 ] || fail "secret-shaped DEPLOY_TOKEN was adopted (must never be)"
 
 # 4. the summary line names the adopted key(s) and the count.
-echo "$out1" | grep -qE "herd upgrade: adopted 1 new config keys: .*NEW_FEATURE_FLAG" \
+grep -qE "herd upgrade: adopted 1 new config keys: .*NEW_FEATURE_FLAG" <<< "$out1" \
   || fail "missing/incorrect adoption summary line:\n$out1"
 
 # ── run 2: idempotent — adopts nothing, config unchanged ─────────────────────────────────────────
 snapshot="$(cat "$CFG")"
 out2="$( cd "$P" && HERD_TARGET_VERSION=1 HERD_CONFIG_TEMPLATE="$TPL" bash "$HERD" upgrade 2>&1 )" \
   || fail "upgrade run 2 failed:\n$out2"
-echo "$out2" | grep -q "adopted" && fail "second run adopted keys (should be a no-op):\n$out2"
+grep -q "adopted" <<< "$out2" && fail "second run adopted keys (should be a no-op):\n$out2"
 [ "$(cat "$CFG")" = "$snapshot" ]                || fail "second run mutated .herd/config"
 [ "$(count_key "$CFG" NEW_FEATURE_FLAG)" -eq 1 ] || fail "second run duplicated NEW_FEATURE_FLAG"
 

@@ -20,7 +20,7 @@ if [ "$rc" -eq 0 ]; then
   [ -n "$ONELINE" ] && echo "clean — $last" || { echo "CLEAN"; printf '%s\n' "$out"; }
   exit 0
 fi
-if printf '%s' "$out" | grep -qiE 'econnrefused|timeout|network|auth'; then
+if grep -qiE 'econnrefused|timeout|network|auth' <<< "$out"; then
   [ -n "$ONELINE" ] && echo "data/env — $last" || { echo "DATA/ENV ISSUE"; printf '%s\n' "$out"; }
   exit 2
 fi

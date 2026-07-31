@@ -89,11 +89,11 @@ ok
 [ "$(wc -l < "$PANE_LOG")" -eq 1 ] || fail "_resume_builder wake-first: pane run should fire once (got $(wc -l < "$PANE_LOG"))"
 ok
 cmd="$(head -1 "$PANE_LOG")"
-printf '%s\n' "$cmd" | grep -q -- "--continue" || fail "_resume_builder: command must use claude --continue (got: $cmd)"
+grep -q -- "--continue" <<< "$cmd" || fail "_resume_builder: command must use claude --continue (got: $cmd)"
 ok
-printf '%s\n' "$cmd" | grep -q "$T/trees/rb-slug" || fail "_resume_builder: command must cd into the correct worktree (got: $cmd)"
+grep -q "$T/trees/rb-slug" <<< "$cmd" || fail "_resume_builder: command must cd into the correct worktree (got: $cmd)"
 ok
-printf '%s\n' "$cmd" | grep -q "claude" || fail "_resume_builder: command must invoke claude (got: $cmd)"
+grep -q "claude" <<< "$cmd" || fail "_resume_builder: command must invoke claude (got: $cmd)"
 ok
 
 # Never wakes → returns 1, pane run twice (initial + retry).
@@ -192,9 +192,9 @@ export HERD_NOW_EPOCH=1000000
 DISPLAY=()
 _handle_limit_blocked "sched-x" "$T/trees/sched-x" "0" "1005000"   # target = 1005000 + 60 buffer
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "auto-resume at" || fail "4: waiting row should say 'auto-resume at' (got: $d)"
+grep -q "auto-resume at" <<< "$d" || fail "4: waiting row should say 'auto-resume at' (got: $d)"
 ok
-printf '%s\n' "$d" | grep -q "needs you" && fail "4: waiting row must NOT be a red 'needs you' row (got: $d)"
+grep -q "needs you" <<< "$d" && fail "4: waiting row must NOT be a red 'needs you' row (got: $d)"
 ok
 [ "$(limit_state "sched-x")" = "scheduled" ] || fail "4: state should be 'scheduled'"
 ok
@@ -214,7 +214,7 @@ printf '0\n' > "$STUB_WAIT_FILE"; : > "$PANE_LOG"; : > "$JOURNAL_FILE"
 DISPLAY=()
 _handle_limit_blocked "sched-x" "$WT_S" "0" "0"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "resumed via --continue" || fail "4: past-reset success row should say 'resumed via --continue' (got: $d)"
+grep -q "resumed via --continue" <<< "$d" || fail "4: past-reset success row should say 'resumed via --continue' (got: $d)"
 ok
 grep -q -- "--continue" "$PANE_LOG" || fail "4: resume must run claude --continue"
 ok
@@ -237,7 +237,7 @@ printf '1\n1\n' > "$STUB_WAIT_FILE"
 DISPLAY=()
 _handle_limit_blocked "esc-y" "$T/trees/esc-y" "0" "1000"   # target 1060 << now → resume immediately
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "needs you · limit-resume failed" || fail "4: failed resume must escalate 'needs you · limit-resume failed' (got: $d)"
+grep -q "needs you · limit-resume failed" <<< "$d" || fail "4: failed resume must escalate 'needs you · limit-resume failed' (got: $d)"
 ok
 [ "$(limit_state "esc-y")" = "failed" ] || fail "4: state should be 'failed' after a failed resume"
 ok
@@ -245,7 +245,7 @@ calls_before="$(wc -l < "$PANE_LOG")"
 DISPLAY=(); printf '0\n' > "$STUB_WAIT_FILE"
 _handle_limit_blocked "esc-y" "$T/trees/esc-y" "0" "1000"   # next tick: state=failed → no re-attempt
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "needs you · limit-resume failed" || fail "4: failed state must keep showing needs-you (got: $d)"
+grep -q "needs you · limit-resume failed" <<< "$d" || fail "4: failed state must keep showing needs-you (got: $d)"
 ok
 [ "$(wc -l < "$PANE_LOG")" -eq "$calls_before" ] || fail "4: a failed record must NOT re-attempt resume every tick"
 ok
@@ -274,7 +274,7 @@ printf '1\n1\n' > "$STUB_WAIT_FILE"
 DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
 _handle_block_verdict "71" "fix-dead" "sha-71" "0"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "needs you · auto-refix failed" || fail "5: a submit that never wakes must escalate (got: $d)"
+grep -q "needs you · auto-refix failed" <<< "$d" || fail "5: a submit that never wakes must escalate (got: $d)"
 ok
 
 # ── (6) herd_write_ratelimit_hook: merge-safe + idempotent ───────────────────
@@ -367,7 +367,7 @@ ok
 grep -q '"event":"refix_deferred_limit"' "$JOURNAL_FILE" || fail "8: the deferral must be journaled refix_deferred_limit"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "limit-hit" || fail "8: the row must show the limit-hold, not a refix row (got: $d)"
+grep -q "limit-hit" <<< "$d" || fail "8: the row must show the limit-hold, not a refix row (got: $d)"
 ok
 unset HERD_NOW_EPOCH
 
@@ -388,9 +388,9 @@ export HERD_LIMIT_UNKNOWN_WAIT=7200
 DISPLAY=()
 _handle_limit_blocked "lim-unknown" "$WT_U" "0" "$r"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "auto-resume at" || fail "9: unknown-reset hold row should say 'auto-resume at' (got: $d)"
+grep -q "auto-resume at" <<< "$d" || fail "9: unknown-reset hold row should say 'auto-resume at' (got: $d)"
 ok
-printf '%s\n' "$d" | grep -q "needs you" && fail "9: unknown-reset hold row must NOT be a red 'needs you' row (got: $d)"
+grep -q "needs you" <<< "$d" && fail "9: unknown-reset hold row must NOT be a red 'needs you' row (got: $d)"
 ok
 [ "$(limit_state "lim-unknown")" = "scheduled" ] || fail "9: state should be 'scheduled' after an unparseable-reset hit"
 ok

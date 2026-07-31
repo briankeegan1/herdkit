@@ -87,7 +87,7 @@ ok; echo "PASS (a2) shipped driver-qualified MODEL_REVIEW accepted"
 _herd_set MODEL_REVIEW codx:gpt-5.4
 [ "$RC" -ne 0 ] \
   || fail "(a3) MODEL_REVIEW with unknown driver prefix must be REFUSED (rc=0, out=$OUT)"
-printf '%s\n' "$OUT" | grep -qi 'refusing to set MODEL_REVIEW' \
+grep -qi 'refusing to set MODEL_REVIEW' <<< "$OUT" \
   || fail "(a3) refusal message must mention 'refusing to set MODEL_REVIEW' (got: $OUT)"
 ok; echo "PASS (a3) bogus driver prefix refused at config set with clear message"
 
@@ -160,7 +160,7 @@ ok; echo "PASS (b2) driver-qualified MODEL_REVIEW dispatches to the named driver
 _review HERD_REVIEW_MODEL="codx:gpt-5.4"
 [ "$RC" -ne 0 ] \
   || fail "(b3) an unknown driver in REVIEW_MODEL must cause herd-review.sh to exit non-zero (rc=0)"
-printf '%s\n' "$REVIEW_OUT" | grep -qi 'does not resolve\|not resolve\|refusing' \
+grep -qi 'does not resolve\|not resolve\|refusing' <<< "$REVIEW_OUT" \
   || fail "(b3) the error message must explain the bad ref (got: $REVIEW_OUT)"
 # No dispatch must have occurred — the bogus ref must be caught before any binary is launched.
 [ ! -s "$REVIEW_CALLS" ] \

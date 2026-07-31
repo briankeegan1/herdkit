@@ -46,8 +46,8 @@ mkproj() {
 proj="$T/noninteractive"; mkproj "$proj" "package.json"
 out="$( cd "$proj" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
         "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(1) init failed: $out"
-echo "$out" | grep -q "Grounding & tooling"            && fail "(1) non-tty init must print ZERO grounding prompts"
-echo "$out" | grep -q "CONTEXT_PROVISION=codemap"      && fail "(1) non-tty init must not offer/set CONTEXT_PROVISION"
+grep -q "Grounding & tooling" <<< "$out" && fail "(1) non-tty init must print ZERO grounding prompts"
+grep -q "CONTEXT_PROVISION=codemap" <<< "$out" && fail "(1) non-tty init must not offer/set CONTEXT_PROVISION"
 grep -qE '^CONTEXT_PROVISION=' "$proj/.herd/config"    && fail "(1) non-tty init must not write CONTEXT_PROVISION"
 grep -qE '^MCP_PROVISION=' "$proj/.herd/config"        && fail "(1) non-tty init must not write MCP_PROVISION"
 [ -e "$proj/.herd/config.local" ]                      && fail "(1) non-tty init must not create .herd/config.local"
@@ -59,7 +59,7 @@ proj="$T/yes"; mkproj "$proj" "package.json"
 out="$( cd "$proj" && printf 'y\ny\ncontext7\n' \
         | PATH="$FAKEBIN:$PATH" HERD_GROUND_ASSUME_TTY=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
           "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(2) init failed: $out"
-echo "$out" | grep -q "Grounding & tooling"                 || fail "(2) grounding interview should run under HERD_GROUND_ASSUME_TTY"
+grep -q "Grounding & tooling" <<< "$out" || fail "(2) grounding interview should run under HERD_GROUND_ASSUME_TTY"
 # (a) codemap grounding — map generated + CONTEXT_PROVISION pointed at it, in the COMMITTED baseline.
 [ -f "$proj/docs/codemap.md" ]                              || fail "(2) yes → docs/codemap.md must be generated"
 grep -qE '^CONTEXT_PROVISION="codemap"$' "$proj/.herd/config" || fail "(2) yes → CONTEXT_PROVISION=codemap in baseline: $(grep CONTEXT_PROVISION "$proj/.herd/config" 2>/dev/null)"
@@ -71,7 +71,7 @@ grep -qxF '.herd/config.local' "$proj/.gitignore"           || fail "(2) yes →
 # (c) MCP — committed baseline.
 grep -qE '^MCP_PROVISION="context7"$' "$proj/.herd/config"  || fail "(2) yes → MCP_PROVISION=context7 in baseline: $(grep MCP_PROVISION "$proj/.herd/config" 2>/dev/null)"
 # (d) efficiency levers are SURFACED (never written).
-echo "$out" | grep -q "Efficiency levers"                   || fail "(2) efficiency levers should be surfaced"
+grep -q "Efficiency levers" <<< "$out" || fail "(2) efficiency levers should be surfaced"
 grep -qE '^REVIEW_ESCALATE_GLOB=' "$proj/.herd/config"      && fail "(2) surface-only levers must never be auto-written (REVIEW_ESCALATE_GLOB)"
 ok
 
@@ -81,8 +81,8 @@ proj="$T/no"; mkproj "$proj" "package.json"
 out="$( cd "$proj" && printf 'n\n\n' \
         | PATH="$SAFE" HERD_GROUND_ASSUME_TTY=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
           "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(3) init failed: $out"
-echo "$out" | grep -q "Grounding & tooling"                 || fail "(3) grounding interview should run (prompts shown)"
-echo "$out" | grep -q "pipx install graphifyy"              || fail "(3) graphify absent → PyPI install hint must be printed"
+grep -q "Grounding & tooling" <<< "$out" || fail "(3) grounding interview should run (prompts shown)"
+grep -q "pipx install graphifyy" <<< "$out" || fail "(3) graphify absent → PyPI install hint must be printed"
 grep -qE '^CONTEXT_PROVISION=' "$proj/.herd/config"         && fail "(3) no → CONTEXT_PROVISION must not be written"
 grep -qE '^MCP_PROVISION=' "$proj/.herd/config"             && fail "(3) no → MCP_PROVISION must not be written"
 [ -e "$proj/.herd/config.local" ]                           && fail "(3) no → .herd/config.local must not be created"

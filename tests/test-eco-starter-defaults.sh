@@ -46,7 +46,7 @@ echo MODEL_RESEARCH=\$MODEL_RESEARCH
 echo MODEL_REVIEW=\$MODEL_REVIEW
 echo MODEL_ESCALATE_GLOB=\$MODEL_ESCALATE_GLOB" )
 }
-kv() { echo "$1" | grep -qx "$2" || fail "$3 (wanted $2)"$'\n'"--- dump ---"$'\n'"$1"; }
+kv() { grep -qx "$2" <<< "$(echo "$1")" || fail "$3 (wanted $2)"$'\n'"--- dump ---"$'\n'"$1"; }
 
 # ── (1) a fresh non-interactive `herd init` seeds the eco starter tiers; the loader resolves them ──
 proj="$T/fresh"; mkdir -p "$proj"

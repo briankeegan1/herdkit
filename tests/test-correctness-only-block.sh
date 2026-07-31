@@ -137,7 +137,7 @@ out="$(HERD_NO_PANE=1 HERD_REVIEW_RESULT_FILE="$RES6" WORKTREES_DIR="$T/trees" \
        HERD_CONFIG_FILE="$T/no-such-config" JOURNAL_FILE="$T/j6" bash "$REVIEW" 6 slug6 2>/dev/null)"
 rc=$?
 [ "$rc" -eq 0 ] || fail "(6) PASS-with-advisory should exit 0 (got $rc)"
-printf '%s\n' "$out" | grep -qF 'REVIEW: PASS — advisory: prefer printf | advisory: add a test' \
+grep -qF 'REVIEW: PASS — advisory: prefer printf | advisory: add a test' <<< "$out" \
   || fail "(6) herd-review.sh should emit the advisory PASS line verbatim to stdout"
 grep -qF 'REVIEW: PASS — advisory: prefer printf | advisory: add a test' "$RES6" \
   || fail "(6) result file should carry the advisory PASS line verbatim"
@@ -155,7 +155,7 @@ out="$(HERD_NO_PANE=1 HERD_REVIEW_RESULT_FILE="$RES7" WORKTREES_DIR="$T/trees" \
        HERD_CONFIG_FILE="$T/no-such-config" JOURNAL_FILE="$T/j7" bash "$REVIEW" 7 slug7 2>/dev/null)"
 rc=$?
 [ "$rc" -eq 0 ] || fail "(7) bare PASS should exit 0 (got $rc)"
-printf '%s\n' "$out" | grep -qx 'REVIEW: PASS' || fail "(7) bare PASS must be emitted byte-identically as 'REVIEW: PASS'"
+grep -qx 'REVIEW: PASS' <<< "$out" || fail "(7) bare PASS must be emitted byte-identically as 'REVIEW: PASS'"
 grep -qx 'REVIEW: PASS' "$RES7" || fail "(7) result file should contain exactly 'REVIEW: PASS'"
 ok
 
@@ -171,7 +171,7 @@ out="$(HERD_NO_PANE=1 HERD_REVIEW_RESULT_FILE="$RES8" WORKTREES_DIR="$T/trees" \
        HERD_CONFIG_FILE="$T/no-such-config" JOURNAL_FILE="$T/j8" bash "$REVIEW" 8 slug8 2>/dev/null)"
 rc=$?
 [ "$rc" -eq 1 ] || fail "(8) a correctness BLOCK must exit 1 (got $rc)"
-printf '%s\n' "$out" | grep -q '^REVIEW: BLOCK — rule: off-by-one' || fail "(8) the structured BLOCK must survive"
+grep -q '^REVIEW: BLOCK — rule: off-by-one' <<< "$out" || fail "(8) the structured BLOCK must survive"
 ok
 
 ################################################################################

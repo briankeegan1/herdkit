@@ -54,12 +54,12 @@ else
   [ "$RC" -eq 0 ] || fail "(1) init must not hang/hard-fail non-interactively (rc=$RC): $out"
   pout="$(plain "$out")"
   # consequence block — the operator SEES what each value does, verbatim in the flow.
-  echo "$pout" | grep -qi "watcher MERGES every gate-passed PR"    || fail "(1) auto consequence not shown: $out"
-  echo "$pout" | grep -qi "HOLDS each PR for an explicit human"    || fail "(1) approve consequence not shown: $out"
-  echo "$pout" | grep -qi "NEVER merges"                          || fail "(1) observe consequence not shown: $out"
+grep -qi "watcher MERGES every gate-passed PR" <<< "$pout" || fail "(1) auto consequence not shown: $out"
+grep -qi "HOLDS each PR for an explicit human" <<< "$pout" || fail "(1) approve consequence not shown: $out"
+grep -qi "NEVER merges" <<< "$pout" || fail "(1) observe consequence not shown: $out"
   # LOUD notice (not a single dim line) that we defaulted to auto without a human choosing it.
-  echo "$pout" | grep -qi "MERGE_POLICY defaulted to 'auto'"      || fail "(1) loud auto-default notice missing: $out"
-  echo "$pout" | grep -qi "NO human sign-off"                     || fail "(1) auto notice must spell out the consequence: $out"
+grep -qi "MERGE_POLICY defaulted to 'auto'" <<< "$pout" || fail "(1) loud auto-default notice missing: $out"
+grep -qi "NO human sign-off" <<< "$pout" || fail "(1) auto notice must spell out the consequence: $out"
   grep -qE '^MERGE_POLICY="auto"$' "$proj/.herd/config"           || fail "(1) config should seed MERGE_POLICY=auto: $(cat "$proj/.herd/config")"
   ok
 fi
@@ -86,8 +86,8 @@ proj="$T/approve"; mkproj "$proj" "git@github.com:acme/widgets.git"
 out="$(cd "$proj" && PATH="$STUB:$PATH" HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$HERD" init 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] || fail "(2) init should succeed with approve detection (rc=$RC): $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -qi "MERGE_POLICY=approve"                        || fail "(2) approve seeded value not announced: $out"
-echo "$pout" | grep -qi "MERGE_POLICY defaulted to 'auto'"           && fail "(2) must NOT warn about auto when default is approve: $out"
+grep -qi "MERGE_POLICY=approve" <<< "$pout" || fail "(2) approve seeded value not announced: $out"
+grep -qi "MERGE_POLICY defaulted to 'auto'" <<< "$pout" && fail "(2) must NOT warn about auto when default is approve: $out"
 grep -qE '^MERGE_POLICY="approve"$' "$proj/.herd/config"             || fail "(2) config should seed MERGE_POLICY=approve: $(cat "$proj/.herd/config")"
 ok
 
@@ -128,7 +128,7 @@ if [ "$PTY_RC" = "7" ] || [ -z "$ptyout" ]; then
   ok
 else
   pptyout="$(plain "$ptyout" | tr -d '\r')"
-  echo "$pptyout" | grep -qi "MERGE_POLICY (auto | approve | observe)" || fail "(3) interactive prompt did not render: $ptyout"
+grep -qi "MERGE_POLICY (auto | approve | observe)" <<< "$pptyout" || fail "(3) interactive prompt did not render: $ptyout"
   [ "$(plain "$(cat "$ANSF")" | tr -d '\r\n ')" = "approve" ]          || fail "(3) operator answer not honored: got [$(cat "$ANSF")]"
   ok
 fi

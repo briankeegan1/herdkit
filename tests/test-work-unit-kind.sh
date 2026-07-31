@@ -108,7 +108,7 @@ ok "(2) sourcing agent-watch.sh transitively loads every moved git-pr function u
 
   err="$(wunit_resolve_adapter doc-apply 2>&1 1>/dev/null)"; rc=$?
   [ "$rc" -eq 1 ] || { echo "FAIL: (3d) unsupported kind must return rc 1 (got rc=$rc)"; exit 1; }
-  printf '%s' "$err" | grep -qi 'not supported' || { echo "FAIL: (3d) refusal must be LOUD (stderr), got: $err"; exit 1; }
+grep -qi 'not supported' <<< "$err" || { echo "FAIL: (3d) refusal must be LOUD (stderr), got: $err"; exit 1; }
   out="$(wunit_resolve_adapter doc-apply 2>/dev/null)"
   [ -z "$out" ] || { echo "FAIL: (3e) unsupported kind must print NOTHING on stdout (a silent fallback), got: '$out'"; exit 1; }
 

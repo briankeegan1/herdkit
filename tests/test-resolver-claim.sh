@@ -119,12 +119,12 @@ now() { date +%s; }
 # ══════════════════════════════ 3. render/parse round-trip ══════════════════════════════════════
 body="$(_resolve_claim_render 42 abc123 alice myslug 1700000000 claimed)"
 parsed="$(printf '%s' "$body" | _resolve_claim_parse)"
-echo "$parsed" | grep -qx "RC_PR=42"          || fail "round-trip RC_PR: got: $parsed"; ok
-echo "$parsed" | grep -qx "RC_SHA=abc123"     || fail "round-trip RC_SHA"; ok
-echo "$parsed" | grep -qx "RC_SEAT=alice"     || fail "round-trip RC_SEAT"; ok
-echo "$parsed" | grep -qx "RC_SLUG=myslug"    || fail "round-trip RC_SLUG"; ok
-echo "$parsed" | grep -qx "RC_EPOCH=1700000000" || fail "round-trip RC_EPOCH"; ok
-echo "$parsed" | grep -qx "RC_STATE=claimed"  || fail "round-trip RC_STATE"; ok
+grep -qx "RC_PR=42" <<< "$parsed" || fail "round-trip RC_PR: got: $parsed"; ok
+grep -qx "RC_SHA=abc123" <<< "$parsed" || fail "round-trip RC_SHA"; ok
+grep -qx "RC_SEAT=alice" <<< "$parsed" || fail "round-trip RC_SEAT"; ok
+grep -qx "RC_SLUG=myslug" <<< "$parsed" || fail "round-trip RC_SLUG"; ok
+grep -qx "RC_EPOCH=1700000000" <<< "$parsed" || fail "round-trip RC_EPOCH"; ok
+grep -qx "RC_STATE=claimed" <<< "$parsed" || fail "round-trip RC_STATE"; ok
 
 # A non-claim comment (no marker) parses to nothing.
 [ -z "$(printf 'just a human comment\nno marker here' | _resolve_claim_parse)" ] || fail "non-claim body must parse empty"; ok

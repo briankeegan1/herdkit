@@ -57,31 +57,31 @@ run_gate() {
 
 # ── 1. off (default) + no ref → no gate, proceed silently ────────────────────────────────────────────
 out="$(run_gate s1 "")"
-echo "$out" | grep -q "RC=0" || fail "(1) off default must proceed (rc 0), got '$out'"
-echo "$out" | grep -qiE "refus|TRACKED_SPAWNS" && fail "(1) off default must print nothing, got '$out'"
+grep -q "RC=0" <<< "$out" || fail "(1) off default must proceed (rc 0), got '$out'"
+grep -qiE "refus|TRACKED_SPAWNS" <<< "$out" && fail "(1) off default must print nothing, got '$out'"
 pass; echo "PASS (1) TRACKED_SPAWNS unset (off) → gate is a silent no-op"
 
 # ── 2. off explicitly + no ref → still proceed (byte-identical to today) ──────────────────────────────
 out="$(TRACKED_SPAWNS=off run_gate s2 "")"
-echo "$out" | grep -q "RC=0" || fail "(2) explicit off must proceed, got '$out'"
+grep -q "RC=0" <<< "$out" || fail "(2) explicit off must proceed, got '$out'"
 pass; echo "PASS (2) TRACKED_SPAWNS=off + no ref → proceed"
 
 # ── 3. required + HERD_ITEM_REF present → proceed ─────────────────────────────────────────────────────
 out="$(TRACKED_SPAWNS=required HERD_ITEM_REF=HERD-64 run_gate s3 "")"
-echo "$out" | grep -q "RC=0" || fail "(3) required + HERD_ITEM_REF must proceed, got '$out'"
-echo "$out" | grep -qi "refus" && fail "(3) required + ref must not print a refusal, got '$out'"
+grep -q "RC=0" <<< "$out" || fail "(3) required + HERD_ITEM_REF must proceed, got '$out'"
+grep -qi "refus" <<< "$out" && fail "(3) required + ref must not print a refusal, got '$out'"
 pass; echo "PASS (3) required + HERD_ITEM_REF → proceed"
 
 # ── 4. required + HERD_CLAIM_ID present → proceed (same ref set as herd-claim.sh) ─────────────────────
 out="$(TRACKED_SPAWNS=required HERD_CLAIM_ID=repo#item-a run_gate s4 "")"
-echo "$out" | grep -q "RC=0" || fail "(4) required + HERD_CLAIM_ID must proceed, got '$out'"
+grep -q "RC=0" <<< "$out" || fail "(4) required + HERD_CLAIM_ID must proceed, got '$out'"
 pass; echo "PASS (4) required + HERD_CLAIM_ID → proceed"
 
 # ── 5. required + NO ref + not forced → REFUSE (rc 1) with a loud one-line reason ─────────────────────
 out="$(TRACKED_SPAWNS=required run_gate s5 "")"
-echo "$out" | grep -q "RC=1" || fail "(5) required + no ref must abort (rc 1), got '$out'"
-echo "$out" | grep -q "refusing to spawn 's5'" || fail "(5) missing loud refusal reason, got '$out'"
-echo "$out" | grep -q "HERD_FORCE_SPAWN=1" || fail "(5) refusal must name the escape hatch, got '$out'"
+grep -q "RC=1" <<< "$out" || fail "(5) required + no ref must abort (rc 1), got '$out'"
+grep -q "refusing to spawn 's5'" <<< "$out" || fail "(5) missing loud refusal reason, got '$out'"
+grep -q "HERD_FORCE_SPAWN=1" <<< "$out" || fail "(5) refusal must name the escape hatch, got '$out'"
 [ -f "$T/journal.jsonl" ] && grep -q tracked_spawn_bypassed "$T/journal.jsonl" \
   && fail "(5) a REFUSED spawn must NOT journal a bypass"
 pass; echo "PASS (5) required + no ref + no force → refuse (rc 1) + loud reason, no bypass journaled"
@@ -89,8 +89,8 @@ pass; echo "PASS (5) required + no ref + no force → refuse (rc 1) + loud reaso
 # ── 6. required + NO ref + HERD_FORCE_SPAWN=1 → proceed + JOURNAL the bypass ──────────────────────────
 rm -f "$T/journal.jsonl"
 out="$(TRACKED_SPAWNS=required HERD_FORCE_SPAWN=1 run_gate s6 "")"
-echo "$out" | grep -q "RC=0" || fail "(6) forced bypass must proceed (rc 0), got '$out'"
-echo "$out" | grep -q "spawning anyway" || fail "(6) forced bypass must print a loud notice, got '$out'"
+grep -q "RC=0" <<< "$out" || fail "(6) forced bypass must proceed (rc 0), got '$out'"
+grep -q "spawning anyway" <<< "$out" || fail "(6) forced bypass must print a loud notice, got '$out'"
 [ -f "$T/journal.jsonl" ] || fail "(6) forced bypass must write a journal event"
 grep -q '"event":"tracked_spawn_bypassed"' "$T/journal.jsonl" || fail "(6) bypass event not journaled ($(cat "$T/journal.jsonl"))"
 grep -q '"slug":"s6"' "$T/journal.jsonl" || fail "(6) bypass journal missing slug"
@@ -99,13 +99,13 @@ pass; echo "PASS (6) required + no ref + HERD_FORCE_SPAWN=1 → proceed + tracke
 # ── 7. required + NO ref + lane --force arg (arg2) → proceed (the lanes pass their FORCE_SPAWN) ───────
 rm -f "$T/journal.jsonl"
 out="$(TRACKED_SPAWNS=required run_gate s7 "1")"
-echo "$out" | grep -q "RC=0" || fail "(7) lane --force arg must bypass (rc 0), got '$out'"
+grep -q "RC=0" <<< "$out" || fail "(7) lane --force arg must bypass (rc 0), got '$out'"
 grep -q tracked_spawn_bypassed "$T/journal.jsonl" 2>/dev/null || fail "(7) lane --force bypass must also journal"
 pass; echo "PASS (7) required + no ref + lane --force (arg2) → proceed + journaled"
 
 # ── 8. unknown TRACKED_SPAWNS value → treated as off (safe default) ──────────────────────────────────
 out="$(TRACKED_SPAWNS=banana run_gate s8 "")"
-echo "$out" | grep -q "RC=0" || fail "(8) unknown value must fall back to off (proceed), got '$out'"
+grep -q "RC=0" <<< "$out" || fail "(8) unknown value must fall back to off (proceed), got '$out'"
 pass; echo "PASS (8) unknown TRACKED_SPAWNS value → treated as off"
 
 # ============================ enqueue gate + ref threading: spawn.sh ==================================
@@ -123,15 +123,15 @@ reset_q()   { rm -rf "$Q"; }
 # ── 9. required + NO ref → spawn.sh refuses; nothing enters the queue ─────────────────────────────────
 reset_q
 out="$(TRACKED_SPAWNS=required run_spawn reject-me quick "do a thing")"
-echo "$out" | grep -q "SPAWN_RC=1" || fail "(9) spawn.sh under required + no ref must exit 1, got '$out'"
-echo "$out" | grep -q "refusing to spawn 'reject-me'" || fail "(9) spawn.sh must print the loud refusal, got '$out'"
+grep -q "SPAWN_RC=1" <<< "$out" || fail "(9) spawn.sh under required + no ref must exit 1, got '$out'"
+grep -q "refusing to spawn 'reject-me'" <<< "$out" || fail "(9) spawn.sh must print the loud refusal, got '$out'"
 [ -d "$Q" ] && ls "$Q"/*.req >/dev/null 2>&1 && fail "(9) a refused spawn must NOT enqueue an intent"
 pass; echo "PASS (9) spawn.sh refuses a ref-less intent under required — queue stays empty"
 
 # ── 10. required + HERD_ITEM_REF → enqueued + .ref sidecar written with the ref ──────────────────────
 reset_q
 out="$(TRACKED_SPAWNS=required HERD_ITEM_REF=HERD-64 run_spawn build-it quick "build the thing")"
-echo "$out" | grep -q "SPAWN_RC=0" || fail "(10) tracked spawn.sh must exit 0, got '$out'"
+grep -q "SPAWN_RC=0" <<< "$out" || fail "(10) tracked spawn.sh must exit 0, got '$out'"
 req="$(ls "$Q"/*.req 2>/dev/null | head -1)"; [ -n "$req" ] || fail "(10) tracked intent was not enqueued"
 ref="${req%.req}.ref"
 [ -f "$ref" ] || fail "(10) ref sidecar not written next to the intent"
@@ -160,7 +160,7 @@ pass; echo "PASS (11) spawn-step threads the ref on line 3 and done reaps both i
 # ── 12. off + no ref → spawn.sh enqueues normally, NO sidecar, ref line drains EMPTY ─────────────────
 reset_q
 out="$(TRACKED_SPAWNS=off run_spawn plain-item quick "plain task")"
-echo "$out" | grep -q "SPAWN_RC=0" || fail "(12) off + no ref must enqueue (rc 0), got '$out'"
+grep -q "SPAWN_RC=0" <<< "$out" || fail "(12) off + no ref must enqueue (rc 0), got '$out'"
 req="$(ls "$Q"/*.req 2>/dev/null | head -1)"; [ -n "$req" ] || fail "(12) intent not enqueued under off"
 [ -f "${req%.req}.ref" ] && fail "(12) an untracked spawn must NOT write a ref sidecar"
 c0=""; c1=""; c2=""; c3=""; c4=""; c5=""

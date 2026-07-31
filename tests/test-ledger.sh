@@ -67,10 +67,10 @@ ok
 [ "$(_all_valid_json "$LEDGER_FILE")" = "1" ] || fail "(1) first set should yield exactly 1 JSON line"
 ok
 get10="$(L get HERD-10)" || fail "(1) get of a present id should exit 0"
-printf '%s\n' "$get10" | grep -q "id=HERD-10"      || fail "(1) get should show id"
-printf '%s\n' "$get10" | grep -q "slug=feat-x"      || fail "(1) get should show slug"
-printf '%s\n' "$get10" | grep -q "pr=42"            || fail "(1) get should show pr"
-printf '%s\n' "$get10" | grep -q "status=spawned"   || fail "(1) get should show status"
+grep -q "id=HERD-10" <<< "$get10" || fail "(1) get should show id"
+grep -q "slug=feat-x" <<< "$get10" || fail "(1) get should show slug"
+grep -q "pr=42" <<< "$get10" || fail "(1) get should show pr"
+grep -q "status=spawned" <<< "$get10" || fail "(1) get should show status"
 ok
 # pr is a JSON number, slug a string (mirrors journal int-coercion).
 python3 -c '
@@ -86,9 +86,9 @@ L set HERD-10 status in-review pr 42 reviewer opus >/dev/null || fail "(2) updat
 [ "$(_all_valid_json "$LEDGER_FILE")" = "2" ] || fail "(2) update should APPEND a second line"
 ok
 get10b="$(L get HERD-10)"
-printf '%s\n' "$get10b" | grep -q "status=in-review" || fail "(2) later status must win"
-printf '%s\n' "$get10b" | grep -q "slug=feat-x"       || fail "(2) unmentioned field must persist"
-printf '%s\n' "$get10b" | grep -q "reviewer=opus"     || fail "(2) new field must be added"
+grep -q "status=in-review" <<< "$get10b" || fail "(2) later status must win"
+grep -q "slug=feat-x" <<< "$get10b" || fail "(2) unmentioned field must persist"
+grep -q "reviewer=opus" <<< "$get10b" || fail "(2) new field must be added"
 # exactly one status token in the folded view (not duplicated).
 [ "$(printf '%s\n' "$get10b" | grep -o 'status=[^ ]*' | wc -l | tr -d ' ')" = "1" ] \
   || fail "(2) folded view must not duplicate a field"
@@ -129,9 +129,9 @@ L list | cut -f1 | grep -qx HERD-20 && fail "(4) tombstoned id must not appear i
 ok
 L set HERD-20 slug feat-y status respawned >/dev/null || fail "(4) revive set failed"
 rev="$(L get HERD-20)" || fail "(4) revived id should be gettable"
-printf '%s\n' "$rev" | grep -q "status=respawned" || fail "(4) revived id should carry the new field"
+grep -q "status=respawned" <<< "$rev" || fail "(4) revived id should carry the new field"
 # revive starts fresh after a tombstone: the pre-rm `planned`/`note` must NOT resurrect.
-printf '%s\n' "$rev" | grep -q "note=" && fail "(4) tombstone must clear prior fields (note leaked)"
+grep -q "note=" <<< "$rev" && fail "(4) tombstone must clear prior fields (note leaked)"
 ok
 
 # ── (5) compact: fold history to one line per live id, lossless for current state, atomic ──
@@ -180,8 +180,8 @@ out="$(bash -c '
   if bash "'"$LEDGER_SH"'" set HERD-1 slug x >/dev/null 2>&1; then echo UNEXPECTED_OK; else echo HANDLED; fi
   echo SURVIVED
 ')"
-printf '%s\n' "$out" | grep -qx SURVIVED || fail "(8) a failed write must not abort a set -e caller"
-printf '%s\n' "$out" | grep -qx HANDLED  || fail "(8) an unwritable set should report failure (non-zero)"
+grep -qx SURVIVED <<< "$out" || fail "(8) a failed write must not abort a set -e caller"
+grep -qx HANDLED <<< "$out" || fail "(8) an unwritable set should report failure (non-zero)"
 ok
 # Reserved keys can't be overridden through the k/v API (id/ts/_deleted stay engine-managed).
 export LEDGER_FILE="$T/l8/ledger.jsonl"
@@ -218,8 +218,8 @@ unset LEDGER_FILE   # let the CLI resolve the path from the project's WORKTREES_
 [ -f "$TREES/.herd/ledger.jsonl" ] || fail "(10) CLI should write to WORKTREES_DIR/.herd/ledger.jsonl"
 ok
 cli_get="$(cd "$PROJ" && bash "$HERD_BIN" ledger get HERD-77)" || fail "(10) herd ledger get failed"
-printf '%s\n' "$cli_get" | grep -q "slug=cli-feat" || fail "(10) CLI get should fold the item"
-printf '%s\n' "$cli_get" | grep -q "pr=7"           || fail "(10) CLI get should show pr"
+grep -q "slug=cli-feat" <<< "$cli_get" || fail "(10) CLI get should fold the item"
+grep -q "pr=7" <<< "$cli_get" || fail "(10) CLI get should show pr"
 ok
 cli_path="$(cd "$PROJ" && bash "$HERD_BIN" ledger path)"
 [ "$cli_path" = "$TREES/.herd/ledger.jsonl" ] || fail "(10) herd ledger path wrong (got: $cli_path)"

@@ -63,7 +63,7 @@ warn="$(herd_enum FOO_ENUM hold a b 2>&1 >/dev/null)"; rc=$?
 out="$(herd_enum FOO_ENUM hold a b 2>/dev/null)"; rc2=$?
 [ "$out" = "hold" ] || fail "(1c) invalid enum should print default, got: $out"
 [ "$rc2" -eq 1 ]    || fail "(1c) invalid enum should exit 1, got: $rc2"
-printf '%s' "$warn" | grep -qi 'invalid FOO_ENUM' || fail "(1c) invalid enum should warn: $warn"
+grep -qi 'invalid FOO_ENUM' <<< "$warn" || fail "(1c) invalid enum should warn: $warn"
 ok "herd_enum invalid → default + warn + exit 1"
 
 unset FOO_NUM 2>/dev/null || true
@@ -155,9 +155,9 @@ attr_out="$(
   bash "$HC" "$REPO" --light 2>&1
 )"; attr_rc=$?
 [ "$attr_rc" -eq 0 ] || fail "(5a) invalid ATTRIBUTION_POLICY must not red the suite (rc=$attr_rc)"
-printf '%s' "$attr_out" | grep -qi 'invalid ATTRIBUTION_POLICY' \
+grep -qi 'invalid ATTRIBUTION_POLICY' <<< "$attr_out" \
   || fail "(5b) invalid ATTRIBUTION_POLICY must WARN, got: $attr_out"
-printf '%s' "$attr_out" | grep -qi 'lint skipped' \
+grep -qi 'lint skipped' <<< "$attr_out" \
   || fail "(5c) invalid ATTRIBUTION_POLICY warn should say lint skipped: $attr_out"
 ok "ATTRIBUTION_POLICY typo → WARN (not silent-off)"
 
@@ -170,7 +170,7 @@ attr_off="$(
   export ATTRIBUTION_POLICY=""
   bash "$HC" "$REPO" --light 2>&1
 )"
-printf '%s' "$attr_off" | grep -qi 'attribution' \
+grep -qi 'attribution' <<< "$attr_off" \
   && fail "(5d) empty ATTRIBUTION_POLICY must stay silent, got: $attr_off"
 ok "ATTRIBUTION_POLICY empty → still silent-off"
 
@@ -190,7 +190,7 @@ ok "CODEMAP_AUTOREFRESH=false stays false"
 # (7) capabilities.tsv value_shape column
 # ══════════════════════════════════════════════════════════════════════════════
 header="$(head -1 "$CAPS")"
-printf '%s' "$header" | grep -q $'\tvalue_shape$' || printf '%s' "$header" | grep -q $'\tvalue_shape' \
+grep -q $'\tvalue_shape$' <<< "$header" || grep -q $'\tvalue_shape' <<< "$header" \
   || fail "(7a) capabilities.tsv header missing value_shape column: $header"
 ok "capabilities.tsv has value_shape column"
 

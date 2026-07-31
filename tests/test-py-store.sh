@@ -106,15 +106,15 @@ OUT_FLAT="$(run_sim flat)"   || fail "flat sim exited nonzero"
 OUT_SQL="$(run_sim sqlite)"  || fail "sqlite sim exited nonzero"
 [ -n "$OUT_FLAT" ] || fail "flat sim produced no outcomes"
 [ "$OUT_FLAT" = "$OUT_SQL" ] || fail "backends diverged on the sim scenario: flat=$OUT_FLAT sqlite=$OUT_SQL"
-echo "$OUT_FLAT" | grep -q '"1": "MERGE"' || fail "green PR should MERGE on both backends ($OUT_FLAT)"
-echo "$OUT_FLAT" | grep -q '"3": "BLOCK"' || fail "review-block PR should BLOCK on both backends ($OUT_FLAT)"
+grep -q '"1": "MERGE"' <<< "$OUT_FLAT" || fail "green PR should MERGE on both backends ($OUT_FLAT)"
+grep -q '"3": "BLOCK"' <<< "$OUT_FLAT" || fail "review-block PR should BLOCK on both backends ($OUT_FLAT)"
 [ -f "$SIM/.herd/store.db" ] || fail "sqlite sim should have opened a db"
 pass
 
 # ── (4) byte-identical-off (ship default is a HARD no-op) ─────────────────────────────────────────
 OFF="$T/off"; mkdir -p "$OFF/.herd"
 unset STORE_BACKEND
-WORKTREES_DIR="$OFF" python3 -m herd.store --status | grep -q '^backend: flat$' \
+grep -q '^backend: flat$' <<< "$(WORKTREES_DIR="$OFF" python3 -m herd.store --status)" \
   || fail "default backend must resolve flat (ship-dormant)"
 # shadow-runtime stdout must OMIT the store_backend key under the default (byte-identical to pre-seam).
 WORKTREES_DIR="$OFF" python3 -m herd.shadow_runtime --fixture "$T/scenario.json" \

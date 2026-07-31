@@ -97,17 +97,17 @@ PY
 
 # ── 1 — RUBRIC_FILE unset → no rubric block, and the plain checklist/RULES text is untouched ───────
 run_local slug-unset
-printf '%s' "$PROMPT" | grep -qF "REVIEW RUBRIC" \
+grep -qF "REVIEW RUBRIC" <<< "$PROMPT" \
   && fail "1: unset RUBRIC_FILE must NOT inject a rubric block"
-printf '%s' "$PROMPT" | grep -qF "RUBRIC:" \
+grep -qF "RUBRIC:" <<< "$PROMPT" \
   && fail "1: unset RUBRIC_FILE must NOT mention the RUBRIC: verdict-line format"
-printf '%s' "$PROMPT" | grep -qF "do not add markdown, quotes, or extra text around it. THIS REVIEW:" \
+grep -qF "do not add markdown, quotes, or extra text around it. THIS REVIEW:" <<< "$PROMPT" \
   || fail "1: unset RUBRIC_FILE should leave the RULES→THIS REVIEW transition byte-identical (no stray space/text)"
 ok
 
 # ── 2 — RUBRIC_FILE set but the named file is missing → same no-op (fail-soft) ──────────────────────
 run_local slug-missing-file RUBRIC_FILE=".herd/does-not-exist.tsv"
-printf '%s' "$PROMPT" | grep -qF "REVIEW RUBRIC" \
+grep -qF "REVIEW RUBRIC" <<< "$PROMPT" \
   && fail "2: RUBRIC_FILE naming a missing file should still be a no-op"
 ok
 
@@ -115,7 +115,7 @@ ok
 mkdir -p "$GREPO/.herd"
 printf 'id\ttext\tweight\tpass_condition\n' > "$GREPO/.herd/empty-rubric.tsv"
 run_local slug-empty-rubric RUBRIC_FILE=".herd/empty-rubric.tsv"
-printf '%s' "$PROMPT" | grep -qF "REVIEW RUBRIC" \
+grep -qF "REVIEW RUBRIC" <<< "$PROMPT" \
   && fail "3: a header-only rubric file (zero criteria) should still be a no-op"
 ok
 
@@ -128,15 +128,15 @@ printf 'id\ttext\tweight\tpass_condition\n' > "$GREPO/.herd/rubric.tsv"
 printf 'scoped\tChange touches only its own worktree\trequired\tNo path outside the worktree changed\n' >> "$GREPO/.herd/rubric.tsv"
 printf 'docs\tUser-facing behavior is documented\tadvisory\tA nearby doc/comment explains it\n' >> "$GREPO/.herd/rubric.tsv"
 run_local slug-main-rubric RUBRIC_FILE=".herd/rubric.tsv"
-printf '%s' "$PROMPT" | grep -qF "REVIEW RUBRIC" \
+grep -qF "REVIEW RUBRIC" <<< "$PROMPT" \
   || fail "4: a present rubric file should inject the rubric block"
-printf '%s' "$PROMPT" | grep -qF "[scoped] (required) Change touches only its own worktree" \
+grep -qF "[scoped] (required) Change touches only its own worktree" <<< "$PROMPT" \
   || fail "4: the required criterion's id/weight/text should render verbatim"
-printf '%s' "$PROMPT" | grep -qF "[docs] (advisory) User-facing behavior is documented" \
+grep -qF "[docs] (advisory) User-facing behavior is documented" <<< "$PROMPT" \
   || fail "4: the advisory criterion's id/weight/text should render verbatim"
-printf '%s' "$PROMPT" | grep -qF "RUBRIC: <id> | PASS|FAIL | <one-line reason>" \
+grep -qF "RUBRIC: <id> | PASS|FAIL | <one-line reason>" <<< "$PROMPT" \
   || fail "4: the reviewer should be told the exact RUBRIC: verdict-line format"
-printf '%s' "$PROMPT" | grep -qF "your final REVIEW: line is still the ONLY thing the merge gate reads" \
+grep -qF "your final REVIEW: line is still the ONLY thing the merge gate reads" <<< "$PROMPT" \
   || fail "4: the prompt must state the rubric is advisory-only — REVIEW: still alone decides the merge"
 ok
 
@@ -147,7 +147,7 @@ mkdir -p "$WT/.herd"
 printf 'id\ttext\tweight\tpass_condition\n' > "$WT/.herd/wt-only-rubric.tsv"
 printf 'wt-only\tWorktree-local criterion\trequired\tSome condition\n' >> "$WT/.herd/wt-only-rubric.tsv"
 run_local wt-rubric RUBRIC_FILE=".herd/wt-only-rubric.tsv"
-printf '%s' "$PROMPT" | grep -qF "[wt-only] (required) Worktree-local criterion" \
+grep -qF "[wt-only] (required) Worktree-local criterion" <<< "$PROMPT" \
   || fail "5: a rubric file committed only in the worktree should be picked up"
 ok
 git -C "$GREPO" worktree remove -f "$WT" >/dev/null 2>&1 || true
@@ -155,9 +155,9 @@ git -C "$GREPO" worktree remove -f "$WT" >/dev/null 2>&1 || true
 # ── 6 — RUBRIC_FILE composes with REVIEW_CHECKLIST (both present at once, independently injected) ──
 printf 'CUSTOM_MARKER: verify every currency amount is stored in integer cents\n' > "$GREPO/.herd/review-checklist.md"
 run_local slug-both-checklist-and-rubric RUBRIC_FILE=".herd/rubric.tsv" REVIEW_CHECKLIST=".herd/review-checklist.md"
-printf '%s' "$PROMPT" | grep -qF "CUSTOM_MARKER" \
+grep -qF "CUSTOM_MARKER" <<< "$PROMPT" \
   || fail "6: REVIEW_CHECKLIST injection should be unaffected by RUBRIC_FILE"
-printf '%s' "$PROMPT" | grep -qF "REVIEW RUBRIC" \
+grep -qF "REVIEW RUBRIC" <<< "$PROMPT" \
   || fail "6: RUBRIC_FILE injection should be unaffected by REVIEW_CHECKLIST"
 ok
 

@@ -88,23 +88,23 @@ Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>"
 # ── 1a. _herd_attr_scan prints a violation line ──────────────────────────────────────────────────
 out="$(run_attr_scan "$T/vio/repo")"
 [ -n "$out" ] || fail "(1a) scan of violating commit must print violations; got empty output"
-echo "$out" | grep -qi "co-authored-by: claude" \
+grep -qi "co-authored-by: claude" <<< "$out" \
   || fail "(1a) violation line must name the offending trailer; got: $out"
 pass
 
 # ── 1b. violation line includes the commit sha (12-char prefix) ──────────────────────────────────
 sha="$(cd "$T/vio/repo" && git log --format="%H" origin/main..HEAD | head -1)"
 short="$(printf '%.12s' "$sha")"
-echo "$out" | grep -qF "$short" \
+grep -qF "$short" <<< "$out" \
   || fail "(1b) violation must name the offending sha ($short); got: $out"
 pass
 
 # ── 1c. healthcheck exits 1 and output names the sha ────────────────────────────────────────────
 hc_out="$(run_healthcheck "$T/vio/repo" "no-ai-coauthor")" ; hc_rc=$?
 [ "$hc_rc" -eq 1 ] || fail "(1c) healthcheck must exit 1 on violating trailer; got rc=$hc_rc"
-echo "$hc_out" | grep -qi "attribution" \
+grep -qi "attribution" <<< "$hc_out" \
   || fail "(1c) healthcheck output must mention attribution lint; got: $hc_out"
-echo "$hc_out" | grep -qF "$short" \
+grep -qF "$short" <<< "$hc_out" \
   || fail "(1c) healthcheck output must name the offending sha ($short); got: $hc_out"
 pass
 
@@ -116,7 +116,7 @@ add_commit "$T/gen/repo" "feat: add thing
 
 gen_out="$(run_attr_scan "$T/gen/repo")"
 [ -n "$gen_out" ] || fail "(1d) 'Generated with Claude' footer must trigger violation; got empty"
-echo "$gen_out" | grep -qi "generated with" \
+grep -qi "generated with" <<< "$gen_out" \
   || fail "(1d) violation line must include the 'Generated with' trailer; got: $gen_out"
 pass
 
@@ -134,7 +134,7 @@ pass
 # ── 2b. healthcheck exits 0 for clean history ────────────────────────────────────────────────────
 hc2_out="$(run_healthcheck "$T/clean/repo" "no-ai-coauthor")"; hc2_rc=$?
 [ "$hc2_rc" -eq 0 ] || fail "(2b) healthcheck must exit 0 for clean history; got rc=$hc2_rc (output: $hc2_out)"
-echo "$hc2_out" | grep -qi "attribution lint clean" \
+grep -qi "attribution lint clean" <<< "$hc2_out" \
   || fail "(2b) healthcheck output must confirm attribution lint clean; got: $hc2_out"
 pass
 
@@ -154,7 +154,7 @@ hc3_out="$(run_healthcheck "$T/off/repo" "")"; hc3_rc=$?
 pass
 
 # ── 3b. output contains no attribution mentions when policy is off ───────────────────────────────
-echo "$hc3_out" | grep -qi "attribution" \
+grep -qi "attribution" <<< "$hc3_out" \
   && fail "(3b) ATTRIBUTION_POLICY='' output must not mention attribution; got: $hc3_out"
 pass
 
@@ -168,7 +168,7 @@ hc4_out="$(
   bash "$HC" "$T/off/repo" --light 2>&1
 )"; hc4_rc=$?
 [ "$hc4_rc" -eq 0 ] || fail "(3c) unset ATTRIBUTION_POLICY must not flag violations; got rc=$hc4_rc"
-echo "$hc4_out" | grep -qi "attribution" \
+grep -qi "attribution" <<< "$hc4_out" \
   && fail "(3c) unset ATTRIBUTION_POLICY output must not mention attribution; got: $hc4_out"
 pass
 

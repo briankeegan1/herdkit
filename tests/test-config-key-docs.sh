@@ -103,7 +103,7 @@ grep -Eq 'APP_PREVIEW_PORT_BASE:-8501'                  "$FEATURE" || fail "(5) 
 # capabilities.tsv documents the same numeric defaults.
 for pair in "DEP_POLL_MIN:30" "DEP_POLL_MAX:300" "DEP_STALE_TTL:86400" "APP_PREVIEW_PORT_BASE:8501"; do
   key="${pair%%:*}"; val="${pair##*:}"
-  awk -F'\t' -v k="$key" '$1==k{print $3}' "$CAPS" | grep -q "default: $val" \
+grep -q "default: $val" <<< "$(awk -F'\t' -v k="$key" '$1==k{print $3}' "$CAPS")" \
     || fail "(5) capabilities.tsv row for $key must document 'default: $val'"
 done
 pass

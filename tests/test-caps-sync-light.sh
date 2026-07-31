@@ -75,15 +75,15 @@ printf '#!/usr/bin/env bash\necho lane\n' > "$WT/scripts/herd/x.sh"
 commit_all
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 1 ] || fail "(1) new scripts/herd/x.sh with no manifest touch must be red (exit 1, got $rc): $out"
-printf '%s' "$out" | grep -q 'CAPS-SYNC' || fail "(1) should emit the CAPS-SYNC headline (got: $out)"
-printf '%s' "$out" | grep -q 'new lane script added' || fail "(1) should name the offending surface (got: $out)"
-printf '%s' "$out" | grep -q 'LIGHT CHECK CLEAN' && fail "(1) must not also claim a clean light verdict"
+grep -q 'CAPS-SYNC' <<< "$out" || fail "(1) should emit the CAPS-SYNC headline (got: $out)"
+grep -q 'new lane script added' <<< "$out" || fail "(1) should name the offending surface (got: $out)"
+grep -q 'LIGHT CHECK CLEAN' <<< "$out" && fail "(1) must not also claim a clean light verdict"
 ok
 oneout="$(run_hc --oneline)"; orc=$?
 [ "$orc" -eq 1 ] || fail "(1) oneline violation must exit 1 (got $orc)"
 [ "$(nlines "$oneout")" -eq 1 ] || fail "(1) oneline must be exactly one line (got: $oneout)"
-printf '%s' "$oneout" | grep -q 'caps-sync' || fail "(1) oneline should name caps-sync (got: $oneout)"
-printf '%s' "$oneout" | grep -q '❌' || fail "(1) oneline should carry a ❌ (got: $oneout)"
+grep -q 'caps-sync' <<< "$oneout" || fail "(1) oneline should name caps-sync (got: $oneout)"
+grep -q '❌' <<< "$oneout" || fail "(1) oneline should carry a ❌ (got: $oneout)"
 ok
 
 # ── (2) SATISFIED — the same diff, manifest touched → clean ───────────────────────────────────
@@ -93,8 +93,8 @@ touch_manifest
 commit_all
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(2) new lane script WITH a manifest touch must be clean (exit 0, got $rc): $out"
-printf '%s' "$out" | grep -q 'CAPS-SYNC' && fail "(2) a satisfied guard must print nothing (got: $out)"
-printf '%s' "$out" | grep -q 'LIGHT CHECK CLEAN' || fail "(2) should be a confident light clean (got: $out)"
+grep -q 'CAPS-SYNC' <<< "$out" && fail "(2) a satisfied guard must print nothing (got: $out)"
+grep -q 'LIGHT CHECK CLEAN' <<< "$out" || fail "(2) should be a confident light clean (got: $out)"
 ok
 
 # ── (3) BYTE-IDENTICAL — a diff touching no engine surface reads exactly as it did pre-HERD-220 ─
@@ -119,7 +119,7 @@ printf 'cmd_brandnew() { echo new; }\n' >> "$WT/bin/herd"
 commit_all
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 1 ] || fail "(4) bin/herd adding a cmd_* with no manifest touch must be red (got $rc): $out"
-printf '%s' "$out" | grep -q 'bin/herd adds cmd_\*' || fail "(4) should name the cmd_* surface (got: $out)"
+grep -q 'bin/herd adds cmd_\*' <<< "$out" || fail "(4) should name the cmd_* surface (got: $out)"
 ok
 touch_manifest; commit_all
 out="$(run_hc)"; rc=$?
@@ -131,7 +131,7 @@ printf ': "${BRAND_NEW_KEY:=off}"\n' >> "$WT/scripts/herd/herd-config.sh"
 commit_all
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 1 ] || fail "(4) herd-config.sh adding a key with no manifest touch must be red (got $rc): $out"
-printf '%s' "$out" | grep -q 'herd-config.sh adds config keys' || fail "(4) should name the config-key surface (got: $out)"
+grep -q 'herd-config.sh adds config keys' <<< "$out" || fail "(4) should name the config-key surface (got: $out)"
 ok
 touch_manifest; commit_all
 out="$(run_hc)"; rc=$?
@@ -144,12 +144,12 @@ printf '#!/usr/bin/env bash\necho lane\n' > "$WT/scripts/herd/x.sh"
 commit_all
 out="$(run_hc)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(5) a tree with no capabilities manifest must SKIP, never red (exit 0, got $rc): $out"
-printf '%s' "$out" | grep -q 'CAPS-SYNC' && fail "(5) the skip must be silent (got: $out)"
-printf '%s' "$out" | grep -q 'LIGHT CHECK CLEAN' || fail "(5) verdict should be the plain light clean (got: $out)"
+grep -q 'CAPS-SYNC' <<< "$out" && fail "(5) the skip must be silent (got: $out)"
+grep -q 'LIGHT CHECK CLEAN' <<< "$out" || fail "(5) verdict should be the plain light clean (got: $out)"
 ok
 # The lib says WHY it skipped, so the heavy caller can render an honest note.
 skip_reason="$(cd "$WT" && . "$LIB" && herd_caps_sync_lint main >/dev/null; printf '%s' "$HERD_CAPS_SYNC_SKIP_REASON")"
-printf '%s' "$skip_reason" | grep -q 'capabilities.tsv' || fail "(5) skip reason should cite the missing manifest (got: $skip_reason)"
+grep -q 'capabilities.tsv' <<< "$skip_reason" || fail "(5) skip reason should cite the missing manifest (got: $skip_reason)"
 ok
 # An unresolvable base ref is infra, not a code error: skip with a reason, exit 2.
 reset_repo with-manifest
@@ -171,8 +171,8 @@ cp "$ROOT/scripts/herd/healthcheck.sh" "$ROOT/scripts/herd/herd-config.sh" \
    "$ROOT/scripts/herd/commit-lint.sh" "$NOLIB/"      # caps-sync-lint.sh deliberately not copied
 out="$(bash "$NOLIB/healthcheck.sh" "$WT" --light 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(6) healthcheck.sh without caps-sync-lint.sh must skip the guard, not break (exit 0, got $rc): $out"
-printf '%s' "$out" | grep -qi 'not found\|No such file' && fail "(6) missing lint must not leak a shell error (got: $out)"
-printf '%s' "$out" | grep -q 'LIGHT CHECK CLEAN' || fail "(6) verdict should be the plain light clean (got: $out)"
+grep -qi 'not found\|No such file' <<< "$out" && fail "(6) missing lint must not leak a shell error (got: $out)"
+grep -q 'LIGHT CHECK CLEAN' <<< "$out" || fail "(6) verdict should be the plain light clean (got: $out)"
 ok
 
 # ── (7) ONE IMPLEMENTATION — both gates source the lib; neither re-greps the rule ──────────────

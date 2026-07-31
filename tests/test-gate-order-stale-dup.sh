@@ -202,7 +202,7 @@ action_pass 41 stale-slug "$REPO" "$STALE_SHA" feat/stale && fail "(2) stale-bas
 [ "$(events review_dispatched)" = "0" ]   || fail "(2) a stale-base sha must dispatch NO review"
 [ "$(events healthcheck_started)" = "0" ] || fail "(2) a stale-base sha must start NO healthcheck"
 [ "$(event_order)" = "stale_dup_hold" ]   || fail "(2) unexpected event order: $(event_order)"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q 'needs you' || fail "(2) hold must render a needs-you row (got: ${DISPLAY[0]:-})"
+grep -q 'needs you' <<< "${DISPLAY[0]:-}" || fail "(2) hold must render a needs-you row (got: ${DISPLAY[0]:-})"
 [ "$(comments)" -ge 1 ] || fail "(2) hold must post the once-per-sha PR comment"
 ok "(2) stale-base holds before any review/healthcheck dispatch"
 

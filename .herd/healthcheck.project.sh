@@ -321,7 +321,7 @@ _hk_codemap_failure_is_env() {
   local t="tests/test-codemap-project.sh" o
   [ -f "$t" ] || return 1
   o="$(bash "$t" 2>&1)" && return 1
-  printf '%s\n' "$o" | grep -qiE 'FAIL:.*real.?repo'
+grep -qiE 'FAIL:.*real.?repo' <<< "$o"
 }
 
 _hk_bats_env_only() {

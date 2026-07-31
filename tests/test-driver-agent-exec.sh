@@ -49,7 +49,7 @@ ok; echo "PASS (1) both drivers parse and bind all 8 agent-exec classes"
 # ── 2. The bindings are ZERO-SECRET — command SHAPES only, no absolute host paths / credentials. ──
 # ($HOME/.herd tokens are fine; a literal /Users//home/ or credential word is not.)
 for df in "$HC" "$HL"; do
-  if grep -E '^DRIVER_AGENT_[A-Z_]+=' "$df" | grep -qiE '/users/|/home/|secret|password|apikey'; then
+  if grep -qiE '/users/|/home/|secret|password|apikey' <<< "$(grep -E '^DRIVER_AGENT_[A-Z_]+=' "$df")"; then
     fail "$df: an agent-exec binding leaks a secret or absolute path"
   fi
 done

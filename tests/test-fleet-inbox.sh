@@ -103,53 +103,53 @@ alpha_block="$(printf '%s' "$out" | awk '/^alpha$/{f=1;next} /^[a-zA-Z]/{f=0} f'
 beta_block="$(printf '%s'  "$out" | awk '/^beta$/{f=1;next}  /^[a-zA-Z]/{f=0} f')"
 
 # ── 1. review BLOCK surfaces on the right project with the right action ────────
-printf '%s' "$alpha_block" | grep -q '#12' || fail "alpha should surface blocked PR #12"
+grep -q '#12' <<< "$alpha_block" || fail "alpha should surface blocked PR #12"
 printf '%s' "$alpha_block" | grep '#12' | grep -qi 'BLOCK'          || fail "#12 should be labelled a review BLOCK"
 printf '%s' "$alpha_block" | grep '#12' | grep -q 'herd why 12'     || fail "#12 action should be 'herd why 12'"
 ok
 
 # ── 2. human-verify hold surfaces with the approve action ─────────────────────
-printf '%s' "$alpha_block" | grep -q '#11' || fail "alpha should surface human-verify hold PR #11"
+grep -q '#11' <<< "$alpha_block" || fail "alpha should surface human-verify hold PR #11"
 printf '%s' "$alpha_block" | grep '#11' | grep -qi 'human-verify'   || fail "#11 should be labelled a human-verify hold"
 printf '%s' "$alpha_block" | grep '#11' | grep -q 'herd-approve.sh approve 11' || fail "#11 action should be 'herd-approve.sh approve 11'"
 ok
 
 # ── 3. failed health gate surfaces with the inspect action ────────────────────
-printf '%s' "$alpha_block" | grep -q '#13' || fail "alpha should surface failed health gate PR #13"
+grep -q '#13' <<< "$alpha_block" || fail "alpha should surface failed health gate PR #13"
 printf '%s' "$alpha_block" | grep '#13' | grep -qi 'health'         || fail "#13 should be labelled a failed health gate"
 printf '%s' "$alpha_block" | grep '#13' | grep -q 'herd why 13'     || fail "#13 action should be 'herd why 13'"
 ok
 
 # ── 4. CONFLICTING PR (from gh) surfaces with the resolve action + slug ───────
-printf '%s' "$alpha_block" | grep -q '#14' || fail "alpha should surface CONFLICTING PR #14"
+grep -q '#14' <<< "$alpha_block" || fail "alpha should surface CONFLICTING PR #14"
 printf '%s' "$alpha_block" | grep '#14' | grep -qi 'CONFLICTING'    || fail "#14 should be labelled CONFLICTING"
 printf '%s' "$alpha_block" | grep '#14' | grep -q 'herd-resolve.sh widget' || fail "#14 action should resolve slug 'widget' (from feat/widget)"
 ok
 
 # ── 5. a MERGEABLE PR (#8) is NOT an attention item ───────────────────────────
-printf '%s' "$alpha_block" | grep -q '#8'  && fail "MERGEABLE PR #8 must not appear as attention"
+grep -q '#8' <<< "$alpha_block" && fail "MERGEABLE PR #8 must not appear as attention"
 ok
 
 # ── 6. a RELEASED hold (#20) and a MERGED PR (#30) clear themselves ───────────
-printf '%s' "$alpha_block" | grep -q '#20' && fail "#20 hold was released → must not appear"
-printf '%s' "$alpha_block" | grep -q '#30' && fail "#30 was merged → must not appear (blocked-then-merged clears)"
+grep -q '#20' <<< "$alpha_block" && fail "#20 hold was released → must not appear"
+grep -q '#30' <<< "$alpha_block" && fail "#30 was merged → must not appear (blocked-then-merged clears)"
 ok
 
 # ── 6b. a STALE BLOCK on a since-CLOSED PR (#69, not in the live open set) is filtered (#131) ──
-printf '%s' "$alpha_block" | grep -q '#69' && fail "#69 is closed (not in gh open set) → stale BLOCK must be filtered"
+grep -q '#69' <<< "$alpha_block" && fail "#69 is closed (not in gh open set) → stale BLOCK must be filtered"
 ok
 
 # ── 7. a clean project shows nothing pending, not items ───────────────────────
-printf '%s' "$beta_block" | grep -qi 'clean'  || fail "beta (empty) should report clean"
-printf '%s' "$beta_block" | grep -q '#'       && fail "clean project beta must list no PR items"
+grep -qi 'clean' <<< "$beta_block" || fail "beta (empty) should report clean"
+grep -q '#' <<< "$beta_block" && fail "clean project beta must list no PR items"
 ok
 
 # ── 8. fleet summary tallies items/projects/clean ─────────────────────────────
-printf '%s' "$out" | grep -q '^Fleet:' || fail "inbox missing the fleet summary line"
+grep -q '^Fleet:' <<< "$out" || fail "inbox missing the fleet summary line"
 summary="$(printf '%s' "$out" | grep '^Fleet:')"
-printf '%s' "$summary" | grep -q '4 items'          || fail "summary should tally 4 items, got: $summary"
-printf '%s' "$summary" | grep -q 'across 1 project'  || fail "summary should count 1 needy project"
-printf '%s' "$summary" | grep -q '1 clean'           || fail "summary should count 1 clean project"
+grep -q '4 items' <<< "$summary" || fail "summary should tally 4 items, got: $summary"
+grep -q 'across 1 project' <<< "$summary" || fail "summary should count 1 needy project"
+grep -q '1 clean' <<< "$summary" || fail "summary should count 1 clean project"
 ok
 
 # ── 8b. a project whose ONLY journal rows are stale (closed PRs) shows CLEAN (#131) ──
@@ -161,8 +161,8 @@ echo '[]' > "$FAKE_GH_DIR/gamma.json"
 bash "$HERD" fleet register "$GAMMA" >/dev/null
 out_g="$(bash "$HERD" fleet inbox)"
 gamma_block="$(printf '%s' "$out_g" | awk '/^gamma$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$gamma_block" | grep -qi 'clean' || fail "gamma (only stale closed-PR rows) should read clean"
-printf '%s' "$gamma_block" | grep -q '#77'    && fail "gamma's stale BLOCK on closed #77 must not surface"
+grep -qi 'clean' <<< "$gamma_block" || fail "gamma (only stale closed-PR rows) should read clean"
+grep -q '#77' <<< "$gamma_block" && fail "gamma's stale BLOCK on closed #77 must not surface"
 # deregister gamma so the summary counts in later assertions stay stable
 grep -v "|$GAMMA|" "$HERD_FLEET_FILE" > "$HERD_FLEET_FILE.tmp" && mv "$HERD_FLEET_FILE.tmp" "$HERD_FLEET_FILE"
 ok
@@ -171,9 +171,9 @@ ok
 printf 'ghost|%s/proj/ghost|me/ghost\n' "$T" >> "$HERD_FLEET_FILE"
 out2="$(bash "$HERD" fleet inbox)"
 ghost_block="$(printf '%s' "$out2" | awk '/^ghost$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$ghost_block" | grep -qi 'unreachable' || fail "missing project should be reported as unreachable"
+grep -qi 'unreachable' <<< "$ghost_block" || fail "missing project should be reported as unreachable"
 printf '%s' "$out2" | grep '^Fleet:' | grep -q '1 unreachable' || fail "summary should count the ghost as unreachable"
-printf '%s' "$out2" | grep -q '^alpha$' || fail "inbox should continue past the unreachable project"
+grep -q '^alpha$' <<< "$out2" || fail "inbox should continue past the unreachable project"
 # drop the ghost line so later runs are clean
 grep -v '^ghost|' "$HERD_FLEET_FILE" > "$HERD_FLEET_FILE.tmp" && mv "$HERD_FLEET_FILE.tmp" "$HERD_FLEET_FILE"
 ok
@@ -181,20 +181,20 @@ ok
 # ── 10. gh unavailable: journal items still render; conflict is skipped + noted ─
 out3="$(FAKE_GH_FAIL=1 bash "$HERD" fleet inbox)"
 a3="$(printf '%s' "$out3" | awk '/^alpha$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$a3" | grep -q '#11' || fail "gh-down: journal-derived hold #11 should still surface"
-printf '%s' "$a3" | grep -q '#12' || fail "gh-down: journal-derived BLOCK #12 should still surface"
-printf '%s' "$a3" | grep -q '#14' && fail "gh-down: CONFLICTING #14 (gh-only) must not appear without gh"
-printf '%s' "$a3" | grep -qi 'gh unavailable' || fail "gh-down should note that conflicts were not checked"
+grep -q '#11' <<< "$a3" || fail "gh-down: journal-derived hold #11 should still surface"
+grep -q '#12' <<< "$a3" || fail "gh-down: journal-derived BLOCK #12 should still surface"
+grep -q '#14' <<< "$a3" && fail "gh-down: CONFLICTING #14 (gh-only) must not appear without gh"
+grep -qi 'gh unavailable' <<< "$a3" || fail "gh-down should note that conflicts were not checked"
 ok
 
 # ── 11. empty registry is a friendly note, not a crash ────────────────────────
 out4="$(HERD_FLEET_FILE="$T/none/fleet" bash "$HERD" fleet inbox)"
-printf '%s' "$out4" | grep -qi 'no fleet registry\|register' || fail "empty-registry inbox should hint how to add a project"
+grep -qi 'no fleet registry\|register' <<< "$out4" || fail "empty-registry inbox should hint how to add a project"
 ok
 
 # ── 12. --help renders usage without touching the registry ────────────────────
 outh="$(bash "$HERD" fleet inbox --help)"
-printf '%s' "$outh" | grep -qi 'attention inbox\|needs you' || fail "inbox --help should describe the command"
+grep -qi 'attention inbox\|needs you' <<< "$outh" || fail "inbox --help should describe the command"
 ok
 
 # ── 13. an unknown argument fails loudly ──────────────────────────────────────

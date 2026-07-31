@@ -126,19 +126,19 @@ grep -qE '^CLAIM_REQUIRED="on"' "$P/.herd/config" || fail "(1) local baseline no
 # a config/CLAIM_REQUIRED branch was pushed to origin carrying the one-key change
 git -C "$BARE" rev-parse --verify --quiet refs/heads/config/CLAIM_REQUIRED >/dev/null \
   || fail "(1) config/CLAIM_REQUIRED branch was not pushed to origin"
-git -C "$BARE" show config/CLAIM_REQUIRED:.herd/config | grep -qE '^CLAIM_REQUIRED="on"' \
+grep -qE '^CLAIM_REQUIRED="on"' <<< "$(git -C "$BARE" show config/CLAIM_REQUIRED:.herd/config)" \
   || fail "(1) pushed branch does not carry CLAIM_REQUIRED=on"
 # it must be a SINGLE-file, single-key diff vs main (only .herd/config changed; only CLAIM_REQUIRED line)
 dieffiles="$(git -C "$BARE" diff --name-only main config/CLAIM_REQUIRED)"
 [ "$dieffiles" = ".herd/config" ] || fail "(1) branch changed more than .herd/config: [$dieffiles]"
 changed_keys="$(git -C "$BARE" diff main config/CLAIM_REQUIRED -- .herd/config | grep -E '^\+[A-Za-z_]+=' || true)"
-printf '%s\n' "$changed_keys" | grep -qE '^\+CLAIM_REQUIRED="on"' || fail "(1) diff missing +CLAIM_REQUIRED=on ($changed_keys)"
+grep -qE '^\+CLAIM_REQUIRED="on"' <<< "$changed_keys" || fail "(1) diff missing +CLAIM_REQUIRED=on ($changed_keys)"
 [ "$(printf '%s\n' "$changed_keys" | grep -c .)" -eq 1 ] || fail "(1) diff touched more than one key: $changed_keys"
 # gh pr create was invoked with a body stating old->new + the reason
 grep -q 'ARGS:.*\[pr\] \[create\]' "$GHLOG" || fail "(1) gh pr create was not called ($(cat "$GHLOG"))"
 BODY="$(cat "$GHSTATE/body-config_CLAIM_REQUIRED")"
-printf '%s' "$BODY" | grep -q 'off' && printf '%s' "$BODY" | grep -q 'on' || fail "(1) PR body missing old->new ($BODY)"
-printf '%s' "$BODY" | grep -q 'enforce claims before builds' || fail "(1) PR body missing the --reason ($BODY)"
+grep -q 'off' <<< "$BODY" && grep -q 'on' <<< "$BODY" || fail "(1) PR body missing old->new ($BODY)"
+grep -q 'enforce claims before builds' <<< "$BODY" || fail "(1) PR body missing the --reason ($BODY)"
 # the operator's own checkout is untouched: still on main.
 [ "$(git -C "$P" symbolic-ref --short HEAD)" = "main" ] || fail "(1) operator checkout was switched off main"
 # HERD-74: the config worktree now PERSISTS in the pool (WORKTREES_DIR) so the STANDARD watcher gate
@@ -150,8 +150,8 @@ CWT="$P/trees/config-CLAIM_REQUIRED"
 grep -qE '^CLAIM_REQUIRED="on"' "$CWT/.herd/config" || fail "(1) config worktree does not carry the change"
 # exactly two worktrees now: the operator's main checkout + the one adopted config worktree (no leak).
 [ "$(git -C "$P" worktree list | wc -l | tr -d ' ')" = "2" ] || fail "(1) unexpected worktree set ($(git -C "$P" worktree list))"
-printf '%s\n' "$OUT" | grep -qi 'opened config PR' || fail "(1) output did not confirm the PR ($OUT)"
-printf '%s\n' "$OUT" | grep -qi 'watcher gates' || fail "(1) output did not flag the worktree left for the watcher ($OUT)"
+grep -qi 'opened config PR' <<< "$OUT" || fail "(1) output did not confirm the PR ($OUT)"
+grep -qi 'watcher gates' <<< "$OUT" || fail "(1) output did not flag the worktree left for the watcher ($OUT)"
 okp
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -159,8 +159,8 @@ okp
 # ══════════════════════════════════════════════════════════════════════════════
 run "$P" config set --shared CLAIM_REQUIRED on
 [ "$RC" -eq 0 ] || fail "(2) re-run --shared failed (rc=$RC): $OUT"
-printf '%s\n' "$OUT" | grep -qi 'no change' && fail "(2) --shared wrongly short-circuited as a plain no-op ($OUT)"
-printf '%s\n' "$OUT" | grep -qi 'refreshed the existing config PR' || fail "(2) re-run did not refresh the existing PR ($OUT)"
+grep -qi 'no change' <<< "$OUT" && fail "(2) --shared wrongly short-circuited as a plain no-op ($OUT)"
+grep -qi 'refreshed the existing config PR' <<< "$OUT" || fail "(2) re-run did not refresh the existing PR ($OUT)"
 # HERD-74: re-run must not choke on the persisted worktree from run (1) — it re-adds it in place and
 # leaves it again (still exactly two worktrees: main + the refreshed config worktree, no accumulation).
 [ -d "$CWT" ] || fail "(2) config worktree missing after re-run ($(git -C "$P" worktree list))"
@@ -172,7 +172,7 @@ okp
 # ══════════════════════════════════════════════════════════════════════════════
 run "$P" config set --shared MODEL_QUICK claude-x
 [ "$RC" -ne 0 ] || fail "(3) --shared on a machine-scoped key was NOT refused"
-printf '%s\n' "$OUT" | grep -qi 'machine-scoped' || fail "(3) wrong refusal message ($OUT)"
+grep -qi 'machine-scoped' <<< "$OUT" || fail "(3) wrong refusal message ($OUT)"
 # nothing committed/pushed for it
 git -C "$BARE" rev-parse --verify --quiet refs/heads/config/MODEL_QUICK >/dev/null \
   && fail "(3) a config/MODEL_QUICK branch was pushed despite the refusal"
@@ -184,7 +184,7 @@ okp
 # ══════════════════════════════════════════════════════════════════════════════
 run "$P" config set --local --shared CLAIM_REQUIRED off
 [ "$RC" -ne 0 ] || fail "(4) --local --shared combo was accepted"
-printf '%s\n' "$OUT" | grep -qi 'mutually exclusive' || fail "(4) wrong mutual-exclusion message ($OUT)"
+grep -qi 'mutually exclusive' <<< "$OUT" || fail "(4) wrong mutual-exclusion message ($OUT)"
 okp
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -192,11 +192,11 @@ okp
 # ══════════════════════════════════════════════════════════════════════════════
 P2="$T/p2"; _make_project "$P2"
 run "$P2" config set --shared MY_SECRET_TOKEN hunter2
-{ [ "$RC" -ne 0 ] && printf '%s\n' "$OUT" | grep -qi 'secret-shaped'; } || fail "(5) --shared did not refuse a secret-shaped key ($OUT)"
+{ [ "$RC" -ne 0 ] && grep -qi 'secret-shaped' <<< "$OUT"; } || fail "(5) --shared did not refuse a secret-shaped key ($OUT)"
 run "$P2" config set --shared DENY_PATHS /etc
-{ [ "$RC" -ne 0 ] && printf '%s\n' "$OUT" | grep -qi 'refusing to set DENY_PATHS'; } || fail "(5) --shared did not refuse DENY_PATHS ($OUT)"
+{ [ "$RC" -ne 0 ] && grep -qi 'refusing to set DENY_PATHS' <<< "$OUT"; } || fail "(5) --shared did not refuse DENY_PATHS ($OUT)"
 run "$P2" config set --shared BOGUS_SETTING x
-{ [ "$RC" -ne 0 ] && printf '%s\n' "$OUT" | grep -qi 'unknown config key'; } || fail "(5) --shared did not reject an unknown key ($OUT)"
+{ [ "$RC" -ne 0 ] && grep -qi 'unknown config key' <<< "$OUT"; } || fail "(5) --shared did not reject an unknown key ($OUT)"
 # none of the three reached git: no config/* branch exists on origin for p2's remote
 [ -z "$(git -C "$BARE" for-each-ref --format='%(refname)' 'refs/heads/config/MY_SECRET_TOKEN' 'refs/heads/config/BOGUS_SETTING')" ] \
   || fail "(5) a refused key still pushed a branch"
@@ -234,7 +234,7 @@ done
 OUT="$( cd "$P3" && PATH="$NOGH_PATH" HERD_RELOAD_SKIP_LAUNCH=1 HERD_CAPABILITIES_FILE="$CAPS" bash "$HERD" config set --shared CLAIM_REQUIRED on 2>&1 )"; RC=$?
 [ "$RC" -eq 0 ] || fail "(6) --shared without gh should still succeed locally (rc=$RC): $OUT"
 grep -qE '^CLAIM_REQUIRED="on"' "$P3/.herd/config" || fail "(6) local change not applied in the degrade path"
-printf '%s\n' "$OUT" | grep -qi 'gh CLI not found' || fail "(6) degrade path did not warn about missing gh ($OUT)"
+grep -qi 'gh CLI not found' <<< "$OUT" || fail "(6) degrade path did not warn about missing gh ($OUT)"
 okp
 
 echo "ALL PASS ($pass tests)"

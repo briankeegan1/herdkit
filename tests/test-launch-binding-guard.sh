@@ -42,8 +42,8 @@ EOF
 # A1. flag set + rule-3 fallback (no HERD_CONFIG_FILE, no walk-up match) → REFUSE (non-zero).
 outA1="$(cd "$FOREIGN" && HERD_REQUIRE_PROJECT_CONFIG=1 bash -c ". '$LOADER'" 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] || fail "A1: console-strict did not refuse the rule-3 dogfood fallback (rc=$rc): $outA1"
-printf '%s' "$outA1" | grep -q "REFUSING" || fail "A1: no REFUSING message ($outA1)"
-printf '%s' "$outA1" | grep -Fq "$FOREIGN" || fail "A1: refusal did not name the offending \$PWD ($outA1)"
+grep -q "REFUSING" <<< "$outA1" || fail "A1: no REFUSING message ($outA1)"
+grep -Fq "$FOREIGN" <<< "$outA1" || fail "A1: refusal did not name the offending \$PWD ($outA1)"
 ok
 
 # A2. NO flag, same setup → normal CLI fallback preserved (exit 0, no refusal); it silently binds
@@ -51,7 +51,7 @@ ok
 # behavior the flag guards against for consoles, and exactly what `herd <cmd>` still relies on.
 outA2="$(cd "$FOREIGN" && bash -c ". '$LOADER'; printf 'ROOT=%s\n' \"\$PROJECT_ROOT\"" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "A2: normal CLI resolution was refused (rc=$rc): $outA2"
-printf '%s' "$outA2" | grep -q "REFUSING" && fail "A2: normal CLI resolution wrongly refused ($outA2)" || true
+grep -q "REFUSING" <<< "$outA2" && fail "A2: normal CLI resolution wrongly refused ($outA2)" || true
 root_a2="$(printf '%s' "$outA2" | sed -n 's/^ROOT=//p')"
 [ -n "$root_a2" ] || fail "A2: fallback did not set PROJECT_ROOT ($outA2)"
 [ "$root_a2" != "$PROJ" ] || fail "A2: fallback unexpectedly bound to the test project ($outA2)"
@@ -66,7 +66,7 @@ ok
 outA4="$(cd "$FOREIGN" && HERD_REQUIRE_PROJECT_CONFIG=1 HERD_CONFIG_FILE="$PROJ/.herd/config" \
   bash -c ". '$LOADER'; printf 'WS=%s\n' \"\$WORKSPACE_NAME\"" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "A4: explicit HERD_CONFIG_FILE was wrongly refused (rc=$rc): $outA4"
-printf '%s' "$outA4" | grep -qx "WS=proj-under-test" || fail "A4: config not loaded ($outA4)"
+grep -qx "WS=proj-under-test" <<< "$outA4" || fail "A4: config not loaded ($outA4)"
 ok
 
 # ── B. herd_console_guard: banner + foreign-cwd refusal ──────────────────────
@@ -80,17 +80,17 @@ guard_run() {  # <cwd> [extra-env=val ...]
 # B1. PWD inside PROJECT_ROOT → PASS (exit 0) + banner names workspace + project.
 outB1="$(guard_run "$PROJ")"; rc=$?
 [ "$rc" -eq 0 ] || fail "B1: guard refused the standard in-project cwd (rc=$rc): $outB1"
-printf '%s' "$outB1" | grep -q "workspace=proj-under-test" || fail "B1: banner missing WORKSPACE_NAME ($outB1)"
-printf '%s' "$outB1" | grep -Fq "project=$PROJ"            || fail "B1: banner missing PROJECT_ROOT ($outB1)"
+grep -q "workspace=proj-under-test" <<< "$outB1" || fail "B1: banner missing WORKSPACE_NAME ($outB1)"
+grep -Fq "project=$PROJ" <<< "$outB1" || fail "B1: banner missing PROJECT_ROOT ($outB1)"
 ok
 
 # B2. PWD outside PROJECT_ROOT → REFUSE (non-zero) naming workspace / project / pwd.
 outB2="$(guard_run "$FOREIGN")"; rc=$?
 [ "$rc" -ne 0 ] || fail "B2: guard did not refuse a foreign cwd (rc=$rc): $outB2"
-printf '%s' "$outB2" | grep -q "REFUSING to start test-console" || fail "B2: no refusal message ($outB2)"
-printf '%s' "$outB2" | grep -q "proj-under-test" || fail "B2: refusal missing WORKSPACE_NAME ($outB2)"
-printf '%s' "$outB2" | grep -Fq "$PROJ"          || fail "B2: refusal missing PROJECT_ROOT ($outB2)"
-printf '%s' "$outB2" | grep -Fq "$FOREIGN"       || fail "B2: refusal missing offending \$PWD ($outB2)"
+grep -q "REFUSING to start test-console" <<< "$outB2" || fail "B2: no refusal message ($outB2)"
+grep -q "proj-under-test" <<< "$outB2" || fail "B2: refusal missing WORKSPACE_NAME ($outB2)"
+grep -Fq "$PROJ" <<< "$outB2" || fail "B2: refusal missing PROJECT_ROOT ($outB2)"
+grep -Fq "$FOREIGN" <<< "$outB2" || fail "B2: refusal missing offending \$PWD ($outB2)"
 ok
 
 # B3. Foreign cwd + HERD_ALLOW_FOREIGN_CWD=1 → PASS.
@@ -103,7 +103,7 @@ ok
 # C1. coordinator.sh from a foreign cwd REFUSES (non-zero) before any herdr call.
 outC1="$(cd "$FOREIGN" && HERD_SKIP_PREFLIGHT=1 HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$COORD" 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] || fail "C1: coordinator.sh did not refuse a foreign cwd (rc=$rc): $outC1"
-printf '%s' "$outC1" | grep -q "REFUSING to start coordinator" || fail "C1: coordinator refusal missing ($outC1)"
+grep -q "REFUSING to start coordinator" <<< "$outC1" || fail "C1: coordinator refusal missing ($outC1)"
 ok
 
 # C2. coordinator.sh from the STANDARD in-project cwd starts cleanly (exit 0) + prints the banner.
@@ -130,14 +130,14 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/claude"; chmod +x "$BIN/claude"
 outC2="$(cd "$PROJ" && PATH="$BIN:$PATH" HERD_NO_WATCH=1 HERD_SKIP_PREFLIGHT=1 \
   HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$COORD" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "C2: coordinator.sh did not start cleanly on the standard in-project path (rc=$rc): $outC2"
-printf '%s' "$outC2" | grep -q "workspace=proj-under-test" || fail "C2: standard launch missing banner ($outC2)"
-printf '%s' "$outC2" | grep -q "REFUSING" && fail "C2: standard launch was wrongly refused ($outC2)" || true
+grep -q "workspace=proj-under-test" <<< "$outC2" || fail "C2: standard launch missing banner ($outC2)"
+grep -q "REFUSING" <<< "$outC2" && fail "C2: standard launch was wrongly refused ($outC2)" || true
 ok
 
 # C3. agent-watch.sh (the watcher console) from a foreign cwd REFUSES end-to-end (before the loop).
 outC3="$(cd "$FOREIGN" && HERD_CONFIG_FILE="$PROJ/.herd/config" bash "$WATCH" 2>&1)"; rc=$?
 [ "$rc" -ne 0 ] || fail "C3: agent-watch.sh did not refuse a foreign cwd (rc=$rc): $outC3"
-printf '%s' "$outC3" | grep -q "REFUSING to start herd watch" || fail "C3: agent-watch refusal missing ($outC3)"
+grep -q "REFUSING to start herd watch" <<< "$outC3" || fail "C3: agent-watch refusal missing ($outC3)"
 ok
 
 echo "ALL PASS ($pass checks)"

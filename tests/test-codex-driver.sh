@@ -39,7 +39,7 @@ DRIVER_AGENT_SESSION_ID DRIVER_AGENT_COST_USAGE_KEYS DRIVER_AGENT_PROCESS_SIGNAT
 ok; echo "PASS (1) codex.driver parses and binds all 8 mux + 9 agent-exec capabilities"
 
 # ── 2. ZERO-SECRET — command SHAPES only, no credentials / absolute host paths. ($HOME tokens ok.) ─
-if grep -E '^DRIVER_[A-Z_]+=' "$DRIVER" | grep -qiE '/users/|/home/|secret|password|apikey'; then
+if grep -qiE '/users/|/home/|secret|password|apikey' <<< "$(grep -E '^DRIVER_[A-Z_]+=' "$DRIVER")"; then
   fail "codex.driver leaks a secret or absolute host path"
 fi
 ok; echo "PASS (2) codex.driver bindings are zero-secret"
@@ -58,8 +58,8 @@ grepd '--dangerously-bypass-approvals-and-sandbox'                              
 [ "$(exact DRIVER_LIST_AGENTS)" = "'herdr agent list'" ] || fail "codex.driver mux LIST_AGENTS drifted off herdr"
 # Codex must NOT carry Claude's exec incantations in a BINDING (proves the runtime really swapped);
 # scope to assignment lines so prose mentions of `claude …` in comments are fine.
-grep -E '^DRIVER_' "$DRIVER" | grep -qF -e 'claude --model' && fail "codex.driver still binds a raw 'claude' spawn" || true
-grep -E '^DRIVER_' "$DRIVER" | grep -qF -e 'claude -p'      && fail "codex.driver still binds a raw 'claude -p' one-shot" || true
+grep -qF -e 'claude --model' <<< "$(grep -E '^DRIVER_' "$DRIVER")" && fail "codex.driver still binds a raw 'claude' spawn" || true
+grep -qF -e 'claude -p' <<< "$(grep -E '^DRIVER_' "$DRIVER")" && fail "codex.driver still binds a raw 'claude -p' one-shot" || true
 ok; echo "PASS (3) codex.driver binds Codex's real flags; mux stays herdr; no residual claude exec"
 
 # ── 4. Absent-binding DEGRADATION CONTRACT — unexposed classes carry the fail-safe @degrade sentinel.
@@ -69,7 +69,7 @@ for k in DRIVER_AGENT_LIMIT_PATTERN DRIVER_AGENT_COST_USAGE_KEYS; do
 done
 # Fail-safe property: used as a regex the sentinel must NOT match a real usage-limit banner line.
 lim="$( . "$DRIVER"; printf '%s' "$DRIVER_AGENT_LIMIT_PATTERN" )"
-printf 'you have hit your usage limit\n' | grep -qE "$lim" \
+grep -qE "$lim" <<< "$(printf 'you have hit your usage limit\n')" \
   && fail "@degrade limit sentinel wrongly matches a real banner (not fail-safe)" || true
 ok; echo "PASS (4) degradation contract: unexposed classes carry a fail-safe @degrade sentinel"
 

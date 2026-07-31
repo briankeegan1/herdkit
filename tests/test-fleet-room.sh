@@ -69,8 +69,8 @@ set +e
 out="$(HERD_FLEET_FILE="$T/none/fleet" bash "$HERD" fleet room 2>&1)"; rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "empty-registry fleet room should exit non-zero"
-printf '%s' "$out" | grep -qi "register" || fail "empty refusal should point at 'herd fleet register'"
-printf '%s' "$out" | grep -qi "discover" || fail "empty refusal should point at 'herd fleet discover'"
+grep -qi "register" <<< "$out" || fail "empty refusal should point at 'herd fleet register'"
+grep -qi "discover" <<< "$out" || fail "empty refusal should point at 'herd fleet discover'"
 [ ! -s "$HERDR_LOG" ] || fail "empty-registry refusal must NOT invoke herdr (no launch on empty fleet)"
 ok
 
@@ -82,8 +82,8 @@ bash "$HERD" fleet register "$BETA"  >/dev/null
 
 : > "$HERDR_LOG"   # fresh log for the launch assertions
 out="$(bash "$HERD" fleet room 2>&1)" || fail "fleet room should succeed with a non-empty registry"
-printf '%s' "$out" | grep -qi "fleet room up" || fail "launch should report the room is up"
-printf '%s' "$out" | grep -q "fleet-coordinator" || fail "launch should name the fleet-coordinator agent"
+grep -qi "fleet room up" <<< "$out" || fail "launch should report the room is up"
+grep -q "fleet-coordinator" <<< "$out" || fail "launch should name the fleet-coordinator agent"
 ok
 
 # ── 3. the skill renders with registry projects substituted, no raw tokens ────
@@ -117,16 +117,16 @@ ok
 # ── 4. the launcher invocation shape (stubbed herdr) ─────────────────────────
 # Fresh workspace path: workspace create (labeled 'fleet') → agent start … -- claude --model … /cmd.
 grep -q "workspace create" "$HERDR_LOG" || fail "launcher should create a fleet workspace"
-grep "workspace create" "$HERDR_LOG" | grep -q -- "--label fleet" \
+grep -q -- "--label fleet" <<< "$(grep "workspace create" "$HERDR_LOG")" \
   || fail "the fleet workspace must be created with --label fleet"
-grep "workspace create" "$HERDR_LOG" | grep -q -- "--cwd $HERD_FLEET_ROOM_DIR" \
+grep -q -- "--cwd $HERD_FLEET_ROOM_DIR" <<< "$(grep "workspace create" "$HERDR_LOG")" \
   || fail "the workspace cwd should be the fleet room dir"
 grep -q "agent start fleet-coordinator" "$HERDR_LOG" \
   || fail "launcher should start the fleet-coordinator agent"
 astart="$(grep 'agent start fleet-coordinator' "$HERDR_LOG")"
-printf '%s' "$astart" | grep -q -- "--workspace ws-fleet" || fail "agent should start in the created workspace"
-printf '%s' "$astart" | grep -q -- "claude --model test-model-x" || fail "agent should run claude on MODEL_COORDINATOR"
-printf '%s' "$astart" | grep -q -- "/fleet-coordinator" || fail "agent should run the /fleet-coordinator skill"
+grep -q -- "--workspace ws-fleet" <<< "$astart" || fail "agent should start in the created workspace"
+grep -q -- "claude --model test-model-x" <<< "$astart" || fail "agent should run claude on MODEL_COORDINATOR"
+grep -q -- "/fleet-coordinator" <<< "$astart" || fail "agent should run the /fleet-coordinator skill"
 ok
 
 # ── 5. NO watcher/backlog panes (minimal: one tab only) ──────────────────────
@@ -180,8 +180,8 @@ chmod +x "$BIN/herdr"
 
 : > "$HERDR_LOG"
 out="$(bash "$HERD" fleet room 2>&1)" || fail "adopt path (existing agent) should exit 0"
-printf '%s' "$out" | grep -qi "already up" || fail "adopt path should report the room is already up"
-printf '%s' "$out" | grep -q "herdr agent focus fleet-coordinator" || fail "adopt path should point at 'herdr agent focus fleet-coordinator'"
+grep -qi "already up" <<< "$out" || fail "adopt path should report the room is already up"
+grep -q "herdr agent focus fleet-coordinator" <<< "$out" || fail "adopt path should point at 'herdr agent focus fleet-coordinator'"
 if grep -q "agent start" "$HERDR_LOG"; then fail "adopt path must NOT start a second agent"; fi
 if grep -q "workspace create" "$HERDR_LOG"; then fail "adopt path must NOT create a workspace"; fi
 if grep -q "tab close" "$HERDR_LOG"; then fail "adopt path must NOT tear down the running room's tab"; fi
@@ -211,7 +211,7 @@ set +e
 out="$(bash "$HERD" fleet room 2>&1)"; rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "a genuine agent-start failure should exit non-zero"
-printf '%s' "$out" | grep -qi "could not start" || fail "genuine failure should report it could not start the agent"
+grep -qi "could not start" <<< "$out" || fail "genuine failure should report it could not start the agent"
 grep -q "agent start fleet-coordinator" "$HERDR_LOG" || fail "genuine failure must have actually attempted the start"
 ok
 
@@ -235,8 +235,8 @@ chmod +x "$BIN/herdr"
 # ── 6d. launch output documents the interactive permission posture (#132b) ────
 : > "$HERDR_LOG"
 out="$(bash "$HERD" fleet room 2>&1)" || fail "launch should succeed"
-printf '%s' "$out" | grep -qi "interactive" || fail "launch output should note the seat runs interactive claude"
-printf '%s' "$out" | grep -qi "approval\|approve" || fail "launch output should note the first fleet-CLI call asks for approval"
+grep -qi "interactive" <<< "$out" || fail "launch output should note the seat runs interactive claude"
+grep -qi "approval\|approve" <<< "$out" || fail "launch output should note the first fleet-CLI call asks for approval"
 if grep -q -- "--dangerously-skip-permissions" "$HERDR_LOG"; then fail "the room must NOT pass --dangerously-skip-permissions"; fi
 ok
 
@@ -249,7 +249,7 @@ ok
 # ── 8. --help prints usage without launching herdr ───────────────────────────
 : > "$HERDR_LOG"
 out="$(bash "$HERD" fleet room --help 2>&1)" || fail "fleet room --help should exit 0"
-printf '%s' "$out" | grep -qi "master-coordinator" || fail "help should describe the master-coordinator"
+grep -qi "master-coordinator" <<< "$out" || fail "help should describe the master-coordinator"
 [ ! -s "$HERDR_LOG" ] || fail "--help must not invoke herdr"
 ok
 

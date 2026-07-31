@@ -68,7 +68,7 @@ cat > "$proj/.claude/settings.local.json" <<'JSON'
 JSON
 # accept pre-commit, DECLINE pre-push, accept run-checks.
 out="$(run_render "$proj" local $'a\nn\na\n')" || fail "(1) render failed: $out"
-echo "$out" | grep -q "merged 2 hook(s)" || fail "(1) summary should report 2 merged hooks: $out"
+grep -q "merged 2 hook(s)" <<< "$out" || fail "(1) summary should report 2 merged hooks: $out"
 SET="$proj/.claude/settings.local.json" REPO="$REPO" python3 - <<'PY' || fail "(1) merged JSON assertions failed"
 import json, os, sys
 d = json.load(open(os.environ["SET"]))
@@ -126,7 +126,7 @@ printf '%s' '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' | eval "$CO
 # run-checks: a commit → advisory WARN but ALLOW (exit 0), and the guidance reaches stderr.
 warn_out="$(printf '%s' "$payload_clean" | eval "$CHECKS_CMD" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(3) run-checks must allow (exit 0), got $rc"
-printf '%s' "$warn_out" | grep -qi "before committing or pushing" || fail "(3) run-checks should warn on stderr"
+grep -qi "before committing or pushing" <<< "$warn_out" || fail "(3) run-checks should warn on stderr"
 ok
 
 # ── (4) fail-soft: no map / no hook rows / non-interactive / fresh decline-all → no file ───────────

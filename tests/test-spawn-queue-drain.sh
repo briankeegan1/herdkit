@@ -147,7 +147,7 @@ line three: verify"
 enqueue slug-ok quick "$MULTI"
 echo ok > "$T/lane.mode"; : > "$LANELOG"; : > "$JLOG"
 run_drain
-ls "$T/trees/spawn-queue" | grep -q . && fail "spawned intent was not consumed ($(ls "$T/trees/spawn-queue"))"
+grep -q . <<< "$(ls "$T/trees/spawn-queue")" && fail "spawned intent was not consumed ($(ls "$T/trees/spawn-queue"))"
 grep -q "herd-quick.sh slug-ok" "$LANELOG" || fail "quick lane was not invoked for slug-ok"
 grep -q "line two: edge cases" "$LANELOG" || fail "multi-line task truncated before the lane saw it"
 grep -q "spawn_launched slug slug-ok lane quick" "$JLOG" || fail "spawn_launched not journaled ($(cat "$JLOG"))"
@@ -160,7 +160,7 @@ echo defer > "$T/lane.mode"; : > "$LANELOG"; : > "$JLOG"
 run_drain
 reqs=$(ls "$T/trees/spawn-queue"/*.req 2>/dev/null | wc -l | tr -d ' ')
 [ "$reqs" = "2" ] || fail "deferred intents must BOTH survive as .req (found $reqs; held one lost = the exact BLOCK bug)"
-ls "$T/trees/spawn-queue"/*.mine 2>/dev/null | grep -q . && fail "release left a .mine claim behind"
+grep -q . <<< "$(ls "$T/trees/spawn-queue"/*.mine 2>/dev/null)" && fail "release left a .mine claim behind"
 grep -q "spawn_deferred slug slug-held lane feature" "$JLOG" || fail "spawn_deferred not journaled ($(cat "$JLOG"))"
 [ "$(grep -c '^herd-feature.sh' "$LANELOG")" = "1" ] || fail "drain must STOP after a defer (siblings defer against the same gate)"
 pass
@@ -170,7 +170,7 @@ rm -f "$T/trees/spawn-queue"/*.req
 enqueue slug-bad quick "task that will fail to launch"
 echo fail > "$T/lane.mode"; : > "$LANELOG"; : > "$JLOG"
 run_drain
-ls "$T/trees/spawn-queue" | grep -q . && fail "hard-failed intent should be dropped (with a loud journal trail)"
+grep -q . <<< "$(ls "$T/trees/spawn-queue")" && fail "hard-failed intent should be dropped (with a loud journal trail)"
 grep -q "spawn_skipped slug slug-bad lane quick reason lane exited 1" "$JLOG" \
   || fail "spawn_skipped (lane exited 1) not journaled ($(cat "$JLOG"))"
 pass

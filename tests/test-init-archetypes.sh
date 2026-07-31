@@ -71,9 +71,9 @@ mkproj() {
 # ── (1) unit: archetype-lib.sh reads templates/archetypes.tsv ────────────────────────────────────
 alib() { "$REAL_BASH" -c '. "$REPO/scripts/herd/sim/archetype-lib.sh"; "$@"' _ "$@"; }
 names="$(alib archetype_names)"
-printf '%s\n' "$names" | grep -qx code          || fail "(1) archetype_names missing 'code': $names"
-printf '%s\n' "$names" | grep -qx research-lab  || fail "(1) archetype_names missing 'research-lab': $names"
-printf '%s\n' "$names" | grep -qx docs          || fail "(1) archetype_names missing 'docs': $names"
+grep -qx code <<< "$names" || fail "(1) archetype_names missing 'code': $names"
+grep -qx research-lab <<< "$names" || fail "(1) archetype_names missing 'research-lab': $names"
+grep -qx docs <<< "$names" || fail "(1) archetype_names missing 'docs': $names"
 alib archetype_exists code            || fail "(1) archetype_exists code should be true"
 alib archetype_exists nope            && fail "(1) archetype_exists nope should be false"
 [ "$(alib archetype_healthcheck_template code)" = "auto" ]                      || fail "(1) code template should be 'auto'"
@@ -97,7 +97,7 @@ proj="$T/noninteractive"; mkproj "$proj" "go.mod"
 out="$( cd "$proj" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
         "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(3) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -q "Project archetype" && fail "(3) non-interactive must NOT run the archetype interview: $out"
+grep -q "Project archetype" <<< "$pout" && fail "(3) non-interactive must NOT run the archetype interview: $out"
 grep -qE '^PROJECT_ARCHETYPE="code"$' "$proj/.herd/config" || fail "(3) PROJECT_ARCHETYPE should default to code: $(grep PROJECT_ARCHETYPE "$proj/.herd/config")"
 cmp -s "$proj/.herd/healthcheck.project.sh" "$REPO/templates/healthcheck.go.sh" \
   || fail "(3) go consumer should still get healthcheck.go.sh"
@@ -109,9 +109,9 @@ out="$( cd "$proj" && printf '2\n' \
         | HERD_ARCHETYPE_ASSUME_TTY=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
           "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(4) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -qi "language=unknown"        || fail "(4) scout should report lang=unknown: $out"
-echo "$pout" | grep -q "archetype=research-lab"    || fail "(4) should announce the selected archetype: $out"
-echo "$pout" | grep -qi "no app to preview"        || fail "(4) should explain the skipped app-preview question: $out"
+grep -qi "language=unknown" <<< "$pout" || fail "(4) scout should report lang=unknown: $out"
+grep -q "archetype=research-lab" <<< "$pout" || fail "(4) should announce the selected archetype: $out"
+grep -qi "no app to preview" <<< "$pout" || fail "(4) should explain the skipped app-preview question: $out"
 grep -qE '^PROJECT_ARCHETYPE="research-lab"$' "$proj/.herd/config" || fail "(4) PROJECT_ARCHETYPE not persisted: $(grep PROJECT_ARCHETYPE "$proj/.herd/config")"
 grep -qE '^APP_PREVIEW_CMD=""$' "$proj/.herd/config" || fail "(4) APP_PREVIEW_CMD should stay blank: $(grep APP_PREVIEW_CMD "$proj/.herd/config")"
 cmp -s "$proj/.herd/healthcheck.project.sh" "$REPO/templates/healthcheck.docs.sh" \
@@ -124,7 +124,7 @@ out="$( cd "$proj" && printf 'docs\n' \
         | HERD_ARCHETYPE_ASSUME_TTY=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
           "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(5) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -qi "language=python" || fail "(5) scout should still detect python: $out"
+grep -qi "language=python" <<< "$pout" || fail "(5) scout should still detect python: $out"
 cmp -s "$proj/.herd/healthcheck.project.sh" "$REPO/templates/healthcheck.docs.sh" \
   || fail "(5) archetype=docs must override the python-detected template"
 grep -qE '^PROJECT_ARCHETYPE="docs"$' "$proj/.herd/config" || fail "(5) PROJECT_ARCHETYPE not persisted"
@@ -158,7 +158,7 @@ out="$( cd "$proj" && "$REAL_BASH" "$HERD" config set PROJECT_ARCHETYPE research
 grep -qE '^PROJECT_ARCHETYPE="research-lab"$' "$proj/.herd/config" || fail "(8) valid value not persisted: $(grep PROJECT_ARCHETYPE "$proj/.herd/config")"
 out="$( cd "$proj" && "$REAL_BASH" "$HERD" config set PROJECT_ARCHETYPE webapp 2>&1 )"; rc=$?
 [ "$rc" -ne 0 ] || fail "(8) set accepted unknown PROJECT_ARCHETYPE=webapp"
-printf '%s\n' "$out" | grep -qi 'invalid value' || fail "(8) unknown value missing invalid-value message: $out"
+grep -qi 'invalid value' <<< "$out" || fail "(8) unknown value missing invalid-value message: $out"
 grep -qE '^PROJECT_ARCHETYPE="webapp"$' "$proj/.herd/config" && fail "(8) invalid value was written"
 ok
 

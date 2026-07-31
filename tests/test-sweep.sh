@@ -228,11 +228,11 @@ MAIN=/x/proj TREES=/x/proj-trees _sweep_owns_path /x/proj-other/t.sh \
   && fail "(6) a sibling project's path was attributed to us (cross-project kill, issue #60)"
 MAIN=/x/proj TREES=/x/proj-trees _sweep_owns_path /x/proj/scripts/t.sh \
   || fail "(6) our own path was not attributed to us"
-_sweep_live_marker_pids | grep -qx "$LIVEWORKER" || fail "(6) the live marker's pid was not reported live"
+grep -qx "$LIVEWORKER" <<< "$(_sweep_live_marker_pids)" || fail "(6) the live marker's pid was not reported live"
 PROCS="$(sweep_orphan_procs)"
-printf '%s' "$PROCS" | grep -q "^$VICTIM	" || fail "(6) the orphan victim was not detected"
-printf '%s' "$PROCS" | grep -q "^$LIVEWORKER	" && fail "(6) a LIVE gate worker was listed as an orphan — killing it strands the PR"
-printf '%s' "$PROCS" | grep -q '9999901' && fail "(6) a foreign project's process was listed as an orphan"
+grep -q "^$VICTIM	" <<< "$PROCS" || fail "(6) the orphan victim was not detected"
+grep -q "^$LIVEWORKER	" <<< "$PROCS" && fail "(6) a LIVE gate worker was listed as an orphan — killing it strands the PR"
+grep -q '9999901' <<< "$PROCS" && fail "(6) a foreign project's process was listed as an orphan"
 ok; echo "PASS (6) attribution rejects sibling/foreign paths; a live gate worker is never an orphan"
 
 # ── (20) HERD-348: session exemption spares a detached gate worker's WHOLE subtree ────────────────
@@ -267,16 +267,16 @@ printf '%s 1 %s bash %s/scripts/herd/healthcheck.sh %s/merged-clean\n' "$SESS_WR
 printf '%s 1 %s bash %s/scripts/herd/healthcheck.sh %s/merged-clean\n' "$SESS_BATS" "$SESS_BATS" "$MAINDIR" "$TREESDIR"
 EOF
 chmod +x "$T/ps-sess"
-_sweep_live_marker_sessions | grep -qx "$SESS_WRAP" \
+grep -qx "$SESS_WRAP" <<< "$(_sweep_live_marker_sessions)" \
   || fail "(20) leg-a/b: the live marker's session was not reported"
 PROCS2="$(HERD_SWEEP_PS_CMD="$T/ps-sess" sweep_orphan_procs)"
-printf '%s' "$PROCS2" | grep -q "^$SESS_WRAP	" && fail "(20) the live worker (marker pid) was listed as an orphan"
-printf '%s' "$PROCS2" | grep -q "^$SESS_BATS	" \
+grep -q "^$SESS_WRAP	" <<< "$PROCS2" && fail "(20) the live worker (marker pid) was listed as an orphan"
+grep -q "^$SESS_BATS	" <<< "$PROCS2" \
   && fail "(20) a LIVE suite's bats subtree (session-exempt) was reaped mid-run — the #450/#451/#452 stall"
 # GENUINE ORPHAN: once the marker is gone, nothing proves the session live, so the same bats IS reaped.
 rm -f "$SESSMARK"
 PROCS3="$(HERD_SWEEP_PS_CMD="$T/ps-sess" sweep_orphan_procs)"
-printf '%s' "$PROCS3" | grep -q "^$SESS_BATS	" \
+grep -q "^$SESS_BATS	" <<< "$PROCS3" \
   || fail "(20) a genuinely orphaned bats (marker gone) must still be reaped"
 kill "$SESS_WRAP" "$SESS_BATS" 2>/dev/null || true
 ok; echo "PASS (20) a detached gate worker's whole subtree is session-exempt; a marker-gone orphan is still reaped"
@@ -295,11 +295,11 @@ ok; echo "PASS (2) cheap detection counts the mess; advisory row renders (and st
 
 # ── (3) dry-run is inert ─────────────────────────────────────────────────────
 PLAN="$(cd "$T" && sweep_main --dry-run 2>&1)" || fail "(3) dry-run exited non-zero"
-printf '%s' "$PLAN" | grep -q "reap worktree merged-clean" || fail "(3) plan omits the merged worktree reap"
-printf '%s' "$PLAN" | grep -q "drop dead inflight marker"  || fail "(3) plan omits the dead marker"
-printf '%s' "$PLAN" | grep -q "kill orphan pid $VICTIM"    || fail "(3) plan omits the orphan process"
-printf '%s' "$PLAN" | grep -q "FLAG merged-dirty"          || fail "(3) plan omits the dirty-worktree flag"
-printf '%s' "$PLAN" | grep -q "close stale resolve tab tabRESOLVE" \
+grep -q "reap worktree merged-clean" <<< "$PLAN" || fail "(3) plan omits the merged worktree reap"
+grep -q "drop dead inflight marker" <<< "$PLAN" || fail "(3) plan omits the dead marker"
+grep -q "kill orphan pid $VICTIM" <<< "$PLAN" || fail "(3) plan omits the orphan process"
+grep -q "FLAG merged-dirty" <<< "$PLAN" || fail "(3) plan omits the dirty-worktree flag"
+grep -q "close stale resolve tab tabRESOLVE" <<< "$PLAN" \
   || fail "(3) plan omits the stale resolve tab it would close (invisible destructive action)"
 [ -d "$TREESDIR/merged-clean" ] || fail "(3) DRY-RUN DELETED a worktree"
 [ -f "$DEADMARK" ]              || fail "(3) DRY-RUN removed the dead marker"
@@ -317,7 +317,7 @@ sweep_run_safe_legs >/dev/null 2>&1 || fail "(5a) sweep_run_safe_legs exited non
 [ -d "$TREESDIR/stale-sha" ]     || fail "(10) AUTO reaped a worktree with NO sha anchor"
 grep -q '"reason":"merged-dirty"' "$JOURNAL_FILE"          || fail "(5a) no sweep_flag for the dirty worktree"
 grep -q '"reason":"closed-unique-commits"' "$JOURNAL_FILE" || fail "(5a) no sweep_flag for the unique-commit worktree"
-grep '"event":"sweep_flag"' "$JOURNAL_FILE" | grep -q 'f.txt' || fail "(5a) the dirty flag carries no file evidence"
+grep -q 'f.txt' <<< "$(grep '"event":"sweep_flag"' "$JOURNAL_FILE")" || fail "(5a) the dirty flag carries no file evidence"
 grep -q '"reason":"scratch-unique-commits"' "$JOURNAL_FILE" \
   || fail "(5a) no sweep_flag for the DETACHED tree carrying unique commits"
 grep -q '"reason":"scratch-in-use"' "$JOURNAL_FILE" \
@@ -474,10 +474,10 @@ bash -c 'sleep 30' & SLOWPID=$!
 disown 2>/dev/null || true
 SLOWMARK="$TREESDIR/.review-inflight-902-shaY"
 printf '%s\n%s\n%s\n' "$SLOWPID" "$(_pid_starttime "$SLOWPID")" "$(( $(date +%s) - 9999 ))" > "$SLOWMARK"
-REVIEW_INFLIGHT_TIMEOUT=1 sweep_timedout_marker_keys | grep -q '.review-inflight-902-shaY' \
+grep -q '.review-inflight-902-shaY' <<< "$(REVIEW_INFLIGHT_TIMEOUT=1 sweep_timedout_marker_keys)" \
   || fail "(17) a past-deadline LIVE marker was not detected"
 PLAN2="$(REVIEW_INFLIGHT_TIMEOUT=1 sweep_leg_markers 1 2>&1)"
-printf '%s' "$PLAN2" | grep -q 'SIGTERM past-deadline worker for .review-inflight-902-shaY' \
+grep -q 'SIGTERM past-deadline worker for .review-inflight-902-shaY' <<< "$PLAN2" \
   || fail "(17) the plan omits the past-deadline worker it would SIGTERM: $PLAN2"
 kill -0 "$SLOWPID" 2>/dev/null || fail "(17) the dry-run plan killed the worker"
 kill "$SLOWPID" 2>/dev/null || true; rm -f "$SLOWMARK"
@@ -517,7 +517,7 @@ SWEEP_AUTO=off; _SWEEP_C_TABS=5; _SWEEP_C_MARKERS=5; _SWEEP_C_PROCS=5
 build_sweep_note
 [ -z "${SWEEP_NOTE:-}" ] || fail "(9) SWEEP_AUTO=off must render NO console row"
 SWEEP_AUTO=advise; build_sweep_note
-printf '%s' "${SWEEP_NOTE:-}" | grep -q 'sweep recommended' || fail "(9) advise must render the console row"
+grep -q 'sweep recommended' <<< "${SWEEP_NOTE:-}" || fail "(9) advise must render the console row"
 ok; echo "PASS (9) SWEEP_AUTO off|advise|auto normalize; off is byte-inert; unknown degrades to advise"
 
 # ── (12) counters reset per run ──────────────────────────────────────────────
@@ -531,9 +531,9 @@ ok; echo "PASS (9) SWEEP_AUTO off|advise|auto normalize; off is byte-inert; unkn
 sweep_run_safe_legs >/dev/null 2>&1 || true
 sweep_run_safe_legs >/dev/null 2>&1 || true
 LAST="$(grep '"event":"sweep_auto"' "$JOURNAL_FILE" | tail -1)"
-printf '%s' "$LAST" | grep -q '"flagged":4' \
+grep -q '"flagged":4' <<< "$LAST" \
   || fail "(12) counters accumulated across runs (expected flagged=4 on every pass): $LAST"
-printf '%s' "$LAST" | grep -q '"reaped":0' || fail "(12) reaped counter accumulated across runs: $LAST"
+grep -q '"reaped":0' <<< "$LAST" || fail "(12) reaped counter accumulated across runs: $LAST"
 ok; echo "PASS (12) SWEEP_N_* counters reset per run (auto ticks never report a lifetime total)"
 
 # ── (19) stray-watcher detection EXEMPTS live gate-worker forks (HERD-217) ───────────────────────
@@ -561,15 +561,15 @@ printf '%s 1 %s herd-watch-sweepws bash %s/scripts/herd/agent-watch.sh\n'       
 EOF
 chmod +x "$T/ps-stray"
 STRAY="$(HERD_SWEEP_PS_CMD="$T/ps-stray" HERD_WATCH_ARGV0=herd-watch-sweepws HERD_WATCHER_LOCK="$T/watch.lock" sweep_stray_watchers)"
-printf '%s\n' "$STRAY" | grep -qx "$ORPHAN" \
+grep -qx "$ORPHAN" <<< "$STRAY" \
   || fail "(19) a GENUINE orphan duplicate watcher (parent dead, no gate child) was not listed: '$STRAY'"
-printf '%s\n' "$STRAY" | grep -qx "$WPID" \
+grep -qx "$WPID" <<< "$STRAY" \
   && fail "(19) the canonical lockfile watcher was listed as a stray"
-printf '%s\n' "$STRAY" | grep -qx "$FORK_A" \
+grep -qx "$FORK_A" <<< "$STRAY" \
   && fail "(19) a live gate-worker fork (child of the canonical watcher) was listed — leg 5 would SIGKILL it and strand the PR"
-printf '%s\n' "$STRAY" | grep -qx "$FORK_B" \
+grep -qx "$FORK_B" <<< "$STRAY" \
   && fail "(19) a reparented gate-worker fork still parenting a live healthcheck was listed — leg 5 would SIGKILL in-flight gate work"
-printf '%s\n' "$STRAY" | grep -qx "$HC_CHILD" \
+grep -qx "$HC_CHILD" <<< "$STRAY" \
   && fail "(19) a non-argv0-tagged healthcheck worker was mistaken for a watcher"
 # MUTATION CHECK: exactly these two exemptions are load-bearing. Deleting the ppid guard lists FORK_A;
 # deleting the gate-child guard lists FORK_B — either regression flips one assertion above to FAIL.

@@ -90,7 +90,7 @@ step add-item "$p" "Refactor the drainer. hard-after HERD-52 so the seam lands f
 [ "$RC" -eq 0 ]                                       || fail "1: add-item exited $RC ($OUT)"
 grep -qE $'^ADD\t' "$DISPATCH"                        || fail "1: the item was not filed ($(cat "$DISPATCH"))"
 grep -qE $'^QUEUE\tHERD-900\tHERD-52$' "$QUEUELOG"    || fail "1: did not auto-queue HERD-900 after HERD-52 ($(cat "$QUEUELOG"))"
-printf '%s\n' "$OUT" | grep -q '📌 sequenced HERD-900 after HERD-52' || fail "1: no auto-marker confirmation in output ($OUT)"
+grep -q '📌 sequenced HERD-900 after HERD-52' <<< "$OUT" || fail "1: no auto-marker confirmation in output ($OUT)"
 [ ! -e "$p" ]                                         || fail "1: claimed file not cleaned up"
 ok
 
@@ -164,7 +164,7 @@ RC=$?
 set -e
 [ "$RC" -eq 0 ]                                       || fail "7: no-id add-item hard-failed ($OUT)"
 [ ! -s "$QUEUELOG" ]                                  || fail "7: queued despite no surfaced id ($(cat "$QUEUELOG"))"
-printf '%s\n' "$OUT" | grep -q 'surfaced no id'      || fail "7: no soft note about the missing id ($OUT)"
+grep -q 'surfaced no id' <<< "$OUT" || fail "7: no soft note about the missing id ($OUT)"
 ok
 
 echo "ALL PASS ($pass checks)"

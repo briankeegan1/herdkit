@@ -83,17 +83,17 @@ ok
 # ── (4) degraded row never says "awaiting task"; genuine spare does ───────────────────────────────
 WT="$T/wt-spare"; mkdir -p "$WT"
 pending="$(_row_pr_match_pending "retirement-invariant")"
-printf '%s' "$pending" | grep -q 'PR match pending · retrying' \
+grep -q 'PR match pending · retrying' <<< "$pending" \
   || fail "(4) degraded row missing 'PR match pending · retrying', got: $pending"
-printf '%s' "$pending" | grep -q 'awaiting task' \
+grep -q 'awaiting task' <<< "$pending" \
   && fail "(4) degraded row must NEVER say 'awaiting task', got: $pending"
-printf '%s' "$pending" | grep -q 'assign or retire' \
+grep -q 'assign or retire' <<< "$pending" \
   && fail "(4) degraded row must NEVER say 'assign or retire', got: $pending"
-printf '%s' "$pending" | grep -q 'retirement-invariant' \
+grep -q 'retirement-invariant' <<< "$pending" \
   || fail "(4) degraded row dropped the slug, got: $pending"
 
 awaiting="$(_row_awaiting_task "spare-a" "$WT")"
-printf '%s' "$awaiting" | grep -q 'awaiting task · assign or retire' \
+grep -q 'awaiting task · assign or retire' <<< "$awaiting" \
   || fail "(4) successful-no-PR spare must still render awaiting task, got: $awaiting"
 ok
 
@@ -112,16 +112,16 @@ _classify_no_pr_row() {
 
 PRS_LOOKUP_OK=0
 row_fail="$(_classify_no_pr_row "multi-seat-doctrine" "$WT")"
-printf '%s' "$row_fail" | grep -q 'awaiting task' \
+grep -q 'awaiting task' <<< "$row_fail" \
   && fail "(5) failed PR lookup must NOT render 'awaiting task', got: $row_fail"
-printf '%s' "$row_fail" | grep -q 'PR match pending · retrying' \
+grep -q 'PR match pending · retrying' <<< "$row_fail" \
   || fail "(5) failed PR lookup must render 'PR match pending · retrying', got: $row_fail"
 
 PRS_LOOKUP_OK=1
 row_ok="$(_classify_no_pr_row "spare-a" "$WT")"
-printf '%s' "$row_ok" | grep -q 'awaiting task · assign or retire' \
+grep -q 'awaiting task · assign or retire' <<< "$row_ok" \
   || fail "(5) successful list with no PR must render awaiting task, got: $row_ok"
-printf '%s' "$row_ok" | grep -q 'PR match pending' \
+grep -q 'PR match pending' <<< "$row_ok" \
   && fail "(5) successful empty list must NOT render PR match pending, got: $row_ok"
 ok
 

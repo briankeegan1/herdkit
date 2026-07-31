@@ -32,7 +32,7 @@ if [ "$rc" -eq 0 ]; then
   [ -n "$ONELINE" ] && echo "clean — $last" || { echo "CLEAN"; printf '%s\n' "$out"; }
   exit 0
 fi
-if printf '%s' "$out" | grep -qiE 'connection refused|timeout|unknownhost|network|could not resolve|auth|credential'; then
+if grep -qiE 'connection refused|timeout|unknownhost|network|could not resolve|auth|credential' <<< "$out"; then
   [ -n "$ONELINE" ] && echo "data/env — $last" || { echo "DATA/ENV ISSUE"; printf '%s\n' "$out"; }
   exit 2
 fi

@@ -281,8 +281,8 @@ fi
 # HERD-176: watcher wake surface is driver-bound — default resume is the byte-identical claude shape.
 _resume_shape="$(herd_driver_agent_resume_cmd "continue" 2>/dev/null || true)"
 _lim_pat="$(herd_driver_agent_limit_pattern 2>/dev/null || true)"
-if printf '%s' "$_resume_shape" | grep -qF 'claude' \
-   && printf '%s' "$_resume_shape" | grep -qF -- '--continue' \
+if grep -qF 'claude' <<< "$_resume_shape" \
+   && grep -qF -- '--continue' <<< "$_resume_shape" \
    && [ "$_lim_pat" = 'usage limit|session limit|hit your (usage|session) limit' ]; then
   checkpoint driver_wake_routing pass "resume=$_resume_shape; limit pattern bound (byte-identical claude default)"
 else
@@ -907,7 +907,7 @@ _DEAD_ROW="${DISPLAY[0]}"
 #     produce the SAME frame, and neither may leak a pasture header.
 unset WATCHER_FLAIR;      _f_noflag="$(console_frame 'flair check')"
 export WATCHER_FLAIR=off; _f_off="$(console_frame 'flair check')"
-if [ "$_f_noflag" = "$_f_off" ] && ! printf '%s' "$_f_off" | grep -q 'pasture'; then
+if [ "$_f_noflag" = "$_f_off" ] && ! grep -q 'pasture' <<< "$_f_off"; then
   checkpoint flair_off_byte_identical pass "off frame byte-identical to a no-flag run; no pasture header, no celebration"
 else
   checkpoint flair_off_byte_identical fail "off-mode frame diverged from the no-flag run or leaked flair"
@@ -915,14 +915,14 @@ fi
 
 # (2a) ON adds the pasture header (one glyph per builder by state).
 export WATCHER_FLAIR=on; _f_on="$(console_frame 'flair check')"
-if printf '%s' "$_f_on" | grep -q 'pasture' && printf '%s' "$_f_on" | grep -q '🐑'; then
+if grep -q 'pasture' <<< "$_f_on" && grep -q '🐑' <<< "$_f_on"; then
   checkpoint flair_on_header_present pass "on renders the pasture header (🐑 grazing / 💤 idle / ✅ in the pen)"
 else
   checkpoint flair_on_header_present fail "on-mode frame is missing the pasture header"
 fi
 
 # (2b) HARD RULE — the 💀 dead builder's row is byte-IDENTICAL in both modes (flair never touches DISPLAY).
-if printf '%s\n' "$_f_off" | grep -qxF "$_DEAD_ROW" && printf '%s\n' "$_f_on" | grep -qxF "$_DEAD_ROW"; then
+if grep -qxF "$_DEAD_ROW" <<< "$_f_off" && grep -qxF "$_DEAD_ROW" <<< "$_f_on"; then
   checkpoint flair_dead_row_unchanged pass "💀 dead-builder row byte-identical in both modes (never softened)"
 else
   checkpoint flair_dead_row_unchanged fail "dead-builder row changed between off/on — flair softened a loud state"
@@ -931,9 +931,9 @@ fi
 # (2d) CLOSED VOCABULARY (HERD-172) — the spare-builder row (built above from the SHIPPED
 #      _row_awaiting_task) must name whose move it is (awaiting task · assign or retire) and carry an
 #      age, and the banned ownerless 'idle' state word must never reach an operator-facing frame.
-if printf '%s' "$_f_on" | grep -q 'awaiting task · assign or retire' \
-   && printf '%s' "$_f_on" | grep -qE 'assign or retire · [0-9]+[smhd]' \
-   && ! printf '%s' "$_f_on" | grep -qw 'idle'; then
+if grep -q 'awaiting task · assign or retire' <<< "$_f_on" \
+   && grep -qE 'assign or retire · [0-9]+[smhd]' <<< "$_f_on" \
+   && ! grep -qw 'idle' <<< "$_f_on"; then
   checkpoint console_vocab_closed pass "spare-builder row uses the closed vocabulary (awaiting task · owner · age); no banned 'idle' word"
 else
   checkpoint console_vocab_closed fail "console frame leaked the banned 'idle' word or is missing the awaiting-task vocabulary/age"
@@ -942,7 +942,7 @@ fi
 # (2c) Merge CELEBRATION — a pending marker turns into exactly one 'joins the flock' line next frame.
 printf '4242\n' > "$FLAIR_CELEBRATE_STATE"
 _f_cel="$(console_frame 'flair check')"
-if printf '%s' "$_f_cel" | grep -q '#4242 joins the flock'; then
+if grep -q '#4242 joins the flock' <<< "$_f_cel"; then
   checkpoint flair_merge_celebration pass "post-merge celebration rendered ('🐑 #4242 joins the flock · N grazing')"
 else
   checkpoint flair_merge_celebration fail "merge celebration line missing under WATCHER_FLAIR=on"
@@ -1424,7 +1424,7 @@ if [ "${_FAIR_TARGET_MERGED:-1}" -eq 0 ] && [ "${_FO_GREENRESTALED:-0}" -ge 1 ] 
 else
   checkpoint fairness_off_reproduces_starvation fail "the fault leg did not reproduce starvation (target merged=${_FAIR_TARGET_MERGED}, green re-staled=${_FO_GREENRESTALED}, laps=${_FO_MAXLAPS})"
 fi
-if [ "${_FO_STARVE:-0}" -ge 1 ] && printf '%s' "$_FO_ROW" | grep -q "starving · .* re-stale laps"; then
+if [ "${_FO_STARVE:-0}" -ge 1 ] && grep -q "starving · .* re-stale laps" <<< "$_FO_ROW"; then
   checkpoint starvation_surfaced pass "pr_starvation journaled + the loud row rendered: $(printf '%s' "$_FO_ROW" | sed 's/\x1b\[[0-9;]*m//g' | tr -s ' ')"
 else
   checkpoint starvation_surfaced fail "starvation was not surfaced (pr_starvation=${_FO_STARVE}, row='${_FO_ROW:-<none>}')"

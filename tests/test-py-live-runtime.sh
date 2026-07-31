@@ -64,18 +64,18 @@ OUT="$(LIVE_DRYRUN_JOURNAL="$T/dry.jsonl" WORKTREES_DIR="$T" \
         PYTHONPATH="$REPO/pysrc" python3 -m herd.live_runtime --dry-run --fixture "$T/fix.json")" \
   || fail "dry-run smoke exited nonzero"
 # Terminal outcomes for the mixed scenario.
-printf '%s' "$OUT" | grep -q '"1":"MERGE"'   || fail "pr1 should MERGE ($OUT)"
-printf '%s' "$OUT" | grep -q '"2":"HOLD"'    || fail "pr2 (stale) should HOLD ($OUT)"
-printf '%s' "$OUT" | grep -q '"3":"BLOCK"'   || fail "pr3 (review block) should BLOCK ($OUT)"
-printf '%s' "$OUT" | grep -q '"4":"HOLD"'    || fail "pr4 (human-verify) should HOLD ($OUT)"
-printf '%s' "$OUT" | grep -q '"5":"ESCALATE"' || fail "pr5 (infra) should ESCALATE ($OUT)"
+grep -q '"1":"MERGE"' <<< "$OUT" || fail "pr1 should MERGE ($OUT)"
+grep -q '"2":"HOLD"' <<< "$OUT" || fail "pr2 (stale) should HOLD ($OUT)"
+grep -q '"3":"BLOCK"' <<< "$OUT" || fail "pr3 (review block) should BLOCK ($OUT)"
+grep -q '"4":"HOLD"' <<< "$OUT" || fail "pr4 (human-verify) should HOLD ($OUT)"
+grep -q '"5":"ESCALATE"' <<< "$OUT" || fail "pr5 (infra) should ESCALATE ($OUT)"
 # Journal shapes present, and the merge/reap pair for the one green PR.
 grep -q '"event":"merge"' "$T/dry.jsonl"            || fail "no merge event in dry-run stream"
 grep -q '"event":"reap"' "$T/dry.jsonl"             || fail "no reap event (reap-on-merge) in stream"
 grep -q '"event":"stale_dup_hold"' "$T/dry.jsonl"   || fail "no stale hold in stream"
 grep -q '"event":"infra_event"' "$T/dry.jsonl"      || fail "no infra_event in stream"
 # INFRA must NEVER be cached as a verdict.
-grep '"event":"verdict_recorded"' "$T/dry.jsonl" | grep -q '"value":"INFRA"' \
+grep -q '"value":"INFRA"' <<< "$(grep '"event":"verdict_recorded"' "$T/dry.jsonl")" \
   && fail "INFRA leaked as a cached verdict"
 # The dry-run smoke must NOT write the real journal.jsonl (WORKTREES_DIR points here).
 [ -f "$T/.herd/journal.jsonl" ] && fail "dry-run smoke leaked into the REAL journal.jsonl"
@@ -93,9 +93,9 @@ JSON
 OUT2="$(LIVE_DRYRUN_JOURNAL="$T/scope.jsonl" WORKTREES_DIR="$T" \
          PYTHONPATH="$REPO/pysrc" python3 -m herd.live_runtime --dry-run --fixture "$T/scope.json")" \
   || fail "scope dry-run smoke exited nonzero"
-printf '%s' "$OUT2" | grep -q '"10":"MERGE"'   || fail "pr10 (own, green) should MERGE ($OUT2)"
-printf '%s' "$OUT2" | grep -q '"11":"PENDING"' || fail "pr11 (review WAIT) should be PENDING ($OUT2)"
-printf '%s' "$OUT2" | grep -q '"12"'           && fail "pr12 (foreign owner) must never be classified ($OUT2)"
+grep -q '"10":"MERGE"' <<< "$OUT2" || fail "pr10 (own, green) should MERGE ($OUT2)"
+grep -q '"11":"PENDING"' <<< "$OUT2" || fail "pr11 (review WAIT) should be PENDING ($OUT2)"
+grep -q '"12"' <<< "$OUT2" && fail "pr12 (foreign owner) must never be classified ($OUT2)"
 grep -q '"event":"review_pending"' "$T/scope.jsonl" || fail "no review_pending event for the WAIT rail"
 # The foreign PR is green too — prove the ONLY merge is the operator's own.
 [ "$(grep -c '"event":"merge"' "$T/scope.jsonl")" = 1 ] || fail "scope leak: more than one merge"
@@ -117,7 +117,7 @@ done
 # The retired values WARN loudly on stderr (once); the live values are silent.
 for v in bash shadow; do
   w="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>&1 >/dev/null)"
-  printf '%s' "$w" | grep -qi 'RETIRED' || fail "ENGINE_IMPL='$v' must WARN that it is retired (got: '$w')"
+grep -qi 'RETIRED' <<< "$w" || fail "ENGINE_IMPL='$v' must WARN that it is retired (got: '$w')"
 done
 for v in "" python; do
   w="$(ENGINE_IMPL="$v" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_impl' 2>&1 >/dev/null)"

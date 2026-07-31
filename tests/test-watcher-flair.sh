@@ -76,8 +76,8 @@ build_celebrate 5
 # ── 6. build_celebrate ON: one line per pending merged PR, then the marker is CONSUMED ────────────
 WATCHER_FLAIR=on; printf '101\n102\n' > "$FLAIR_CELEBRATE_STATE"
 build_celebrate 2
-printf '%s' "$CELEBRATE" | grep -q '🐑 #101 joins the flock · 2 grazing' || fail "missing #101 celebration"; pass
-printf '%s' "$CELEBRATE" | grep -q '🐑 #102 joins the flock · 2 grazing' || fail "missing #102 celebration"; pass
+grep -q '🐑 #101 joins the flock · 2 grazing' <<< "$CELEBRATE" || fail "missing #101 celebration"; pass
+grep -q '🐑 #102 joins the flock · 2 grazing' <<< "$CELEBRATE" || fail "missing #102 celebration"; pass
 [ ! -e "$FLAIR_CELEBRATE_STATE" ] || fail "ON build_celebrate must consume (delete) the marker"; pass
 # No pending merges → empty, no error.
 CELEBRATE="dirty"; build_celebrate 0
@@ -94,6 +94,6 @@ case "$(_flair_glyph pen)"       in "<GRN>✅<RST>")  pass ;; *) fail "pen glyph
 # And in a full header the dead builder's LOUD red glyph survives beside the cozy calm ones.
 WATCHER_FLAIR=on; FLAIR_STATE=(grazing dead)
 build_pasture
-printf '%s' "$PASTURE" | grep -q '<RED>💀<RST>' || fail "pasture header softened the dead builder — MUST stay C_RED 💀"; pass
+grep -q '<RED>💀<RST>' <<< "$PASTURE" || fail "pasture header softened the dead builder — MUST stay C_RED 💀"; pass
 
 echo "PASS ($PASS assertions) — tests/test-watcher-flair.sh"

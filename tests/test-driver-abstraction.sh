@@ -60,7 +60,7 @@ for key in DRIVER_LIST_AGENTS DRIVER_FOCUS_AGENT DRIVER_SEND_TEXT DRIVER_SWITCH_
 done
 # The driver file is ZERO-SECRET / command-shapes only — the DRIVER_* VALUES carry no absolute paths
 # or credential-shaped material (comments are prose and exempt; only the bindings ship into renders).
-if grep -E '^DRIVER_[A-Z_]+=' "$DRIVER_FILE" | grep -qiE '/users/|/home/|secret|password|apikey'; then
+if grep -qiE '/users/|/home/|secret|password|apikey' <<< "$(grep -E '^DRIVER_[A-Z_]+=' "$DRIVER_FILE")"; then
   fail "a driver binding value leaks a secret or absolute path"
 fi
 ok; echo "PASS (0) herdr-claude.driver binds all 8 capabilities, zero-secret"
@@ -103,8 +103,8 @@ ok; echo "PASS (2) HERD_DRIVER=herdr-claude renders byte-identical to the defaul
 # ── 3. Unknown HERD_DRIVER fails LOUDLY and lists the drivers that ship. ──────────────────────────
 U="$T/unknown"; mkdir -p "$U"; seed_repo "$U" 'HERD_DRIVER="vscode-copilot"'
 if out="$(render "$U" 2>&1)"; then fail "unknown driver render should have failed but did not: $out"; fi
-echo "$out" | grep -q "unknown HERD_DRIVER 'vscode-copilot'" || fail "unknown-driver error not loud: $out"
-echo "$out" | grep -q "herdr-claude"                        || fail "unknown-driver error did not list herdr-claude: $out"
+grep -q "unknown HERD_DRIVER 'vscode-copilot'" <<< "$out" || fail "unknown-driver error not loud: $out"
+grep -q "herdr-claude" <<< "$out" || fail "unknown-driver error did not list herdr-claude: $out"
 ok; echo "PASS (3) unknown HERD_DRIVER → loud error listing available drivers"
 
 # ── 4. A driver missing a tokenized capability fails LOUDLY (unrendered {{DRIVER_*}} token). ──────
@@ -116,8 +116,8 @@ DRIVER_SEND_TEXT='x send'
 EOF
 M="$T/missing"; mkdir -p "$M"; seed_repo "$M" 'HERD_DRIVER="incomplete"'
 if out="$(render "$M" HERD_DRIVERS_DIR="$DD" 2>&1)"; then fail "incomplete driver should have failed the render: $out"; fi
-echo "$out" | grep -q 'unsubstituted token'   || fail "completeness lint did not fire: $out"
-echo "$out" | grep -q 'DRIVER_SWITCH_MODEL'    || fail "lint did not name the missing capability token: $out"
+grep -q 'unsubstituted token' <<< "$out" || fail "completeness lint did not fire: $out"
+grep -q 'DRIVER_SWITCH_MODEL' <<< "$out" || fail "lint did not name the missing capability token: $out"
 ok; echo "PASS (4) driver missing a tokenized capability → loud completeness-lint failure"
 
 # ── 5. A COMPLETE alternate driver renders cleanly and mechanically SWAPS every incantation. ─────
@@ -139,7 +139,7 @@ grep -qF 'herdr pane send-keys <agent-pane> Enter' "$ASK" && fail "old herdr sen
 ok; echo "PASS (5) a complete alternate driver swaps every tokenized incantation, no fork"
 
 # ── 6. HERD_DRIVER is documented as a config key AND in config.example (kept in sync). ────────────
-awk -F'\t' '$1=="HERD_DRIVER" && $2=="config"{print $5}' "$CAPS" | grep -q '^render$' \
+grep -q '^render$' <<< "$(awk -F'\t' '$1=="HERD_DRIVER" && $2=="config"{print $5}' "$CAPS")" \
   || fail "HERD_DRIVER not a config key with requires=render in capabilities.tsv"
 grep -qE '^HERD_DRIVER="herdr-claude"' "$CFG_EXAMPLE" \
   || fail "config.example does not document HERD_DRIVER default herdr-claude"

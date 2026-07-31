@@ -63,16 +63,16 @@ fi
 sed 's/"CLEAN"/"CODEERROR"/' "$T/real.jsonl" > "$T/div.jsonl"
 out="$(parity "$T/real.jsonl" "$T/div.jsonl" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] || fail "value divergence should exit 1, got $rc"
-printf '%s\n' "$out" | grep -q "DIVERGENT" || fail "value divergence: no DIVERGENT header"
-printf '%s\n' "$out" | grep -q "outcome" || fail "value divergence: report did not name the 'outcome' field"
-printf '%s\n' "$out" | grep -q "CODEERROR" || fail "value divergence: report did not show the shadow value"
+grep -q "DIVERGENT" <<< "$out" || fail "value divergence: no DIVERGENT header"
+grep -q "outcome" <<< "$out" || fail "value divergence: report did not name the 'outcome' field"
+grep -q "CODEERROR" <<< "$out" || fail "value divergence: report did not show the shadow value"
 ok "value divergence → per-mismatch report names the field, exit 1"
 
 # ── (A3) a LENGTH divergence (missing event) is reported and exits 1 ─────────────────────────────
 head -4 "$T/real.jsonl" > "$T/short.jsonl"
 out="$(parity "$T/real.jsonl" "$T/short.jsonl" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] || fail "length divergence should exit 1, got $rc"
-printf '%s\n' "$out" | grep -qi "MISSING from shadow" || fail "length divergence: missing-event not reported"
+grep -qi "MISSING from shadow" <<< "$out" || fail "length divergence: missing-event not reported"
 ok "length divergence → missing-event reported, exit 1"
 
 # ── (A4) an unreadable/invalid journal is INFRA (exit 2), never a silent green ────────────────────
@@ -117,7 +117,7 @@ cat > "$T/priv-shadow.jsonl" <<'EOF'
 EOF
 out="$(parity "$T/priv-real.jsonl" "$T/priv-shadow.jsonl" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] || fail "shadow-private frames were not filtered — stream diverged (rc=$rc): $out"
-printf '%s\n' "$out" | grep -q "shadow-private frame" || fail "OK line should note the filtered shadow-private frames"
+grep -q "shadow-private frame" <<< "$out" || fail "OK line should note the filtered shadow-private frames"
 # The real families survive the filter: dropping main_health from the shadow makes it DIVERGE.
 grep -v main_health "$T/priv-shadow.jsonl" > "$T/priv-shadow-nomh.jsonl"
 parity "$T/priv-real.jsonl" "$T/priv-shadow-nomh.jsonl" >/dev/null 2>&1; rc=$?
@@ -134,7 +134,7 @@ out="$(parity "$T/real.jsonl" "$T/align-shadow.jsonl" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] || fail "an inserted event should DIVERGE (exit 1), got $rc"
 ndiv="$(printf '%s\n' "$out" | sed -n 's/^  divergences: \([0-9]*\).*/\1/p')"
 [ "$ndiv" = "1" ] || fail "one inserted event must yield exactly ONE divergence (no positional cascade), got $ndiv"
-printf '%s\n' "$out" | grep -qi "MISSING from real" || fail "the lone insertion should read as MISSING from real"
+grep -qi "MISSING from real" <<< "$out" || fail "the lone insertion should read as MISSING from real"
 ok "alignment diff: a single inserted event is ONE divergence, not a cascade (leg 2)"
 
 # ── (A9) S2: the oracle folds bash's health_refix_bounce onto refix_bounce{rule=healthcheck} ──────
@@ -200,9 +200,9 @@ ok "S3: a semantic field's absolute path is NOT folded — a real location diver
 HERD_SIM_LOAD_RETRY_QUIET="${HERD_SIM_LOAD_RETRY_QUIET:-3}"   # quiet interval (s) before the one retry
 
 parity_leg_assert_green() {   # <artifacts-dir> <captured-output> — the green-path invariants
-  printf '%s\n' "$2" | grep -q "journal parity: OK" \
+grep -q "journal parity: OK" <<< "$(printf '%s\n' "$2")" \
     || fail "parity-run exited 0 but did not report journal parity OK"
-  printf '%s\n' "$2" | grep -q "scorecard:" \
+grep -q "scorecard:" <<< "$(printf '%s\n' "$2")" \
     || fail "parity-run did not read/surface the scorecard from file"
   [ -f "$1/scorecard.json" ] || fail "scenario scorecard.json missing after parity-run"
   [ -s "$1/journal-real.jsonl" ] || fail "parity-run collected an empty real journal"

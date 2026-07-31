@@ -61,7 +61,7 @@ for key in DRIVER_LIST_AGENTS DRIVER_FOCUS_AGENT DRIVER_SEND_TEXT DRIVER_SWITCH_
            DRIVER_START_AGENT DRIVER_CREATE_TAB DRIVER_READ_PANE DRIVER_SEND_KEYS; do
   grep -qE "^$key=" "$HEADLESS_DRIVER" || fail "headless.driver missing capability binding: $key"
 done
-if grep -E '^DRIVER_[A-Z_]+=' "$HEADLESS_DRIVER" | grep -qiE '/users/|/home/|secret|password|apikey'; then
+if grep -qiE '/users/|/home/|secret|password|apikey' <<< "$(grep -E '^DRIVER_[A-Z_]+=' "$HEADLESS_DRIVER")"; then
   fail "a headless.driver binding value leaks a secret or absolute path"
 fi
 ok; echo "PASS (0) headless.driver binds all 8 capabilities, zero-secret"
@@ -86,8 +86,8 @@ ok; echo "PASS (1) HERD_DRIVER=headless renders cleanly, headless incantations s
 # ── 2. Unknown driver error lists BOTH shipped drivers. ──────────────────────────────────────────
 U="$T/unknown"; mkdir -p "$U"; seed_repo "$U" 'HERD_DRIVER="vscode-copilot"'
 if out="$(render "$U" 2>&1)"; then fail "unknown driver render should have failed: $out"; fi
-echo "$out" | grep -q "herdr-claude" || fail "unknown-driver error did not list herdr-claude: $out"
-echo "$out" | grep -q "headless"     || fail "unknown-driver error did not list headless: $out"
+grep -q "herdr-claude" <<< "$out" || fail "unknown-driver error did not list herdr-claude: $out"
+grep -q "headless" <<< "$out" || fail "unknown-driver error did not list headless: $out"
 ok; echo "PASS (2) unknown driver → loud error listing herdr-claude AND headless"
 
 # ── 3. driver.sh under HERD_DRIVER=headless — fail-soft capabilities. ─────────────────────────────
@@ -100,15 +100,15 @@ ok; echo "PASS (2) unknown driver → loud error listing herdr-claude AND headle
 
   # list-agents: empty registry → an empty roster (never a broken parse).
   j="$(herd_driver_agent_list_json)"
-  echo "$j" | grep -qF '"agents":[]' || { echo "FAIL: empty registry not empty roster: $j"; exit 1; }
+grep -qF '"agents":[]' <<< "$j" || { echo "FAIL: empty registry not empty roster: $j"; exit 1; }
 
   # seed a LIVE agent (this test's pid) + a DEAD one (a pid that cannot exist).
   mkdir -p "$WORKTREES_DIR/.herd/agents/live" "$WORKTREES_DIR/.herd/agents/gone"
   echo $$ > "$WORKTREES_DIR/.herd/agents/live/pid"; echo working > "$WORKTREES_DIR/.herd/agents/live/status"
   echo 2147483646 > "$WORKTREES_DIR/.herd/agents/gone/pid"
   j="$(herd_driver_agent_list_json)"
-  echo "$j" | grep -qF '"name":"live"' || { echo "FAIL: live agent not listed: $j"; exit 1; }
-  echo "$j" | grep -qF '"name":"gone"' && { echo "FAIL: dead-pid agent WAS listed: $j"; exit 1; }
+grep -qF '"name":"live"' <<< "$j" || { echo "FAIL: live agent not listed: $j"; exit 1; }
+grep -qF '"name":"gone"' <<< "$j" && { echo "FAIL: dead-pid agent WAS listed: $j"; exit 1; }
 
   # notify: durable sink written, rc 0.
   herd_driver_notify "🐑 t" "the body" default || { echo "FAIL: notify rc"; exit 1; }
@@ -124,14 +124,14 @@ ok; echo "PASS (2) unknown driver → loud error listing herdr-claude AND headle
   # read-pane: empty on no log, tails a real log.
   [ -z "$(herd_driver_read_pane nosuch)" ] || { echo "FAIL: read-pane not empty for missing agent"; exit 1; }
   printf 'hello-log\n' > "$WORKTREES_DIR/.herd/agents/live/log"
-  herd_driver_read_pane live | grep -qF hello-log || { echo "FAIL: read-pane did not tail the log"; exit 1; }
+grep -qF hello-log <<< "$(herd_driver_read_pane live)" || { echo "FAIL: read-pane did not tail the log"; exit 1; }
 
   # send-text: queues to the input file.
   herd_driver_send_text live "wake up" || { echo "FAIL: send-text rc"; exit 1; }
   grep -qF "wake up" "$WORKTREES_DIR/.herd/agents/live/input" || { echo "FAIL: send-text not queued"; exit 1; }
 
   # focus: prints view guidance, rc 0.
-  herd_driver_focus_agent live | grep -qF "tail -f" || { echo "FAIL: focus did not print view guidance"; exit 1; }
+grep -qF "tail -f" <<< "$(herd_driver_focus_agent live)" || { echo "FAIL: focus did not print view guidance"; exit 1; }
   exit 0
 ) || fail "headless capability checks failed (see FAIL above)"
 ok; echo "PASS (3) headless driver: registry liveness, notify sink, no-ops, log tail — all fail-soft"

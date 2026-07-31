@@ -146,24 +146,24 @@ grep -qE 'pane-A.*Enter|Enter' "$SENDKEYS_LOG" \
   || fail "A: must send-keys Enter after typing the re-task (send-keys log: $(cat "$SENDKEYS_LOG"))"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "refixing" \
+grep -q "refixing" <<< "$d" \
   || fail "A: display should show 'refixing', not an escalation (got: $d)"
 ok
-printf '%s\n' "$d" | grep -q "auto-refix failed" \
+grep -q "auto-refix failed" <<< "$d" \
   && fail "A: a woken builder must NOT escalate to 'auto-refix failed' (got: $d)"
 ok
 refix_attempted "80" "sha-80" || fail "A: the refix bounce must be recorded"
 ok
 # The wake result must journal woke=1 / escalated=false and the done→working transition.
 wl="$(grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1)"
-printf '%s\n' "$wl" | grep -q '"woke":1' \
+grep -q '"woke":1' <<< "$wl" \
   || fail "A: refix_wake_result must record woke=1 (got: $wl)"
 ok
-printf '%s\n' "$wl" | grep -q '"escalated":"false"' \
+grep -q '"escalated":"false"' <<< "$wl" \
   || fail "A: refix_wake_result must record escalated=false (got: $wl)"
 ok
-printf '%s\n' "$wl" | grep -q '"agent_status_before":"done"' \
-  && printf '%s\n' "$wl" | grep -q '"agent_status_after":"working"' \
+grep -q '"agent_status_before":"done"' <<< "$wl" \
+  && grep -q '"agent_status_after":"working"' <<< "$wl" \
   || fail "A: refix_wake_result must record the done→working transition (got: $wl)"
 ok
 
@@ -184,7 +184,7 @@ grep -qE 'Enter' "$SENDKEYS_LOG" \
   || fail "B: delayed-wake path must still send-keys Enter (log: $(cat "$SENDKEYS_LOG"))"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "refixing" \
+grep -q "refixing" <<< "$d" \
   || fail "B: a delayed-but-successful wake should show 'refixing' (got: $d)"
 ok
 grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1 | grep -q '"woke":1' \
@@ -206,7 +206,7 @@ ok
   || fail "C: never-waking path must send-keys Enter twice (log: $(cat "$SENDKEYS_LOG"))"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "needs you · auto-refix failed" \
+grep -q "needs you · auto-refix failed" <<< "$d" \
   || fail "C: a submit that never wakes must escalate to 'needs you · auto-refix failed' (got: $d)"
 ok
 grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1 | grep -q '"woke":0' \

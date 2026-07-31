@@ -258,7 +258,7 @@ _retire_tail_ok "beef"      && fail "(16) a short hex-looking sibling segment mu
 : > "$TREES/.retire-anchor-sib-bling-0123456789abcdef0123456789abcdef01234567"
 files="$(_retire_ledger_files sib)"
 case "$files" in *sib-bling*) fail "(16) slug 'sib' must not own slug 'sib-bling' ledger files" ;; esac
-printf '%s' "$files" | grep -q 'retire-anchor-sib-0123' || fail "(16) slug 'sib' must own its own ledger file"
+grep -q 'retire-anchor-sib-0123' <<< "$files" || fail "(16) slug 'sib' must own its own ledger file"
 rm -f "$TREES/.retire-anchor-sib-"*
 ok
 
@@ -319,7 +319,7 @@ SLUGW=20; C_DIM=""; C_RED=""; C_BOLD=""; C_RESET=""
 row_r="$(_row_retirement "conv " conv retiring "tab,agent")"
 case "$row_r" in *"retiring…"*) : ;; *) fail "(15) a converging slug must read 'retiring…', got: $row_r" ;; esac
 case "$row_r" in *"tab,agent"*) : ;; *) fail "(15) …and name what is left, got: $row_r" ;; esac
-printf '%s' "$row_r" | grep -qw idle && fail "(15) retiring row leaked the banned 'idle' word"
+grep -qw idle <<< "$row_r" && fail "(15) retiring row leaked the banned 'idle' word"
 case "$row_r" in *"awaiting task"*) fail "(15) a merged builder must never read 'awaiting task'" ;; esac
 
 row_s="$(_row_retirement "stuck " stuck stuck agent)"
@@ -395,7 +395,7 @@ case "$d" in *"exist only on branch"*) : ;; *) fail "(18) evidence must name the
 git -C "$REPO" show-ref --verify --quiet refs/heads/feat/orphan-held \
   || fail "(18) a held orphan's branch must survive"
 # …and the hold stays DISCOVERABLE: `.retire-<slug>` is the last key leg C has once the ref is gone.
-printf '%s\n' "$(_retire_residual_slugs)" | grep -qxF orphan-held \
+grep -qxF orphan-held <<< "$(_retire_residual_slugs)" \
   || fail "(18) a held orphan must remain discoverable by leg C, or its red row goes silent forever"
 
 # A retiring orphan whose branch adds nothing must REAP that branch. This record carries an empty <pr>
@@ -447,7 +447,7 @@ for f in "${pr_files[@]}"; do : > "$f"; done
 # …nor may they manufacture a phantom slug for leg C to tear down.
 res="$(_retire_residual_slugs)"
 for phantom in 312 312-abc1234def5678 main-abc1234def5678; do
-  printf '%s\n' "$res" | grep -qxF "$phantom" \
+grep -qxF "$phantom" <<< "$res" \
     && fail "(19) leg C manufactured the phantom slug '$phantom' from a live PR's ledger"
 done
 # …and a full tick leaves every one of them on disk.

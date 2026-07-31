@@ -79,14 +79,14 @@ bash "$HERD" fleet register "$ALPHA" >/dev/null
 out="$(bash "$HERD" fleet digest)"
 alpha_block="$(printf '%s' "$out" | awk '/^alpha$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
 ship_line="$(printf '%s' "$alpha_block" | grep -E 'shipped:')"
-printf '%s' "$ship_line" | grep -q '#343' || fail "digest: externally-merged #343 must be shipped, got: $alpha_block"
+grep -q '#343' <<< "$ship_line" || fail "digest: externally-merged #343 must be shipped, got: $alpha_block"
 block_line="$(printf '%s' "$alpha_block" | grep -E 'blocked:')"
-printf '%s' "$block_line" | grep -q '#343' && fail "digest: #343 must NOT be listed blocked (retire_converged is terminal)"
+grep -q '#343' <<< "$block_line" && fail "digest: #343 must NOT be listed blocked (retire_converged is terminal)"
 ok
 
 # ── 2. DIGEST: a genuinely-blocked control PR (#12, no retire_converged) stays blocked ─────────
-printf '%s' "$block_line" | grep -q '#12'  || fail "digest: #12 (BLOCK, never converged) must remain blocked"
-printf '%s' "$ship_line"  | grep -q '#12'  && fail "digest: #12 must NOT be shipped (no retire_converged)"
+grep -q '#12' <<< "$block_line" || fail "digest: #12 (BLOCK, never converged) must remain blocked"
+grep -q '#12' <<< "$ship_line" && fail "digest: #12 must NOT be shipped (no retire_converged)"
 ok
 
 # ── 3. INBOX with gh DOWN (fail-open): #343's stale BLOCK is cleared by retire_converged ───────
@@ -94,11 +94,11 @@ ok
 # clears #343. Without the reducer fix the stale BLOCK would surface here.
 out_i="$(FAKE_GH_FAIL=1 bash "$HERD" fleet inbox)"
 alpha_i="$(printf '%s' "$out_i" | awk '/^alpha$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$alpha_i" | grep -q '#343' && fail "inbox (gh down): externally-merged #343 must not surface as blocked"
+grep -q '#343' <<< "$alpha_i" && fail "inbox (gh down): externally-merged #343 must not surface as blocked"
 ok
 
 # ── 4. INBOX with gh DOWN: the genuinely-blocked control #12 STILL surfaces ────────────────────
-printf '%s' "$alpha_i" | grep -q '#12' || fail "inbox (gh down): genuinely-blocked #12 must still surface, got: $alpha_i"
+grep -q '#12' <<< "$alpha_i" || fail "inbox (gh down): genuinely-blocked #12 must still surface, got: $alpha_i"
 printf '%s' "$alpha_i" | grep '#12' | grep -qi 'BLOCK' || fail "inbox: #12 should be labelled a review BLOCK"
 ok
 

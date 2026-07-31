@@ -79,10 +79,10 @@ grep -qE '^PROJECT_ARCHETYPE="research-lab"$' "$proj1/.herd/config" || fail "(1)
 grep -qE '^MERGE_POLICY="observe"$' "$proj1/.herd/config" || fail "(1) posture flag not applied"
 
 committed="$(git -C "$proj1" ls-files)"
-echo "$committed" | grep -qx ".herd/config" || fail "(1) .herd/config not committed: $committed"
-echo "$committed" | grep -qx ".gitignore" || fail "(1) .gitignore not committed: $committed"
-echo "$committed" | grep -q "secrets" && fail "(1) LEAK: .herd/secrets committed: $committed"
-echo "$committed" | grep -q "config.local" && fail "(1) LEAK: .herd/config.local committed: $committed"
+grep -qx ".herd/config" <<< "$committed" || fail "(1) .herd/config not committed: $committed"
+grep -qx ".gitignore" <<< "$committed" || fail "(1) .gitignore not committed: $committed"
+grep -q "secrets" <<< "$committed" && fail "(1) LEAK: .herd/secrets committed: $committed"
+grep -q "config.local" <<< "$committed" && fail "(1) LEAK: .herd/config.local committed: $committed"
 grep -qxF ".herd/secrets" "$proj1/.gitignore" || fail "(1) .herd/secrets not gitignored: $(cat "$proj1/.gitignore")"
 grep -qxF ".herd/config.local" "$proj1/.gitignore" || fail "(1) .herd/config.local not gitignored: $(cat "$proj1/.gitignore")"
 [ -z "$(git -C "$proj1" remote)" ] || fail "(1) --no-remote should leave no git remote: $(git -C "$proj1" remote -v)"
@@ -104,9 +104,9 @@ out="$(env "${COMMON_ENV[@]}" HERD_FLEET_FILE="$HERD_FLEET_FILE" HOME="$HOME" \
 rc=$?
 [ "$rc" -eq 0 ] || fail "(2) fleet new failed (rc=$rc): $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -qi "no --archetype/--posture flags and no tty" \
+grep -qi "no --archetype/--posture flags and no tty" <<< "$pout" \
   || fail "(2) missing the loud no-flags-no-tty banner: $out"
-echo "$pout" | grep -qi "archetype=code posture=solo-auto" \
+grep -qi "archetype=code posture=solo-auto" <<< "$pout" \
   || fail "(2) banner should name the defaults it is applying: $out"
 grep -qE '^PROJECT_ARCHETYPE="code"$' "$proj2/.herd/config" || fail "(2) default archetype not applied"
 grep -qE '^MERGE_POLICY="auto"$' "$proj2/.herd/config" || fail "(2) default posture (solo-auto) not applied"
@@ -140,12 +140,12 @@ out="$(env "${COMMON_ENV[@]}" HERD_FLEET_FILE="$HERD_FLEET_FILE" HOME="$HOME" \
 rc=$?
 [ "$rc" -eq 0 ] || fail "(3) fleet new failed (rc=$rc): $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -qi "gh repo create: acmeuser/moneybet-3" \
+grep -qi "gh repo create: acmeuser/moneybet-3" <<< "$pout" \
   || fail "(3) should announce the created repo: $out"
 remote_url="$(git -C "$proj3" remote get-url origin 2>/dev/null || true)"
 [ -n "$remote_url" ] || fail "(3) origin remote not set"
 # The bare repo should now have the pushed branch.
-git --git-dir="$BARE" log --oneline 2>/dev/null | grep -q . \
+grep -q . <<< "$(git --git-dir="$BARE" log --oneline 2>/dev/null)" \
   || fail "(3) push did not land any commits in the bare remote"
 # The registry's repo field is resolved from the git remote's OWN URL (fleet_register's identity
 # rule — issue #128), not gh's "acmeuser/moneybet-3" slug; our stand-in remote is a local bare repo
@@ -167,7 +167,7 @@ out="$(env "${COMMON_ENV[@]}" HERD_FLEET_FILE="$HERD_FLEET_FILE" HOME="$HOME" HE
         bash "$HERD" fleet new "$proj4" --archetype code --posture solo-auto < /dev/null 2>&1)"
 rc=$?
 [ "$rc" -eq 0 ] || fail "(4) fleet new should degrade cleanly, not fail (rc=$rc): $out"
-echo "$out" | grep -qi "gh CLI not found" || fail "(4) missing the loud gh-not-found warning: $out"
+grep -qi "gh CLI not found" <<< "$out" || fail "(4) missing the loud gh-not-found warning: $out"
 [ -z "$(git -C "$proj4" remote 2>/dev/null)" ] || fail "(4) no remote should have been created"
 [ -f "$proj4/.herd/config" ] || fail "(4) project should still be fully spun up despite no gh"
 grep -qF "moneybet-4|$proj4|" "$HERD_FLEET_FILE" || fail "(4) project should still be registered despite no gh"
@@ -179,7 +179,7 @@ out="$(env "${COMMON_ENV[@]}" HERD_FLEET_FILE="$HERD_FLEET_FILE" HOME="$HOME" \
         bash "$HERD" fleet new "$proj5" --archetype totally-bogus < /dev/null 2>&1)"
 rc=$?
 [ "$rc" -ne 0 ] || fail "(5) unknown --archetype should refuse: $out"
-echo "$out" | grep -qi "unknown --archetype" || fail "(5) should name the bad flag: $out"
+grep -qi "unknown --archetype" <<< "$out" || fail "(5) should name the bad flag: $out"
 [ -e "$proj5" ] && fail "(5) no directory should be created when the archetype flag is rejected"
 ok
 

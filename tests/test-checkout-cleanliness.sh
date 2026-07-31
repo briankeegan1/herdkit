@@ -246,11 +246,11 @@ ok
 
 # ── (B2) the baseline leg actually RAN (inherited-failure downgrade), proving the sandbox executed ─
 #         the suite — otherwise (B1) would pass vacuously by never touching the base at all.
-printf '%s\n' "$OUT" | grep -q "INHERITED BASE FAILURE" \
+grep -q "INHERITED BASE FAILURE" <<< "$OUT" \
   || fail "(B2) the sandboxed base suite must have run and downgraded the inherited failure — $OUT"
 [ "$BRC" -eq 0 ] || fail "(B2) an inherited-only failure must PASS the gate (exit 0), got $BRC — $OUT"
 # And no sandbox worktree was leaked into the shared checkout's registry.
-git -C "$BMAIN" worktree list 2>/dev/null | grep -q '/base' \
+grep -q '/base' <<< "$(git -C "$BMAIN" worktree list 2>/dev/null)" \
   && fail "(B2) the disposable base worktree was not cleaned up — $(git -C "$BMAIN" worktree list)"
 ok
 

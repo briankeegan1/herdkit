@@ -37,21 +37,21 @@ echo HERD_BRANCH_NAME=\$HERD_BRANCH_NAME" )
 
 # 1. Fallback defaults — point HERD_CONFIG_FILE at a nonexistent file so the loader uses defaults.
 out="$(load_vars "$T/.nonexistent")"
-echo "$out" | grep -qx "SCRIBE_BACKEND=file"            || fail "default SCRIBE_BACKEND wrong ($out)"
-echo "$out" | grep -qx "BACKLOG_FILE=BACKLOG.md"        || fail "default BACKLOG_FILE wrong"
+grep -qx "SCRIBE_BACKEND=file" <<< "$out" || fail "default SCRIBE_BACKEND wrong ($out)"
+grep -qx "BACKLOG_FILE=BACKLOG.md" <<< "$out" || fail "default BACKLOG_FILE wrong"
 # Eco-leaning starter fallbacks (HERD-161): Opus is an escalation tier, not a bare default.
-echo "$out" | grep -qx "MODEL_FEATURE=claude-sonnet-4-6" || fail "default MODEL_FEATURE wrong"
-echo "$out" | grep -qx "MODEL_QUICK=claude-haiku-4-5"    || fail "default MODEL_QUICK wrong"
-echo "$out" | grep -qx "MODEL_REVIEW=claude-sonnet-4-6"  || fail "default MODEL_REVIEW wrong"
-echo "$out" | grep -qx "WATCHER_AUTOMERGE=true"         || fail "default WATCHER_AUTOMERGE wrong"
-echo "$out" | grep -qx "HERD_VERSION=1"                 || fail "default HERD_VERSION wrong"
-echo "$out" | grep -qx "COORDINATOR_CMD=/coordinator"   || fail "default COORDINATOR_CMD wrong"
-echo "$out" | grep -qx "DEFAULT_BRANCH=origin/main"     || fail "default DEFAULT_BRANCH wrong"
-echo "$out" | grep -qx "HERD_REMOTE=origin"             || fail "default HERD_REMOTE not derived"
-echo "$out" | grep -qx "HERD_BRANCH_NAME=main"          || fail "default HERD_BRANCH_NAME not derived"
-echo "$out" | grep -q  "WORKSPACE_NAME="                || fail "WORKSPACE_NAME not set"
+grep -qx "MODEL_FEATURE=claude-sonnet-4-6" <<< "$out" || fail "default MODEL_FEATURE wrong"
+grep -qx "MODEL_QUICK=claude-haiku-4-5" <<< "$out" || fail "default MODEL_QUICK wrong"
+grep -qx "MODEL_REVIEW=claude-sonnet-4-6" <<< "$out" || fail "default MODEL_REVIEW wrong"
+grep -qx "WATCHER_AUTOMERGE=true" <<< "$out" || fail "default WATCHER_AUTOMERGE wrong"
+grep -qx "HERD_VERSION=1" <<< "$out" || fail "default HERD_VERSION wrong"
+grep -qx "COORDINATOR_CMD=/coordinator" <<< "$out" || fail "default COORDINATOR_CMD wrong"
+grep -qx "DEFAULT_BRANCH=origin/main" <<< "$out" || fail "default DEFAULT_BRANCH wrong"
+grep -qx "HERD_REMOTE=origin" <<< "$out" || fail "default HERD_REMOTE not derived"
+grep -qx "HERD_BRANCH_NAME=main" <<< "$out" || fail "default HERD_BRANCH_NAME not derived"
+grep -q  "WORKSPACE_NAME=" <<< "$out" || fail "WORKSPACE_NAME not set"
 # Defaults must NOT leak any single-consumer literal.
-echo "$out" | grep -qi "northstar" && fail "default config leaked a 'northstar' literal" || true
+grep -qi "northstar" <<< "$out" && fail "default config leaked a 'northstar' literal" || true
 
 # 2. Config file override.
 mkdir -p "$T/.herd"
@@ -68,14 +68,14 @@ COORDINATOR_CMD="/run-the-herd"
 HERD_VERSION=1
 EOF
 out2="$(load_vars "$T/.herd/config")"
-echo "$out2" | grep -qx "DEFAULT_BRANCH=upstream/develop"  || fail "config DEFAULT_BRANCH not loaded ($out2)"
-echo "$out2" | grep -qx "WORKSPACE_NAME=myapp"             || fail "config WORKSPACE_NAME not loaded"
-echo "$out2" | grep -qx "MODEL_FEATURE=claude-sonnet-4-6"  || fail "config MODEL_FEATURE not loaded"
-echo "$out2" | grep -qx "BACKLOG_FILE=TODO.md"             || fail "config BACKLOG_FILE not loaded"
-echo "$out2" | grep -qx "SCRIBE_BACKEND=changelog"         || fail "config SCRIBE_BACKEND not loaded"
-echo "$out2" | grep -qx "WATCHER_AUTOMERGE=false"          || fail "config WATCHER_AUTOMERGE not loaded"
-echo "$out2" | grep -qx "COORDINATOR_CMD=/run-the-herd"    || fail "config COORDINATOR_CMD not loaded"
-echo "$out2" | grep -qx "HERD_REMOTE=upstream"             || fail "HERD_REMOTE not derived from config ($out2)"
-echo "$out2" | grep -qx "HERD_BRANCH_NAME=develop"         || fail "HERD_BRANCH_NAME not derived from config"
+grep -qx "DEFAULT_BRANCH=upstream/develop" <<< "$out2" || fail "config DEFAULT_BRANCH not loaded ($out2)"
+grep -qx "WORKSPACE_NAME=myapp" <<< "$out2" || fail "config WORKSPACE_NAME not loaded"
+grep -qx "MODEL_FEATURE=claude-sonnet-4-6" <<< "$out2" || fail "config MODEL_FEATURE not loaded"
+grep -qx "BACKLOG_FILE=TODO.md" <<< "$out2" || fail "config BACKLOG_FILE not loaded"
+grep -qx "SCRIBE_BACKEND=changelog" <<< "$out2" || fail "config SCRIBE_BACKEND not loaded"
+grep -qx "WATCHER_AUTOMERGE=false" <<< "$out2" || fail "config WATCHER_AUTOMERGE not loaded"
+grep -qx "COORDINATOR_CMD=/run-the-herd" <<< "$out2" || fail "config COORDINATOR_CMD not loaded"
+grep -qx "HERD_REMOTE=upstream" <<< "$out2" || fail "HERD_REMOTE not derived from config ($out2)"
+grep -qx "HERD_BRANCH_NAME=develop" <<< "$out2" || fail "HERD_BRANCH_NAME not derived from config"
 
 echo "ALL PASS"

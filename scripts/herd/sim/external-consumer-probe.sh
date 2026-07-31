@@ -91,7 +91,7 @@ cp "$FIXTURE/internal/greet/greet.go" "$ARTIFACTS/greet.go.orig"
 printf '\nfunc broken( {  // deliberate Go syntax error\n' >> "$FIXTURE/internal/greet/greet.go"
 LIGHT_OUT="$(HERD_CONFIG_FILE=/dev/null bash "$HEALTHCHECK" "$FIXTURE" --oneline 2>&1)"; LIGHT_RC=$?
 cp "$ARTIFACTS/greet.go.orig" "$FIXTURE/internal/greet/greet.go"   # restore fixture
-if [ "$LIGHT_RC" -eq 0 ] && printf '%s' "$LIGHT_OUT" | grep -q '✅'; then
+if [ "$LIGHT_RC" -eq 0 ] && grep -q '✅' <<< "$LIGHT_OUT"; then
   record "light-profile-ignores-go" "leak" \
     "broken .go passed the light healthcheck as a confident clean '$LIGHT_OUT' (exit 0) — silent-green (healthcheck.sh run_light)"
 else
@@ -100,7 +100,7 @@ fi
 
 # ── PROBE 3: the seeded ^app/ heavy/surface globs never match a Go layout ──
 GO_PATHS=$'cmd/greetd/main.go\ninternal/greet/greet.go'
-if printf '%s\n' "$GO_PATHS" | grep -qE '^app/'; then
+if grep -qE '^app/' <<< "$GO_PATHS"; then
   record "app-glob-mismatch" "clean" "^app/ matched a Go path (unexpected)"
 else
   record "app-glob-mismatch" "leak" \

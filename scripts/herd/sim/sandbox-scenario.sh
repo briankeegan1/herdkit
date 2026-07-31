@@ -381,9 +381,9 @@ BROKEN
      && grep -q '"failed":"app/greet.test.sh"' "$JN_C" 2>/dev/null \
      && grep -Eq '"since":"?226"?' "$JN_C" 2>/dev/null \
      && [ -s "$(_mh_state "$TR_CD")" ] \
-     && printf '%s' "$ROW_C" | grep -q 'MAIN RED' \
-     && printf '%s' "$ROW_C" | grep -q 'app/greet.test.sh' \
-     && printf '%s' "$ROW_C" | grep -q 'since #226'; then
+     && grep -q 'MAIN RED' <<< "$ROW_C" \
+     && grep -q 'app/greet.test.sh' <<< "$ROW_C" \
+     && grep -q 'since #226' <<< "$ROW_C"; then
     checkpoint main_health_red pass "broken main → red journal + state + row: ${ROW_C}"
   else
     checkpoint main_health_red fail "broken main did NOT raise the alarm (row='$ROW_C')"
@@ -421,7 +421,7 @@ BROKEN
   MH_E="$ART/mh-e"; TR_E="$ART/tr-e"; JN_E="$ART/jn-e.jsonl"; mkdir -p "$TR_E"; : > "$JN_E"
   sandbox_fixture_build "$MH_E" >/dev/null 2>&1 && mh_break "$MH_E" >/dev/null 2>&1 && mh_docs_commit "$MH_E" >/dev/null 2>&1
   ROW_E="$(mh_drive "$MH_E" "$TR_E" "$JN_E" 300 on)"
-  if _mh_has_result "$JN_E" red && [ -s "$(_mh_state "$TR_E")" ] && printf '%s' "$ROW_E" | grep -q 'MAIN RED'; then
+  if _mh_has_result "$JN_E" red && [ -s "$(_mh_state "$TR_E")" ] && grep -q 'MAIN RED' <<< "$ROW_E"; then
     checkpoint main_health_nonheavy_red pass "a docs-only (non-heavy-glob) merge on a broken main still runs the full suite and reds — not a vacuous light green"
   else
     checkpoint main_health_nonheavy_red fail "non-heavy merge on a broken main did NOT red (would falsely clear a real MAIN RED); row='$ROW_E'"
@@ -495,7 +495,7 @@ XSJSON
   XS_HELD="$(xs_drive "$XS/held.json")"
   _xs_get() { printf '%s\n' "$1" | grep "^$2=" | head -1 | cut -d= -f2- ; }
   if [ "$(_xs_get "$XS_HELD" STANDING)" = "yes" ] && [ "$(_xs_get "$XS_HELD" SEAT)" = "seat-a" ] \
-     && printf '%s' "$XS_HELD" | grep -q 'cross-seat BLOCK · needs reconcile'; then
+     && grep -q 'cross-seat BLOCK · needs reconcile' <<< "$XS_HELD"; then
     checkpoint cross_seat_block_held pass "our PASS did NOT overwrite seat-a's standing BLOCK: scenario ends HELD with the reconcile row"
   else
     checkpoint cross_seat_block_held fail "a standing foreign BLOCK was not honored (report: $(printf '%s' "$XS_HELD" | tr '\n' ' '))"
@@ -598,7 +598,7 @@ RPSTUB
   rp_runtime stub-agent 'REVIEW: BLOCK — rule: off-by-one | why: overshoots the last row | location: app/greet.sh:3'
   RP_B="$(rp_drive b "bare-model stub:stub-model" any-block)"
   if [ "$(_rp_rc "$RP_B")" = "1" ] \
-     && printf '%s' "$(_rp_line "$RP_B")" | grep -q '^REVIEW: BLOCK — rule: off-by-one'; then
+     && grep -q '^REVIEW: BLOCK — rule: off-by-one' <<< "$(_rp_line "$RP_B")"; then
     checkpoint review_panel_vendor_block pass "a lone dissenting vendor's structured BLOCK gated the merge (exit 1) and survived the fold"
   else
     checkpoint review_panel_vendor_block fail "a vendor BLOCK did not gate the merge (rc=$(_rp_rc "$RP_B") line='$(_rp_line "$RP_B")')"
@@ -612,8 +612,8 @@ RPSTUB
   rm -f "$RP/bin/stub-agent"
   RP_C="$(rp_drive c "bare-model stub:stub-model" all-pass)"
   _rp_line_c="$(_rp_line "$RP_C")"
-  if [ "$(_rp_rc "$RP_C")" = "2" ] && printf '%s' "$_rp_line_c" | grep -q '^REVIEW: INFRA-FAIL' \
-     && ! printf '%s' "$_rp_line_c" | grep -q 'BLOCK'; then
+  if [ "$(_rp_rc "$RP_C")" = "2" ] && grep -q '^REVIEW: INFRA-FAIL' <<< "$_rp_line_c" \
+     && ! grep -q 'BLOCK' <<< "$_rp_line_c"; then
     checkpoint review_panel_missing_binary_infra pass "an absent vendor binary folded to INFRA-FAIL (retry), never a BLOCK — under all-pass a clean co-panelist cannot mask the gap"
   else
     checkpoint review_panel_missing_binary_infra fail "an absent vendor binary did not fold to a BLOCK-free INFRA-FAIL (rc=$(_rp_rc "$RP_C") line='$_rp_line_c')"
@@ -763,7 +763,7 @@ PRCMD
 
   # (B) LIST surfaces the pre-PR hold with the worktree path (what the human reviews).
   PG_LIST="$(pg_env "$PG_REPO" bash "$PG_ENGINE/herd-approve.sh" list 2>/dev/null || true)"
-  if printf '%s' "$PG_LIST" | grep -q 'pg-demo' && printf '%s' "$PG_LIST" | grep -q "$PG_REPO"; then
+  if grep -q 'pg-demo' <<< "$PG_LIST" && grep -q "$PG_REPO" <<< "$PG_LIST"; then
     checkpoint push_gate_listed pass "herd-approve.sh list shows the pre-PR hold + worktree path"
   else
     checkpoint push_gate_listed fail "herd-approve.sh list did not surface the push-hold"
@@ -859,9 +859,9 @@ else
 
   # (B) LIST surfaces the step-hold with the worktree path (what the human reviews).
   ST_LIST="$(st_env bash "$ST_ENGINE/herd-approve.sh" list 2>/dev/null || true)"
-  if printf '%s' "$ST_LIST" | grep -q 'demo-steps' \
-     && printf '%s' "$ST_LIST" | grep -q 'peer-review' \
-     && printf '%s' "$ST_LIST" | grep -q "$ST_REPO"; then
+  if grep -q 'demo-steps' <<< "$ST_LIST" \
+     && grep -q 'peer-review' <<< "$ST_LIST" \
+     && grep -q "$ST_REPO" <<< "$ST_LIST"; then
     checkpoint pipeline_steps_listed pass "herd-approve.sh list shows the step-hold (step + worktree path)"
   else
     checkpoint pipeline_steps_listed fail "herd-approve.sh list did not surface the step-hold"
@@ -873,7 +873,7 @@ else
   ST_LIST2="$(st_env bash "$ST_ENGINE/herd-approve.sh" list 2>/dev/null || true)"
   if grep -q "released demo-steps" "$_st_hold" 2>/dev/null \
      && grep -q '"name":"doc-pass".*"kind":"skill".*"outcome":"pass"' "$ST_JN" 2>/dev/null \
-     && ! printf '%s' "$ST_LIST2" | grep -q 'demo-steps'; then
+     && ! grep -q 'demo-steps' <<< "$ST_LIST2"; then
     checkpoint pipeline_steps_released pass "approve released the hold and resumed: skill step ran, hold cleared"
   else
     checkpoint pipeline_steps_released fail "approve did not release + resume the pipeline (skill step / released record missing)"

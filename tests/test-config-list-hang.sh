@@ -58,16 +58,16 @@ rows="$(printf '%s\n' "$OUT" | grep -cE '^\s+[A-Za-z_][A-Za-z0-9_]*\s')"
 [ "$rows" -eq "$TOTAL_KEYS" ] || fail "(1) printed $rows rows, expected all $TOTAL_KEYS keys — truncated/hung? OUT:
 $OUT"
 # Spot-check first and LAST key both present (a truncating hang would drop the tail).
-printf '%s\n' "$OUT" | grep -qE 'HERD_VERSION[[:space:]]+1[[:space:]]+\[baseline\]' || fail "(1) first key missing"
-printf '%s\n' "$OUT" | grep -qE 'K59[[:space:]]+v59[[:space:]]+\[baseline\]'        || fail "(1) LAST key missing — output was truncated"
+grep -qE 'HERD_VERSION[[:space:]]+1[[:space:]]+\[baseline\]' <<< "$OUT" || fail "(1) first key missing"
+grep -qE 'K59[[:space:]]+v59[[:space:]]+\[baseline\]' <<< "$OUT" || fail "(1) LAST key missing — output was truncated"
 okp
 
 # ── 2. Masked secrets in baseline context ─────────────────────────────────────
-printf '%s\n' "$OUT" | grep -qE 'MY_API_TOKEN[[:space:]]+\*{8}[[:space:]]+\[baseline\]' \
+grep -qE 'MY_API_TOKEN[[:space:]]+\*{8}[[:space:]]+\[baseline\]' <<< "$OUT" \
   || fail "(2) secret-shaped MY_API_TOKEN not masked in baseline ($OUT)"
-printf '%s\n' "$OUT" | grep -qE 'DEPLOY_KEY[[:space:]]+\*{8}[[:space:]]+\[baseline\]' \
+grep -qE 'DEPLOY_KEY[[:space:]]+\*{8}[[:space:]]+\[baseline\]' <<< "$OUT" \
   || fail "(2) secret-shaped DEPLOY_KEY not masked in baseline ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'raw-token-value' && fail "(2) raw secret value leaked into output"
+grep -q 'raw-token-value' <<< "$OUT" && fail "(2) raw secret value leaked into output"
 okp
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -82,22 +82,22 @@ CFG
 run "$P" config list
 [ "$RC" -eq 0 ] || fail "(3) config list with overlay did not exit 0 (rc=$RC): $OUT"
 # Header notes the overlay.
-printf '%s\n' "$OUT" | grep -q 'config.local overlay' || fail "(3) header did not note the overlay ($OUT)"
+grep -q 'config.local overlay' <<< "$OUT" || fail "(3) header did not note the overlay ($OUT)"
 # A baseline-only key stays [baseline].
-printf '%s\n' "$OUT" | grep -qE 'WORKSPACE_NAME[[:space:]]+baselinews[[:space:]]+\[baseline\]' \
+grep -qE 'WORKSPACE_NAME[[:space:]]+baselinews[[:space:]]+\[baseline\]' <<< "$OUT" \
   || fail "(3) baseline key lost [baseline] provenance ($OUT)"
 # An overridden key shows the LOCAL value tagged [local].
-printf '%s\n' "$OUT" | grep -qE 'SCRIBE_BACKEND[[:space:]]+github[[:space:]]+\[local\]' \
+grep -qE 'SCRIBE_BACKEND[[:space:]]+github[[:space:]]+\[local\]' <<< "$OUT" \
   || fail "(3) override did not show [local]/local value ($OUT)"
 # A key present ONLY in the overlay is [local-only].
-printf '%s\n' "$OUT" | grep -qE 'MY_LOCAL_ONLY[[:space:]]+hello[[:space:]]+\[local-only\]' \
+grep -qE 'MY_LOCAL_ONLY[[:space:]]+hello[[:space:]]+\[local-only\]' <<< "$OUT" \
   || fail "(3) local-only key missing [local-only] provenance ($OUT)"
 # A secret-shaped local-only key is masked.
-printf '%s\n' "$OUT" | grep -qE 'OVERLAY_PASSWORD[[:space:]]+\*{8}[[:space:]]+\[local-only\]' \
+grep -qE 'OVERLAY_PASSWORD[[:space:]]+\*{8}[[:space:]]+\[local-only\]' <<< "$OUT" \
   || fail "(3) secret-shaped local-only key not masked ($OUT)"
-printf '%s\n' "$OUT" | grep -q 's3kret' && fail "(3) raw overlay secret leaked into output"
+grep -q 's3kret' <<< "$OUT" && fail "(3) raw overlay secret leaked into output"
 # Baseline order is still respected AND all baseline keys plus the one local-only key are present.
-printf '%s\n' "$OUT" | grep -qE 'K59[[:space:]]+v59[[:space:]]+\[baseline\]' || fail "(3) tail key missing with overlay"
+grep -qE 'K59[[:space:]]+v59[[:space:]]+\[baseline\]' <<< "$OUT" || fail "(3) tail key missing with overlay"
 okp
 
 # ══════════════════════════════════════════════════════════════════════════════

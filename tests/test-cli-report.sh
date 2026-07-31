@@ -70,9 +70,9 @@ printf '%s' '[{"number":12,"title":"[widgets] scribe lane drops the receipt some
 out="$(run_report 2>&1)" || fail "report (dup) should hold cleanly (exit 0), got non-zero: $out"
 grep -q -- "issue create" "$GHLOG" \
   && fail "report filed a likely-dup in non-interactive mode (should HOLD) — ($out)"
-echo "$out" | grep -qi "duplicate" || fail "report did not surface the duplicate candidate(s) — ($out)"
-echo "$out" | grep -q "HERD_REPORT_FORCE=1" || fail "report did not hint at HERD_REPORT_FORCE=1 — ($out)"
-echo "$out" | grep -q "scribe lane drops the receipt sometimes" \
+grep -qi "duplicate" <<< "$out" || fail "report did not surface the duplicate candidate(s) — ($out)"
+grep -q "HERD_REPORT_FORCE=1" <<< "$out" || fail "report did not hint at HERD_REPORT_FORCE=1 — ($out)"
+grep -q "scribe lane drops the receipt sometimes" <<< "$out" \
   || fail "report did not print the matching open candidate — ($out)"
 pass
 

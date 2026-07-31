@@ -211,13 +211,13 @@ rm -f "$T/trees/spawn-queue"/*
 printf '%s %s held-slug feature dep-x\n' "int-old" "$(( now - 10000 ))" > "$SPAWN_HELD_STATE"
 : > "$T/trees/spawn-queue/int-old.req"
 holds="$(run_holds 1)"
-printf '%s' "$holds" | grep -q "stalled" || fail "an over-TTL hold must render a 'stalled' row ($holds)"
-printf '%s' "$holds" | grep -q "<RED>"  || fail "a stalled hold must be LOUD (red) ($holds)"
-printf '%s' "$holds" | grep -q "after dep-x" || fail "the hold row must name the dependency"
+grep -q "stalled" <<< "$holds" || fail "an over-TTL hold must render a 'stalled' row ($holds)"
+grep -q "<RED>" <<< "$holds" || fail "a stalled hold must be LOUD (red) ($holds)"
+grep -q "after dep-x" <<< "$holds" || fail "the hold row must name the dependency"
 # Same hold under a generous TTL → calm 'waiting', not stalled.
 holds="$(run_holds 86400)"
-printf '%s' "$holds" | grep -q "waiting" || fail "an under-TTL hold must render a calm 'waiting' row ($holds)"
-printf '%s' "$holds" | grep -q "stalled" && fail "an under-TTL hold must NOT be stalled ($holds)"
+grep -q "waiting" <<< "$holds" || fail "an under-TTL hold must render a calm 'waiting' row ($holds)"
+grep -q "stalled" <<< "$holds" && fail "an under-TTL hold must NOT be stalled ($holds)"
 # GC: a held row whose intent has vanished (operator cleared the .req) is pruned from the ledger.
 rm -f "$T/trees/spawn-queue/int-old.req"
 holds="$(run_holds 1)"
@@ -255,7 +255,7 @@ run_drain   # must return; on the buggy code the safety cap trips and the assert
 grep -q "herd-feature.sh slug-aged" "$LANELOG" && fail "an aged, dependency-held intent must NOT spawn while its dep is unmerged"
 ls "$T/trees/spawn-queue"/*.req >/dev/null 2>&1 || fail "aged held intent should be released back to .req at tick end"
 ls "$T/trees/spawn-queue"/*.after >/dev/null 2>&1 || fail "aged held intent lost its .after sidecar — the dependency hold would be dropped"
-find "$T/trees/spawn-queue" -name '*.req' -mmin +5 | grep -q . && fail "released intent is still >5min stale — the claim/release touch did not restart the stale clock"
+grep -q . <<< "$(find "$T/trees/spawn-queue" -name '*.req' -mmin +5)" && fail "released intent is still >5min stale — the claim/release touch did not restart the stale clock"
 grep -q "spawn_held slug slug-aged lane feature after dep-unmerged" "$JLOG" || fail "aged held intent should journal spawn_held once ($(cat "$JLOG"))"
 # Restore the shared not-merged gh stub for any later cases.
 cat > "$BIN/gh" <<'GH'

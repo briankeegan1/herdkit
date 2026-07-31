@@ -65,7 +65,7 @@ run_note() {
 # A single-line (already flattened) >300-char note with a UNIQUE tail the 300-char cap would DROP.
 LONG="HEAD-$(python3 -c 'import sys; sys.stdout.write("y"*400)')-UNIQUETAIL298"
 out="$(run_note "$LONG")" || fail "herd note (long) exited non-zero: $out"
-echo "$out" | grep -q "noted" || fail "herd note should confirm (got: $out)"
+grep -q "noted" <<< "$out" || fail "herd note should confirm (got: $out)"
 ok
 
 # The capped journal line is present and TRUNCATED (tail gone), and carries a note_full path.
@@ -115,8 +115,8 @@ show_out="$(
   NO_COLOR=1 \
   bash "$HERD_BIN" notes show 1 2>&1
 )" || fail "herd notes show 1 exited non-zero: $show_out"
-printf '%s' "$show_out" | grep -qF "UNIQUETAIL298" || fail "show must restore the dropped tail (got: $show_out)"
-printf '%s' "$show_out" | grep -qF "$LONG" || fail "show must print the FULL note losslessly"
+grep -qF "UNIQUETAIL298" <<< "$show_out" || fail "show must restore the dropped tail (got: $show_out)"
+grep -qF "$LONG" <<< "$show_out" || fail "show must print the FULL note losslessly"
 ok
 
 # ── (b) a sub-cap note writes NO sidecar and a byte-identical journal line (no note_full) ─────────
@@ -146,7 +146,7 @@ else
   : > "$TREES/.builder-notes-full"
   LONG2="BLOCKED-$(python3 -c 'import sys; sys.stdout.write("z"*400)')-TAIL"
   out="$(run_note "$LONG2")" || fail "herd note must not fail when the sidecar cannot be written: $out"
-  echo "$out" | grep -q "noted" || fail "herd note should still confirm when the sidecar fails"
+grep -q "noted" <<< "$out" || fail "herd note should still confirm when the sidecar fails"
   [ "$(_field "$JOURNAL_FILE" event)" = "builder_note" ] || fail "capped note must still be journaled on sidecar failure"
   [ "$(_field "$JOURNAL_FILE" note_full)" = "<MISSING>" ] || fail "a failed sidecar must NOT leave a note_full field"
   rm -f "$TREES/.builder-notes-full"

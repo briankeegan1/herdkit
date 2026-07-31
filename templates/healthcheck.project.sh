@@ -36,7 +36,7 @@ if "$PY" -m pytest --version >/dev/null 2>&1; then
     exit 0
   fi
   # Heuristic: treat connection/auth/timeout failures as data/env (tolerated).
-  if printf '%s' "$out" | grep -qiE 'connection|timeout|auth|credential|network'; then
+  if grep -qiE 'connection|timeout|auth|credential|network' <<< "$out"; then
     [ -n "$ONELINE" ] && echo "data/env (not a code bug) — $last" || { echo "DATA/ENV ISSUE"; printf '%s\n' "$out"; }
     exit 2
   fi

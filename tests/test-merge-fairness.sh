@@ -353,13 +353,13 @@ _restale_note 308 "sha$_RESTALE_STARVE_THRESHOLD" slug-h stale-base
 [ "$(events pr_starvation)" = "1" ] || fail "(11) crossing the threshold must journal pr_starvation"
 [ "$(event_field pr_starvation laps)" = "$_RESTALE_STARVE_THRESHOLD" ] || fail "(11) pr_starvation must carry the lap count"
 ROW="$(_starvation_row 308)"
-printf '%s' "$ROW" | grep -q "starving · ${_RESTALE_STARVE_THRESHOLD} re-stale laps" \
+grep -q "starving · ${_RESTALE_STARVE_THRESHOLD} re-stale laps" <<< "$ROW" \
   || fail "(11) expected the loud 'starving · N re-stale laps' row, got: $ROW"
 # The row rides UNDER the existing hold row — it decorates, never replaces.
 DISPLAY=("    original hold row")
 _restale_decorate_row 0 308
-printf '%s' "${DISPLAY[0]}" | grep -q "original hold row" || fail "(11) decoration must preserve the hold row"
-printf '%s' "${DISPLAY[0]}" | grep -q "starving"          || fail "(11) decoration must append the starvation line"
+grep -q "original hold row" <<< "${DISPLAY[0]}" || fail "(11) decoration must preserve the hold row"
+grep -q "starving" <<< "${DISPLAY[0]}" || fail "(11) decoration must append the starvation line"
 [ "$(printf '%s' "${DISPLAY[0]}" | wc -l | tr -d ' ')" = "1" ] || fail "(11) decoration must add exactly one line"
 # A PR under the threshold is never decorated — the console stays byte-identical for it.
 DISPLAY=("    untouched row"); _restale_decorate_row 0 999
