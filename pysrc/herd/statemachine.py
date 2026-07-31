@@ -64,6 +64,14 @@ blessed in the same window never land out of the deterministic queue order (the 
 exists to make structurally impossible). Ship-dormant like ``merge_frozen``: :mod:`herd.live_runtime`
 emits ``queue_wait`` ONLY under ``MERGE_QUEUE`` (default off), so with the lever off this row is
 unreachable too.
+
+CROSS-SEAT BLOCK PRECEDENCE (HERD-247, restored HERD-446). A blessed candidate whose sha carries a
+STANDING foreign BLOCK — another seat's verdict comment, unresolved by a sha-keyed human override or
+a newer PASS from that SAME seat — is held the same shape again: the ``cross_seat_block`` edge
+:data:`BLESSED` → :data:`HOLD`. This seat's own green gates are a second opinion, not a resolution
+(the PR #343 incident: a later seat's PASS blessed and merged over a standing BLOCK it could not see).
+Unlike ``merge_frozen``/``queue_wait`` this edge is NOT lever-gated — the guard runs unconditionally,
+because withholding it is exactly the defect HERD-247/HERD-442 found unenforced in the port.
 """
 
 from herd import decisions
@@ -124,6 +132,8 @@ SIBLING_RESTALE = "sibling_restale"  # a sibling merge re-staled this still-vali
 MERGE_RESULT_CONFLICT = "merge_result_conflict"  # HERD-296/§6.4: the merged (head+base) candidate tree
                                                   # would not merge cleanly — resolver-owned, held exactly
                                                   # like a stale-base hold, never a bounce/BLOCK.
+CROSS_SEAT_BLOCK = "cross_seat_block"  # HERD-247/HERD-446: a standing foreign BLOCK on this exact sha
+                                       # holds a blessed candidate — this seat's PASS is not a resolution.
 
 EVENTS = (
     BREAKER_OPEN, BREAKER_CLOSE, STALE_DETECTED, BASE_FRESH,
@@ -131,7 +141,7 @@ EVENTS = (
     REVIEW_PASS, REVIEW_BLOCK, REVIEW_INFRA,
     REFIX_BOUNCE, REFIX_EXHAUSTED, BLESSING_POSTED,
     DECIDE_MERGE, DECIDE_HOLD, DECIDE_OBSERVE, APPROVED, MERGE_REFUSED, MERGE_FROZEN, QUEUE_WAIT,
-    NEW_SHA, SIBLING_RESTALE, MERGE_RESULT_CONFLICT,
+    NEW_SHA, SIBLING_RESTALE, MERGE_RESULT_CONFLICT, CROSS_SEAT_BLOCK,
 )
 
 # The two events that supersede a subject from ANY non-terminal state (§2.4 new-sha cancel; §6.1
@@ -206,6 +216,12 @@ _BASE_TRANSITIONS = {
     # instead of starvation). Ship-dormant: live_runtime emits this ONLY under MERGE_QUEUE (default
     # off), so with the lever off this row is unreachable and the merge path is byte-identical.
     (BLESSED, QUEUE_WAIT): HOLD,
+    # HERD-247/HERD-446 cross-seat BLOCK precedence: a BLESSED candidate whose sha carries a standing
+    # foreign BLOCK is held — exactly the merge_frozen/queue_wait shape, unconditionally (no lever):
+    # withholding this edge is the defect this restores. See docs/multi-seat-doctrine.md Rule 2 — ONE
+    # shared check (live_runtime._cross_seat_block_standing), reused at both the merge decision and the
+    # gate-status setter (LiveActuator.post_gate_status).
+    (BLESSED, CROSS_SEAT_BLOCK): HOLD,
 
     # HOLD — a gates-green PR awaiting a human/coordinator signal (§5.4 human-verify, §5.5 approval).
     # The hold is loud and owned (§5.6); an approval clears it to merge. A hold is sha-keyed, so a

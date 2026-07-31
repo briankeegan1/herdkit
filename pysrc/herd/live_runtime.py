@@ -62,6 +62,7 @@ Unit-driven by ``tests/test_live_runtime.py`` + gate wrapper ``tests/test-py-liv
 import glob
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -856,10 +857,11 @@ class LiveState:
     def approvals_ledger(self):
         return os.environ.get("HERD_APPROVALS_FILE") or self._p(".agent-watch-approvals")
 
-    def _approval_row(self, state, pr, sha):
-        """True iff the ledger carries an exact `<epoch> <state> <pr> <sha>` row. False on any read
-        fault / missing ledger — fail-soft, mirroring bash's `[ -s "$APPROVALS" ] || return 1`."""
-        path = self.approvals_ledger()
+    def _ledger_row(self, path, state, pr, sha):
+        """True iff `path` carries an exact `<epoch> <state> <pr> <sha>` row. False on any read
+        fault / missing ledger — fail-soft, mirroring bash's `[ -s "$LEDGER" ] || return 1`. Shared by
+        the approvals ledger (:meth:`_approval_row`) and the overrides ledger (:meth:`override_exists`)
+        — same flat-row shape, different file."""
         if not path or not os.path.exists(path):
             return False
         want = (str(state), str(pr), str(sha))
@@ -872,6 +874,9 @@ class LiveState:
         except Exception:
             return False
         return False
+
+    def _approval_row(self, state, pr, sha):
+        return self._ledger_row(self.approvals_ledger(), state, pr, sha)
 
     def approval_is_approved(self, pr, sha):
         """True iff `herd-approve.sh approve` wrote an explicit approval for this exact (pr, sha)."""
@@ -909,6 +914,20 @@ class LiveState:
             os.replace(tmp, path)
         except Exception:
             pass
+
+    # cross-seat BLOCK override substrate (HERD-247, restored HERD-446) ──────────────────────────────
+    # A SEPARATE flat ledger from the approvals one above — `herd-approve.sh override <pr#>` writes
+    # `<epoch> override <pr> <sha>` rows to `$WORKTREES_DIR/.agent-watch-overrides` (agent-watch.sh:
+    # OVERRIDES), never to the approvals file. Sha-keyed: a new commit does not inherit the override.
+
+    def overrides_ledger(self):
+        return self._p(".agent-watch-overrides")
+
+    def override_exists(self, pr, sha):
+        """True iff a human override was recorded for this exact ``(pr, sha)`` via
+        ``herd-approve.sh override`` (agent-watch.sh:override_exists) — the documented human out that
+        clears a standing cross-seat BLOCK."""
+        return self._ledger_row(self.overrides_ledger(), "override", pr, sha)
 
     def merge_refusals(self, pr, sha):
         """The count of consecutive merge REFUSALS recorded for this ``(pr, sha)`` (0 if none / no dir)."""
@@ -2194,6 +2213,194 @@ class LiveHoldSource:
         return self.state.approval_is_approved(pr, sha)
 
 
+# ── cross-seat BLOCK precedence (HERD-247, restored HERD-446) ──────────────────────────────────────
+# INCIDENT (PR #343, 2026-07-09 16:19-16:25Z): two seats gated the same PR concurrently. One seat's
+# reviewer posted a correctness BLOCK; minutes later the OTHER seat's reviewer posted a PASS, that
+# seat's watcher blessed the sha and merged over the standing BLOCK. A BLOCK from ANY seat must be
+# TERMINAL for that sha until it is RESOLVED — a second seat's PASS is a second opinion, not a
+# resolution. The review ledger cannot see this: it is per-seat local state, so each watcher only ever
+# knows its OWN verdict. The check below reads only artifacts EVERY seat already writes — the
+# herd/gates commit status and the PR's comments. No new substrate, no new config key.
+#
+# BOTH BASH ENFORCEMENT STAGES DIED SEPARATELY (HERD-442 audit): the merge stage inside the deleted
+# `_tick_act` (commit ede7d45, HERD-306 P5b), and the setter stage inside bash's `post_gate_status`,
+# which has had no callers since :meth:`LiveActuator.post_gate_status` took over the blessing. pysrc
+# carried no cross_seat reference at all until this restoration. Reinstated at BOTH surfaces — the
+# merge decision (:meth:`LiveTick._walk`) and the gate-status setter (:meth:`LiveActuator.post_gate_status`)
+# — from this ONE shared implementation (:func:`_cross_seat_block_standing`), per multi-seat doctrine
+# Rule 2 (docs/multi-seat-doctrine.md): one shared check, reused identically at every enforcement
+# surface, never a second copy per surface.
+#
+# WHY NO ``failure`` STATUS IS POSTED. Posting herd/gates=failure on the standing-BLOCK sha would break
+# the SUCCESS-ONLY invariant (:meth:`LiveActuator.post_gate_status`'s docstring) and strand the PR
+# permanently: a non-passing status flips a CLEAN sha to mergeStateStatus=UNSTABLE in the default
+# unprotected config, and UNSTABLE is neither CLEAN (drops out of the candidate loop) nor BLOCKED (not
+# gate-eligible) — no seat could ever re-enter the loop to overwrite the status back to success once
+# the blocking seat reconciles. WITHHOLDING success is enough: it already leaves the PR unmergeable
+# under `require herd/gates` branch protection, and the merge-decision surface holds it in the
+# unprotected config too. The other half IS honored — an existing herd/gates=failure written by
+# another seat is KEPT, never overwritten with our success.
+#
+# RESOLUTION flows through existing surfaces only: the blocking seat posts a NEWER verdict comment for
+# the same sha reading PASS, or a human records the sha-keyed override (`herd-approve.sh override`). A
+# new commit is a new sha and carries no verdict at all, so it starts clean.
+#
+# FAIL-SOFT throughout: an unreadable commit/status/comment read, or an unresolvable seat identity,
+# reports NO standing block (never a false hold) — the surface behaves exactly as it did before this
+# guard existed.
+
+_XSEAT_GH_TIMEOUT = 15   # bounded, like _HV_BODY_TIMEOUT — an outage costs one tick, never a hang
+_XSEAT_MD_STRIP_RE = re.compile(r"[*`_#>]")
+_XSEAT_BLOCK_RE = re.compile(r"\bBLOCK\b")
+_XSEAT_PASS_RE = re.compile(r"\bPASS\b")
+
+
+def _xseat_commit_date(sha):
+    """The sha's committer date (ISO 8601) — keys a verdict comment to THIS commit (a comment posted
+    BEFORE the sha landed is a verdict on the OLD commit). Empty string on any unreadable read
+    (agent-watch.sh:_xseat_foreign_block)."""
+    try:
+        out = subprocess.run(
+            ["gh", "api", "repos/{owner}/{repo}/commits/%s" % sha, "--jq", ".commit.committer.date"],
+            capture_output=True, text=True, timeout=_XSEAT_GH_TIMEOUT)
+    except Exception:
+        return ""
+    if out.returncode != 0:
+        return ""
+    return (out.stdout or "").strip()
+
+
+def _xseat_pr_comments(pr):
+    """``(comments, ok)`` — the PR's comments (author/createdAt/body); ``ok`` False on ANY unreadable
+    read (timeout, non-zero exit, unparseable JSON) — never spent as "no comments"."""
+    try:
+        out = subprocess.run(["gh", "pr", "view", str(pr), "--json", "comments"],
+                             capture_output=True, text=True, timeout=_XSEAT_GH_TIMEOUT)
+    except Exception:
+        return [], False
+    if out.returncode != 0:
+        return [], False
+    try:
+        data = json.loads(out.stdout or "{}")
+    except Exception:
+        return [], False
+    if not isinstance(data, dict):
+        return [], False
+    return data.get("comments") or [], True
+
+
+def _xseat_first_verdict(body):
+    """The verdict word on the FIRST non-empty line, markdown emphasis stripped — real reviewers post
+    ``REVIEW: **BLOCK** — …``; BLOCK wins a line mentioning both. ``None`` when that line names
+    neither (agent-watch.sh's ``_XSEAT_PY`` classifier)."""
+    for line in (body or "").splitlines():
+        s = _XSEAT_MD_STRIP_RE.sub("", line).strip()
+        if not s:
+            continue
+        if _XSEAT_BLOCK_RE.search(s):
+            return "BLOCK"
+        if _XSEAT_PASS_RE.search(s):
+            return "PASS"
+        return None
+    return None
+
+
+def _xseat_foreign_block(pr, sha, me):
+    """``(seat, rc)`` for a standing foreign BLOCK on this EXACT sha — rc 0 standing · 1 none ·
+    2 degraded (unreadable). Keeps only each foreign seat's LATEST verdict comment at or after the sha
+    landed, so a blocking seat's newer PASS resolves its OWN block — a DIFFERENT seat's PASS never does
+    (the #343 incident). Port of agent-watch.sh's ``_xseat_foreign_block`` + ``_XSEAT_PY``."""
+    since = _xseat_commit_date(sha)
+    if not since or since == "null":
+        return "", 2
+    comments, ok = _xseat_pr_comments(pr)
+    if not ok:
+        return "", 2
+    latest = {}
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        login = ((c.get("author") or {}).get("login") or "")
+        when = c.get("createdAt") or ""
+        if not login or not when or login == me or when < since:
+            continue
+        verdict = _xseat_first_verdict(c.get("body"))
+        if verdict is None:
+            continue
+        prev = latest.get(login)
+        if prev is None or when >= prev[0]:
+            latest[login] = (when, verdict)
+    blockers = sorted(login for login, (_, v) in latest.items() if v == "BLOCK")
+    if blockers:
+        return blockers[0], 0
+    return "", 1
+
+
+def _gate_status_current(sha):
+    """``(state, creator_login)`` for the CURRENT herd/gates status on this sha — newest-first, first
+    match wins (agent-watch.sh:_gate_status_current). Empty strings on any unreadable read or no such
+    status."""
+    if not sha:
+        return "", ""
+    try:
+        out = subprocess.run(
+            ["gh", "api", "repos/{owner}/{repo}/commits/%s/statuses" % sha],
+            capture_output=True, text=True, timeout=_XSEAT_GH_TIMEOUT)
+    except Exception:
+        return "", ""
+    if out.returncode != 0:
+        return "", ""
+    try:
+        rows = json.loads(out.stdout or "[]")
+    except Exception:
+        return "", ""
+    if not isinstance(rows, list):
+        return "", ""
+    for row in rows:
+        if isinstance(row, dict) and row.get("context") == _GATE_STATUS_CONTEXT:
+            return row.get("state") or "", ((row.get("creator") or {}).get("login") or "")
+    return "", ""
+
+
+def _cross_seat_block_standing(pr, sha, state, config=None, me=None):
+    """THE shared cross-seat BLOCK precedence check (HERD-247) — reused, unmodified, at BOTH
+    enforcement surfaces (multi-seat doctrine Rule 2). Checks, cheapest first:
+
+      1. a sha-keyed human override (``herd-approve.sh override``) → resolved, no hold.
+      2. herd/gates=failure written by ANOTHER seat → standing (this seat never posts failure, so any
+         failure on the sha is foreign).
+      3. a foreign seat whose LATEST verdict comment for this sha is BLOCK → standing.
+
+    Returns ``(seat, degraded_reason)``: ``seat`` is the blocking seat's login when a BLOCK stands,
+    else ``""``; ``degraded_reason`` is a non-empty string when the scan itself could not read the
+    shared artifacts (identity unresolved / commit+comment scan unreadable) — still reports NO
+    standing block either way, never a false hold.
+
+    ``me`` is this seat's identity, pre-resolved by the caller (:meth:`LiveTick._xseat_identity` /
+    :meth:`LiveActuator._xseat_identity`) and memoized per tick — mirrors bash's
+    ``_resolve_watcher_owner`` (memoized so "the 4s poll loop must never spawn a gh probe every
+    tick"); Python is a fresh process per ``--tick``, so the per-tick memo is what caps the identity
+    probe at ONE call per tick regardless of how many green candidates walk this check, rather than
+    one per candidate. ``None`` (any caller that has not resolved one) falls back to resolving it here.
+    """
+    if not pr or not sha:
+        return "", ""
+    if state is not None and state.override_exists(pr, sha):
+        return "", ""
+    me = me if me is not None else _resolve_owner(config or {})
+    if not me:
+        return "", "seat identity unresolved"
+    cur_state, creator = _gate_status_current(sha)
+    if cur_state == "failure" and creator and creator != me:
+        return creator, ""
+    seat, rc = _xseat_foreign_block(pr, sha, me)
+    if rc == 0:
+        return seat, ""
+    if rc == 2:
+        return "", "commit status / comment scan unreadable"
+    return "", ""
+
+
 class LiveActuator:
     """The REAL apply layer: merge via ``gh``, reap the worktree via ``git`` (contract §2, §6.1).
 
@@ -2206,10 +2413,25 @@ class LiveActuator:
     Reached only from ``--tick`` in genuine live mode — never from any test.
     """
 
-    def __init__(self, home, journal, config=None):
+    def __init__(self, home, journal, config=None, state=None):
         self.home = home
         self.journal = journal
         self.config = config or {}
+        # The shared on-disk state ($TREES) — used for the cross-seat override read (HERD-446,
+        # LiveState.override_exists) and its once-per-(pr,sha) journal dedup. ``None`` (every
+        # pre-HERD-446 caller/test) falls back to a black-hole LiveState(None) — the SAME degrade
+        # LiveTick uses — so override_exists reports False and once() never suppresses, exactly the
+        # no-cross-tick-memory behavior a stateless caller already expects.
+        self.state = state if state is not None else LiveState(None)
+        # Per-instance memo (HERD-446): a LiveActuator lives exactly one tick (constructed fresh in
+        # _run_live_tick), so caching here is tick-scoped for free — caps the `gh api user` identity
+        # probe at ONE call per tick no matter how many candidates reach the setter guard.
+        self._xseat_identity_cache = None
+
+    def _xseat_identity(self):
+        if self._xseat_identity_cache is None:
+            self._xseat_identity_cache = _resolve_owner(self.config) or ""
+        return self._xseat_identity_cache
 
     def merge(self, cand):
         # Run the squash-merge, then VERIFY via the API that the PR actually reached state=MERGED before
@@ -2271,6 +2493,24 @@ class LiveActuator:
         returns True; a failed/empty write journals NOTHING and returns False, so the tick retries next
         round — the blessing MUST land for the ``require herd/gates`` fail-safe to hold. Never raises."""
         if not cand.sha:
+            return False
+        # SETTER GUARD (HERD-247, restored HERD-446): never bless a sha another seat is still blocking,
+        # and never overwrite a foreign herd/gates=failure with our success. Defense in depth: the
+        # merge-decision surface (LiveTick._walk) already holds a candidate before ever reaching this
+        # call, but this guard does not depend on being reached that way — ANY caller of
+        # post_gate_status must never post a blessing over a standing foreign BLOCK. One shared
+        # implementation (_cross_seat_block_standing), reused verbatim at both surfaces.
+        seat, degraded = _cross_seat_block_standing(cand.pr, cand.sha, self.state, self.config,
+                                                     me=self._xseat_identity())
+        if degraded:
+            if self.state.once(cand.pr, cand.sha, "xseat_degraded"):
+                self.journal.append("cross_seat_block_scan", "pr", cand.pr, "sha", cand.sha,
+                                    "state", "degraded", "reason", degraded)
+        elif seat:
+            if self.state.once(cand.pr, cand.sha, "xseat_honored_setter"):
+                self.journal.append("cross_seat_block_honored", "pr", cand.pr, "sha", cand.sha,
+                                    "seat", seat, "stage", "setter",
+                                    "reason", "cross-seat BLOCK standing (seat %s)" % seat)
             return False
         try:
             subprocess.run(
@@ -2451,6 +2691,10 @@ class LiveTick:
         # None → a black-hole LiveState (no dir): a sim/dry-run tick has no cross-tick state and never
         # writes a marker, so the fixture path stays hermetic.
         self.state = state if state is not None else LiveState(None)
+        # Per-tick memo (HERD-446): a LiveTick instance lives exactly one tick (fresh per --tick), so
+        # caching here caps the cross-seat identity probe (`gh api user`) at ONE call per tick no
+        # matter how many blessed candidates walk the guard this round (mirrors _main_health_pending_memo).
+        self._xseat_identity_cache = None
         self._merge_policy = D.effective_merge_policy(
             self.config.get("MERGE_POLICY"), self.config.get("WATCHER_AUTOMERGE"))
         self._hv_policy = self.config.get("HUMAN_VERIFY_POLICY", "hold")
@@ -2698,6 +2942,13 @@ class LiveTick:
         (byte-inert: no post, no journal, no ledger). Any other value is on
         (agent-watch.sh:_gate_status_enabled — unknown value → on)."""
         return self._gate_status != "off"
+
+    def _xseat_identity(self):
+        """This seat's resolved identity for the cross-seat guard, memoized for the LIFE OF THE TICK
+        (HERD-446) — see the cache comment in :meth:`__init__`."""
+        if self._xseat_identity_cache is None:
+            self._xseat_identity_cache = _resolve_owner(self.config) or ""
+        return self._xseat_identity_cache
 
     # lifecycle transition through SM; journal it, never let a disagreement sink the tick (as shadow).
     def _advance(self, cand, event):
@@ -3018,6 +3269,37 @@ class LiveTick:
             self.journal.append("blessing", "pr", cand.pr, "sha", cand.sha, "context", "herd/gates",
                                 "state", "success")
 
+        # 4a. CROSS-SEAT BLOCK precedence (HERD-247, restored HERD-446). Re-establish the invariant from
+        #     SHARED state before the blessing is posted and before any merge is attempted: this seat's
+        #     own green gates are a second opinion, not a resolution of a BLOCK another seat is still
+        #     standing behind on this EXACT sha (the PR #343 incident — a BLOCK from ANY seat is TERMINAL
+        #     until resolved by a sha-keyed human override or a newer PASS from that SAME seat). ONE
+        #     shared check (_cross_seat_block_standing), reused verbatim at the gate-status setter too
+        #     (LiveActuator.post_gate_status) — multi-seat doctrine Rule 2. Unconditional on GATE_STATUS:
+        #     runs even under GATE_STATUS=off, because the hazard it guards (a blind merge) is
+        #     independent of whether the blessing posts. FAIL-SOFT: an unreadable scan reports no block
+        #     and this tick behaves exactly as it did before the guard existed.
+        #
+        #     LIVE-ONLY (mirrors _resolve_hold_inputs, HERD-442): gated on `hold_source`, the SAME signal
+        #     that marks a genuine live tick — `_run_live_tick` is the only caller that constructs one.
+        #     A fixture/dry-run tick (every existing test, the --dry-run smoke CLI) must invoke NO
+        #     subprocess at all (the VERIFY discipline this module's docstring documents); without this
+        #     gate, EVERY blessed fixture candidate would shell out to `gh api user`/`gh pr view` here.
+        if self.hold_source is not None:
+            seat, degraded = _cross_seat_block_standing(cand.pr, cand.sha, self.state, self.config,
+                                                         me=self._xseat_identity())
+            if degraded:
+                if self.state.once(cand.pr, cand.sha, "xseat_degraded"):
+                    self.journal.append("cross_seat_block_scan", "pr", cand.pr, "sha", cand.sha,
+                                        "state", "degraded", "reason", degraded)
+            elif seat:
+                if self.state.once(cand.pr, cand.sha, "xseat_honored_merge"):
+                    self.journal.append("cross_seat_block_honored", "pr", cand.pr, "sha", cand.sha,
+                                        "seat", seat, "stage", "merge",
+                                        "reason", "cross-seat BLOCK standing (seat %s)" % seat)
+                self._advance(cand, "cross_seat_block")
+                return HOLD
+
         # 4b. POST the herd/gates=success commit status (GATE_STATUS=on contract, agent-watch.sh:
         #     post_gate_status). ONLY the actuator touches the network; the DryRunActuator twin is a pure
         #     no-op, so the side-effect-free VERIFY column never posts. At-most-once per (pr,sha): the
@@ -3294,7 +3576,7 @@ def _run_live_tick():
             "journal path (docs/engine-contract.md §3) — never actuate a merge with journal:null")
     journal = LiveJournal(path)
     state = LiveState()          # $TREES / $WORKTREES_DIR — the shared sha-keyed ledger + marker substrate
-    actuator = DryRunActuator(journal) if dry else LiveActuator(home, journal, config)
+    actuator = DryRunActuator(journal) if dry else LiveActuator(home, journal, config, state)
     # The §5.4/§5.5 hold inputs, LIVE ONLY (HERD-442): the PR body and the approvals ledger. Passed
     # here and nowhere else, so a dry-run / fixture tick never shells out to `gh` for a body and never
     # overrides a scenario-injected hv_hold/approved.

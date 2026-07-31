@@ -32,7 +32,7 @@ import time
 from herd import cost_emit as CE
 from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
-                               LiveActuator,
+                               LiveActuator, LiveHoldSource,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
                                parse_rubric_verdicts,
                                _select_candidates, _marker_write, _marker_live, _terminate_worker,
@@ -926,8 +926,9 @@ class TestHealthDispatchFreshness(LiveCase):
 class _FakeCompleted:
     """Stand-in for a subprocess.CompletedProcess — carries a captured stdout for the API verify read."""
 
-    def __init__(self, stdout=""):
+    def __init__(self, stdout="", returncode=0):
         self.stdout = stdout
+        self.returncode = returncode
 
 
 class _RecordingSub:
@@ -1101,8 +1102,11 @@ class TestLiveGateStatusPost(LiveCase):
         sub = _RecordingSub()
         act = self._actuator(sub)
         self.assertTrue(act.post_gate_status(LiveCandidate(7, "deadbeef", slug="feat-x")))
-        # The gh api call carries the exact success-only status shape bash posts.
-        api = [c for c in sub.calls if "api" in c][0]
+        # The gh api call carries the exact success-only status shape bash posts. Matched by the
+        # unique "statuses/deadbeef" segment — the cross-seat setter guard (HERD-446) now makes its
+        # OWN read-only gh api calls first (commit date, current status), so the status POST is no
+        # longer necessarily the first "api" call recorded.
+        api = [c for c in sub.calls if any("statuses/deadbeef" in str(a) for a in c)][0]
         self.assertIn("repos/{owner}/{repo}/statuses/deadbeef", api)
         self.assertIn("state=success", api)
         self.assertIn("context=herd/gates", api)
@@ -1152,6 +1156,272 @@ class TestLiveGateStatusPost(LiveCase):
         self.tmp = tempfile.mkdtemp()
         self.jpath = os.path.join(self.tmp, "live-test.jsonl")
         self.assertEqual(run({"MERGE_POLICY": "observe", "GATE_STATUS": "off"}), 0)  # byte-inert
+
+
+class _XseatSub:
+    """Subprocess stand-in scripting the gh reads/writes the cross-seat guard (HERD-446) and the
+    ordinary merge/post-status actuation make — proves the guard end-to-end through the REAL
+    LiveActuator, hermetically. Unmatched argvs fall through to a benign default so a test only
+    scripts what it cares about; ``fail`` (a set of tokens) makes the matching read raise, simulating
+    an unreadable gh call — never a crash, the guard's own fail-soft must absorb it."""
+
+    def __init__(self, commit_date="2026-07-09T16:10:00Z", comments=None,
+                 current_status=("", ""), view_state="MERGED", fail=()):
+        self.calls = []
+        self.commit_date = commit_date
+        self.comments = comments if comments is not None else []
+        self.current_status = current_status       # (state, creator_login)
+        self.view_state = view_state
+        self.fail = set(fail)
+
+    def run(self, argv, *a, **k):
+        self.calls.append(list(argv))
+        joined = " ".join(str(x) for x in argv)
+        if argv[:2] == ["gh", "api"] and "/statuses" in joined and "/commits/" in joined:
+            if "statuses" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            state, creator = self.current_status
+            rows = ([{"context": "herd/gates", "state": state, "creator": {"login": creator}}]
+                    if state else [])
+            return _FakeCompleted(json.dumps(rows))
+        if argv[:2] == ["gh", "api"] and "/commits/" in joined:
+            if "commit_date" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted(self.commit_date)
+        if argv[:2] == ["gh", "api"] and "/statuses/" in joined:
+            if "post" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted("")
+        if argv[:3] == ["gh", "pr", "view"] and "comments" in argv:
+            if "comments" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted(json.dumps({"comments": self.comments}))
+        if argv[:3] == ["gh", "pr", "view"]:
+            if "view_state" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted(self.view_state + "\n")
+        if argv[:3] == ["gh", "pr", "merge"]:
+            if "merge" in self.fail:
+                raise subprocess.CalledProcessError(1, argv)
+            return _FakeCompleted("")
+        return _FakeCompleted("")
+
+
+class TestCrossSeatBlockPrecedence(LiveCase):
+    """HERD-247/HERD-446: cross-seat BLOCK precedence, restored at BOTH enforcement surfaces from ONE
+    shared implementation (``_cross_seat_block_standing``) — the merge decision (``LiveTick._walk``)
+    and the gate-status setter (``LiveActuator.post_gate_status``). Grounded in PR #343 (2026-07-09):
+    two seats gated the same PR concurrently; one posted a correctness BLOCK, the other's later PASS
+    blessed the sha and merged over it, silently. Hermetic: gh is stubbed via :class:`_XseatSub` — no
+    network, no real PR, no model call.
+
+    Each test drives a REAL :class:`LiveActuator` (not the dry-run twin) through a green candidate
+    (health=CLEAN, review=PASS, pr=7, sha=deadbeef) via :class:`LiveTick`, so a standing block is
+    proven to withhold the ACTUAL merge/post-status subprocess calls, not just a return value.
+    """
+
+    FOREIGN_BLOCK = 'REVIEW: **BLOCK** — rule: safety-rail bypass | why: a limit-parked resolver reads idle'
+    FOREIGN_PASS = '**Pre-merge correctness review — PASS (no blocking findings).**'
+
+    def _drive(self, sub, config=None, fail_hold_source=False):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        config = dict(config if config is not None else {"MERGE_POLICY": "auto", "WATCHER_OWNER": "mySeat"})
+        actuator = LiveActuator("/nonexistent-home", journal, config, state)
+        hold_source = LiveHoldSource(state, config)
+        scenario = {"candidates": [self.one(7, sha="deadbeef", review="PASS", health="CLEAN")],
+                    "config": config}
+        t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
+                     state=state, hold_source=hold_source)
+        res = t.run()
+        return res, events(self.jpath), sub
+
+    def _merge_calls(self, sub):
+        return [c for c in sub.calls if c[:3] == ["gh", "pr", "merge"]]
+
+    def _post_calls(self, sub):
+        return [c for c in sub.calls
+                if c[:2] == ["gh", "api"] and any("statuses/deadbeef" in str(x) for x in c)]
+
+    def test_standing_foreign_block_holds_never_blesses_never_merges(self):
+        sub = _XseatSub(comments=[
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+        ])
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+        self.assertFalse(self._merge_calls(sub), "a standing foreign BLOCK must never be merged over")
+        self.assertFalse(self._post_calls(sub), "a standing foreign BLOCK must never be blessed")
+        honored = [o for o in ev if o["event"] == "cross_seat_block_honored"]
+        self.assertEqual(len(honored), 1)
+        self.assertEqual(honored[0]["seat"], "otherSeat")
+        self.assertEqual(honored[0]["stage"], "merge")
+        self.assertEqual(honored[0]["pr"], 7)
+        self.assertEqual(honored[0]["sha"], "deadbeef")
+
+    def test_no_foreign_block_is_byte_identical(self):
+        sub = _XseatSub(comments=[])
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "MERGE")
+        self.assertTrue(self._merge_calls(sub))
+        self.assertTrue(self._post_calls(sub))
+        self.assertTrue([o for o in ev if o["event"] == "gate_status"])
+        self.assertFalse([o for o in ev if o["event"].startswith("cross_seat_block")])
+
+    def test_foreign_gate_failure_status_withholds_blessing_and_merge(self):
+        sub = _XseatSub(current_status=("failure", "otherSeat"))
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+        self.assertFalse(self._merge_calls(sub))
+        honored = [o for o in ev if o["event"] == "cross_seat_block_honored"]
+        self.assertEqual(len(honored), 1)
+        self.assertEqual(honored[0]["seat"], "otherSeat")
+
+    def test_own_block_is_not_a_cross_seat_block(self):
+        # THIS seat's own local BLOCK is not a cross-seat block — a solo watcher must not hold its
+        # own blocked PRs behind a reconcile row (agent-watch.sh test (b)-own-block equivalent).
+        sub = _XseatSub(comments=[
+            {"author": {"login": "mySeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+        ])
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "MERGE")
+        self.assertFalse([o for o in ev if o["event"] == "cross_seat_block_honored"])
+
+    def test_override_resolves_the_standing_block(self):
+        with open(os.path.join(self.tmp, ".agent-watch-overrides"), "w", encoding="utf-8") as fh:
+            fh.write("%d override 7 deadbeef\n" % int(time.time()))
+        sub = _XseatSub(comments=[
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+        ])
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "MERGE")
+        self.assertFalse([o for o in ev if o["event"] == "cross_seat_block_honored"])
+
+    def test_override_is_sha_keyed_and_does_not_carry_to_a_new_commit(self):
+        with open(os.path.join(self.tmp, ".agent-watch-overrides"), "w", encoding="utf-8") as fh:
+            fh.write("%d override 7 someothersha\n" % int(time.time()))
+        sub = _XseatSub(comments=[
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+        ])
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+
+    def test_blocking_seats_later_pass_resolves_its_own_block(self):
+        sub = _XseatSub(comments=[
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:40:00Z",
+             "body": self.FOREIGN_PASS},
+        ])
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "MERGE")
+
+    def test_third_seats_pass_does_not_resolve_another_seats_block(self):
+        # The #343 incident, exactly: a DIFFERENT seat's PASS is a second opinion, not a resolution.
+        sub = _XseatSub(comments=[
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+            {"author": {"login": "thirdSeat"}, "createdAt": "2026-07-09T16:40:00Z",
+             "body": self.FOREIGN_PASS},
+        ])
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+        honored = [o for o in ev if o["event"] == "cross_seat_block_honored"]
+        self.assertEqual(honored[0]["seat"], "otherSeat")
+
+    def test_block_predating_the_head_sha_never_holds_the_new_commit(self):
+        sub = _XseatSub(commit_date="2026-07-09T17:00:00Z", comments=[
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+        ])
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "MERGE")
+
+    def test_degraded_scan_fails_soft_and_still_merges(self):
+        sub = _XseatSub(commit_date="")   # unreadable commit date -> degraded, never a false hold
+        res, ev, sub = self._drive(sub)
+        self.assertEqual(res["outcomes"]["7"], "MERGE")
+        scan = [o for o in ev if o["event"] == "cross_seat_block_scan"]
+        self.assertEqual(len(scan), 1)
+        self.assertEqual(scan[0]["state"], "degraded")
+
+    def test_unresolvable_seat_identity_fails_soft(self):
+        sub = _XseatSub(comments=[
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+        ])
+        res, ev, sub = self._drive(sub, config={"MERGE_POLICY": "auto"})   # no WATCHER_OWNER configured
+        self.assertEqual(res["outcomes"]["7"], "MERGE")
+        scan = [o for o in ev if o["event"] == "cross_seat_block_scan"]
+        self.assertEqual(len(scan), 1)
+
+    def test_identity_probe_does_not_scale_with_candidate_count(self):
+        # HERD-446: with no WATCHER_OWNER configured, resolving this seat's identity means a real
+        # `gh api user` call. Bash memoized that probe for the life of the (long-running) watcher
+        # process; Python is a fresh process per --tick, so LiveTick/LiveActuator each memoize it
+        # per-INSTANCE instead (a fixed, small cost per tick — 1 probe per surface class touched),
+        # never growing per candidate. Proved by comparing 1 candidate against 5: SAME call count.
+        def run(n):
+            sub = _XseatSub(comments=[])
+            orig = LR.subprocess
+            LR.subprocess = sub
+            self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+            journal = LiveJournal(os.path.join(self.tmp, "j-%d.jsonl" % n))
+            state = LiveState(os.path.join(self.tmp, "state-%d" % n))
+            os.makedirs(state.dir, exist_ok=True)
+            config = {"MERGE_POLICY": "auto"}   # no WATCHER_OWNER -> _resolve_owner shells out
+            actuator = LiveActuator("/nonexistent-home", journal, config, state)
+            hold_source = LiveHoldSource(state, config)
+            candidates = [self.one(100 + i, sha="sha%d" % i, review="PASS", health="CLEAN")
+                          for i in range(n)]
+            scenario = {"candidates": candidates, "config": config}
+            t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
+                         state=state, hold_source=hold_source)
+            res = t.run()
+            for i in range(n):
+                self.assertEqual(res["outcomes"][str(100 + i)], "MERGE")
+            return len([c for c in sub.calls if c[:3] == ["gh", "api", "user"]])
+
+        self.assertEqual(run(1), run(5),
+                         "the identity probe must not scale with the number of candidates walked")
+
+    def test_setter_guard_independently_withholds_a_direct_post(self):
+        """Proves the SECOND surface (LiveActuator.post_gate_status) on its own, calling it directly —
+        bypassing the merge-decision surface entirely. Defense in depth (multi-seat doctrine Rule 2):
+        the setter must never bless a standing foreign BLOCK regardless of how it is reached."""
+        sub = _XseatSub(comments=[
+            {"author": {"login": "otherSeat"}, "createdAt": "2026-07-09T16:19:00Z",
+             "body": self.FOREIGN_BLOCK},
+        ])
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        act = LiveActuator("/nonexistent-home", journal, {"WATCHER_OWNER": "mySeat"}, state)
+        self.assertFalse(act.post_gate_status(LiveCandidate(7, "deadbeef", slug="feat-x")))
+        self.assertFalse(self._post_calls(sub))
+        honored = [o for o in events(self.jpath) if o["event"] == "cross_seat_block_honored"]
+        self.assertEqual(len(honored), 1)
+        self.assertEqual(honored[0]["stage"], "setter")
+
+    def test_setter_guard_posts_normally_with_no_standing_block(self):
+        sub = _XseatSub(comments=[])
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        act = LiveActuator("/nonexistent-home", journal, {"WATCHER_OWNER": "mySeat"}, state)
+        self.assertTrue(act.post_gate_status(LiveCandidate(7, "deadbeef", slug="feat-x")))
+        self.assertTrue(self._post_calls(sub))
+        self.assertFalse([o for o in events(self.jpath) if o["event"].startswith("cross_seat_block")])
 
 
 class TestVerdictParser(unittest.TestCase):
