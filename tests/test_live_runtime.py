@@ -44,6 +44,7 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                _merge_result_gate_enabled, _resolve_default_branch_sha,
                                _dispatch_nonce_with_base, _nonce_base, _total_health_inflight)
 from herd import work_unit as WU
+from herd import human_verify as _hv
 
 # HERMETICITY (HERD-331 gate red): a watcher/healthcheck-descended environment EXPORTS the live
 # engine's main-health coordinates — herd-config.sh exports MAIN_HEALTH_TICK (HERD-359) and
@@ -4201,6 +4202,251 @@ class TestChaosRestartReconciliation(LiveCase):
         self.assertTrue(act.merge(cand))
         merge_events = [e for e in events(self.jpath) if e["event"] == "merge"]
         self.assertEqual(len(merge_events), 1)
+
+
+# ── the §5.4/§5.5 hold LAYER, restored (HERD-442) ─────────────────────────────────────────────────
+# HERD-306 (P5b) deleted the bash action pass and the port never re-acquired the two INPUTS to the
+# hold decision: discover_via_graphql fetches number/sha/base/mergeState and nothing else, so
+# LiveCandidate.hv_hold and .approved sat at their constructor defaults on every live tick. Under the
+# SHIP DEFAULT (MERGE_POLICY=auto + HUMAN_VERIFY_POLICY=hold) that auto-merged every PR that declared
+# HUMAN-VERIFY steps (proven live: PR #555, 2026-07-30, merge{reason:gates_passed} with no hold_applied
+# anywhere), and nothing ever wrote the `awaiting` row `herd approve` refuses to run without.
+#
+# Each test below FAILS without the restoration: delete the LiveHoldSource wiring and the hv tests see
+# MERGE instead of HOLD, the ledger tests see an empty file, and hold_released disappears.
+
+class _StubHoldSource:
+    """A LiveHoldSource twin with no gh and no ledger — the body/rc and approval are injected."""
+
+    def __init__(self, body="", rc=0, approved=False):
+        self.body, self.rc, self._approved = body, rc, approved
+        self.body_reads = 0
+
+    def hv_body(self, pr):
+        self.body_reads += 1
+        return self.body, self.rc
+
+    def approved(self, pr, sha):
+        return self._approved
+
+
+class _RefusingActuator(DryRunActuator):
+    """A dry-run actuator whose merge is REFUSED (the API verify did not confirm MERGED) — the state
+    in which the pre-merge ledger window is observable, because no purge runs."""
+
+    def merge(self, cand):
+        return False
+
+
+_HV_BODY = "Some PR body.\n\nHUMAN-VERIFY:\n- run the live smoke test\n\nMore prose.\n"
+
+
+class TestHoldLayerRestored(LiveCase):
+    def tick_live(self, hold_source, config=None, **kw):
+        """A tick with a hold_source wired — the LIVE shape, minus the network."""
+        cand = self.one(1, **kw)
+        scenario = {"candidates": [cand], "config": config or {"MERGE_POLICY": "auto"}}
+        journal = LiveJournal(self.jpath)
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     DryRunActuator(journal), journal, state=LiveState(self.tmp),
+                     hold_source=hold_source)
+        res = t.run()
+        return res["outcomes"]["1"], (events(self.jpath) if os.path.exists(self.jpath) else [])
+
+    def ledger(self):
+        path = os.path.join(self.tmp, ".agent-watch-approvals")
+        return open(path).read() if os.path.exists(path) else ""
+
+    # ── the input that was never read ────────────────────────────────────────────────────────────
+    def test_declared_human_verify_block_holds_on_the_default_policy(self):
+        # THE regression. Before the fix this merged: hv_hold was never set from the body.
+        src = _StubHoldSource(body=_HV_BODY)
+        out, ev = self.tick_live(src, review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertEqual(src.body_reads, 1)
+        held = [o for o in ev if o["event"] == "hold_applied"]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["kind"], "human-verify")
+        self.assertFalse([o for o in ev if o["event"] == "merge"])
+
+    def test_a_body_with_no_block_still_merges(self):
+        # The other half of the same read: the gate must not hold a PR that declared nothing.
+        out, ev = self.tick_live(_StubHoldSource(body="No manual steps here.\n"),
+                                 review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertFalse([o for o in ev if o["event"] == "hold_applied"])
+
+    def test_bare_marker_with_no_steps_is_not_a_hold(self):
+        # human-verify.sh: nothing for a human to verify => must never trip the gate.
+        out, _ = self.tick_live(_StubHoldSource(body="HUMAN-VERIFY:\n\n"),
+                                review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+
+    # ── fail CLOSED on an unreadable body (HERD-237) ─────────────────────────────────────────────
+    def test_unreadable_body_holds_and_journals_hv_body_unreadable(self):
+        out, ev = self.tick_live(_StubHoldSource(body="", rc=124), review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertFalse([o for o in ev if o["event"] == "merge"])
+        un = [o for o in ev if o["event"] == "hv_body_unreadable"]
+        self.assertEqual(len(un), 1)
+        self.assertEqual(str(un[0]["pr"]), "1")
+        self.assertEqual(un[0]["rc"], 124)
+        self.assertIn("holding rather than merging", un[0]["detail"])
+        # No ledger row and no hold_applied: nothing was DECIDED, so the next tick re-decides clean.
+        self.assertEqual(self.ledger(), "")
+        self.assertFalse([o for o in ev if o["event"] == "hold_applied"])
+
+    # ── the awaiting row `herd approve` refuses to run without ───────────────────────────────────
+    def test_hold_writes_the_awaiting_row_herd_approve_reads(self):
+        self.tick_live(_StubHoldSource(body=_HV_BODY), review="PASS", health="CLEAN")
+        row = self.ledger().split()
+        self.assertEqual(row[1:4], ["awaiting", "1", "sha1"])
+
+    def test_approve_policy_holds_with_kind_approve_not_approval(self):
+        # bash wrote kind=approve; fleet.sh:1556 matches that literal to render "approval hold".
+        out, ev = self.tick_live(_StubHoldSource(), config={"MERGE_POLICY": "approve"},
+                                 review="PASS", health="CLEAN")
+        self.assertEqual(out, "HOLD")
+        self.assertEqual([o for o in ev if o["event"] == "hold_applied"][0]["kind"], "approve")
+
+    def test_approve_policy_never_spends_a_body_read(self):
+        # bash only fetched the body in auto mode — approve/observe hold every PR anyway.
+        src = _StubHoldSource()
+        self.tick_live(src, config={"MERGE_POLICY": "approve"}, review="PASS", health="CLEAN")
+        self.assertEqual(src.body_reads, 0)
+
+    # ── release: the approval the port could not see ─────────────────────────────────────────────
+    def test_approved_hold_merges_and_journals_hold_released(self):
+        src = _StubHoldSource(body=_HV_BODY, approved=True)
+        out, ev = self.tick_live(src, review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        rel = [o for o in ev if o["event"] == "hold_released"]
+        self.assertEqual(len(rel), 1)
+        self.assertEqual(rel[0]["kind"], "human-verify")
+        self.assertEqual(rel[0]["reason"], "approved")
+        self.assertEqual(str(rel[0]["sha"]), "sha1")
+
+    def test_approve_policy_release_carries_kind_approve(self):
+        out, ev = self.tick_live(_StubHoldSource(approved=True), config={"MERGE_POLICY": "approve"},
+                                 review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertEqual([o for o in ev if o["event"] == "hold_released"][0]["kind"], "approve")
+
+    def test_an_unheld_merge_journals_no_release(self):
+        # Byte-identical for the ordinary case: nothing was held, so nothing is released.
+        out, ev = self.tick_live(_StubHoldSource(), review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertFalse([o for o in ev if o["event"] == "hold_released"])
+
+    def test_hv_auto_records_the_hv_informed_row_in_the_pre_merge_window(self):
+        # The ledger is EPHEMERAL by design (approvals.sh): a merge purges every row for the PR, so
+        # the row is only observable BEFORE the merge lands. A REFUSED merge is exactly that window —
+        # and is a real production state (the API verify did not confirm MERGED).
+        journal = LiveJournal(self.jpath)
+        scenario = {"candidates": [self.one(1, review="PASS", health="CLEAN")],
+                    "config": {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"}}
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     _RefusingActuator(journal), journal, state=LiveState(self.tmp),
+                     hold_source=_StubHoldSource(body=_HV_BODY))
+        t.run()
+        self.assertEqual(self.ledger().split()[1:4], ["hv-informed", "1", "sha1"])
+
+    def test_a_merge_purges_only_this_prs_approval_rows(self):
+        # HERD-90: an old sha whose `awaiting` row survives the merge is a phantom hold that
+        # `herd approve list` keeps surfacing for a long-merged PR.
+        st = LiveState(self.tmp)
+        st.record_approval("awaiting", 1, "old-sha")
+        st.record_approval("awaiting", 2, "sha2")
+        out, _ = self.tick_live(_StubHoldSource(approved=True), review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertFalse(st.approval_awaiting_noted(1, "old-sha"))
+        self.assertTrue(st.approval_awaiting_noted(2, "sha2"))
+
+    # ── OFF-PATH: no hold_source ⇒ nothing moves ─────────────────────────────────────────────────
+    # The restoration is live-only. Every sim, fixture and dry-run tick passes hold_source=None and
+    # must be byte-identical to before it existed — pinned here rather than asserted in prose.
+    def test_without_a_hold_source_the_event_stream_is_unchanged(self):
+        res_a, ev_a = self.tick([self.one(1, review="PASS", health="CLEAN")])
+        self.assertEqual(res_a["outcomes"]["1"], "MERGE")
+        names = [o["event"] for o in ev_a]
+        self.assertNotIn("hv_body_unreadable", names)
+        self.assertNotIn("hold_released", names)
+        self.assertEqual(self.ledger(), "")          # no ledger path is ever written off the live path
+
+    def test_without_a_hold_source_an_injected_hv_hold_is_honored_verbatim(self):
+        # A scenario that injects hv_hold must NOT be overwritten by a body read that never happens.
+        res, ev = self.tick([self.one(1, review="PASS", health="CLEAN", hv_hold=True)])
+        self.assertEqual(res["outcomes"]["1"], "HOLD")
+        self.assertEqual([o for o in ev if o["event"] == "hold_applied"][0]["kind"], "human-verify")
+
+
+class TestApprovalsLedger(LiveCase):
+    """LiveState's half of the ledger — the same flat file herd-approve.sh reads and writes."""
+
+    def setUp(self):
+        LiveCase.setUp(self)
+        self.st = LiveState(self.tmp)
+
+    def test_exact_sha_match_only(self):
+        self.st.record_approval("approved", 7, "abcdef123456")
+        self.assertTrue(self.st.approval_is_approved(7, "abcdef123456"))
+        self.assertFalse(self.st.approval_is_approved(7, "abcdef"))     # a prefix is NOT an approval
+        self.assertFalse(self.st.approval_is_approved(70, "abcdef123456"))
+
+    def test_awaiting_is_not_an_approval(self):
+        self.st.record_approval("awaiting", 7, "s7")
+        self.assertTrue(self.st.approval_awaiting_noted(7, "s7"))
+        self.assertFalse(self.st.approval_is_approved(7, "s7"))
+
+    def test_hv_informed_is_not_an_approval(self):
+        # approvals.sh: "a record, NOT an approval" — nobody ran the declared steps.
+        self.st.record_approval("hv-informed", 7, "s7")
+        self.assertFalse(self.st.approval_is_approved(7, "s7"))
+
+    def test_row_shape_matches_bash(self):
+        self.st.record_approval("awaiting", 7, "s7")
+        f = open(os.path.join(self.tmp, ".agent-watch-approvals")).read().split()
+        self.assertEqual(len(f), 4)
+        self.assertTrue(f[0].isdigit())                                  # <epoch> <state> <pr> <sha>
+        self.assertEqual(f[1:], ["awaiting", "7", "s7"])
+
+    def test_purge_drops_only_this_prs_rows(self):
+        self.st.record_approval("awaiting", 7, "s7")
+        self.st.record_approval("approved", 70, "s70")
+        self.st.purge_pr_approvals(7)
+        self.assertFalse(self.st.approval_awaiting_noted(7, "s7"))
+        self.assertTrue(self.st.approval_is_approved(70, "s70"))         # PR 70 is not PR 7
+
+    def test_no_state_dir_is_a_silent_no_op(self):
+        st = LiveState(None)
+        st.record_approval("awaiting", 1, "s1")                          # must not raise
+        self.assertFalse(st.approval_is_approved(1, "s1"))
+        st.purge_pr_approvals(1)
+
+
+class TestHumanVerifyParser(unittest.TestCase):
+    """The parse contract of human-verify.sh, in Python (the bash twin is pinned by
+    tests/test-human-verify-parity.sh; these are the shape assertions)."""
+
+    def test_bulleted_block(self):
+        self.assertEqual(_hv.steps("HUMAN-VERIFY:\n- one\n- two\n\ntail"), ["one", "two"])
+
+    def test_one_liner_form(self):
+        self.assertEqual(_hv.steps("HUMAN-VERIFY: just this"), ["just this"])
+
+    def test_markdown_decorated_marker(self):
+        # A builder naturally writes the whole block as a list; a missing bullet here fails OPEN.
+        self.assertEqual(_hv.steps("- **HUMAN-VERIFY:**\n- step a\n"), ["step a"])
+
+    def test_bare_marker_is_not_a_hold(self):
+        self.assertFalse(_hv.has("HUMAN-VERIFY:\n\nprose"))
+
+    def test_absent_marker_is_not_a_hold(self):
+        self.assertFalse(_hv.has("nothing to see"))
+
+    def test_block_ends_at_the_first_blank_line(self):
+        self.assertEqual(_hv.steps("HUMAN-VERIFY:\n- a\n\n- b\n"), ["a"])
+
 
 
 if __name__ == "__main__":
