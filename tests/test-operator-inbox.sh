@@ -78,9 +78,9 @@ FIX='{"comments":[
  {"id":"c3","author":{"login":"bot"},"body":"line one\nline two"}
 ]}'
 out="$(printf '%s' "$FIX" | _inbox_extract_pr_comments "me-operator")"
-printf '%s\n' "$out" | grep -q "^c1	teammate	dont self-merge, main broke$" || fail "c1 (teammate) must surface: [$out]"; pass
-printf '%s\n' "$out" | grep -q "me-operator" && fail "my own comment (c2) must be excluded: [$out]"; pass
-printf '%s\n' "$out" | grep -q "^c3	bot	line one line two$" || fail "c3 must surface whitespace-flattened: [$out]"; pass
+grep -q "^c1	teammate	dont self-merge, main broke$" <<< "$out" || fail "c1 (teammate) must surface: [$out]"; pass
+grep -q "me-operator" <<< "$out" && fail "my own comment (c2) must be excluded: [$out]"; pass
+grep -q "^c3	bot	line one line two$" <<< "$out" || fail "c3 must surface whitespace-flattened: [$out]"; pass
 
 # ── 4. OFF is byte-inert: _inbox_scan writes nothing; build leaves the section empty even with a ledger
 OPERATOR_INBOX=off
@@ -116,7 +116,7 @@ after="$(wc -l < "$INBOX_LEDGER")"
 
 # ── 6. build_operator_inbox ON renders the surfaced entry (newest-first, cyan 📬, @author) ──────────
 OPERATOR_INBOX_ROWS=""; build_operator_inbox
-printf '%s' "$OPERATOR_INBOX_ROWS" | grep -q '📬 #11 @teammate dont self-merge, main broke' \
+grep -q '📬 #11 @teammate dont self-merge, main broke' <<< "$OPERATOR_INBOX_ROWS" \
   || fail "inbox section missing the surfaced PR comment: [$OPERATOR_INBOX_ROWS]"; pass
 
 # ── 7. TRACKER feed via the REAL subshell-source path against a fake backend op ─────────────────────

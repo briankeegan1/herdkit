@@ -63,7 +63,7 @@ out1="$(env -i HOME="$HOME" PATH="$BIN:/usr/bin:/bin:/usr/sbin:/sbin" TERM=xterm
 grep -q "alpha render item" <<<"$out1" || fail "no-glow render did not print the backlog list ($out1)"
 grep -qF "$HINT" <<<"$out1"            || fail "no-glow render missing the self-diagnosing doctor hint ($out1)"
 # Dim, NEVER red: the hint line must carry the dim SGR (\033[2m) and NO red foreground (31/91).
-hintline="$(grep -F "$HINT" <<<"$out1" | head -1)"
+hintline="$(grep -Fm1 "$HINT" <<<"$out1")"
 grep -q $'\033\[2m' <<<"$hintline" || fail "hint line is not dim (missing \\033[2m): $(printf %q "$hintline")"
 grep -qE $'\033\[[0-9;]*(31|91)[;m]' <<<"$hintline" && fail "hint line is RED — violates the no-false-red rule"
 pass
@@ -79,18 +79,18 @@ command -v _herd_soft_dep_startup_notice >/dev/null 2>&1 \
 EMPTYBIN="$T/emptybin"; mkdir -p "$EMPTYBIN"   # no glow/shellcheck/bats reachable here
 
 # unset → default off → byte-identical (no output)
-o_unset="$( unset DOCTOR_STARTUP_HINT; PATH="$EMPTYBIN" _herd_soft_dep_startup_notice )"
+o_unset="$( unset DOCTOR_STARTUP_HINT; PATH="$EMPTYBIN" _herd_soft_dep_startup_notice)"
 [ -z "$o_unset" ] || fail "notice must be silent when DOCTOR_STARTUP_HINT is unset (got: $o_unset)"
 # explicit off → silent
-o_off="$( DOCTOR_STARTUP_HINT=off PATH="$EMPTYBIN" _herd_soft_dep_startup_notice )"
+o_off="$( DOCTOR_STARTUP_HINT=off PATH="$EMPTYBIN" _herd_soft_dep_startup_notice)"
 [ -z "$o_off" ] || fail "notice must be silent when DOCTOR_STARTUP_HINT=off (got: $o_off)"
 # a bogus value is treated as off (only 'on' enables)
-o_bogus="$( DOCTOR_STARTUP_HINT=yes PATH="$EMPTYBIN" _herd_soft_dep_startup_notice )"
+o_bogus="$( DOCTOR_STARTUP_HINT=yes PATH="$EMPTYBIN" _herd_soft_dep_startup_notice)"
 [ -z "$o_bogus" ] || fail "notice must treat any non-'on' value as off (got: $o_bogus)"
 pass
 
 # ── Case 3: opt-in ON surfaces each MISSING soft dep + a single doctor pointer, dim never red ─────
-o_on="$( DOCTOR_STARTUP_HINT=on PATH="$EMPTYBIN" _herd_soft_dep_startup_notice )"
+o_on="$( DOCTOR_STARTUP_HINT=on PATH="$EMPTYBIN" _herd_soft_dep_startup_notice)"
 grep -q "glow not found"       <<<"$o_on" || fail "notice(on) must surface missing glow ($o_on)"
 grep -q "shellcheck not found" <<<"$o_on" || fail "notice(on) must surface missing shellcheck ($o_on)"
 grep -q "bats not found"       <<<"$o_on" || fail "notice(on) must surface missing bats ($o_on)"
@@ -105,7 +105,7 @@ pass
 # ── Case 4: opt-in ON with every soft dep PRESENT prints nothing (no spurious noise) ──────────────
 FULLBIN="$T/fullbin"; mkdir -p "$FULLBIN"
 for t in glow shellcheck bats; do printf '#!/bin/sh\n:\n' > "$FULLBIN/$t"; chmod +x "$FULLBIN/$t"; done
-o_full="$( DOCTOR_STARTUP_HINT=on PATH="$FULLBIN:/usr/bin:/bin" _herd_soft_dep_startup_notice )"
+o_full="$( DOCTOR_STARTUP_HINT=on PATH="$FULLBIN:/usr/bin:/bin" _herd_soft_dep_startup_notice)"
 [ -z "$o_full" ] || fail "notice(on) must be silent when all soft deps are present (got: $o_full)"
 pass
 

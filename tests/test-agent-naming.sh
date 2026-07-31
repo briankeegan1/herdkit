@@ -27,17 +27,17 @@ echo HERD_TAB_COORDINATOR=\$HERD_TAB_COORDINATOR" )
 
 # 1. WORKSPACE_NAME=alpha → every singleton carries the -alpha suffix.
 outA="$(load_names alpha)"
-echo "$outA" | grep -qx "HERD_AGENT_COORDINATOR=coordinator-alpha" || fail "coordinator name not scoped to -alpha ($outA)"
-echo "$outA" | grep -qx "HERD_AGENT_SCRIBE=scribe-alpha"           || fail "scribe name not scoped to -alpha"
-echo "$outA" | grep -qx "HERD_AGENT_RESEARCHER=researcher-alpha"   || fail "researcher name not scoped to -alpha"
-echo "$outA" | grep -qx "HERD_TAB_COORDINATOR=coordinator-alpha"   || fail "coordinator tab label not scoped to -alpha"
+grep -qx "HERD_AGENT_COORDINATOR=coordinator-alpha" <<< "$outA" || fail "coordinator name not scoped to -alpha ($outA)"
+grep -qx "HERD_AGENT_SCRIBE=scribe-alpha" <<< "$outA" || fail "scribe name not scoped to -alpha"
+grep -qx "HERD_AGENT_RESEARCHER=researcher-alpha" <<< "$outA" || fail "researcher name not scoped to -alpha"
+grep -qx "HERD_TAB_COORDINATOR=coordinator-alpha" <<< "$outA" || fail "coordinator tab label not scoped to -alpha"
 
 # 2. A DIFFERENT WORKSPACE_NAME yields DISTINCT names — the whole point: two projects in one herdr
 #    never share a singleton name, so neither closes the other's tab nor blocks the other's drainer.
 outB="$(load_names beta)"
-echo "$outB" | grep -qx "HERD_AGENT_COORDINATOR=coordinator-beta" || fail "coordinator name not scoped to -beta ($outB)"
-echo "$outB" | grep -qx "HERD_AGENT_SCRIBE=scribe-beta"           || fail "scribe name not scoped to -beta"
-echo "$outB" | grep -qx "HERD_AGENT_RESEARCHER=researcher-beta"   || fail "researcher name not scoped to -beta"
+grep -qx "HERD_AGENT_COORDINATOR=coordinator-beta" <<< "$outB" || fail "coordinator name not scoped to -beta ($outB)"
+grep -qx "HERD_AGENT_SCRIBE=scribe-beta" <<< "$outB" || fail "scribe name not scoped to -beta"
+grep -qx "HERD_AGENT_RESEARCHER=researcher-beta" <<< "$outB" || fail "researcher name not scoped to -beta"
 
 get(){ printf '%s\n' "$1" | grep "^$2=" | cut -d= -f2-; }
 for key in HERD_AGENT_COORDINATOR HERD_AGENT_SCRIBE HERD_AGENT_RESEARCHER HERD_TAB_COORDINATOR; do
@@ -53,6 +53,6 @@ case "$coord" in
   coordinator-*) : ;;
   *) fail "sanitized coordinator name lost its prefix ($coord)" ;;
 esac
-printf '%s' "$coord" | grep -Eq '^[A-Za-z0-9_-]+$' || fail "sanitized coordinator name has unsafe chars ($coord)"
+grep -Eq '^[A-Za-z0-9_-]+$' <<< "$coord" || fail "sanitized coordinator name has unsafe chars ($coord)"
 
 echo "ALL PASS"

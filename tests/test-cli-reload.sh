@@ -89,36 +89,36 @@ ok
 P="$T/p2a"; mkdir "$P"
 _make_project "$P" "reloadtest" 'MERGE_POLICY="auto"'
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
-printf '%s' "$out" | grep -q "MERGE_POLICY:" || fail "output missing MERGE_POLICY line"
-printf '%s' "$out" | grep -q "auto"          || fail "MERGE_POLICY should be 'auto'"
+grep -q "MERGE_POLICY:" <<< "$out" || fail "output missing MERGE_POLICY line"
+grep -q "auto" <<< "$out" || fail "MERGE_POLICY should be 'auto'"
 ok
 
 # ── 2b. MERGE_POLICY=approve ──────────────────────────────────────────────────
 P="$T/p2b"; mkdir "$P"
 _make_project "$P" "reloadtest" 'MERGE_POLICY="approve"'
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
-printf '%s' "$out" | grep -q "approve" || fail "MERGE_POLICY should be 'approve'"
+grep -q "approve" <<< "$out" || fail "MERGE_POLICY should be 'approve'"
 ok
 
 # ── 2c. MERGE_POLICY=observe ──────────────────────────────────────────────────
 P="$T/p2c"; mkdir "$P"
 _make_project "$P" "reloadtest" 'MERGE_POLICY="observe"'
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
-printf '%s' "$out" | grep -q "observe" || fail "MERGE_POLICY should be 'observe'"
+grep -q "observe" <<< "$out" || fail "MERGE_POLICY should be 'observe'"
 ok
 
 # ── 2d. WATCHER_AUTOMERGE=false → approve when MERGE_POLICY unset ────────────
 P="$T/p2d"; mkdir "$P"
 _make_project "$P" "reloadtest" 'WATCHER_AUTOMERGE="false"'
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
-printf '%s' "$out" | grep -q "approve" || fail "WATCHER_AUTOMERGE=false should derive approve"
+grep -q "approve" <<< "$out" || fail "WATCHER_AUTOMERGE=false should derive approve"
 ok
 
 # ── 2e. Default (WATCHER_AUTOMERGE=true, no MERGE_POLICY) → auto ─────────────
 P="$T/p2e"; mkdir "$P"
 _make_project "$P" "reloadtest"
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
-printf '%s' "$out" | grep -q "auto" || fail "default WATCHER_AUTOMERGE=true should derive auto"
+grep -q "auto" <<< "$out" || fail "default WATCHER_AUTOMERGE=true should derive auto"
 ok
 
 # ── 2f. TYPO'd MERGE_POLICY fails STRICT to observe (HERD-210) ───────────────
@@ -130,9 +130,9 @@ P="$T/p2f"; mkdir "$P"
 _make_project "$P" "reloadtest" 'MERGE_POLICY="aprove"'
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
 pol_line="$(printf '%s\n' "$out" | grep "MERGE_POLICY:" || true)"
-printf '%s' "$pol_line" | grep -q "observe" \
+grep -q "observe" <<< "$pol_line" \
   || fail "typo MERGE_POLICY=aprove must report observe, got: $pol_line"
-printf '%s' "$pol_line" | grep -q "auto" \
+grep -q "auto" <<< "$pol_line" \
   && fail "typo MERGE_POLICY=aprove reported 'auto' from the legacy WATCHER_AUTOMERGE derivation" || true
 ok
 
@@ -167,7 +167,7 @@ ok
 P="$T/p5"; mkdir "$P"
 _make_project "$P" "reloadtest"
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 )"
-printf '%s' "$out" | grep -qi "no running watcher\|not found" \
+grep -qi "no running watcher\|not found" <<< "$out" \
   || fail "reload should note no running watcher when lockfile is absent"
 ok
 
@@ -176,7 +176,7 @@ P="$T/p6"; mkdir "$P"
 git -C "$P" init -q; git -C "$P" config user.email t@t.t; git -C "$P" config user.name t
 ( cd "$P" && git commit -q --allow-empty -m init )
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload 2>&1 || true )"
-printf '%s' "$out" | grep -qi "herd init\|no .herd/config" \
+grep -qi "herd init\|no .herd/config" <<< "$out" \
   || fail "reload should report missing .herd/config clearly"
 ok
 
@@ -472,13 +472,13 @@ P="$T/p11"; mkdir "$P"
 _make_project "$P" "reloadtest"
 S="$T/state11"
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (canonical rebuild path)"
-printf '%s' "$out" | grep -q "building a fresh canonical control room" || fail "did not announce a canonical rebuild"
+grep -q "building a fresh canonical control room" <<< "$out" || fail "did not announce a canonical rebuild"
 grep -q "tab create .*--label coordinator-reloadtest" "$S/log" || fail "coordinator tab not created"
 grep -q "tab create .*--label watch-reloadtest" "$S/log" && fail "created a stray standalone watch tab" || true
 grep -q "tab create .*--label backlog-reloadtest" "$S/log" && fail "created a stray standalone backlog tab" || true
 grep -rl "herd-watch.sh" "$S/panes" >/dev/null || fail "no pane received the watch script"
 grep -rl "backlog-view.sh" "$S/panes" >/dev/null || fail "no pane received backlog-view.sh"
-printf '%s' "$out" | grep -q "start it yourself" || fail "missing coordinator-agent restart hint"
+grep -q "start it yourself" <<< "$out" || fail "missing coordinator-agent restart hint"
 # Registry written from the observed rebuilt panes.
 P11_REAL="$(cd "$P" && pwd -P)"
 grep -q "coordinator-agent" "$P11_REAL/trees/.herd-panes" || fail "registry missing coordinator-agent row"
@@ -493,8 +493,8 @@ S="$T/state12"; _rich_coord_state "$S"
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (coordinator layout)"
 grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null || fail "watch script not run in the pane below the coordinator"
 grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null || fail "backlog-view not run in the pane left of the coordinator"
-printf '%s' "$out" | grep -q "pane below coordinator" || fail "output missing 'pane below coordinator'"
-printf '%s' "$out" | grep -q "visible ✓" || fail "watcher visibility not reported (coordinator layout)"
+grep -q "pane below coordinator" <<< "$out" || fail "output missing 'pane below coordinator'"
+grep -q "visible ✓" <<< "$out" || fail "watcher visibility not reported (coordinator layout)"
 grep -q "tab close tC" "$S/log" && fail "reload CLOSED the coordinator tab (must never happen)" || true
 grep -q "pane split" "$S/log" && fail "reload split a pane when both panes were reusable" || true
 [ -f "$S/tabs/tC" ] || fail "coordinator tab is gone from state"
@@ -506,7 +506,7 @@ _make_project "$P" "reloadtest"
 S="$T/state13"; _rich_coord_state "$S"
 printf 'bash /somewhere/backlog-view.sh' > "$S/panes/pL/cmd"   # already live
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (live backlog test)"
-printf '%s' "$out" | grep -q "already live ✓" || fail "live backlog pane not reported as already live"
+grep -q "already live ✓" <<< "$out" || fail "live backlog pane not reported as already live"
 grep -q "pane run pL" "$S/log" && fail "reload re-ran a command in the LIVE backlog pane" || true
 ok
 
@@ -525,9 +525,9 @@ out="$(_rich_reload "$P" "$S" FAKE_RUN_WRITES_LOCK="$lockfile:$ZPID")" \
   || { kill "$ZPID" 2>/dev/null || true; fail "reload failed (invisible-watcher test)"; }
 runs="$(grep -c "pane run pW" "$S/log" || true)"
 [ "$runs" -eq 2 ] || { kill "$ZPID" 2>/dev/null || true; fail "expected exactly 2 pane run attempts (retry once), got $runs"; }
-printf '%s' "$out" | grep -q "RUNNING but NOT visible" \
+grep -q "RUNNING but NOT visible" <<< "$out" \
   || { kill "$ZPID" 2>/dev/null || true; fail "invisible watcher not reported loudly"; }
-printf '%s' "$out" | grep -q "DETACHED" \
+grep -q "DETACHED" <<< "$out" \
   || { kill "$ZPID" 2>/dev/null || true; fail "summary missing DETACHED watcher state"; }
 [ "$(cat "$lockfile" 2>/dev/null)" = "$ZPID" ] \
   || { kill "$ZPID" 2>/dev/null || true; fail "detached watcher's lockfile was clobbered"; }
@@ -542,7 +542,7 @@ rm -f "$S/neighbors/pA.left"   # user closed the backlog pane
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (missing backlog pane)"
 grep -q "pane split pA --direction right" "$S/log" || fail "missing backlog pane did not split the coordinator pane"
 grep -q "pane swap --source-pane" "$S/log" || fail "recreated backlog pane was not swapped into the left slot"
-printf '%s' "$out" | grep -q "recreated ✓" || fail "recreated backlog pane not verified/reported"
+grep -q "recreated ✓" <<< "$out" || fail "recreated backlog pane not verified/reported"
 ok
 
 # ── 16. verify-failure without a detached watcher → loud warning, fallback suppressed ─
@@ -551,7 +551,7 @@ _make_project "$P" "reloadtest"
 S="$T/state16"; _rich_coord_state "$S"
 touch "$S/panes/pW/noshow"     # pane run never becomes visible, and nothing grabs the lock
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (verify-failure test)"
-printf '%s' "$out" | grep -q "NOT relaunched" || fail "suppressed fallback not reported after verify failure"
+grep -q "NOT relaunched" <<< "$out" || fail "suppressed fallback not reported after verify failure"
 ok
 
 # ═══ pane registry path (tests 17+) ══════════════════════════════════════════
@@ -597,7 +597,7 @@ REG
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (registry watch pane gone)"
 # pW_gone is GONE → reload falls through to neighbor (pA.down=pW) or splits; either way
 # the watch ends up in the coordinator tab.
-printf '%s' "$out" | grep -q "pane below coordinator" \
+grep -q "pane below coordinator" <<< "$out" \
   || fail "watch not placed in coordinator tab after registry pane was gone"
 # backlog from registry (pL_r) used without a neighbor query.
 grep -q "pane run pL_r" "$S/log" \
@@ -621,7 +621,7 @@ backlog pL_dead tC
 watch pW_dead tC
 REG
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (coordinator tab gone)"
-printf '%s' "$out" | grep -q "building a fresh canonical control room" \
+grep -q "building a fresh canonical control room" <<< "$out" \
   || fail "stale registry: expected a canonical rebuild when the coordinator tab is gone"
 grep -q "tab create .*--label coordinator-reloadtest" "$S/log" \
   || fail "coordinator tab not rebuilt when tab was gone"
@@ -642,7 +642,7 @@ lockfile="$P20_REAL/trees/.watcher-reloadtest.pid"
 FAKE_PID="55555"
 out="$(_rich_reload "$P" "$S" FAKE_RUN_WRITES_LOCK="$lockfile:$FAKE_PID")" \
   || fail "reload failed (lockfile pid test)"
-printf '%s' "$out" | grep -q "pid $FAKE_PID" \
+grep -q "pid $FAKE_PID" <<< "$out" \
   || fail "summary pid should come from lockfile (expected pid $FAKE_PID, got: $(printf '%s' "$out" | grep pid || echo none))"
 ok
 
@@ -676,8 +676,7 @@ grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null \
 grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null \
   || fail "migration: backlog script not in coordinator-tab pane"
 # No standalone watch tab should have been created.
-grep "tab create" "$S/log" 2>/dev/null \
-  | grep -q "watch-reloadtest" && fail "migration: standalone watch tab created — fallback not suppressed" || true
+grep -q "watch-reloadtest" <<< "$(grep "tab create" "$S/log" 2>/dev/null || true)" && fail "migration: standalone watch tab created — fallback not suppressed" || true
 # Registry must be written with the pane IDs actually used.
 [ -f "$P21_REAL/trees/.herd-panes" ] \
   || fail "migration: .herd-panes not written after seeding run"
@@ -726,9 +725,9 @@ out="$(_rich_reload "$P" "$S")" || fail "reload failed (canonical-rebuild regist
 [ -f "$P23_REAL/trees/.herd-panes" ] \
   || fail "canonical-rebuild path did not write .herd-panes"
 reg="$(cat "$P23_REAL/trees/.herd-panes")"
-printf '%s' "$reg" | grep -q "coordinator-agent" || fail "registry missing coordinator-agent row"
-printf '%s' "$reg" | grep -q "watch"   || fail "registry missing watch row"
-printf '%s' "$reg" | grep -q "backlog" || fail "registry missing backlog row"
+grep -q "coordinator-agent" <<< "$reg" || fail "registry missing coordinator-agent row"
+grep -q "watch" <<< "$reg" || fail "registry missing watch row"
+grep -q "backlog" <<< "$reg" || fail "registry missing backlog row"
 # The pane IDs in the registry must be the ones that actually received the scripts.
 watch_pane_id="$(awk '$1=="watch"  {print $2}' "$P23_REAL/trees/.herd-panes")"
 backlog_pane_id="$(awk '$1=="backlog" {print $2}' "$P23_REAL/trees/.herd-panes")"
@@ -762,7 +761,7 @@ grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null \
   || fail "watch not (re)launched in the coordinator-tab watch pane"
 grep -q "pane run pA" "$S/log" && fail "reload ran a command in the coordinator (anchor) pane" || true
 grep -q "pane run pL" "$S/log" && fail "reload re-ran the still-live backlog viewer" || true
-printf '%s' "$out" | grep -q "start it yourself" || fail "missing restart hint for the dead coordinator agent"
+grep -q "start it yourself" <<< "$out" || fail "missing restart hint for the dead coordinator agent"
 [ -f "$S/tabs/tC" ] || fail "coordinator tab was destroyed"
 # Registry preserved with coordinator-tab pane IDs.
 grep -q "^coordinator-agent pA tC" "$P24_REAL/trees/.herd-panes" || fail "registry coordinator-agent row not preserved"
@@ -779,8 +778,8 @@ out="$(_rich_reload "$P" "$S")" || fail "reload failed (live-agent adopt path)"
 grep -q "pane run pA" "$S/log" && fail "reload wrote into the live coordinator pane" || true
 grep -q "tab create" "$S/log" && fail "reload created a tab when the control room was up" || true
 grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null || fail "watcher not relaunched below coordinator"
-printf '%s' "$out" | grep -q "already live ✓" || fail "live backlog not adopted"
-printf '%s' "$out" | grep -q "start it yourself" && fail "printed a restart hint while the agent was live" || true
+grep -q "already live ✓" <<< "$out" || fail "live backlog not adopted"
+grep -q "start it yourself" <<< "$out" && fail "printed a restart hint while the agent was live" || true
 ok
 
 # ── 26. watch-pane-spanning-bottom geometry repair via re-parent (bounce out/in) ─
@@ -921,10 +920,10 @@ P="$T/p32"; mkdir "$P"; _make_project "$P" "reloadtest"
 S="$T/state32"; mkdir -p "$S/tabs" "$S/panes" "$S/neighbors"
 out="$( cd "$P" && env PATH="$RICH:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="someotherlabel" \
     HERD_RELOAD_SKIP_LAUNCH=fallback bash "$HERD" reload 2>&1 )" || fail "reload failed (empty-ws fail-loud)"
-printf '%s' "$out" | grep -q "no herdr workspace labelled 'reloadtest'" || fail "empty-ws: expected label not named"
-printf '%s' "$out" | grep -q "someotherlabel" || fail "empty-ws: observed open labels not listed"
-printf '%s' "$out" | grep -qi "control room" || fail "empty-ws: summary missing control-room verdict"
-printf '%s' "$out" | grep -qi "NOT rebuilt" || fail "empty-ws: summary did not flag control room NOT rebuilt"
+grep -q "no herdr workspace labelled 'reloadtest'" <<< "$out" || fail "empty-ws: expected label not named"
+grep -q "someotherlabel" <<< "$out" || fail "empty-ws: observed open labels not listed"
+grep -qi "control room" <<< "$out" || fail "empty-ws: summary missing control-room verdict"
+grep -qi "NOT rebuilt" <<< "$out" || fail "empty-ws: summary did not flag control room NOT rebuilt"
 ok
 
 # ── 33. herdr CLI/parse error (list exits non-zero) is distinguished from a genuine no-match ──────
@@ -932,8 +931,8 @@ ok
 # collapse it into "no such workspace".
 P="$T/p33"; mkdir "$P"; _make_project "$P" "reloadtest"
 out="$( cd "$P" && HERD_RELOAD_SKIP_LAUNCH=fallback bash "$HERD" reload 2>&1 )" || fail "reload failed (parse-error path)"
-printf '%s' "$out" | grep -qi "workspace list' failed" || fail "herdr list failure not surfaced distinctly"
-printf '%s' "$out" | grep -qi "NOT rebuilt" || fail "parse-error: control room not flagged NOT rebuilt"
+grep -qi "workspace list' failed" <<< "$out" || fail "herdr list failure not surfaced distinctly"
+grep -qi "NOT rebuilt" <<< "$out" || fail "parse-error: control room not flagged NOT rebuilt"
 ok
 
 # ── 34. herdr NOT installed → its OWN distinct message (not the no-match one) ─────────────────────
@@ -951,8 +950,8 @@ rm -f "$NOHERDR/pgrep"; cp "$BIN/pgrep" "$NOHERDR/pgrep"; chmod +x "$NOHERDR/pgr
 P="$T/p34"; mkdir "$P"; _make_project "$P" "reloadtest"
 out="$( cd "$P" && env -i LC_ALL="$UTF8_LOCALE" PATH="$NOHERDR" HOME="$HOME" HERD_RELOAD_SKIP_LAUNCH=fallback \
     bash "$HERD" reload 2>&1 )" || fail "reload failed (herdr-absent path)"
-printf '%s' "$out" | grep -qi "herdr not found" || fail "herdr-absent: distinct 'herdr not found' message missing"
-printf '%s' "$out" | grep -q "no herdr workspace labelled" && fail "herdr-absent wrongly reported as a no-match" || true
+grep -qi "herdr not found" <<< "$out" || fail "herdr-absent: distinct 'herdr not found' message missing"
+grep -q "no herdr workspace labelled" <<< "$out" && fail "herdr-absent wrongly reported as a no-match" || true
 ok
 
 # ═══ issue #60 fix 3: .herd-panes per-workspace + role validation (tests 35+) ═════════════════════
@@ -976,7 +975,7 @@ grep -q "pane run pL_r" "$S/log" && fail "adopted a backlog pane stamped for a F
 grep -q "herd-watch.sh"  "$S/panes/pW/cmd" 2>/dev/null || fail "watch role not re-established from the live roster"
 grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null || fail "backlog role not re-established from the live roster"
 # The rewritten registry must be stamped with THIS workspace (w1) as the 4th column.
-awk '$1=="watch" {print $4}' "$P35_REAL/trees/.herd-panes" | grep -qx "w1" || fail "rewritten watch row not stamped with workspace_id w1"
+grep -qx "w1" <<< "$(awk '$1=="watch" {print $4}' "$P35_REAL/trees/.herd-panes")" || fail "rewritten watch row not stamped with workspace_id w1"
 ok
 
 # ── 36. a registry row whose pane serves the WRONG role is dropped + recreated ────────────────────
@@ -1017,9 +1016,9 @@ out="$( cd "$P" && timeout 45 env PATH="$RICH:$PATH" HERDR_STATE="$S" FAKE_WS_LA
 rc=$?
 set -e
 [ "$rc" -ne 124 ] || fail "reload BLOCKED on a wedged herdr pane-verify (outer timeout fired) — HERD-208 regression"
-printf '%s' "$out" | grep -qi "hard timeout" || fail "wedged verify did not emit the hard-timeout degraded note"
-printf '%s' "$out" | grep -qi "headless"     || fail "wedged verify did not name the headless-watcher fallback"
-printf '%s' "$out" | grep -q  "NOT relaunched" || fail "wedged verify did not reach the (suppressed) watcher fallback"
+grep -qi "hard timeout" <<< "$out" || fail "wedged verify did not emit the hard-timeout degraded note"
+grep -qi "headless" <<< "$out" || fail "wedged verify did not name the headless-watcher fallback"
+grep -q  "NOT relaunched" <<< "$out" || fail "wedged verify did not reach the (suppressed) watcher fallback"
 ok
 
 # ═══ --with-coordinator (HERD-427): opt-in coordinator start on `herd reload` ═══════════════════════
@@ -1040,7 +1039,7 @@ backlog pL tC
 watch pW tC
 REG
 out="$(_rich_reload "$P" "$S")" || fail "reload failed (--with-coordinator OFF, no agent)"
-printf '%s' "$out" | grep -qF "no coordinator agent is live in pane pA — start it yourself:  claude /coordinator" \
+grep -qF "no coordinator agent is live in pane pA — start it yourself:  claude /coordinator" <<< "$out" \
   || fail "default reload's restart hint changed — must stay byte-identical with the flag off"
 grep -q "agent start" "$S/log" && fail "flag OFF but reload started a coordinator agent" || true
 grep -q "pane close pA" "$S/log" && fail "flag OFF but reload closed the (bare) coordinator anchor pane" || true
@@ -1064,8 +1063,8 @@ out="$( cd "$P" && env PATH="$RICH:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="reload
     bash "$HERD" reload --with-coordinator 2>&1 )" || fail "reload failed (--with-coordinator, no agent)"
 grep -q "pane close pA" "$S/log" || fail "did not close the bare coordinator anchor before relaunching"
 grep -q "agent start coordinator-reloadtest" "$S/log" || fail "did not start a fresh coordinator agent"
-printf '%s' "$out" | grep -q "started ✓" || fail "summary missing the coordinator 'started ✓' line"
-printf '%s' "$out" | grep -q "start it yourself" && fail "printed the manual-start hint despite --with-coordinator succeeding" || true
+grep -q "started ✓" <<< "$out" || fail "summary missing the coordinator 'started ✓' line"
+grep -q "start it yourself" <<< "$out" && fail "printed the manual-start hint despite --with-coordinator succeeding" || true
 new_c="$(awk '$1=="coordinator-agent" {print $2}' "$P39_REAL/trees/.herd-panes")"
 [ -n "$new_c" ] && [ "$new_c" != "pA" ] || fail "registry coordinator-agent not updated to the freshly-started pane (got '$new_c')"
 grep -q "^backlog pL" "$P39_REAL/trees/.herd-panes" || fail "registry backlog row not preserved"
@@ -1088,8 +1087,8 @@ out="$( cd "$P" && env PATH="$RICH:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="reload
     bash "$HERD" reload --with-coordinator 2>&1 )" || fail "reload failed (--with-coordinator, agent live)"
 grep -q "pane close pA" "$S/log" && fail "--with-coordinator killed the LIVE coordinator pane" || true
 grep -q "agent start" "$S/log" && fail "--with-coordinator started a second agent over a live one" || true
-printf '%s' "$out" | grep -qi "refusing to restart it" || fail "missing the live-agent refusal message"
-printf '%s' "$out" | grep -q "herd pane coordinator" || fail "refusal message did not point at 'herd pane coordinator'"
+grep -qi "refusing to restart it" <<< "$out" || fail "missing the live-agent refusal message"
+grep -q "herd pane coordinator" <<< "$out" || fail "refusal message did not point at 'herd pane coordinator'"
 grep -q "^coordinator-agent pA tC" "$P40_REAL/trees/.herd-panes" || fail "registry coordinator-agent row changed despite the refusal"
 ok
 

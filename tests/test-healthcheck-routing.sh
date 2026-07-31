@@ -80,9 +80,9 @@ write_cfg '"^app/"'
 touch_app
 out="$(run_auto)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(1) heavy stub is clean → exit 0 (got $rc): $out"
-printf '%s' "$out" | grep -q "$HEAVY_MARKER" \
+grep -q "$HEAVY_MARKER" <<< "$out" \
   || fail "(1) a change matching '^app/' must route HEAVY (stub marker expected): $out"
-printf '%s' "$out" | grep -q 'light clean' \
+grep -q 'light clean' <<< "$out" \
   && fail "(1) a matching change must NOT route light: $out"
 ok
 
@@ -91,9 +91,9 @@ write_cfg '"^app/"'
 touch_src
 out="$(run_auto)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(2) light clean → exit 0 (got $rc): $out"
-printf '%s' "$out" | grep -q "$HEAVY_MARKER" \
+grep -q "$HEAVY_MARKER" <<< "$out" \
   && fail "(2) a change NOT matching '^app/' must route LIGHT — the heavy stub must NOT run: $out"
-printf '%s' "$out" | grep -q 'light clean' \
+grep -q 'light clean' <<< "$out" \
   || fail "(2) a non-matching change must emit the light verdict: $out"
 ok
 
@@ -104,7 +104,7 @@ ok
 write_cfg '"^app/"'
 touch_app;  m_app="$(run_auto)"
 touch_src;  m_src="$(run_auto)"
-{ printf '%s' "$m_app" | grep -q "$HEAVY_MARKER" && printf '%s' "$m_src" | grep -q 'light clean'; } \
+{ grep -q "$HEAVY_MARKER" <<< "$m_app" && grep -q 'light clean' <<< "$m_src"; } \
   || fail "(3) routing not mutually exclusive (app='$m_app' src='$m_src') — a swapped branch would slip through"
 ok
 
@@ -115,7 +115,7 @@ write_cfg "'['"
 touch_src   # a NON-heavy path: under the bug this would go light; the fix forces heavy anyway
 out="$(run_auto)"; rc=$?
 [ "$rc" -eq 0 ] || fail "(4) heavy stub is clean → exit 0 (got $rc): $out"
-printf '%s' "$out" | grep -q "$HEAVY_MARKER" \
+grep -q "$HEAVY_MARKER" <<< "$out" \
   || fail "(4) an INVALID HEALTHCHECK_HEAVY_GLOB must FAIL TOWARD HEAVY, not silently light: $out"
 grep -q 'invalid HEALTHCHECK_HEAVY_GLOB' "$T/stderr" \
   || fail "(4) an invalid glob must emit a LOUD warning to stderr: $(cat "$T/stderr")"
@@ -125,15 +125,15 @@ ok
 write_cfg '""' 1        # empty glob, WITH a health cmd → "no app axis" → always heavy
 touch_src
 out="$(run_auto)"
-printf '%s' "$out" | grep -q "$HEAVY_MARKER" \
+grep -q "$HEAVY_MARKER" <<< "$out" \
   || fail "(5) empty glob + a health cmd must route HEAVY (no app axis): $out"
 ok
 write_cfg '"^app/"' 0   # NO health cmd → auto is always light (pure syntax gate), glob is moot
 touch_app
 out="$(run_auto)"
-printf '%s' "$out" | grep -q "$HEAVY_MARKER" \
+grep -q "$HEAVY_MARKER" <<< "$out" \
   && fail "(5) with NO HEALTHCHECK_CMD auto must be LIGHT regardless of the glob: $out"
-printf '%s' "$out" | grep -q 'light clean' \
+grep -q 'light clean' <<< "$out" \
   || fail "(5) no health cmd → light verdict expected: $out"
 ok
 

@@ -56,7 +56,7 @@ out="$( cd "$proj" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETE
         "$REAL_BASH" "$HERD" init --archetype nope-not-real 2>&1 )"
 rc=$?
 [ "$rc" -ne 0 ] || fail "(1) unknown --archetype should fail: $out"
-echo "$out" | grep -qi "unknown --archetype" || fail "(1) should name the bad flag: $out"
+grep -qi "unknown --archetype" <<< "$out" || fail "(1) should name the bad flag: $out"
 [ -e "$proj/.herd/config" ] && fail "(1) no .herd/config should be written on a rejected flag"
 ok
 
@@ -66,7 +66,7 @@ out="$( cd "$proj" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETE
         "$REAL_BASH" "$HERD" init --posture nope-not-real 2>&1 )"
 rc=$?
 [ "$rc" -ne 0 ] || fail "(2) unknown --posture should fail: $out"
-echo "$out" | grep -qi "unknown --posture" || fail "(2) should name the bad flag: $out"
+grep -qi "unknown --posture" <<< "$out" || fail "(2) should name the bad flag: $out"
 [ -e "$proj/.herd/config" ] && fail "(2) no .herd/config should be written on a rejected flag"
 ok
 
@@ -76,8 +76,8 @@ out="$( cd "$proj" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETE
         "$REAL_BASH" "$HERD" init --archetype research-lab --posture observe-only 2>&1 )" \
   || fail "(3) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -q "from --archetype flag" || fail "(3) should announce the archetype flag: $out"
-echo "$pout" | grep -q "from --posture flag"   || fail "(3) should announce the posture flag: $out"
+grep -q "from --archetype flag" <<< "$pout" || fail "(3) should announce the archetype flag: $out"
+grep -q "from --posture flag" <<< "$pout" || fail "(3) should announce the posture flag: $out"
 grep -qE '^PROJECT_ARCHETYPE="research-lab"$' "$proj/.herd/config" \
   || fail "(3) PROJECT_ARCHETYPE not persisted: $(grep PROJECT_ARCHETYPE "$proj/.herd/config")"
 grep -qE '^MERGE_POLICY="observe"$' "$proj/.herd/config" \
@@ -94,9 +94,9 @@ out="$( cd "$proj" && HERD_ARCHETYPE_ASSUME_TTY=1 HERD_POSTURE_ASSUME_TTY=1 \
           < /dev/null 2>&1 )" \
   || fail "(4) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -q "from --archetype flag" || fail "(4) archetype flag should still win under a tty: $out"
-echo "$pout" | grep -q "from --posture flag"   || fail "(4) posture flag should still win under a tty: $out"
-echo "$pout" | grep -qE '^\s+[0-9]\) code' && fail "(4) the archetype PICKER must not run when the flag is given: $out"
+grep -q "from --archetype flag" <<< "$pout" || fail "(4) archetype flag should still win under a tty: $out"
+grep -q "from --posture flag" <<< "$pout" || fail "(4) posture flag should still win under a tty: $out"
+grep -qE '^\s+[0-9]\) code' <<< "$pout" && fail "(4) the archetype PICKER must not run when the flag is given: $out"
 grep -qE '^PROJECT_ARCHETYPE="docs"$' "$proj/.herd/config" || fail "(4) PROJECT_ARCHETYPE not persisted"
 grep -qE '^MERGE_POLICY="approve"$' "$proj/.herd/config" || fail "(4) team-approve posture should set MERGE_POLICY=approve"
 ok
@@ -106,8 +106,8 @@ proj="$T/no-flags"; mkproj "$proj"
 out="$( cd "$proj" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
         "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(5) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -q "Project archetype" && fail "(5) plain non-interactive must NOT run/announce the archetype interview: $out"
-echo "$pout" | grep -q "Operating posture"  && fail "(5) plain non-interactive must NOT run/announce the posture interview: $out"
+grep -q "Project archetype" <<< "$pout" && fail "(5) plain non-interactive must NOT run/announce the archetype interview: $out"
+grep -q "Operating posture" <<< "$pout" && fail "(5) plain non-interactive must NOT run/announce the posture interview: $out"
 grep -qE '^PROJECT_ARCHETYPE="code"$' "$proj/.herd/config" || fail "(5) PROJECT_ARCHETYPE should still default to code"
 grep -qE '^MERGE_POLICY="auto"$' "$proj/.herd/config" || fail "(5) MERGE_POLICY should still default to auto (no remote, no protection)"
 ok

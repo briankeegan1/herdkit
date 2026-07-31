@@ -52,8 +52,8 @@ _fixture() {
 out="$(herd_journal_emission_lint "$ROOT")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(1) the real tree must be clean; got rc=$rc:
 $out"
-printf '%s' "$out" | grep -q '^ADVISORY:' || fail "(1) expected an ADVISORY summary, got: $out"
-printf '%s' "$out" | grep -q '^EMISSION-ORPHAN' && fail "(1) real tree reported an orphan: $out"
+grep -q '^ADVISORY:' <<< "$out" || fail "(1) expected an ADVISORY summary, got: $out"
+grep -q '^EMISSION-ORPHAN' <<< "$out" && fail "(1) real tree reported an orphan: $out"
 ok
 
 # ── (2) a consumer with no producer REDS, naming the site ─────────────────────────────────────────
@@ -61,8 +61,8 @@ F="$T/orphan"; _fixture "$F"
 printf 'if ev == "ghost_event":\n    pass\n' > "$F/pysrc/herd/why.py"
 out="$(herd_journal_emission_lint "$F")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(2) an unproduced consumer must red (rc=1); got rc=$rc: $out"
-printf '%s' "$out" | grep -q 'EMISSION-ORPHAN ghost_event' || fail "(2) orphan not named: $out"
-printf '%s' "$out" | grep -q 'pysrc/herd/why.py:1' || fail "(2) consuming site not named: $out"
+grep -q 'EMISSION-ORPHAN ghost_event' <<< "$out" || fail "(2) orphan not named: $out"
+grep -q 'pysrc/herd/why.py:1' <<< "$out" || fail "(2) consuming site not named: $out"
 ok
 
 # ── (3) adding the producer clears it ─────────────────────────────────────────────────────────────
@@ -88,7 +88,7 @@ open(p, "w", encoding="utf-8").write(s)
 PYX
 out="$(herd_journal_emission_lint "$M")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(4) deleting a real producer must red; got rc=$rc: $out"
-printf '%s' "$out" | grep -q 'EMISSION-ORPHAN human_verify_policy' \
+grep -q 'EMISSION-ORPHAN human_verify_policy' <<< "$out" \
   || fail "(4) the deleted producer's event must be reported: $out"
 ok
 
@@ -98,7 +98,7 @@ printf 'if ev == "sim_only_event":\n    pass\n' > "$S/pysrc/herd/why.py"
 printf 'journal_append sim_only_event pr 1\n' > "$S/scripts/herd/sim/scenario.sh"
 out="$(herd_journal_emission_lint "$S")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(5) a sim-only emission must NOT count as a producer; got rc=$rc: $out"
-printf '%s' "$out" | grep -q 'EMISSION-ORPHAN sim_only_event' || fail "(5) not reported: $out"
+grep -q 'EMISSION-ORPHAN sim_only_event' <<< "$out" || fail "(5) not reported: $out"
 ok
 
 # ── (6) dynamic producers are resolved ────────────────────────────────────────────────────────────
@@ -138,8 +138,8 @@ allowed_event|dropped on purpose, for this test
 out="$(herd_journal_emission_lint "$A")"; rc=$?
 HERD_JOURNAL_EMISSION_ALLOW="$_save"
 [ "$rc" -eq 1 ] || fail "(8) the un-allowlisted name must still red; got rc=$rc: $out"
-printf '%s' "$out" | grep -q 'EMISSION-ORPHAN other_event' || fail "(8) other_event must red: $out"
-printf '%s' "$out" | grep -q 'EMISSION-ORPHAN allowed_event' && fail "(8) allowlisted name leaked: $out"
+grep -q 'EMISSION-ORPHAN other_event' <<< "$out" || fail "(8) other_event must red: $out"
+grep -q 'EMISSION-ORPHAN allowed_event' <<< "$out" && fail "(8) allowlisted name leaked: $out"
 ok
 
 # ── (9) the python producer half counts ───────────────────────────────────────────────────────────
@@ -176,7 +176,7 @@ cat > "$C/docs/engine-contract.md" <<'MD'
 MD
 out="$(herd_journal_emission_lint "$C")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(11) a documented-but-unproduced event must red; got rc=$rc: $out"
-printf '%s' "$out" | grep -q 'EMISSION-ORPHAN documented_only' || fail "(11) not reported: $out"
+grep -q 'EMISSION-ORPHAN documented_only' <<< "$out" || fail "(11) not reported: $out"
 ok
 
 # ── (12) the lifecycle alphabet is not mistaken for journal events ────────────────────────────────
@@ -223,7 +223,7 @@ for _b in /bin/bash /usr/bin/bash /usr/local/bin/bash /opt/homebrew/bin/bash "$(
   case " $_bashes " in *" $_b "*) continue ;; esac
   [ -x "$_b" ] || continue
   _bashes="$_bashes $_b"
-  "$_b" -n "$LINT" 2>/dev/null || fail "(14) $LINT does not parse under $_b ($("$_b" --version | head -1))"
+  "$_b" -n "$LINT" 2>/dev/null || fail "(14) $LINT does not parse under $_b ($("$_b" --version | head -1))"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
 done
 [ -n "$_bashes" ] || fail "(14) no bash found to syntax-check with"
 ok

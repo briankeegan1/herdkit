@@ -36,7 +36,7 @@ done < <(
 )
 
 if [ -n "$errs" ]; then
-  [ -n "$ONELINE" ] && echo "syntax: $(printf '%s' "$errs" | head -1)" || { echo "SYNTAX ERROR"; printf '%s' "$errs"; }
+  [ -n "$ONELINE" ] && echo "syntax: $(printf '%s' "$errs" | head -1)" || { echo "SYNTAX ERROR"; printf '%s' "$errs"; }  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
   exit 1
 fi
 
@@ -69,7 +69,7 @@ if command -v shellcheck >/dev/null 2>&1; then
     else
       sc="${sc}"$'\n'"(retried=$sc_retried)"
     fi
-    [ -n "$ONELINE" ] && echo "shellcheck: $(printf '%s' "$sc" | head -1)" || { echo "SHELLCHECK ERRORS"; printf '%s\n' "$sc"; }
+    [ -n "$ONELINE" ] && echo "shellcheck: $(printf '%s' "$sc" | head -1)" || { echo "SHELLCHECK ERRORS"; printf '%s\n' "$sc"; }  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
     exit 1
   fi
 fi
@@ -288,7 +288,7 @@ _hk_bats_notok() {
 _hk_bats_notok_line() {
   # Emit the FULL 'not ok N <desc>' line whose description contains $2 — the REAL failing line to quote
   # in the detail, NOT the adjacent diagnostic comment / next 'ok' that a bare `tail -1` used to grab.
-  printf '%s\n' "$1" | grep -E "^[[:space:]]*not ok [0-9]+ .*$2" | head -1
+  printf '%s\n' "$1" | grep -E "^[[:space:]]*not ok [0-9]+ .*$2" | sed -n 1p
 }
 
 _hk_bats_first_notok() {
@@ -300,7 +300,7 @@ _hk_bats_first_notok() {
   # must name a FAILING test or nothing at all. Falls back to the last line only when the output carries
   # no TAP 'not ok' at all (a non-bats failure), where there is nothing better to quote.
   local _bfn_line _bfn_n
-  _bfn_line="$(printf '%s\n' "$1" | grep -m1 -E '^[[:space:]]*not ok( |$)')"
+  _bfn_line="$(grep -m1 -E '^[[:space:]]*not ok( |$)' <<< "$1")"
   if [ -z "$_bfn_line" ]; then printf '%s' "$(printf '%s' "$1" | tail -1)"; return 0; fi
   # grep -c PRINTS "0" and exits 1 on no match, so `… || printf 1` would APPEND a 1 to that 0 ("01")
   # rather than replace it. Unreachable (a match is already proven above) but the idiom reads as a bug:
@@ -321,7 +321,7 @@ _hk_codemap_failure_is_env() {
   local t="tests/test-codemap-project.sh" o
   [ -f "$t" ] || return 1
   o="$(bash "$t" 2>&1)" && return 1
-  printf '%s\n' "$o" | grep -qiE 'FAIL:.*real.?repo'
+  grep -qiE 'FAIL:.*real.?repo' <<< "$o"
 }
 
 _hk_bats_env_only() {
@@ -409,7 +409,7 @@ _hk_dh_verdict() {
   # BEFORE the env classification. Cleans up the sandbox dir on the way out (leak or clean).
   if [ -n "$_hk_dh_log" ] && [ -s "$_hk_dh_log" ]; then
     if [ -n "$ONELINE" ]; then
-      echo "daemon-hermeticity: a test touched a LIVE production surface (control room / desktop notification) — $(sort -u "$_hk_dh_log" | head -1)"
+      echo "daemon-hermeticity: a test touched a LIVE production surface (control room / desktop notification) — $(sort -u "$_hk_dh_log" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
     else
       echo "DAEMON-HERMETICITY: a test reached a LIVE production surface"
       echo "  (a hermetic test must stub herdr/claude, never launch agent-watch.sh against real state,"
@@ -454,7 +454,7 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   _hk_dh_verdict   # HERD-189: a daemon leak fails HARD, before the timeout / env tolerances below
   if [ "$_hk_bats_rc" = 124 ]; then
     # HERD-185: a timeout-killed suite is an infrastructure hang (a wedged/tty-reading test), not a code bug.
-    _hk_hung="$(printf '%s' "$to" | grep -m1 -E '^(ok|not ok) ' | tail -1)"
+    _hk_hung="$(grep -m1 -E '^(ok|not ok) ' <<< "$to" | tail -1)"
     echo "bats: suite timed out (>${HEALTHCHECK_SUITE_TIMEOUT:-1800}s) — a wedged/tty-reading test, not a code bug${_hk_hung:+ — last: $_hk_hung}"
     [ -z "$ONELINE" ] && printf '%s\n' "$to"
     exit 2
@@ -542,7 +542,7 @@ while IFS= read -r f; do [ -n "$f" ] && leak_files+=("$f"); done < <(
 if [ "${#leak_files[@]}" -gt 0 ]; then
   if hits="$(grep -HinE "$leak_pat" "${leak_files[@]}" 2>/dev/null | grep -vE '\$HOME/source/myproject')"; then
     [ -n "$ONELINE" ] && echo "leak-guard: $(printf '%s' "$hits" | head -1)" \
-      || { echo "LEAK-GUARD: single-consumer literal in generic engine"; printf '%s\n' "$hits"; }
+      || { echo "LEAK-GUARD: single-consumer literal in generic engine"; printf '%s\n' "$hits"; }  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
     exit 1
   fi
 fi
@@ -574,7 +574,7 @@ case "$_hc_sync_rc" in
   2) caps_note="caps-sync: skipped ($HERD_CAPS_SYNC_SKIP_REASON)" ;;
   *) caps_note="caps-sync: VIOLATION"
      if [ -n "$ONELINE" ]; then
-       echo "caps-sync: $(printf '%s' "$_hc_sync_errs" | head -1)"
+       echo "caps-sync: $(printf '%s' "$_hc_sync_errs" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
      else
        echo "CAPS-SYNC: capabilities manifest not updated alongside engine change"
        printf '%s\n' "$_hc_sync_errs"
@@ -599,7 +599,7 @@ case "$_hc_gcov_rc" in
   2) gcov_note="gate-coverage: skipped ($HERD_GATE_COVERAGE_SKIP_REASON)" ;;
   *) gcov_note="gate-coverage: UNGATED TESTS"
      if [ -n "$ONELINE" ]; then
-       echo "gate-coverage: $(printf '%s' "$_hc_gcov_errs" | grep '^UNGATED' | head -1)"
+       echo "gate-coverage: $(printf '%s' "$_hc_gcov_errs" | grep '^UNGATED' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
      else
        echo "GATE-COVERAGE: tests/test-*.sh exists but is not wired into tests/herd.bats"
        printf '%s\n' "$_hc_gcov_errs" | grep '^UNGATED' || printf '%s\n' "$_hc_gcov_errs"
@@ -628,9 +628,9 @@ case "$_hc_pipe_rc" in
   2) pipe_note="pipe-safety: skipped ($HERD_PIPE_SAFETY_SKIP_REASON)" ;;
   *) pipe_note="pipe-safety: EPIPE-UNSAFE PIPES"
      if [ -n "$ONELINE" ]; then
-       echo "pipe-safety: $(printf '%s' "$_hc_pipe_errs" | grep '^PIPE-UNSAFE' | head -1)"
+       echo "pipe-safety: $(printf '%s' "$_hc_pipe_errs" | grep '^PIPE-UNSAFE' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
      else
-       echo "PIPE-SAFETY: '<producer> | grep -q/-m/head' is EPIPE-unsafe under pipefail (grep files/here-strings directly, or annotate '# pipe-ok: <why>')"
+       echo "PIPE-SAFETY: '<producer> | grep -q/-m/head' is EPIPE-unsafe under pipefail (grep files/here-strings directly, or annotate '# pipe-ok: <why>')"  # pipe-ok: the pattern appears in this line's MESSAGE TEXT, not as a pipeline
        printf '%s\n' "$_hc_pipe_errs" | grep '^PIPE-UNSAFE' || printf '%s\n' "$_hc_pipe_errs"
      fi
      exit 1 ;;
@@ -657,7 +657,7 @@ case "$_hc_gscope_rc" in
   2) gscope_note="git-scope: skipped ($HERD_GIT_SCOPE_SKIP_REASON)" ;;
   *) gscope_note="git-scope: UNSCOPED ENGINE GIT OPS"
      if [ -n "$ONELINE" ]; then
-       echo "git-scope: $(printf '%s' "$_hc_gscope_errs" | grep '^GIT-SCOPE' | head -1)"
+       echo "git-scope: $(printf '%s' "$_hc_gscope_errs" | grep '^GIT-SCOPE' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
      else
        echo "GIT-SCOPE: a production engine path stages repo-wide or commits without a pathspec (name the paths, or annotate '# herd-scope-ok: <why>')"
        printf '%s\n' "$_hc_gscope_errs" | grep '^GIT-SCOPE' || printf '%s\n' "$_hc_gscope_errs"
@@ -684,7 +684,7 @@ case "$_hc_eexp_rc" in
   2) eexp_note="env-export: skipped ($HERD_ENV_EXPORT_SKIP_REASON)" ;;
   *) eexp_note="env-export: UNEXPORTED CORE KEYS"
      if [ -n "$ONELINE" ]; then
-       echo "env-export: $(printf '%s' "$_hc_eexp_errs" | head -1) set but not exported"
+       echo "env-export: $(printf '%s' "$_hc_eexp_errs" | head -1) set but not exported"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
      else
        echo "ENV-EXPORT: a config key the Python engine core reads from os.environ is set but not \`export\`ed by herd-config.sh (the child tick process never sees it)"
        printf '%s\n' "$_hc_eexp_errs"

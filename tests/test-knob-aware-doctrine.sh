@@ -69,7 +69,7 @@ grep -q '## Operating posture' "$(skill "$H2")" && fail "(1b) unset autonomy mus
 sed "s#$H#PROOT#g" "$HS" > "$T/h-a"
 sed "s#$H2#PROOT#g" "$(skill "$H2")" > "$T/h-b"
 diff -q "$T/h-a" "$T/h-b" >/dev/null \
-  || { echo "--- human vs unset differ ---"; diff "$T/h-a" "$T/h-b" | head -20; fail "(1c) explicit human not byte-identical to unset default"; }
+  || { echo "--- human vs unset differ ---"; diff "$T/h-a" "$T/h-b" | head -20; fail "(1c) explicit human not byte-identical to unset default"; }  # pipe-ok: diff|head only prints a dump on the way to fail; the pipeline status is not gated
 ok; echo "PASS (1) COORDINATOR_AUTONOMY=human → no Operating posture (byte-identical default)"
 
 # ── (2) full + autofix suite on → FULL doctrine ──────────────────────────────────────────────────
@@ -135,15 +135,15 @@ grep -q '## Operating posture' "$MS" || fail "(4) gated must still render Operat
 # mentions default values for these keys and would false-trip a whole-file grep.
 _op_sec="$(awk '/^## Operating posture$/{p=1;next} p&&/^## /{exit} p' "$MS")"
 [ -n "$_op_sec" ] || fail "(4) could not extract Operating posture section"
-printf '%s\n' "$_op_sec" | grep -qF '`STALE_BASE_AUTOFIX=off`: stale-base holds are yours to bounce' \
+grep -qF '`STALE_BASE_AUTOFIX=off`: stale-base holds are yours to bounce' <<< "$_op_sec" \
   || fail "(4) mixed missing STALE_BASE manual line"
-printf '%s\n' "$_op_sec" | grep -qF '`SWEEP_AUTO=advise`: run `herd sweep` when the console recommends' \
+grep -qF '`SWEEP_AUTO=advise`: run `herd sweep` when the console recommends' <<< "$_op_sec" \
   || fail "(4) mixed missing SWEEP_AUTO=advise manual line"
-printf '%s\n' "$_op_sec" | grep -qF '`HEALTHCHECK_AUTOFIX=false`' \
+grep -qF '`HEALTHCHECK_AUTOFIX=false`' <<< "$_op_sec" \
   && fail "(4) health on must not list a false manual line" || true
-printf '%s\n' "$_op_sec" | grep -qF '`REVIEW_AUTOFIX=false`' \
+grep -qF '`REVIEW_AUTOFIX=false`' <<< "$_op_sec" \
   && fail "(4) review on must not list a false manual line" || true
-printf '%s\n' "$_op_sec" | grep -q 'Autofix suite (engine-owned)' \
+grep -q 'Autofix suite (engine-owned)' <<< "$_op_sec" \
   && fail "(4) gated+partial must not claim full suite" || true
 ok; echo "PASS (4) mixed partial (gated + some knobs off) → only those manual lines"
 

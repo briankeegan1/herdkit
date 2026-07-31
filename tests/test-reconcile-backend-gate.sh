@@ -86,7 +86,7 @@ export HERD_CONFIG_FILE="$REPO/.herd/config"
 write_config file
 rm -f "$REQ"
 out="$(HERD_RECONCILE_SCRIBE="$T/fake-scribe.sh" bash "$SCRIPT" run "$RANGE" 2>&1)" || fail "(1) run exited non-zero: $out"
-printf '%s\n' "$out" | grep -q 'enqueued a scribe request' || fail "(1) file backend did not enqueue: $out"
+grep -q 'enqueued a scribe request' <<< "$out" || fail "(1) file backend did not enqueue: $out"
 [ -f "$REQ" ] || fail "(1) file backend did not invoke the scribe seam"
 pass
 
@@ -103,15 +103,15 @@ write_config tracker
 rm -f "$REQ"
 out="$(SCRIBE_BACKEND_DIR="$FAKE_DIR" HERD_RECONCILE_SCRIBE="$T/fake-scribe.sh" bash "$SCRIPT" run "$RANGE" 2>&1)" \
   || fail "(2) run exited non-zero under the tracker backend: $out"
-printf '%s\n' "$out" | grep -qi 'inert' || fail "(2) tracker backend did not report inert: $out"
-printf '%s\n' "$out" | grep -q 'enqueued a scribe request' && fail "(2) tracker backend still enqueued: $out"
+grep -qi 'inert' <<< "$out" || fail "(2) tracker backend did not report inert: $out"
+grep -q 'enqueued a scribe request' <<< "$out" && fail "(2) tracker backend still enqueued: $out"
 [ -f "$REQ" ] && fail "(2) tracker backend still invoked the scribe seam (should be inert)"
 pass
 
 # ── 3. surface/scan stay ungated (pure read-only seams the tests drive) ───────────────────────────
 write_config tracker
 s="$(SCRIBE_BACKEND_DIR="$FAKE_DIR" bash "$SCRIPT" surface "$RANGE" 2>&1)" || fail "(3) surface errored under tracker backend"
-printf '%s\n' "$s" | grep -q 'agent-watch.sh' || fail "(3) surface should still work regardless of backend: $s"
+grep -q 'agent-watch.sh' <<< "$s" || fail "(3) surface should still work regardless of backend: $s"
 pass
 
 echo "ALL PASS ($PASS checks)"

@@ -169,7 +169,7 @@ ok
 run_gate 2 "$TRIP_FULL"
 [ "$_HC_RESULT" = "CODEERROR" ] || fail "(3b) a trip is still a red THIS tick (got '$_HC_RESULT')"
 [ -f "$(_health_result_file 2 "$SHA")" ] && fail "(3b) a tab-leak-guard trip must NOT be sha-cached (issue #78)"
-row | grep -q 'TAB-LEAK-GUARD' || fail "(3b) the trip row must quote the guard's line (got '$(row)')"
+grep -q 'TAB-LEAK-GUARD' <<< "$(row)" || fail "(3b) the trip row must quote the guard's line (got '$(row)')"
 ok
 
 # ── 4. bounded infra re-dispatch: the exempted red cannot loop forever ──────────────────────────────
@@ -202,13 +202,13 @@ herd_driver_notify() { :; }
 DISPLAY=()
 _handle_health_codeerror 2 slug2 "$SHA" 0 "$T/wt" "$cd"      # the CAPPED infra red
 [ "$(refix_round_count 2)" = "0" ] || fail "(4b) a capped infra red must never bounce a builder"
-row | grep -q 'needs you' || fail "(4b) the capped row must be a needs-you row (got '$(row)')"
-row | grep -q 'did not self-heal' || fail "(4b) the capped row must say the infra red did not self-heal"
+grep -q 'needs you' <<< "$(row)" || fail "(4b) the capped row must be a needs-you row (got '$(row)')"
+grep -q 'did not self-heal' <<< "$(row)" || fail "(4b) the capped row must say the infra red did not self-heal"
 
 DISPLAY=()
 _handle_health_codeerror 9 slug9 shaLEAK 0 "$T/wt" "❌ tab-leak-guard: 1 unexpected tab"
 [ "$(refix_round_count 9)" = "0" ] || fail "(4b) a tab-leak-guard transient must never bounce a builder"
-row | grep -q 'tab-leak-guard' || fail "(4b) the leak-guard row must be preserved verbatim"
+grep -q 'tab-leak-guard' <<< "$(row)" || fail "(4b) the leak-guard row must be preserved verbatim"
 
 # … while a genuine bats red NAMING the guard does bounce — the case the old substring grep swallowed.
 DISPLAY=()

@@ -72,14 +72,14 @@ _slugs()    { while IFS=$'\037' read -r _d slug _rest; do [ -n "$slug" ] && prin
 
 # ── Scoped discovery: only the legit builder survives. ──────────────────────────────────────────────
 OUT="$(_discover "$TREES")"
-SLUGS="$(printf '%s\n' "$OUT" | _slugs | sort | tr '\n' ',' )"
+SLUGS="$(printf '%s\n' "$OUT" | _slugs | sort | tr '\n' ',')"
 [ "$SLUGS" = "feat-alpha," ] || fail "scoped discovery should yield ONLY feat-alpha, got: [$SLUGS]"
 ok
 
-printf '%s\n' "$OUT" | _slugs | grep -qx hk-base          && fail "detached /tmp-style phantom must NOT be discovered"
-printf '%s\n' "$OUT" | _slugs | grep -qx detached-inside  && fail "detached-HEAD under \$TREES must NOT be discovered"
-printf '%s\n' "$OUT" | _slugs | grep -qx outside-branch   && fail "out-of-scope branch worktree must NOT be discovered"
-printf '%s\n' "$OUT" | _slugs | grep -qx main             && fail "\$MAIN must never be discovered"
+grep -qx hk-base <<< "$(printf '%s\n' "$OUT" | _slugs)" && fail "detached /tmp-style phantom must NOT be discovered"
+grep -qx detached-inside <<< "$(printf '%s\n' "$OUT" | _slugs)" && fail "detached-HEAD under \$TREES must NOT be discovered"
+grep -qx outside-branch <<< "$(printf '%s\n' "$OUT" | _slugs)" && fail "out-of-scope branch worktree must NOT be discovered"
+grep -qx main <<< "$(printf '%s\n' "$OUT" | _slugs)" && fail "\$MAIN must never be discovered"
 ok
 
 # ── The legit builder's record is byte-identical to the pre-fix format, plus HERD-226's two trailing
@@ -104,8 +104,8 @@ OUT_NS="$(_discover "")"
 NS_SLUGS="$(printf '%s\n' "$OUT_NS" | _slugs | sort | tr '\n' ',')"
 [ "$NS_SLUGS" = "feat-alpha,outside-branch," ] \
   || fail "fail-soft (empty TREES) should keep both branch worktrees, drop detached, got: [$NS_SLUGS]"
-printf '%s\n' "$OUT_NS" | _slugs | grep -qx hk-base         && fail "fail-soft must still drop detached /tmp phantom"
-printf '%s\n' "$OUT_NS" | _slugs | grep -qx detached-inside && fail "fail-soft must still drop detached-under-trees phantom"
+grep -qx hk-base <<< "$(printf '%s\n' "$OUT_NS" | _slugs)" && fail "fail-soft must still drop detached /tmp phantom"
+grep -qx detached-inside <<< "$(printf '%s\n' "$OUT_NS" | _slugs)" && fail "fail-soft must still drop detached-under-trees phantom"
 ok
 
 # ── End-to-end intent: because the phantom never enters the roster, the dead-builder reconciliation
@@ -118,7 +118,7 @@ NOW=1000000000
 [ "$(_classify_dead_builder 0 0 no "$((NOW-GRACE-1))" "$NOW" "$GRACE")" = "DEAD" ] \
   || fail "sanity: the phantom's signature must classify as DEAD when leaked — proving the scope fix is load-bearing"
 # …yet no discovered slug carries that signature, so the reconciliation is never reached for a phantom.
-printf '%s\n' "$OUT" | _slugs | grep -qxvE 'feat-alpha' && fail "no non-builder slug may reach dead-builder classification"
+grep -qxvE 'feat-alpha' <<< "$(printf '%s\n' "$OUT" | _slugs)" && fail "no non-builder slug may reach dead-builder classification"
 ok
 
 echo "ALL PASS ($PASS groups)"

@@ -112,17 +112,17 @@ PY
 
 # ── 1 — REVIEW_CHECKLIST unset → the generic fallback checklist, no project-checklist framing ──────
 run_local slug-unset
-printf '%s' "$PROMPT" | grep -qF "$GENERIC" \
+grep -qF "$GENERIC" <<< "$PROMPT" \
   || fail "1: unset REVIEW_CHECKLIST should inject the generic fallback checklist text"
-printf '%s' "$PROMPT" | grep -qF "the project's risk checklist:" \
+grep -qF "the project's risk checklist:" <<< "$PROMPT" \
   && fail "1: unset REVIEW_CHECKLIST must NOT claim a project checklist"
 ok
 
 # ── 2 — REVIEW_CHECKLIST set but the named file is missing → same generic fallback (fail-soft) ─────
 run_local slug-missing-file REVIEW_CHECKLIST=".herd/does-not-exist.md"
-printf '%s' "$PROMPT" | grep -qF "$GENERIC" \
+grep -qF "$GENERIC" <<< "$PROMPT" \
   || fail "2: REVIEW_CHECKLIST naming a missing file should still fall back to the generic checklist"
-printf '%s' "$PROMPT" | grep -qF "the project's risk checklist:" \
+grep -qF "the project's risk checklist:" <<< "$PROMPT" \
   && fail "2: a missing checklist file must NOT claim a project checklist"
 ok
 
@@ -134,11 +134,11 @@ ok
 mkdir -p "$GREPO/.herd"
 printf 'CUSTOM_MAIN_MARKER: verify every currency amount is stored in integer cents\n' > "$GREPO/.herd/review-checklist.md"
 run_local slug-main-checklist REVIEW_CHECKLIST=".herd/review-checklist.md"
-printf '%s' "$PROMPT" | grep -qF "the project's risk checklist:" \
+grep -qF "the project's risk checklist:" <<< "$PROMPT" \
   || fail "3: a present checklist file should switch to the project-checklist framing"
-printf '%s' "$PROMPT" | grep -qF "CUSTOM_MAIN_MARKER" \
+grep -qF "CUSTOM_MAIN_MARKER" <<< "$PROMPT" \
   || fail "3: the checklist file's own text should be injected verbatim"
-printf '%s' "$PROMPT" | grep -qF "$GENERIC" \
+grep -qF "$GENERIC" <<< "$PROMPT" \
   && fail "3: the checklist file should REPLACE the generic fallback, not sit alongside it"
 ok
 
@@ -151,11 +151,11 @@ git -C "$GREPO" worktree add -q -b wt-checklist "$WT" main
 mkdir -p "$WT/.herd"
 printf 'CUSTOM_WORKTREE_MARKER: verify pagination cursors never skip or repeat a row\n' > "$WT/.herd/wt-only-checklist.md"
 run_local wt-checklist REVIEW_CHECKLIST=".herd/wt-only-checklist.md"
-printf '%s' "$PROMPT" | grep -qF "the project's risk checklist:" \
+grep -qF "the project's risk checklist:" <<< "$PROMPT" \
   || fail "4: a checklist file committed only in the worktree should switch to project-checklist framing"
-printf '%s' "$PROMPT" | grep -qF "CUSTOM_WORKTREE_MARKER" \
+grep -qF "CUSTOM_WORKTREE_MARKER" <<< "$PROMPT" \
   || fail "4: the worktree-local checklist file's text should be injected verbatim"
-printf '%s' "$PROMPT" | grep -qF "$GENERIC" \
+grep -qF "$GENERIC" <<< "$PROMPT" \
   && fail "4: the worktree checklist file should REPLACE the generic fallback, not sit alongside it"
 ok
 git -C "$GREPO" worktree remove -f "$WT" >/dev/null 2>&1 || true

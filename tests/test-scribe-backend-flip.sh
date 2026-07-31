@@ -79,8 +79,8 @@ write_cfg changelog CHANGELOG.md
 printf 'please add feature X\n' > "$Q/100-a.req"
 step next
 [ "$RC" -eq 0 ]                                   || fail "1: next exited $RC ($OUT)"
-printf '%s\n' "$OUT" | grep -qx 'BACKEND changelog' || fail "1: next did not report the changelog backend ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'please add feature X' || fail "1: next did not echo the request text ($OUT)"
+grep -qx 'BACKEND changelog' <<< "$OUT" || fail "1: next did not report the changelog backend ($OUT)"
+grep -q 'please add feature X' <<< "$OUT" || fail "1: next did not echo the request text ($OUT)"
 ok
 
 # Flip the backend mid-session (as `herd config set` would) and enqueue another request. The very
@@ -88,7 +88,7 @@ ok
 write_cfg file BACKLOG.md
 printf 'another request\n' > "$Q/200-b.req"
 step next
-printf '%s\n' "$OUT" | grep -qx 'BACKEND file' || fail "2: next did not pick up the flipped backend ($OUT)"
+grep -qx 'BACKEND file' <<< "$OUT" || fail "2: next did not pick up the flipped backend ($OUT)"
 ok
 
 # ══ 2. `commit` GUARD: a stale file-mode commit under a non-file backend dispatches the ORIGINAL
@@ -103,7 +103,7 @@ step commit "$Q/300-c.req.mine" "no-op: nothing to change"
 [ "$RC" -eq 0 ]                                                     || fail "3: guarded commit exited $RC ($OUT)"
 grep -q -- '- Add dark mode toggle' "$REPO/CHANGELOG.md"           || fail "3: original request text was NOT dispatched to the backend ($(cat "$REPO/CHANGELOG.md" 2>/dev/null))"
 grep -q 'no-op: nothing to change' "$REPO/CHANGELOG.md"           && fail "3: the SUMMARY was filed as an item (the #139 junk bug)"
-printf '%s\n' "$OUT" | grep -q 'issue #139'                        || fail "3: stale-drainer commit did not warn about the mismatch ($OUT)"
+grep -q 'issue #139' <<< "$OUT" || fail "3: stale-drainer commit did not warn about the mismatch ($OUT)"
 [ ! -f "$Q/300-c.req.mine" ]                                       || fail "3: claimed file not cleaned up after dispatch"
 ok
 
@@ -125,14 +125,14 @@ step commit "$Q/400-d.req.mine" "add shiny-thing"
 [ "$RC" -eq 0 ]                                                     || fail "4: file-backend commit exited $RC ($OUT)"
 grep -q 'Backlog: add shiny-thing' <<<"$(git -C "$REPO" log --oneline)" || fail "4: file-backend commit did not commit with the summary ($OUT)"
 grep -q 'shiny-thing' <<<"$(git -C "$REPO" show HEAD:BACKLOG.md)"  || fail "4: the agent's BACKLOG.md edit was not committed"
-printf '%s\n' "$OUT" | grep -q 'issue #139'                        && fail "4: file-backend commit wrongly warned about a mismatch"
+grep -q 'issue #139' <<< "$OUT" && fail "4: file-backend commit wrongly warned about a mismatch"
 ok
 
 # ══ 4. reverse guard: `add-item` while the active backend is 'file' warns loudly ═
 write_cfg file BACKLOG.md
 printf 'orphaned dispatch\n' > "$Q/500-e.req.mine"
 step add-item "$Q/500-e.req.mine" "orphaned dispatch"
-printf '%s\n' "$OUT" | grep -q 'issue #139' || fail "5: add-item under the file backend did not warn ($OUT)"
+grep -q 'issue #139' <<< "$OUT" || fail "5: add-item under the file backend did not warn ($OUT)"
 ok
 
 # ══ 5. scribe.sh emits a SINGLE backend-agnostic prompt (no spawn-time backend branch) ═
@@ -170,13 +170,13 @@ COUT="$( cd "$CPROJ" && HERD_CAPABILITIES_FILE="$CAPS" HERD_RELOAD_SKIP_LAUNCH=1
 CRC=$?
 set -e
 [ "$CRC" -eq 0 ]                                       || fail "7: config set SCRIBE_BACKEND exited $CRC ($COUT)"
-printf '%s\n' "$COUT" | grep -qi 'SCRIBE_BACKEND changed' || fail "7: config set did not announce the backend change ($COUT)"
-printf '%s\n' "$COUT" | grep -qi 'retire'              || fail "7: config set did not warn to retire the old-backend drainer ($COUT)"
+grep -qi 'SCRIBE_BACKEND changed' <<< "$COUT" || fail "7: config set did not announce the backend change ($COUT)"
+grep -qi 'retire' <<< "$COUT" || fail "7: config set did not warn to retire the old-backend drainer ($COUT)"
 # A no-op re-set (value unchanged) must NOT re-warn.
 set +e
 COUT2="$( cd "$CPROJ" && HERD_CAPABILITIES_FILE="$CAPS" bash "$HERD" config set SCRIBE_BACKEND linear 2>&1 )"
 set -e
-printf '%s\n' "$COUT2" | grep -qi 'retire' && fail "7: a no-op backend set still warned to retire the drainer"
+grep -qi 'retire' <<< "$COUT2" && fail "7: a no-op backend set still warned to retire the drainer"
 ok
 
 # ══ 7. the SHIPPED retire-drainer remedy names an ACTIONABLE herdr surface (HERD-287) ═══════════

@@ -275,9 +275,9 @@ fi
 # HERD-176: the default (headless/herdr-claude) resume command is BYTE-IDENTICAL to the pre-P4
 # hardcode, and is composed by the driver seam (not a raw claude string in agent-watch).
 _resume_shape="$(herd_driver_agent_resume_cmd "continue" 2>/dev/null || true)"
-if printf '%s' "$_resume_shape" | grep -qF 'claude' \
-   && printf '%s' "$_resume_shape" | grep -qF -- '--continue' \
-   && printf '%s' "$_resume_shape" | grep -qF -- '--dangerously-skip-permissions'; then
+if grep -qF 'claude' <<< "$_resume_shape" \
+   && grep -qF -- '--continue' <<< "$_resume_shape" \
+   && grep -qF -- '--dangerously-skip-permissions' <<< "$_resume_shape"; then
   checkpoint driver_resume_routing pass "herd_driver_agent_resume_cmd → $_resume_shape (byte-identical claude shape)"
 else
   checkpoint driver_resume_routing fail "resume seam did not compose the claude --continue shape (got: $_resume_shape)"
@@ -408,8 +408,8 @@ take_screenshot "parked"
 # park: scheduled hold recorded, journal limit_detected, row present and NOT a red "needs you".
 _state="$(limit_state "$SLUG")"
 if [ "$_state" = "scheduled" ] && grep -q '"event":"limit_detected"' "$JOURNAL_FILE" \
-   && printf '%s' "$PARK_ROW" | grep -q 'limit-hit' \
-   && ! printf '%s' "$PARK_ROW" | grep -q 'needs you'; then
+   && grep -q 'limit-hit' <<< "$PARK_ROW" \
+   && ! grep -q 'needs you' <<< "$PARK_ROW"; then
   checkpoint park pass "scheduled hold recorded + limit_detected journaled; row is a non-red limit-hit hold"
 else
   checkpoint park fail "state='$_state' row='$PARK_ROW' (expected scheduled, non-red, limit_detected journaled)"
@@ -431,7 +431,7 @@ DISPLAY=()
 run_limit_tick "$SLUG" "$WT" 0
 WAIT_ROW="${DISPLAY[0]:-}"
 _claude_after_wait="$(wc -l < "$CLAUDE_INVOCATION_LOG" | tr -d ' ')"
-if [ "$_claude_before_wait" = "$_claude_after_wait" ] && printf '%s' "$WAIT_ROW" | grep -q 'auto-resume at'; then
+if [ "$_claude_before_wait" = "$_claude_after_wait" ] && grep -q 'auto-resume at' <<< "$WAIT_ROW"; then
   checkpoint waiting_no_early_resume pass "before reset: holding ('$WAIT_ROW'), claude NOT relaunched"
 else
   checkpoint waiting_no_early_resume fail "early resume or wrong hold row (claude runs ${_claude_before_wait}→${_claude_after_wait}, row '$WAIT_ROW')"
@@ -453,7 +453,7 @@ if [ "$_claude_runs" -ge 1 ] \
    && grep -qF "cwd=$WT" "$CLAUDE_INVOCATION_LOG" \
    && grep -q '"event":"limit_resume_result"' "$JOURNAL_FILE" \
    && grep -q '"woke":1' "$JOURNAL_FILE" \
-   && printf '%s' "$RESUME_ROW" | grep -q 'resumed via --continue'; then
+   && grep -q 'resumed via --continue' <<< "$RESUME_ROW"; then
   checkpoint resume pass "relaunched via claude --continue in $WT; woke:1 journaled; green resumed row"
 else
   checkpoint resume fail "resume path did not fire as expected (claude runs=$_claude_runs, row='$RESUME_ROW')"

@@ -65,9 +65,9 @@ BAD="$T/bad.tsv"
 } > "$BAD"
 verr="$(HERD_TRIGGERS_FILE="$BAD" run validate 2>&1)"; vrc=$?
 [ "$vrc" -eq 1 ] || fail "(1) a triggers.tsv with bad rows must exit 1 (got $vrc)"
-printf '%s' "$verr" | grep -q "invalid lane='boguslane'"   || fail "(1) bad lane not flagged"
-printf '%s' "$verr" | grep -q "invalid schedule='every:30x'" || fail "(1) bad schedule not flagged"
-printf '%s' "$verr" | grep -q "'missing' — 'schedule'"     || fail "(1) missing required field not flagged"
+grep -q "invalid lane='boguslane'" <<< "$verr" || fail "(1) bad lane not flagged"
+grep -q "invalid schedule='every:30x'" <<< "$verr" || fail "(1) bad schedule not flagged"
+grep -q "'missing' — 'schedule'" <<< "$verr" || fail "(1) missing required field not flagged"
 pass
 echo "PASS (1) validate: valid list clean, bad lane/schedule/missing-field each flagged"
 
@@ -102,8 +102,8 @@ printf 'watch-b\t@hourly\tfeature\tBuild {item}.\tcat %s\n'        "$INPUT_B" >>
 
 # Tick 1 — first run: EVERYTHING spawns, loudly labelled as a full run.
 T1="$(run tick --now "$NOW" 2>&1)"
-printf '%s' "$T1" | grep -q "watch-a': FIRST RUN" || fail "(3) tick1 must announce watch-a FIRST RUN ($T1)"
-printf '%s' "$T1" | grep -q "watch-b': FIRST RUN" || fail "(3) tick1 must announce watch-b FIRST RUN"
+grep -q "watch-a': FIRST RUN" <<< "$T1" || fail "(3) tick1 must announce watch-a FIRST RUN ($T1)"
+grep -q "watch-b': FIRST RUN" <<< "$T1" || fail "(3) tick1 must announce watch-b FIRST RUN"
 grep -q '^watch-a-x|quick|Fix x for watch-a.$'  "$SPAWNLOG" || fail "(3) tick1 must spawn watch-a-x with rendered task ($(cat "$SPAWNLOG"))"
 grep -q '^watch-a-y|quick|Fix y for watch-a.$'  "$SPAWNLOG" || fail "(3) tick1 must spawn watch-a-y"
 grep -q '^watch-b-one|feature|Build one.$'      "$SPAWNLOG" || fail "(3) tick1 must spawn watch-b-one with the feature lane"
@@ -121,8 +121,8 @@ run tick --now "$((NOW + 60))" >/dev/null 2>&1
 # Tick 2 — 2h later, both due: watch-a unchanged → NO spawn; watch-b → ONLY the delta 'two'.
 : > "$SPAWNLOG"
 T2="$(run tick --now "$((NOW + 7200))" 2>&1)"
-printf '%s' "$T2" | grep -q "watch-a': input unchanged" || fail "(3) tick2 watch-a must report 'input unchanged' ($T2)"
-printf '%s' "$T2" | grep -q "watch-b': input changed"   || fail "(3) tick2 watch-b must report 'input changed'"
+grep -q "watch-a': input unchanged" <<< "$T2" || fail "(3) tick2 watch-a must report 'input unchanged' ($T2)"
+grep -q "watch-b': input changed" <<< "$T2" || fail "(3) tick2 watch-b must report 'input changed'"
 grep -q '^watch-b-two|feature|Build two.$' "$SPAWNLOG" || fail "(3) tick2 must spawn the delta watch-b-two ($(cat "$SPAWNLOG"))"
 grep -q 'watch-a' "$SPAWNLOG" && fail "(3) tick2 must NOT re-spawn unchanged watch-a"
 grep -q 'watch-b-one' "$SPAWNLOG" && fail "(3) tick2 must NOT re-spawn the already-seen watch-b-one"
@@ -137,7 +137,7 @@ printf 'fragile\t@hourly\tquick\tt {item}\tsh -c "exit 7"\n' > "$FIX"
 mkdir -p "$STATE"; printf 'keep-me\n' > "$STATE/fragile.snapshot"; printf '1\n' > "$STATE/fragile.last"
 ferr="$(run tick --now "$NOW" 2>&1)"
 [ ! -s "$SPAWNLOG" ] || fail "(4) an input-error trigger must spawn nothing ($(cat "$SPAWNLOG"))"
-printf '%s' "$ferr" | grep -q "input command FAILED" || fail "(4) an input error must be reported loudly ($ferr)"
+grep -q "input command FAILED" <<< "$ferr" || fail "(4) an input error must be reported loudly ($ferr)"
 [ "$(cat "$STATE/fragile.snapshot")" = "keep-me" ] || fail "(4) a failed input read must NOT overwrite the good snapshot"
 [ "$(cat "$STATE/fragile.last")" = "1" ] || fail "(4) a failed input read must NOT advance the schedule clock"
 pass
@@ -185,7 +185,7 @@ printf 'realq\t@hourly\tfeature\tShip {item}\tcat %s\n' "$REALIN" > "$FIX"
 ( cd "$PROJ2" && HERD_CONFIG_FILE="$PROJ2/.herd/config" HERD_TRIGGERS_FILE="$FIX" \
     HERD_TRIGGERS_STATE_DIR="$T/rstate" HERD_TRIGGERS_INPUT_DIR="$T" \
     bash "$TRIG" tick --now "$NOW" >/dev/null 2>&1 )
-req="$(ls "$QTREES/spawn-queue"/*.req 2>/dev/null | head -1)"
+req="$(ls "$QTREES/spawn-queue"/*.req 2>/dev/null | sed -n 1p)"
 [ -n "$req" ] || fail "(7) the real spawn.sh must land a .req intent on the durable queue"
 [ "$(sed -n '1p' "$req")" = "realq-alpha" ] || fail "(7) queued intent slug wrong ($(sed -n '1p' "$req"))"
 [ "$(sed -n '2p' "$req")" = "feature" ]     || fail "(7) queued intent lane wrong ($(sed -n '2p' "$req"))"

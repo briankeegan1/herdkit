@@ -89,19 +89,19 @@ out="$(run_cl generate --file "$CL_OUT" --since 2026-07-01 2>&1)" || fail "gener
 ok
 
 body="$(cat "$CL_OUT")"
-printf '%s\n' "$body" | grep -qE '^# Changelog'              || fail "(1) missing H1\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '^## \[Unreleased\]'        || fail "(1) missing [Unreleased]\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '^### Features'             || fail "(1) missing Features section\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '^- feat: add the widget \(#42\)' \
+grep -qE '^# Changelog' <<< "$body" || fail "(1) missing H1\n%s" "$body"
+grep -qE '^## \[Unreleased\]' <<< "$body" || fail "(1) missing [Unreleased]\n%s" "$body"
+grep -qE '^### Features' <<< "$body" || fail "(1) missing Features section\n%s" "$body"
+grep -qE '^- feat: add the widget \(#42\)' <<< "$body" \
   || fail "(1) missing feat bullet for #42\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '^### Fixes'                || fail "(1) missing Fixes section\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '^- fix: null-pointer on empty input \(#43\)' \
+grep -qE '^### Fixes' <<< "$body" || fail "(1) missing Fixes section\n%s" "$body"
+grep -qE '^- fix: null-pointer on empty input \(#43\)' <<< "$body" \
   || fail "(1) missing fix bullet for #43\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '^### Documentation'        || fail "(1) missing Documentation section\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '^- docs: document the widget \(#44\)' \
+grep -qE '^### Documentation' <<< "$body" || fail "(1) missing Documentation section\n%s" "$body"
+grep -qE '^- docs: document the widget \(#44\)' <<< "$body" \
   || fail "(1) missing docs bullet for #44 (journal title)\n%s" "$body"
 # Ancient PR 10 must be excluded by --since 2026-07-01
-printf '%s\n' "$body" | grep -qE '#10' && fail "(1) PR #10 should be excluded by --since\n%s" "$body" || true
+grep -qE '#10' <<< "$body" && fail "(1) PR #10 should be excluded by --since\n%s" "$body" || true
 ok
 
 # ── (2) determinism: stdout body is byte-stable across two runs ──
@@ -114,13 +114,13 @@ ok
 cp "$CL_OUT" "$T/before.md"
 out="$(run_cl generate --file "$CL_OUT" --since 2026-07-01 2>&1)" || fail "second generate failed: %s" "$out"
 diff -q "$T/before.md" "$CL_OUT" >/dev/null || fail "(3) second generate rewrote CHANGELOG (not idempotent)"
-printf '%s\n' "$out" | grep -qiE 'up to date|wrote' || fail "(3) unexpected second-run message: %s" "$out"
+grep -qiE 'up to date|wrote' <<< "$out" || fail "(3) unexpected second-run message: %s" "$out"
 ok
 
 # ── (4) --since future date → empty Unreleased placeholder ──
 out="$(run_cl generate --stdout --since 2099-01-01 2>/dev/null)"
-printf '%s\n' "$out" | grep -qE 'No merges in scope' || fail "(4) expected empty-scope note\n%s" "$out"
-printf '%s\n' "$out" | grep -qE '^- feat:' && fail "(4) future --since should have no bullets\n%s" "$out" || true
+grep -qE 'No merges in scope' <<< "$out" || fail "(4) expected empty-scope note\n%s" "$out"
+grep -qE '^- feat:' <<< "$out" && fail "(4) future --since should have no bullets\n%s" "$out" || true
 ok
 
 # ── (5) tag --no-tag promotes Unreleased ──
@@ -128,7 +128,7 @@ ok
 run_cl generate --file "$CL_OUT" --since 2026-07-01 >/dev/null
 out="$(run_cl tag 0.2.0 --file "$CL_OUT" --date 2026-07-09 --no-tag 2>&1)" || fail "tag failed: %s" "$out"
 body="$(cat "$CL_OUT")"
-printf '%s\n' "$body" | grep -qE '^## \[0\.2\.0\] - 2026-07-09' \
+grep -qE '^## \[0\.2\.0\] - 2026-07-09' <<< "$body" \
   || fail "(5) missing versioned heading\n%s" "$body"
 # Fresh Unreleased present and above the versioned section
 python3 - "$CL_OUT" <<'PY' || fail "(5) Unreleased must precede versioned section"
@@ -150,7 +150,7 @@ rm -f "$CL_OUT"
 run_cl generate --file "$CL_OUT" --since 2026-01-01 >/dev/null
 n42="$(grep -cE '\(#42\)' "$CL_OUT" || true)"
 [ "$n42" = "1" ] || fail "(6) PR #42 should appear exactly once, got %s\n%s" "$n42" "$(cat "$CL_OUT")"
-printf '%s\n' "$(cat "$CL_OUT")" | grep -qE 'ancient pre-window work \(#10\)' \
+grep -qE 'ancient pre-window work \(#10\)' <<< "$(cat "$CL_OUT")" \
   || fail "(6) PR #10 should be present with full window\n%s" "$(cat "$CL_OUT")"
 ok
 
@@ -166,7 +166,7 @@ cli_out="$(
     HERD_NONINTERACTIVE=1 \
     bash "$HERD_BIN" changelog generate --stdout --since 2026-07-01 2>/dev/null
 )" || fail "(7) herd changelog CLI failed"
-printf '%s\n' "$cli_out" | grep -qE 'feat: add the widget \(#42\)' \
+grep -qE 'feat: add the widget \(#42\)' <<< "$cli_out" \
   || fail "(7) CLI output missing expected bullet\n%s" "$cli_out"
 ok
 

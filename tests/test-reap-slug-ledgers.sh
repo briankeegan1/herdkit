@@ -106,7 +106,7 @@ _reap_slug "$SLUG" "$TREES/$SLUG" 77 deadbeef merged
 # ── 3. the purge journals what it closed — once, and only when it closed something ────────────────
 purged="$(grep -c '"event":"slug_ledgers_purged"' "$JOURNAL_FILE" 2>/dev/null || printf '0')"
 [ "$purged" = "1" ] && ok || fail "(3) expected exactly 1 slug_ledgers_purged event, got $purged"
-grep '"event":"slug_ledgers_purged"' "$JOURNAL_FILE" | grep -q '"ledgers":"dead,respawn,limit,sendkeys"' && ok \
+grep -q '"ledgers":"dead,respawn,limit,sendkeys"' <<< "$(grep '"event":"slug_ledgers_purged"' "$JOURNAL_FILE")" && ok \
   || fail "(3) the purge event does not name the four ledgers: $(grep slug_ledgers_purged "$JOURNAL_FILE")"
 
 # A second reap of the same (already-purged) slug: idempotent, and silent.

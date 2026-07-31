@@ -36,7 +36,7 @@ echo MODEL_REVIEW=\$MODEL_REVIEW
 echo MODEL_RESOLVER=\$MODEL_RESOLVER" )
 }
 
-kv(){ echo "$1" | grep -qx "$2" || fail "$3 (wanted $2)"$'\n'"--- dump ---"$'\n'"$1"; }
+kv(){ grep -qx "$2" <<< "$(echo "$1")" || fail "$3 (wanted $2)"$'\n'"--- dump ---"$'\n'"$1"; }
 
 # ── 1. TOKEN_MODE=eco → every built-in default flips to the eco tier ──────────────────────────
 cat > "$T/eco" <<'EOF'

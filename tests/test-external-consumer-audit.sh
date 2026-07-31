@@ -78,7 +78,7 @@ for p in d["probes"]:
     assert p["status"] in ("leak","clean","skip"), p
 print("scorecard ok: leaks=%d clean=%d skip=%d (Leak B closed)" % (d["leaks"],d["clean"],d["skipped"]))
 PY
-echo "PASS (b) all documented leaks reproduce — $(sed -n 's/.*"result": *"\([^"]*\)".*/\1/p' "$SC" | head -1)"
+echo "PASS (b) all documented leaks reproduce — $(sed -n 's/.*"result": *"\([^"]*\)".*/\1/p' "$SC" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
 
 # ── (c) THE HEADLINE LEAK, DIRECTLY AGAINST healthcheck.sh — now CLOSED ───────────
 # Build a fresh fixture, break a .go file, and confirm the light profile NO LONGER green-lights it.
@@ -89,9 +89,9 @@ bash "$FIXTURE" "$T/fx3" >/dev/null || fail "(c) fixture build failed"
 printf '\nfunc broken( {\n' >> "$T/fx3/internal/greet/greet.go"
 out_go="$(HERD_CONFIG_FILE=/dev/null bash "$HEALTHCHECK" "$T/fx3" --oneline 2>&1)"; rc_go=$?
 if [ "$rc_go" -eq 0 ]; then
-  printf '%s' "$out_go" | grep -q '✅' \
+  grep -q '✅' <<< "$out_go" \
     && fail "(c1) broken .go must NOT pass as a confident '✅ light clean' (Leak B): '$out_go'"
-  printf '%s' "$out_go" | grep -q '⚠️' \
+  grep -q '⚠️' <<< "$out_go" \
     || fail "(c1) an unchecked broken .go should be flagged with a ⚠️ (got: '$out_go')"
   echo "PASS (c1) broken .go is FLAGGED (⚠️, gofmt absent), never silently green-lit: '$out_go'"
 else

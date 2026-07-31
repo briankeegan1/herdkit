@@ -78,8 +78,8 @@ proj="$T/noninteractive"; mkproj "$proj"
 out="$( cd "$proj" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
         "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(1) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -q "Operating posture" && fail "(1) non-interactive must NOT run the posture interview: $out"
-echo "$pout" | grep -qi "MERGE_POLICY defaulted to 'auto'" || fail "(1) HERD-140 loud auto notice missing: $out"
+grep -q "Operating posture" <<< "$pout" && fail "(1) non-interactive must NOT run the posture interview: $out"
+grep -qi "MERGE_POLICY defaulted to 'auto'" <<< "$pout" || fail "(1) HERD-140 loud auto notice missing: $out"
 cfg_has "$proj" MERGE_POLICY auto
 cfg_has "$proj" PR_FLOW direct
 cfg_has "$proj" PR_READY_WHEN builder
@@ -97,8 +97,8 @@ out="$( cd "$proj" && printf 'team-approve\n' \
         | HERD_POSTURE_ASSUME_TTY=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
           "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(2) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -q "Operating posture" || fail "(2) posture interview should run: $out"
-echo "$pout" | grep -q "posture=team-approve" || fail "(2) should announce selected posture: $out"
+grep -q "Operating posture" <<< "$pout" || fail "(2) posture interview should run: $out"
+grep -q "posture=team-approve" <<< "$pout" || fail "(2) should announce selected posture: $out"
 assert_bundle "$proj" team-approve
 # Base keys still present (same key set + posture extras).
 cfg_has "$proj" PR_FLOW direct
@@ -153,7 +153,7 @@ out="$( cd "$proj" && printf 'advanced\nobserve\nmerge\ndraft\nhuman\ntrue\nnone
         | HERD_POSTURE_ASSUME_TTY=1 HERD_SKIP_DOCTOR=1 HERD_SKIP_GH_DETECT=1 \
           "$REAL_BASH" "$HERD" init 2>&1 )" || fail "(7) init failed: $out"
 pout="$(plain "$out")"
-echo "$pout" | grep -qi "Advanced" || fail "(7) advanced path should be announced: $out"
+grep -qi "Advanced" <<< "$pout" || fail "(7) advanced path should be announced: $out"
 cfg_has "$proj" MERGE_POLICY observe
 cfg_has "$proj" MERGE_METHOD merge
 cfg_has "$proj" PR_FLOW draft

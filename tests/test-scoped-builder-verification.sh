@@ -87,7 +87,7 @@ export HERD_CONFIG_FILE="$CFG"
   printf 'MODEL_FEATURE="test-feature-model"\n'
 } > "$CFG"
 
-agent_start_line() { grep -E 'agent start .*-- claude' "$T/$1.herdr.log" 2>/dev/null | head -1; }
+agent_start_line() { grep -Em1 'agent start .*-- claude' "$T/$1.herdr.log" 2>/dev/null; }
 run_lane() {
   local script="$1" slug="$2"
   export HERDR_CALL_LOG="$T/$slug.herdr.log"; : > "$HERDR_CALL_LOG"
@@ -120,8 +120,8 @@ for pair in "quick $QUICK" "feat $FEATURE"; do
   fi
 
   # ── (c) the scoped block sits in the STABLE preamble, before the per-task body ─────────────────
-  verif_ln=$(grep -n "DESCOPED"           "$spec" | head -1 | cut -d: -f1)
-  body_ln=$( grep -n "SENTINEL_TASK_BODY" "$spec" | head -1 | cut -d: -f1)
+  verif_ln=$(grep -nm1 "DESCOPED"           "$spec" | cut -d: -f1)
+  body_ln=$( grep -nm1 "SENTINEL_TASK_BODY" "$spec" | cut -d: -f1)
   [ -n "$verif_ln" ] && [ -n "$body_ln" ] || fail "$slug: could not locate verification/body lines"
   [ "$verif_ln" -lt "$body_ln" ] || fail "$slug: the scoped block ($verif_ln) is NOT before the per-task body ($body_ln) — not in the stable preamble"
 

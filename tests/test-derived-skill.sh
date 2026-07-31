@@ -79,7 +79,7 @@ ok "A4 herd render regenerates an absent skill, tree stays clean"
 rm -f "$P/$SKILL_REL"
 _herd "$P" upgrade >/dev/null 2>&1 || fail "A5: herd upgrade failed with the skill absent"
 [ -f "$P/$SKILL_REL" ] || fail "A5: herd upgrade did not regenerate the absent skill"
-git -C "$P" status --porcelain | grep -q "$SKILL_REL" \
+grep -q "$SKILL_REL" <<< "$(git -C "$P" status --porcelain)" \
   && fail "A5: the regenerated render showed up in git status"
 ok "A5 herd upgrade regenerates an absent skill without dirtying the tree with it"
 
@@ -107,7 +107,7 @@ grep -qxF "$SKILL_REL" "$M/.gitignore" || fail "B3: upgrade did not restore the 
 ok "B3 upgrade re-adds the gitignore entry"
 
 # The deletion is STAGED (D in the index), so the operator commits one migration commit.
-git -C "$M" status --porcelain | grep -q "^D  $SKILL_REL" || fail "B4: the index deletion was not staged"
+grep -q "^D  $SKILL_REL" <<< "$(git -C "$M" status --porcelain)" || fail "B4: the index deletion was not staged"
 ok "B4 the untracking is staged as a deletion"
 
 # Idempotent: once the migration commit lands, a second upgrade leaves the tree clean — the exact
@@ -171,8 +171,8 @@ case "$_classify2" in
   dirty*) : ;;
   *) fail "D2: real work alongside a derived file must classify dirty, got '$_classify2'" ;;
 esac
-printf '%s' "$_classify2" | grep -q "$SKILL_REL" && fail "D2: the derived render must not be named as evidence"
-printf '%s' "$_classify2" | grep -q 'real.txt'   || fail "D2: the real modified file must be named as evidence"
+grep -q "$SKILL_REL" <<< "$_classify2" && fail "D2: the derived render must not be named as evidence"
+grep -q 'real.txt' <<< "$_classify2" || fail "D2: the real modified file must be named as evidence"
 ok "D2 real work alongside the derived render still classifies dirty (evidence names only the real file)"
 
 # ── E. stale-base exemption: an overlap of derived paths only is not a stale base ──────────────────

@@ -62,34 +62,34 @@ git -C "$T" commit -q -m "seed backlog"
 
 # 1. Slug matching a 🔜 line → open.
 out="$(run_state "repo#open-feature")"
-echo "$out" | grep -q "ITEM_STATE=open" || fail "🔜 item should return open ($out)"
+grep -q "ITEM_STATE=open" <<< "$out" || fail "🔜 item should return open ($out)"
 pass
 
 # 2. Slug matching a 🚧 line → in-progress.
 out="$(run_state "repo#wip-feature")"
-echo "$out" | grep -q "ITEM_STATE=in-progress" || fail "🚧 item should return in-progress ($out)"
+grep -q "ITEM_STATE=in-progress" <<< "$out" || fail "🚧 item should return in-progress ($out)"
 pass
 
 # 3. Slug matching a ✅ line → closed.
 out="$(run_state "repo#done-feature")"
-echo "$out" | grep -q "ITEM_STATE=closed" || fail "✅ item should return closed ($out)"
+grep -q "ITEM_STATE=closed" <<< "$out" || fail "✅ item should return closed ($out)"
 pass
 
 # 4. Unknown slug (not in file) → open (safe default).
 out="$(run_state "repo#no-such-item")"
-echo "$out" | grep -q "ITEM_STATE=open" || fail "missing slug should default to open ($out)"
+grep -q "ITEM_STATE=open" <<< "$out" || fail "missing slug should default to open ($out)"
 pass
 
 # 5. Ref without link prefix (bare slug) is also handled.
 out="$(run_state "done-feature")"
-echo "$out" | grep -q "ITEM_STATE=closed" || fail "bare slug without # prefix should still match ($out)"
+grep -q "ITEM_STATE=closed" <<< "$out" || fail "bare slug without # prefix should still match ($out)"
 pass
 
 # ── HERD-52 planned-work markers ────────────────────────────────────────────────────────────────
 # 6. queue_item → annotates the item's line with a 📌 marker naming who + blocker + [<epoch>], and
 #    reports DONE. The annotation lands ON the 🔜 line so it also shows up in _backend_list_open.
 out="$(run_op _backend_queue_item repo#open-feature alice open-blocker)"
-echo "$out" | grep -q "RESULT=DONE" || fail "queue_item did not report DONE ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "queue_item did not report DONE ($out)"
 grep -qE '📌 queued by alice: sequenced after open-blocker \[[0-9]+\]' "$BACKLOG_FILE" \
   || fail "queue_item did not annotate the item line with the 📌 marker ($(grep open-feature "$BACKLOG_FILE"))"
 grep -q "🔜 open-feature" "$BACKLOG_FILE" || fail "queue_item clobbered the item's own text/emoji"
@@ -98,7 +98,7 @@ pass
 # 7. list_queued → emits one TSV line per marker ("<text>\t<who>\t<detail>\t<epoch>"); only the
 #    marked item appears.
 lq="$( cd "$T" && . "$BACKEND"; _backend_list_queued )"
-echo "$lq" | grep -qE "open-feature.*${TAB}alice${TAB}sequenced after open-blocker${TAB}[0-9]+$" \
+grep -qE "open-feature.*${TAB}alice${TAB}sequenced after open-blocker${TAB}[0-9]+$" <<< "$lq" \
   || fail "list_queued did not emit the parsed marker line ($lq)"
 [ "$(printf '%s\n' "$lq" | grep -c 'alice')" = "1" ] || fail "list_queued emitted more than the one marker ($lq)"
 pass
@@ -115,11 +115,11 @@ pass
 
 # 10. unqueue_item → strips the marker; DONE. A second unqueue with no marker present → NOCHANGE.
 out="$(run_op _backend_unqueue_item repo#open-feature alice)"
-echo "$out" | grep -q "RESULT=DONE" || fail "unqueue_item did not report DONE ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "unqueue_item did not report DONE ($out)"
 grep -q '📌' "$BACKLOG_FILE" && fail "unqueue_item left a 📌 marker behind ($(grep open-feature "$BACKLOG_FILE"))"
 grep -q "🔜 open-feature — a queued item" "$BACKLOG_FILE" || fail "unqueue_item did not restore the item's line cleanly"
 out2="$(run_op _backend_unqueue_item repo#open-feature alice)"
-echo "$out2" | grep -q "RESULT=NOCHANGE" || fail "unqueue_item with no marker should be NOCHANGE ($out2)"
+grep -q "RESULT=NOCHANGE" <<< "$out2" || fail "unqueue_item with no marker should be NOCHANGE ($out2)"
 pass
 
 # 11. CLAIM-poisoning regression (reviewer BLOCK): a queue marker embeds ANOTHER item's slug
@@ -132,7 +132,7 @@ run_op _backend_queue_item repo#alpha alice beta >/dev/null
 grep -qE '🔜 alpha .*📌 queued by alice: sequenced after beta' "$BACKLOG_FILE" \
   || fail "queue did not mark alpha with the beta blocker ($(grep alpha "$BACKLOG_FILE"))"
 cl="$(run_claim repo#beta bob)"
-echo "$cl" | grep -q "CLAIM=CLAIMED" || fail "claim of beta did not report CLAIMED ($cl)"
+grep -q "CLAIM=CLAIMED" <<< "$cl" || fail "claim of beta did not report CLAIMED ($cl)"
 grep -qE '🚧 beta .*\(claimed by bob\)' "$BACKLOG_FILE" \
   || fail "claim did not flip BETA to 🚧 owned by bob ($(grep -E 'alpha|beta' "$BACKLOG_FILE"))"
 grep -qE '🚧 alpha' "$BACKLOG_FILE" && fail "claim of beta wrongly flipped ALPHA — marker-poisoning regression"

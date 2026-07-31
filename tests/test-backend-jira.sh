@@ -121,8 +121,8 @@ run() {
 #    browse URL.
 : > "$APILOG"
 out="$(run _backend_add_item REQ1 "add a dark-mode toggle")"
-echo "$out" | grep -q "RESULT=DONE" || fail "add_item did not report DONE ($out)"
-echo "$out" | grep -q "https://acme.atlassian.net/browse/ENG-42" || fail "add_item did not surface the created issue browse URL ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "add_item did not report DONE ($out)"
+grep -q "https://acme.atlassian.net/browse/ENG-42" <<< "$out" || fail "add_item did not surface the created issue browse URL ($out)"
 grep -q 'M<<POST>>P<<\/rest\/api\/3\/issue>>' "$APILOG" || fail "add_item did not POST to /rest/api/3/issue"
 grep -q "add a dark-mode toggle" "$APILOG" || fail "add_item did not pass the request text as the description"
 grep -q '"key": "ENG"' "$APILOG" || fail "add_item did not target the configured project (project key)"
@@ -134,7 +134,7 @@ pass
 : > "$APILOG"
 BIG="$(python3 -c 'print("Add a really important feature " + "x"*470)')"   # 501 chars, no newline
 out="$(run _backend_add_item REQ2 "$BIG")"
-echo "$out" | grep -q "RESULT=DONE" || fail "add_item (long) did not report DONE ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "add_item (long) did not report DONE ($out)"
 python3 - "$APILOG" <<'PY' || fail "add_item (long) summary/description lengths wrong"
 import sys, json, re
 log = open(sys.argv[1]).read()
@@ -158,16 +158,16 @@ open="$(run _backend_list_open)"
 grep -q 'P<<\/rest\/api\/3\/search\/jql>>' "$APILOG" || fail "list_open did not POST to /search/jql"
 grep -q 'project = ' "$APILOG" || fail "list_open (project set) did not scope the JQL to a project"
 grep -q 'statusCategory != Done' "$APILOG" || fail "list_open did not exclude Done-category issues"
-echo "$open" | grep -q "^#ENG-7 first open issue$"  || fail "list_open missing '#ENG-7 first open issue' ($open)"
-echo "$open" | grep -q "^#ENG-9 second open issue$" || fail "list_open missing '#ENG-9 second open issue'"
+grep -q "^#ENG-7 first open issue$" <<< "$open" || fail "list_open missing '#ENG-7 first open issue' ($open)"
+grep -q "^#ENG-9 second open issue$" <<< "$open" || fail "list_open missing '#ENG-9 second open issue'"
 pass
 
 # 2b. list_open (project scoped OFF) → no project clause, so it spans every project the token can see.
 : > "$APILOG"
-open2="$( unset JIRA_PROJECT_KEY; run _backend_list_open )"
+open2="$( unset JIRA_PROJECT_KEY; run _backend_list_open)"
 grep -q 'statusCategory != Done' "$APILOG" || fail "list_open (no project) did not issue the open JQL"
 grep -q 'project = ' "$APILOG" && fail "list_open (no project) must NOT scope by project — it leaked a project clause"
-echo "$open2" | grep -q "^#ENG-7 first open issue$" || fail "list_open (no project) missing '#ENG-7 first open issue' ($open2)"
+grep -q "^#ENG-7 first open issue$" <<< "$open2" || fail "list_open (no project) missing '#ENG-7 first open issue' ($open2)"
 pass
 
 # 2c. list_open_rich → same open filter but requests status + assignee + description, emits TSV
@@ -180,11 +180,11 @@ rich="$(run _backend_list_open_rich)"
 grep -q '"status"' "$APILOG" || fail "list_open_rich did not request the status field"
 grep -q '"assignee"' "$APILOG" || fail "list_open_rich did not request the assignee field"
 grep -q '"description"' "$APILOG" || fail "list_open_rich did not request the description field"
-echo "$rich" | grep '^#' | head -n1 | grep -q "^#ENG-9" \
+grep -q "^#ENG-9" <<< "$(grep '^#' <<< "$rich" | sed -n 1p)" \
   || fail "list_open_rich did not sort the in-progress issue first ($rich)"
-echo "$rich" | grep -q "^#ENG-9${TAB}indeterminate${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase${TAB}https://acme.atlassian.net/browse/ENG-9$" \
+grep -q "^#ENG-9${TAB}indeterminate${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase${TAB}https://acme.atlassian.net/browse/ENG-9$" <<< "$rich" \
   || fail "list_open_rich TSV shape wrong for ENG-9 (assignee Chase 6th, url 7th) ($rich)"
-echo "$rich" | grep -q "^#ENG-7${TAB}new${TAB}To Do${TAB}first open issue${TAB}Details for seven.${TAB}${TAB}https://acme.atlassian.net/browse/ENG-7$" \
+grep -q "^#ENG-7${TAB}new${TAB}To Do${TAB}first open issue${TAB}Details for seven.${TAB}${TAB}https://acme.atlassian.net/browse/ENG-7$" <<< "$rich" \
   || fail "list_open_rich did not flatten desc / place empty assignee then url; ENG-7 shape wrong ($rich)"
 pass
 
@@ -193,22 +193,22 @@ pass
 : > "$APILOG"
 det="$(run _backend_show_item "#ENG-7")"
 grep -q 'P<<\/rest\/api\/3\/issue\/ENG-7?' "$APILOG" || fail "show_item did not GET the issue by key"
-echo "$det" | grep -q "^#ENG-7 · In Progress (indeterminate) · Chase$" || fail "show_item missing the key · status · assignee header ($det)"
-echo "$det" | grep -q "Full spec body here." || fail "show_item did not print the full description body ($det)"
-echo "$det" | grep -q "browse/ENG-7 · updated 2026-07-06" || fail "show_item missing url + updated date ($det)"
+grep -q "^#ENG-7 · In Progress (indeterminate) · Chase$" <<< "$det" || fail "show_item missing the key · status · assignee header ($det)"
+grep -q "Full spec body here." <<< "$det" || fail "show_item did not print the full description body ($det)"
+grep -q "browse/ENG-7 · updated 2026-07-06" <<< "$det" || fail "show_item missing url + updated date ($det)"
 pass
 
 # 2e. show_item on an unparseable ref → loud stderr, no round-trip.
 : > "$APILOG"
 err="$(run _backend_show_item "nodashhere" 2>&1 >/dev/null || true)"
-echo "$err" | grep -q "not a PROJ-NUMBER" || fail "show_item on an unparseable ref should say so on stderr ($err)"
+grep -q "not a PROJ-NUMBER" <<< "$err" || fail "show_item on an unparseable ref should say so on stderr ($err)"
 grep -q 'P<<\/rest\/api\/3\/issue\/' "$APILOG" && fail "show_item on an unparseable ref should not issue any request"
 pass
 
 # 3. mark_shipped → comments the PR link, then transitions the issue to a Done-category status.
 : > "$APILOG"
 ship="$(run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/3)"
-echo "$ship" | grep -q "RESULT=DONE" || fail "mark_shipped did not report DONE ($ship)"
+grep -q "RESULT=DONE" <<< "$ship" || fail "mark_shipped did not report DONE ($ship)"
 grep -q 'P<<\/rest\/api\/3\/issue\/ENG-7\/comment>>' "$APILOG" || fail "mark_shipped did not comment the PR link"
 grep -q "Shipped via https://github.com/acme/widgets/pull/3" "$APILOG" || fail "mark_shipped did not link the PR in the comment body"
 grep -q 'P<<\/rest\/api\/3\/issue\/ENG-7\/transitions>>' "$APILOG" || fail "mark_shipped did not move the issue via a transition"
@@ -218,7 +218,7 @@ pass
 # 3b. mark_shipped with an unparseable slug → NOCHANGE, no round-trip.
 : > "$APILOG"
 ship2="$(run _backend_mark_shipped nodashhere https://github.com/acme/widgets/pull/9 2>/dev/null)"
-echo "$ship2" | grep -q "RESULT=NOCHANGE" || fail "mark_shipped on an unparseable slug should be NOCHANGE ($ship2)"
+grep -q "RESULT=NOCHANGE" <<< "$ship2" || fail "mark_shipped on an unparseable slug should be NOCHANGE ($ship2)"
 grep -q 'transitions' "$APILOG" && fail "mark_shipped on an unparseable slug should issue no transition"
 pass
 
@@ -226,11 +226,11 @@ pass
 #    last-updated day as ITEM_UPDATED evidence (HERD-117 claim-guard precondition).
 : > "$APILOG"
 out="$(ITEM_CAT=done ITEM_UPD="2026-07-08T21:51:00.000Z" run _backend_item_state "provider-lib#ENG-7")"
-echo "$out" | grep -q "ITEM_STATE=closed" || fail "_backend_item_state did not return ITEM_STATE=closed ($out)"
+grep -q "ITEM_STATE=closed" <<< "$out" || fail "_backend_item_state did not return ITEM_STATE=closed ($out)"
 grep -q 'fields=status,updated' "$APILOG" || fail "_backend_item_state did not request status + updated"
 : > "$APILOG"
 outp="$(ITEM_CAT=indeterminate run _backend_item_state "provider-lib#ENG-7")"
-echo "$outp" | grep -q "ITEM_STATE=in-progress" || fail "_backend_item_state did not map indeterminate → in-progress ($outp)"
+grep -q "ITEM_STATE=in-progress" <<< "$outp" || fail "_backend_item_state did not map indeterminate → in-progress ($outp)"
 pass
 
 # 4a. item_state precondition — a Done issue reads closed AND surfaces its last-updated day so a
@@ -240,15 +240,15 @@ outg="$(cd "$T" && . "$BACKEND"
   ITEM_STATE=""; ITEM_UPDATED=""
   _backend_item_state "provider-lib#ENG-7"
   printf 'ITEM_STATE=%s\nITEM_UPDATED=%s\n' "$ITEM_STATE" "$ITEM_UPDATED")"
-echo "$outg" | grep -q "ITEM_STATE=closed"       || fail "guard precondition: Done issue must read closed ($outg)"
-echo "$outg" | grep -q "ITEM_UPDATED=2026-07-08"  || fail "guard precondition: last-updated day not surfaced ($outg)"
+grep -q "ITEM_STATE=closed" <<< "$outg" || fail "guard precondition: Done issue must read closed ($outg)"
+grep -q "ITEM_UPDATED=2026-07-08" <<< "$outg" || fail "guard precondition: last-updated day not surfaced ($outg)"
 pass
 
 # 4c. update_state (done) → resolves by key via GET /issue transitions, then POSTs a Done-category
 #     transition. It must NOT POST /issue (a state change is not a new item — the gh #139 junk bug).
 : > "$APILOG"
 us="$(run _backend_update_state ENG-7 done)"
-echo "$us" | grep -q "RESULT=DONE" || fail "update_state did not report DONE ($us)"
+grep -q "RESULT=DONE" <<< "$us" || fail "update_state did not report DONE ($us)"
 grep -q 'P<<\/rest\/api\/3\/issue\/ENG-7\/transitions>>' "$APILOG" || fail "update_state did not move the issue via a transition"
 grep -q '"id": "31"' "$APILOG" || fail "update_state (done) did not fire the Done transition"
 grep -q 'M<<POST>>P<<\/rest\/api\/3\/issue>>' "$APILOG" && fail "update_state must NOT file a new issue (the #139 junk bug)"
@@ -265,7 +265,7 @@ pass
 # 4e. update_state with an UNKNOWN target state → NOCHANGE, no round-trip.
 : > "$APILOG"
 us2="$(run _backend_update_state ENG-7 frobnicate 2>/dev/null)"
-echo "$us2" | grep -q "RESULT=NOCHANGE" || fail "update_state on an unknown state should be NOCHANGE ($us2)"
+grep -q "RESULT=NOCHANGE" <<< "$us2" || fail "update_state on an unknown state should be NOCHANGE ($us2)"
 grep -q 'transitions' "$APILOG" && fail "update_state on an unknown state should issue no request"
 pass
 
@@ -274,15 +274,15 @@ pass
 : > "$APILOG"
 us3="$(run _backend_update_state "first open issue" done)"
 grep -q 'summary ~' "$APILOG" || fail "update_state (no key) did not fall back to a summary match"
-echo "$us3" | grep -q "RESULT=DONE"    || fail "update_state summary match did not transition the unique match ($us3)"
+grep -q "RESULT=DONE" <<< "$us3" || fail "update_state summary match did not transition the unique match ($us3)"
 pass
 
 # 4g. name-first pick: a project with BOTH a 'Done' and a 'Cancelled' transition in the done category
 #     must resolve 'done' to the transition NAMED 'Done', never whichever done-category one is first.
 : > "$APILOG"
 us4="$( TRANSITIONS='[{"id":"41","name":"Cancel","to":{"name":"Cancelled","statusCategory":{"key":"done"}}},{"id":"31","name":"Done","to":{"name":"Done","statusCategory":{"key":"done"}}}]' \
-        run _backend_update_state ENG-7 done )"
-echo "$us4" | grep -q "RESULT=DONE" || fail "update_state (multi done) did not report DONE ($us4)"
+        run _backend_update_state ENG-7 done)"
+grep -q "RESULT=DONE" <<< "$us4" || fail "update_state (multi done) did not report DONE ($us4)"
 grep -q '"id": "31"' "$APILOG" || fail "update_state (multi done) did not pick the 'Done' transition by NAME"
 pass
 
@@ -290,8 +290,8 @@ pass
 #     A rejected transition (error envelope) must be NOCHANGE — not an optimistic DONE — so agent-watch
 #     falls back to the fuzzy scribe retry instead of journaling a false verified transition.
 : > "$APILOG"
-usf="$( TRANSITION_FAILS=1 run _backend_update_state ENG-7 done 2>/dev/null )"
-echo "$usf" | grep -q "RESULT=NOCHANGE" || fail "update_state must be NOCHANGE when the transition is rejected ($usf)"
+usf="$( TRANSITION_FAILS=1 run _backend_update_state ENG-7 done 2>/dev/null)"
+grep -q "RESULT=NOCHANGE" <<< "$usf" || fail "update_state must be NOCHANGE when the transition is rejected ($usf)"
 grep -q 'transitions' "$APILOG" || fail "update_state (rejected) should still ATTEMPT the transition"
 grep -q 'M<<POST>>P<<\/rest\/api\/3\/issue>>' "$APILOG" && fail "update_state (rejected) must NOT fall back to filing a new issue"
 pass
@@ -299,15 +299,15 @@ pass
 # 4i. HERD-70: the same verification guards mark_shipped — a rejected Done transition is NOCHANGE, even
 #     though the PR-link comment already posted.
 : > "$APILOG"
-shipf="$( TRANSITION_FAILS=1 run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null )"
-echo "$shipf" | grep -q "RESULT=NOCHANGE" || fail "mark_shipped must be NOCHANGE when the Done transition is rejected ($shipf)"
+shipf="$( TRANSITION_FAILS=1 run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null)"
+grep -q "RESULT=NOCHANGE" <<< "$shipf" || fail "mark_shipped must be NOCHANGE when the Done transition is rejected ($shipf)"
 grep -q '/comment' "$APILOG" || fail "mark_shipped (rejected) should still post the PR-link comment"
 pass
 
 # 5. amend → posts a comment to an EXISTING issue via /comment, DONE; unresolvable ref → NOCHANGE.
 : > "$APILOG"
 am="$(run _backend_amend ENG-7 "a clarifying note")"
-echo "$am" | grep -q "RESULT=DONE" || fail "amend did not report DONE ($am)"
+grep -q "RESULT=DONE" <<< "$am" || fail "amend did not report DONE ($am)"
 grep -q 'P<<\/rest\/api\/3\/issue\/ENG-7\/comment>>' "$APILOG" || fail "amend did not post a comment"
 grep -q "a clarifying note" "$APILOG" || fail "amend did not carry the note text"
 pass
@@ -318,12 +318,12 @@ pass
 HERD_COMPONENT=reconcile HERD_TW_PR=42 run _backend_update_state ENG-7 done >/dev/null
 [ "$(grep -c '^tracker_write ' "$JLOG")" = "1" ] || fail "update_state must journal EXACTLY ONE tracker_write ($(cat "$JLOG"))"
 tw="$(grep '^tracker_write ' "$JLOG")"
-echo "$tw" | grep -q "ref ENG-7"            || fail "tracker_write missing 'ref ENG-7' ($tw)"
-echo "$tw" | grep -q "requested done"       || fail "tracker_write missing 'requested done' ($tw)"
-echo "$tw" | grep -q "component reconcile"  || fail "tracker_write did not attribute the component ($tw)"
-echo "$tw" | grep -q "result DONE"          || fail "tracker_write did not record the result ($tw)"
-echo "$tw" | grep -q "backend jira"         || fail "tracker_write missing the backend field ($tw)"
-echo "$tw" | grep -q "pr 42"                || fail "tracker_write did not carry the PR ($tw)"
+grep -q "ref ENG-7" <<< "$tw" || fail "tracker_write missing 'ref ENG-7' ($tw)"
+grep -q "requested done" <<< "$tw" || fail "tracker_write missing 'requested done' ($tw)"
+grep -q "component reconcile" <<< "$tw" || fail "tracker_write did not attribute the component ($tw)"
+grep -q "result DONE" <<< "$tw" || fail "tracker_write did not record the result ($tw)"
+grep -q "backend jira" <<< "$tw" || fail "tracker_write missing the backend field ($tw)"
+grep -q "pr 42" <<< "$tw" || fail "tracker_write did not carry the PR ($tw)"
 pass
 
 # 6b. FAIL-SOFT: with journal_append UNDEFINED, the write still succeeds and nothing is journaled.
@@ -340,7 +340,7 @@ out="$(
   _backend_update_state ENG-7 done
   printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
 )"
-echo "$out" | grep -q "RESULT=DONE" || fail "update_state must still succeed with journal_append undefined ($out)"
+grep -q "RESULT=DONE" <<< "$out" || fail "update_state must still succeed with journal_append undefined ($out)"
 [ ! -s "$JLOG" ] || fail "no tracker_write should be written when journal_append is undefined ($(cat "$JLOG"))"
 pass
 
@@ -369,7 +369,7 @@ claim() {   # prints _CLAIM_RESULT / _CLAIM_OWNER for the given env-scripted iss
 }
 : > "$APILOG"
 c1="$(claim ENG-7 brian)"
-echo "$c1" | grep -q "CLAIM=CLAIMED" || fail "claim of an unassigned issue should be CLAIMED ($c1)"
+grep -q "CLAIM=CLAIMED" <<< "$c1" || fail "claim of an unassigned issue should be CLAIMED ($c1)"
 grep -q 'P<<\/rest\/api\/3\/issue\/ENG-7\/assignee>>' "$APILOG" || fail "claim did not assign the issue"
 grep -q '"accountId": "acc_self"' "$APILOG" || fail "claim did not assign to the token's own accountId"
 pass
@@ -377,31 +377,31 @@ pass
 # 7b. claim of an issue already assigned to ANOTHER user → ALREADY, naming the owner; no assignment.
 : > "$APILOG"
 c2="$(CLAIM_ASSIGNEE='{"accountId":"acc_other","displayName":"Someone Else"}' claim ENG-7 brian)"
-echo "$c2" | grep -q "CLAIM=ALREADY" || fail "claim of an other-assigned issue should be ALREADY ($c2)"
-echo "$c2" | grep -q "OWNER=Someone Else" || fail "claim ALREADY should name the blocking assignee ($c2)"
+grep -q "CLAIM=ALREADY" <<< "$c2" || fail "claim of an other-assigned issue should be ALREADY ($c2)"
+grep -q "OWNER=Someone Else" <<< "$c2" || fail "claim ALREADY should name the blocking assignee ($c2)"
 grep -q '/assignee' "$APILOG" && fail "claim of an other-assigned issue must not re-assign it"
 pass
 
 # 7c. claim of a Done issue → ALREADY (shipped), no assignment.
 c3="$(CLAIM_CAT=done claim ENG-7 brian)"
-echo "$c3" | grep -q "CLAIM=ALREADY" || fail "claim of a Done issue should be ALREADY ($c3)"
+grep -q "CLAIM=ALREADY" <<< "$c3" || fail "claim of a Done issue should be ALREADY ($c3)"
 pass
 
 # 7d. claim already ours + in-progress → SELF.
 c4="$(CLAIM_ASSIGNEE='{"accountId":"acc_self","displayName":"Herd Bot"}' CLAIM_CAT=indeterminate claim ENG-7 brian)"
-echo "$c4" | grep -q "CLAIM=SELF" || fail "claim of our own in-progress issue should be SELF ($c4)"
+grep -q "CLAIM=SELF" <<< "$c4" || fail "claim of our own in-progress issue should be SELF ($c4)"
 pass
 
 # 7e. claim-verify catches a racer: the re-read assignee is someone else → ALREADY, not CLAIMED.
 c5="$(VERIFY_ASSIGNEE='{"accountId":"acc_racer"}' claim ENG-7 brian)"
-echo "$c5" | grep -q "CLAIM=ALREADY" || fail "claim-verify should flip to ALREADY when a racer won ($c5)"
+grep -q "CLAIM=ALREADY" <<< "$c5" || fail "claim-verify should flip to ALREADY when a racer won ($c5)"
 pass
 
 # 8. HERD-52 queue_item → resolves the key, then posts a 📌 planned marker comment (who + 'sequenced
 #    after <blocker>' + [<epoch>]). DONE.
 : > "$APILOG"
 q="$(run _backend_queue_item ENG-7 alice ENG-9)"
-echo "$q" | grep -q "RESULT=DONE" || fail "queue_item did not report DONE ($q)"
+grep -q "RESULT=DONE" <<< "$q" || fail "queue_item did not report DONE ($q)"
 grep -q 'P<<\/rest\/api\/3\/issue\/ENG-7\/comment>>' "$APILOG" || fail "queue_item did not post the marker via a comment"
 grep -q "queued by alice" "$APILOG" || fail "queue_item marker did not name the operator"
 grep -q "sequenced after ENG-9" "$APILOG" || fail "queue_item marker did not record the blocker"
@@ -411,14 +411,14 @@ pass
 # 8a. queue_item with NO blocker → 'sequenced next', still DONE.
 : > "$APILOG"
 qn="$(run _backend_queue_item ENG-7 alice "")"
-echo "$qn" | grep -q "RESULT=DONE" || fail "queue_item (no blocker) did not report DONE ($qn)"
+grep -q "RESULT=DONE" <<< "$qn" || fail "queue_item (no blocker) did not report DONE ($qn)"
 grep -q "sequenced next" "$APILOG" || fail "queue_item (no blocker) did not fall back to 'sequenced next'"
 pass
 
 # 8b. queue_item on an unparseable ref → NOCHANGE, no comment.
 : > "$APILOG"
 qbad="$(run _backend_queue_item nodashhere alice ENG-9 2>/dev/null)"
-echo "$qbad" | grep -q "RESULT=NOCHANGE" || fail "queue_item on an unparseable ref should be NOCHANGE ($qbad)"
+grep -q "RESULT=NOCHANGE" <<< "$qbad" || fail "queue_item on an unparseable ref should be NOCHANGE ($qbad)"
 grep -q '/comment' "$APILOG" && fail "queue_item on an unparseable ref should post no comment"
 pass
 
@@ -427,16 +427,16 @@ pass
 : > "$APILOG"
 lq="$(run _backend_list_queued)"
 grep -q '"comment"' "$APILOG" || fail "list_queued did not request the inline comment field"
-echo "$lq" | grep -q "^#ENG-7${TAB}alice${TAB}sequenced after ENG-9${TAB}1700000000$" \
+grep -q "^#ENG-7${TAB}alice${TAB}sequenced after ENG-9${TAB}1700000000$" <<< "$lq" \
   || fail "list_queued did not emit the parsed marker TSV for ENG-7 ($lq)"
-echo "$lq" | grep -q "^#ENG-9" && fail "list_queued surfaced ENG-9 which carries no 📌 marker ($lq)"
+grep -q "^#ENG-9" <<< "$lq" && fail "list_queued surfaced ENG-9 which carries no 📌 marker ($lq)"
 pass
 
 # 8d. unqueue_item → reads the issue's comments and DELETEs ONLY the 📌 marker (cmt_mark), never the
 #     unrelated comment (cmt_other). DONE.
 : > "$APILOG"
 uq="$(run _backend_unqueue_item ENG-7 alice)"
-echo "$uq" | grep -q "RESULT=DONE" || fail "unqueue_item did not report DONE ($uq)"
+grep -q "RESULT=DONE" <<< "$uq" || fail "unqueue_item did not report DONE ($uq)"
 grep -q 'M<<DELETE>>P<<\/rest\/api\/3\/issue\/ENG-7\/comment\/cmt_mark>>' "$APILOG" || fail "unqueue_item did not delete the marker comment (cmt_mark)"
 grep -q 'cmt_other' "$APILOG" && fail "unqueue_item deleted a non-marker comment (cmt_other)"
 pass

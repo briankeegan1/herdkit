@@ -164,8 +164,8 @@ ok
 # separates an ENGINE surface (must review) from a LOW-RISK surface (skips) for a sample diff.
 engine=$'scripts/herd/agent-watch.sh\nREADME.md'   # a matching engine path present
 lowrisk=$'README.md\ndocs/notes.md'                # docs-only, no engine path
-printf '%s\n' "$engine"  | grep -qE "$GLOB" || fail "B: an engine-surface diff must MATCH the risk glob"
-printf '%s\n' "$lowrisk" | grep -qE "$GLOB" && fail "B: a low-risk docs diff must NOT match the risk glob"
+grep -qE "$GLOB" <<< "$engine" || fail "B: an engine-surface diff must MATCH the risk glob"
+grep -qE "$GLOB" <<< "$lowrisk" && fail "B: a low-risk docs diff must NOT match the risk glob"
 ok
 
 echo "ALL PASS ($pass checks)"

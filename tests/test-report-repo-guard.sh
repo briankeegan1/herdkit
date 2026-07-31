@@ -72,7 +72,7 @@ P1="$T/consumer"; make_proj "$P1" "https://github.com/acme/widgets.git"
 if out="$(run_report "$P1" 2>&1)"; then
   fail "(1) report should REFUSE when HERD_REPO is unset in a non-herdkit repo — ($out)"
 fi
-echo "$out" | grep -q "HERD_REPO is not set" \
+grep -q "HERD_REPO is not set" <<< "$out" \
   || fail "(1) refusal missing the actionable 'HERD_REPO is not set' message — ($out)"
 grep -q -- "issue create" "$GHLOG" \
   && fail "(1) report filed an issue despite the refusal (leak!) — $(cat "$GHLOG")"
@@ -87,7 +87,7 @@ P1b="$T/consumer-noremote"; make_proj "$P1b" ""
 if out="$(run_report "$P1b" 2>&1)"; then
   fail "(1b) report should REFUSE with no remote and HERD_REPO unset — ($out)"
 fi
-echo "$out" | grep -q "HERD_REPO is not set" || fail "(1b) refusal message missing — ($out)"
+grep -q "HERD_REPO is not set" <<< "$out" || fail "(1b) refusal message missing — ($out)"
 [ -s "$GHLOG" ] && fail "(1b) refusal must not call gh — $(cat "$GHLOG")"
 pass
 

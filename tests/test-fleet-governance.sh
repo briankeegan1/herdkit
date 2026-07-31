@@ -91,7 +91,7 @@ chmod +x "$STUB"
 set +e
 out="$(HERD_FLEET_HERD_BIN="$STUB" bash "$HERD" fleet set MERGE_POLICY approve)"; rc=$?
 set -e
-printf '%s' "$out" | grep -q "config set" \
+grep -q "config set" <<< "$out" \
   || fail "fleet set header should show the delegated 'herd config set' command"
 grep -qx "config set MERGE_POLICY approve" "$ALPHA/.herd/fleet-set-argv" \
   || fail "alpha's herd config set was not invoked with KEY VALUE"
@@ -100,10 +100,10 @@ grep -qx "config set MERGE_POLICY approve" "$BETA/.herd/fleet-set-argv" \
 ok
 
 # ── 2. fleet set rolls up per-project outcomes (ok + failed) + tallies ────────
-printf '%s' "$out" | grep -Eq "alpha.*ok"     || fail "alpha should report ok"
-printf '%s' "$out" | grep -Eq "beta.*failed"  || fail "beta should report failed"
-printf '%s' "$out" | grep -q "1 ok"     || fail "fleet set summary should tally 1 ok"
-printf '%s' "$out" | grep -q "1 failed" || fail "fleet set summary should tally 1 failed"
+grep -Eq "alpha.*ok" <<< "$out" || fail "alpha should report ok"
+grep -Eq "beta.*failed" <<< "$out" || fail "beta should report failed"
+grep -q "1 ok" <<< "$out" || fail "fleet set summary should tally 1 ok"
+grep -q "1 failed" <<< "$out" || fail "fleet set summary should tally 1 failed"
 [ "$rc" -ne 0 ] || fail "fleet set should exit non-zero when a project's set failed"
 ok
 
@@ -112,9 +112,9 @@ printf 'ghost|%s/proj/ghost|me/ghost\n' "$T" >> "$HERD_FLEET_FILE"
 set +e
 out="$(HERD_FLEET_HERD_BIN="$STUB" bash "$HERD" fleet set MERGE_POLICY approve)"; rc=$?
 set -e
-printf '%s' "$out" | grep -Eq "ghost.*skipped" || fail "unreachable project should be reported skipped"
-printf '%s' "$out" | grep -q "alpha" || fail "fan-out should continue past the unreachable project"
-printf '%s' "$out" | grep -q "1 skipped" || fail "summary should tally the skipped project"
+grep -Eq "ghost.*skipped" <<< "$out" || fail "unreachable project should be reported skipped"
+grep -q "alpha" <<< "$out" || fail "fan-out should continue past the unreachable project"
+grep -q "1 skipped" <<< "$out" || fail "summary should tally the skipped project"
 # Drop the ghost so the governance section runs against the clean 2-project fleet.
 grep -v '^ghost|' "$HERD_FLEET_FILE" > "$HERD_FLEET_FILE.tmp" && mv "$HERD_FLEET_FILE.tmp" "$HERD_FLEET_FILE"
 ok
@@ -137,39 +137,39 @@ printf '999999\n'   > "$ALPHA-trees/.review-inflight-12-cafef00d"
 
 # ── 5. governance renders a per-project row with builder + review counts ──────
 out="$(bash "$HERD" fleet governance)"
-printf '%s' "$out" | grep -q "PROJECT"  || fail "governance missing header row"
-printf '%s' "$out" | grep -q "BUILDERS" || fail "governance missing BUILDERS column"
-printf '%s' "$out" | grep -q "REVIEWS"  || fail "governance missing REVIEWS column"
+grep -q "PROJECT" <<< "$out" || fail "governance missing header row"
+grep -q "BUILDERS" <<< "$out" || fail "governance missing BUILDERS column"
+grep -q "REVIEWS" <<< "$out" || fail "governance missing REVIEWS column"
 alpha_row="$(printf '%s' "$out" | grep '^alpha' || true)"
 beta_row="$(printf '%s' "$out" | grep '^beta' || true)"
 # alpha: 2 builders, 1 live review (the dead marker is excluded), 3 in-flight.
-printf '%s' "$alpha_row" | grep -Eq '^alpha +2 +1 +3' \
+grep -Eq '^alpha +2 +1 +3' <<< "$alpha_row" \
   || fail "alpha row should read builders=2 reviews=1 in-flight=3 (got: $alpha_row)"
 # beta: 1 builder, 0 reviews, 1 in-flight.
-printf '%s' "$beta_row" | grep -Eq '^beta +1 +0 +1' \
+grep -Eq '^beta +1 +0 +1' <<< "$beta_row" \
   || fail "beta row should read builders=1 reviews=0 in-flight=1 (got: $beta_row)"
 ok
 
 # ── 6. governance sums the fleet-wide in-flight total ────────────────────────
 # 3 builders (2+1) + 1 review = 4 in-flight across 2 projects.
-printf '%s' "$out" | grep -q "4 in-flight" || fail "fleet total should be 4 in-flight"
-printf '%s' "$out" | grep -q "3 builder"   || fail "fleet total should sum 3 builders"
-printf '%s' "$out" | grep -q "1 review"    || fail "fleet total should sum 1 review"
-printf '%s' "$out" | grep -q "2 project"   || fail "fleet total should count 2 projects"
+grep -q "4 in-flight" <<< "$out" || fail "fleet total should be 4 in-flight"
+grep -q "3 builder" <<< "$out" || fail "fleet total should sum 3 builders"
+grep -q "1 review" <<< "$out" || fail "fleet total should sum 1 review"
+grep -q "2 project" <<< "$out" || fail "fleet total should count 2 projects"
 ok
 
 # ── 7. governance watcher column: alpha alive (stubbed), beta down ───────────
-printf '%s' "$alpha_row" | grep -qi "alive" || fail "alpha's watcher should read alive (stubbed)"
-printf '%s' "$beta_row"  | grep -qi "down"  || fail "beta's watcher should read down"
+grep -qi "alive" <<< "$alpha_row" || fail "alpha's watcher should read alive (stubbed)"
+grep -qi "down" <<< "$beta_row" || fail "beta's watcher should read down"
 ok
 
 # ── 8. soft cap warning fires when in-flight ≥ cap (warn → stderr) ────────────
 # Fleet in-flight is 4; a cap of 3 should trip the account-wide-limit warning.
 errout="$(HERD_FLEET_INFLIGHT_SOFTCAP=3 bash "$HERD" fleet governance 2>&1 >/dev/null)"
-printf '%s' "$errout" | grep -qi "soft cap\|account-wide" || fail "soft cap should warn when in-flight ≥ cap"
+grep -qi "soft cap\|account-wide" <<< "$errout" || fail "soft cap should warn when in-flight ≥ cap"
 # A high cap must NOT warn.
 errout="$(HERD_FLEET_INFLIGHT_SOFTCAP=99 bash "$HERD" fleet governance 2>&1 >/dev/null)"
-printf '%s' "$errout" | grep -qi "soft cap" && fail "soft cap should not warn when in-flight < cap"
+grep -qi "soft cap" <<< "$errout" && fail "soft cap should not warn when in-flight < cap"
 ok
 
 # ── 9. governance: an unreachable project is reported, not fatal ─────────────
@@ -178,21 +178,21 @@ set +e
 out="$(bash "$HERD" fleet governance)"; rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "governance should not fail on an unreachable project"
-printf '%s' "$out" | grep -Eq "ghost.*unreachable" || fail "unreachable project should be reported"
-printf '%s' "$out" | grep -q "1 unreachable" || fail "fleet summary should count the unreachable project"
-printf '%s' "$out" | grep -q "alpha" || fail "governance should still render reachable projects"
+grep -Eq "ghost.*unreachable" <<< "$out" || fail "unreachable project should be reported"
+grep -q "1 unreachable" <<< "$out" || fail "fleet summary should count the unreachable project"
+grep -q "alpha" <<< "$out" || fail "governance should still render reachable projects"
 grep -v '^ghost|' "$HERD_FLEET_FILE" > "$HERD_FLEET_FILE.tmp" && mv "$HERD_FLEET_FILE.tmp" "$HERD_FLEET_FILE"
 ok
 
 # ── 10. empty registry is a friendly note, not a crash ───────────────────────
 out="$(HERD_FLEET_FILE="$T/none/fleet" bash "$HERD" fleet governance)"
-printf '%s' "$out" | grep -qi "no fleet registry\|register" \
+grep -qi "no fleet registry\|register" <<< "$out" \
   || fail "empty-registry governance should hint how to add a project"
 ok
 
 # ── 11. governance --help prints usage without touching the registry ─────────
 out="$(bash "$HERD" fleet governance --help)"
-printf '%s' "$out" | grep -qi "GLOBAL CONCURRENCY\|in-flight" || fail "governance --help should describe the view"
+grep -qi "GLOBAL CONCURRENCY\|in-flight" <<< "$out" || fail "governance --help should describe the view"
 ok
 
 echo "ALL PASS ($pass checks)"

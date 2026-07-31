@@ -208,7 +208,7 @@ fi
 set_roster 1
 run_conflict_tick "$S1"
 _d2="$(dispatch_count)"
-if [ "$_d2" -eq 1 ] && printf '%s' "$(last_row)" | grep -q 'resolving conflict'; then
+if [ "$_d2" -eq 1 ] && grep -q 'resolving conflict' <<< "$(last_row)"; then
   checkpoint alive_holds pass "live resolver held (still 1 dispatch; row=resolving conflict…)"
 else
   checkpoint alive_holds fail "expected hold at 1 dispatch, got count=$_d2 row='$(last_row)'"
@@ -238,7 +238,7 @@ fi
 set_roster 0
 run_conflict_tick "$S3"
 _d5="$(dispatch_count)"
-if [ "$_d5" -eq 3 ] && printf '%s' "$(last_row)" | grep -q 'gave up'; then
+if [ "$_d5" -eq 3 ] && grep -q 'gave up' <<< "$(last_row)"; then
   checkpoint respawn_capped pass "cap reached: no 4th dispatch; row=resolver gave up (3 rounds)"
 else
   checkpoint respawn_capped fail "expected cap at 3 dispatches, got count=$_d5 row='$(last_row)'"
@@ -261,7 +261,7 @@ set_roster 0
 run_conflict_tick "$RA2"                 # resolver now GONE → re-dispatch for RA2
 _rc3="$(dispatch_count)"
 if [ "$_rc1" -eq 1 ] && [ "$_rc2" -eq 1 ] && [ "$_rc3" -eq 2 ] \
-   && printf '%s' "$_race_row" | grep -q 'resolving conflict'; then
+   && grep -q 'resolving conflict' <<< "$_race_row"; then
   checkpoint new_commit_holds_while_alive pass "new commit while resolver alive HELD (no double-dispatch), re-dispatched only after it exited"
 else
   checkpoint new_commit_holds_while_alive fail "expected hold-then-respawn (counts $_rc1/$_rc2/$_rc3, row='$_race_row')"
@@ -278,7 +278,7 @@ set_roster 0
 run_conflict_tick "$ES1"                 # next tick reads the verdict → records escalated, terminal
 _ce2="$(dispatch_count)"
 if [ "$_ce1" -eq 1 ] && [ "$_ce2" -eq 1 ] && resolver_escalated_sha "$PR" "$ES1" \
-   && printf '%s' "$(last_row)" | grep -q 'resolver escalated'; then
+   && grep -q 'resolver escalated' <<< "$(last_row)"; then
   checkpoint escalate_terminal pass "ESCALATE is terminal for the sha (1 dispatch, no respawn; row=escalated)"
 else
   checkpoint escalate_terminal fail "expected terminal escalate (d1=$_ce1 d2=$_ce2 esc=$(resolver_escalated_sha "$PR" "$ES1"; echo $?) row='$(last_row)')"
@@ -324,7 +324,7 @@ _fd_after="$(dispatch_count)"
 _fd_respawn_after="$(grep -c '"event":"resolver_respawn"' "$JOURNAL_FILE" 2>/dev/null || echo 0)"
 if [ "$_fd_base" -eq 1 ] && [ "$_fd_after" -eq 1 ] \
    && [ "$_fd_respawn_after" -eq "$_fd_respawn_before" ] \
-   && ! printf '%s' "$_fd_row" | grep -q 'gave up'; then
+   && ! grep -q 'gave up' <<< "$_fd_row"; then
   checkpoint false_dead_no_loop pass "10 blind ticks over a live resolver: 0 respawns, budget intact (1 dispatch), PR never stranded"
 else
   checkpoint false_dead_no_loop fail "false-dead loop: dispatches ${_fd_base}→${_fd_after}, respawn events ${_fd_respawn_before}→${_fd_respawn_after}, row='$_fd_row'"

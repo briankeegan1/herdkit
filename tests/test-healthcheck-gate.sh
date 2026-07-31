@@ -135,7 +135,7 @@ hc_run 1 slug-clean "$T/wt" 0
 [ "$_HC_RESULT" = "CLEAN" ] || fail "clean healthcheck should yield CLEAN (got '$_HC_RESULT')"
 ok
 [ "$(ledger_outcomes 1)" = "clean" ] || fail "ledger should record 'clean' (got '$(ledger_outcomes 1)')"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "needs you" && fail "clean run must not paint 'needs you'"
+grep -q "needs you" <<< "${DISPLAY[0]:-}" && fail "clean run must not paint 'needs you'"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 1 ] || fail "clean run should invoke healthcheck exactly once"
 [ ! -e "$(_health_inflight_file "1-")" ] || fail "clean run must release its mutex marker"
 ok
@@ -146,7 +146,7 @@ printf '0|⚠️  data/env (not a code bug) — missing fixture\n' > "$STUB_HC_S
 hc_run 2 slug-env "$T/wt" 0
 [ "$_HC_RESULT" = "CLEAN" ] || fail "data/env (rc 0) should yield CLEAN (got '$_HC_RESULT')"
 [ "$(ledger_outcomes 2)" = "dataenv" ] || fail "ledger should record 'dataenv' (got '$(ledger_outcomes 2)')"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "needs you" && fail "data/env run must not paint 'needs you'"
+grep -q "needs you" <<< "${DISPLAY[0]:-}" && fail "data/env run must not paint 'needs you'"
 ok
 
 # ── (4) FLAKY: fail-then-pass → flaky/infra, NOT red, proceeds as passing ─────
@@ -156,9 +156,9 @@ hc_run 3 slug-flaky "$T/wt" 0
 [ "$_HC_RESULT" = "FLAKY" ] || fail "fail-then-pass should yield FLAKY (got '$_HC_RESULT')"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "flaky · infra (passed on retry)" \
+grep -q "flaky · infra (passed on retry)" <<< "$d" \
   || fail "flaky run should show 'flaky · infra (passed on retry)' (got: $d)"
-printf '%s\n' "$d" | grep -q "needs you" && fail "flaky run must NEVER paint 'needs you' red"
+grep -q "needs you" <<< "$d" && fail "flaky run must NEVER paint 'needs you' red"
 ok
 [ "$(ledger_outcomes 3)" = "code-error flaky-pass" ] \
   || fail "ledger should record 'code-error flaky-pass' (got '$(ledger_outcomes 3)')"
@@ -173,9 +173,9 @@ hc_run 4 slug-real "$T/wt" 0
 [ "$_HC_RESULT" = "CODEERROR" ] || fail "fail-then-fail should yield CODEERROR (got '$_HC_RESULT')"
 ok
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "needs you" || fail "reproduced code error should paint red 'needs you' (got: $d)"
-printf '%s\n' "$d" | grep -q "real bug on line 5" || fail "red row should carry the healthcheck's oneline reason"
-printf '%s\n' "$d" | grep -q "flaky" && fail "reproduced failure must not be called flaky"
+grep -q "needs you" <<< "$d" || fail "reproduced code error should paint red 'needs you' (got: $d)"
+grep -q "real bug on line 5" <<< "$d" || fail "red row should carry the healthcheck's oneline reason"
+grep -q "flaky" <<< "$d" && fail "reproduced failure must not be called flaky"
 ok
 [ "$(ledger_outcomes 4)" = "code-error code-error" ] \
   || fail "ledger should record 'code-error code-error' (got '$(ledger_outcomes 4)')"
@@ -242,7 +242,7 @@ _health_slot_free && fail "no slot should be free while a holder is live at HEAL
 hc_run 5 slug-queued "$T/wt" 0
 [ "$_HC_RESULT" = "QUEUED" ] || fail "PR should QUEUE while the slot is busy (got '$_HC_RESULT')"
 ok
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "health-check · queued" \
+grep -q "health-check · queued" <<< "${DISPLAY[0]:-}" \
   || fail "queued PR should show 'health-check · queued' (got: ${DISPLAY[0]:-})"
 [ ! -s "$STUB_HC_LOG" ] || fail "a queued PR must NOT invoke the healthcheck"
 [ ! -e "$(_health_inflight_file "5-")" ] || fail "a queued PR must not claim a marker"
@@ -363,9 +363,9 @@ _HC_RESULT=""; DISPLAY=()
 hc_run 1001 slug-cflaky "$T/wt" 0 "cafe567803"
 [ "$_HC_RESULT" = "FLAKY" ] || fail "8c: cached sha should REUSE FLAKY (got '$_HC_RESULT')"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] || fail "8c: reusing a cached FLAKY must NOT re-run the suite"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "flaky · infra (passed on retry)" \
+grep -q "flaky · infra (passed on retry)" <<< "${DISPLAY[0]:-}" \
   || fail "8c: reused FLAKY should show the flaky/infra row (got: ${DISPLAY[0]:-})"
-printf '%s\n' "${DISPLAY[0]:-}" | grep -q "needs you" && fail "8c: reused FLAKY must never paint red"
+grep -q "needs you" <<< "${DISPLAY[0]:-}" && fail "8c: reused FLAKY must never paint red"
 ok
 
 # (8d) a cached CODEERROR keeps surfacing the red row on later ticks WITHOUT re-running.
@@ -383,8 +383,8 @@ hc_run 1002 slug-cred "$T/wt" 0 "face9abc04"
 [ "$(wc -l < "$STUB_HC_LOG")" -eq 2 ] \
   || fail "8d: a cached CODEERROR must keep the red row WITHOUT re-running ($(wc -l < "$STUB_HC_LOG") invocations, expected 2)"
 d="${DISPLAY[0]:-}"
-printf '%s\n' "$d" | grep -q "needs you" || fail "8d: reused CODEERROR must still paint red 'needs you' (got: $d)"
-printf '%s\n' "$d" | grep -q "real bug on line 5" || fail "8d: reused red row should carry the cached oneline reason (got: $d)"
+grep -q "needs you" <<< "$d" || fail "8d: reused CODEERROR must still paint red 'needs you' (got: $d)"
+grep -q "real bug on line 5" <<< "$d" || fail "8d: reused red row should carry the cached oneline reason (got: $d)"
 ok
 
 # (8e) an empty sha disables the cache — the pre-cache behavior (every call runs the suite).

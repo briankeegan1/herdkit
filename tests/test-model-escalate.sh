@@ -106,7 +106,7 @@ run_lane() {
 
 # resolved_model <slug> — the model actually passed to `claude --model` in the agent-start call.
 resolved_model() {
-  grep -oE 'agent start .*-- claude --model [^ ]+' "$T/$1.herdr.log" | grep -oE '[^ ]+$' | head -1
+  grep -oE 'agent start .*-- claude --model [^ ]+' "$T/$1.herdr.log" | grep -oE '[^ ]+$' | sed -n 1p
 }
 
 MATCH_TASK="Refactor cmd_reload wiring in bin/herd so reload targets the workspace"

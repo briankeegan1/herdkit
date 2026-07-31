@@ -42,8 +42,8 @@ set +e
 lintout="$(cd "$PROJ" && "$HERD" config lint 2>&1)"; lintrc=$?
 set -e
 [ "$lintrc" -ne 0 ]                              || fail "1a: 'config lint' exited 0 despite a config.local dup ($lintout)"
-echo "$lintout" | grep -q 'config.local'         || fail "1b: 'config lint' did not name config.local ($lintout)"
-echo "$lintout" | grep -q 'MODEL_QUICK'          || fail "1c: 'config lint' did not list the overlay dup key ($lintout)"
+grep -q 'config.local' <<< "$lintout" || fail "1b: 'config lint' did not name config.local ($lintout)"
+grep -q 'MODEL_QUICK' <<< "$lintout" || fail "1c: 'config lint' did not list the overlay dup key ($lintout)"
 okc
 
 # ── 2. `herd config lint` is clean when neither file has an INTERNAL duplicate, even if a key is set
@@ -56,7 +56,7 @@ set +e
 cleanout="$(cd "$PROJ" && "$HERD" config lint 2>&1)"; cleanrc=$?
 set -e
 [ "$cleanrc" -eq 0 ]                             || fail "2a: 'config lint' failed on a clean overlay w/ cross-file override ($cleanout)"
-echo "$cleanout" | grep -qi 'no duplicate keys in .herd/config.local' \
+grep -qi 'no duplicate keys in .herd/config.local' <<< "$cleanout" \
                                                  || fail "2b: 'config lint' did not confirm the overlay clean ($cleanout)"
 okc
 
@@ -73,9 +73,9 @@ REVIEW_CONCURRENCY=2
 REVIEW_CONCURRENCY=4
 EOF
 docout="$(_HERD_CONFIG_DUP_WARNED=1 HERD_CONFIG_FILE="$DUP" bash -c '. "$1"; . "$2"; herd_doctor 2>&1' _ "$LOADER" "$PREFLIGHT" || true)"
-echo "$docout" | grep -q 'Config (.herd/config):'    || fail "3a: doctor printed no Config section"
-echo "$docout" | grep -qi 'config.local'             || fail "3b: doctor did not mention config.local ($docout)"
-echo "$docout" | grep -q 'REVIEW_CONCURRENCY'        || fail "3c: doctor did not name the overlay dup key ($docout)"
+grep -q 'Config (.herd/config):' <<< "$docout" || fail "3a: doctor printed no Config section"
+grep -qi 'config.local' <<< "$docout" || fail "3b: doctor did not mention config.local ($docout)"
+grep -q 'REVIEW_CONCURRENCY' <<< "$docout" || fail "3c: doctor did not name the overlay dup key ($docout)"
 okc
 
 # ── 4. doctor is clean-quiet for a duplicate-free overlay ─────────────────────────────────────────
@@ -83,7 +83,7 @@ cat > "$LOCAL" <<'EOF'
 REVIEW_CONCURRENCY=4
 EOF
 docclean="$(_HERD_CONFIG_DUP_WARNED=1 HERD_CONFIG_FILE="$DUP" bash -c '. "$1"; . "$2"; herd_doctor 2>&1' _ "$LOADER" "$PREFLIGHT" || true)"
-echo "$docclean" | grep -qi 'config.local overlay present, no duplicate keys' \
+grep -qi 'config.local overlay present, no duplicate keys' <<< "$docclean" \
                                                      || fail "4a: doctor did not report the clean overlay ($docclean)"
 okc
 

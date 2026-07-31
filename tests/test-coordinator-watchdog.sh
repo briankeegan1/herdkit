@@ -189,9 +189,9 @@ _handle_coordinator_watchdog
 [ "$(wc -l < "$PANE_LOG")" -eq 1 ] || fail "6: resume must fire EXACTLY ONE pane run (got $(wc -l < "$PANE_LOG"))"
 ok
 cmd="$(head -1 "$PANE_LOG")"
-printf '%s\n' "$cmd" | grep -q -- "--continue" || fail "6: resume must use claude --continue (got: $cmd)"
+grep -q -- "--continue" <<< "$cmd" || fail "6: resume must use claude --continue (got: $cmd)"
 ok
-printf '%s\n' "$cmd" | grep -q "$MAIN" || fail "6: resume must cd into the coordinator repo \$MAIN (got: $cmd)"
+grep -q "$MAIN" <<< "$cmd" || fail "6: resume must cd into the coordinator repo \$MAIN (got: $cmd)"
 ok
 [ -z "$(limit_state "$CO")" ] || fail "6: record must be cleared after a successful resume"
 ok

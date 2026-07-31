@@ -32,7 +32,7 @@ echo "test content here" > "$TEST_FILE"
 # ── Test 1: GNU stat detection regex ──
 # Verify the regex matches GNU
 gnu_version="stat (GNU coreutils) 9.1"
-if echo "$gnu_version" | grep -qE "GNU|uutils"; then
+if grep -qE "GNU|uutils" <<< "$gnu_version"; then
   ok
 else
   fail "GNU regex should match 'GNU coreutils'"
@@ -41,7 +41,7 @@ fi
 # ── Test 2: uutils stat detection regex ──
 # Verify the regex matches uutils
 uutils_version="stat (uutils) 0.0.18"
-if echo "$uutils_version" | grep -qE "GNU|uutils"; then
+if grep -qE "GNU|uutils" <<< "$uutils_version"; then
   ok
 else
   fail "uutils regex should match 'uutils'"

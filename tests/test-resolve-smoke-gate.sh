@@ -70,7 +70,7 @@ HERD_CONFIG_FILE="$OK_CFG" HERD_NO_APP=1 bash "$RESOLVE" "$SLUG" >/dev/null 2>&1
 TASK_LINE="$(grep 'agent start' "$HERDR_CALL_LOG" | tail -1)"
 [ -n "$TASK_LINE" ] || fail "no 'agent start' call captured for SMOKE_CMD-set run"
 
-printf '%s' "$TASK_LINE" | grep -qF "the project smoke test ($SMOKE_OK_CMD)" \
+grep -qF "the project smoke test ($SMOKE_OK_CMD)" <<< "$TASK_LINE" \
   || fail "herd-resolve.sh did not fold SMOKE_CMD into the resolver's task contract"$'\n'"$TASK_LINE"
 
 # Ordering: the smoke step must be ordered BEFORE the push step in the resolver's instructed
@@ -86,7 +86,7 @@ GREEN_POS=$(python3 -c "import sys; print(sys.argv[1].find(sys.argv[2]))" "$TASK
 [ "$GREEN_POS" -lt "$PUSH_POS" ]  || fail "the green-checks condition is not ordered before the push instruction"
 
 # Both the smoke command AND the healthcheck must be required before the resolver moves on.
-printf '%s' "$TASK_LINE" | grep -qF "both must pass" \
+grep -qF "both must pass" <<< "$TASK_LINE" \
   || fail "task contract does not require the smoke+healthcheck pass before continuing"
 
 # The configured SMOKE_CMD is a REAL, executable command — running it (as the resolver's task
@@ -115,9 +115,9 @@ HERD_CONFIG_FILE="$FAIL_CFG" HERD_NO_APP=1 bash "$RESOLVE" "$SLUG" >/dev/null 2>
 
 FAIL_TASK_LINE="$(grep 'agent start' "$HERDR_CALL_LOG" | tail -1)"
 [ -n "$FAIL_TASK_LINE" ] || fail "no 'agent start' call captured for SMOKE_CMD-failing run"
-printf '%s' "$FAIL_TASK_LINE" | grep -qF "the project smoke test ($SMOKE_FAIL_CMD)" \
+grep -qF "the project smoke test ($SMOKE_FAIL_CMD)" <<< "$FAIL_TASK_LINE" \
   || fail "herd-resolve.sh did not fold the failing SMOKE_CMD into the task contract"$'\n'"$FAIL_TASK_LINE"
-printf '%s' "$FAIL_TASK_LINE" | grep -qF "both must pass" \
+grep -qF "both must pass" <<< "$FAIL_TASK_LINE" \
   || fail "failing-SMOKE_CMD task contract dropped the pass-both-checks requirement"
 
 if bash -c "$SMOKE_FAIL_CMD" >/dev/null 2>&1; then

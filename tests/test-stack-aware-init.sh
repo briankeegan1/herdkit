@@ -61,7 +61,7 @@ ok
 # ── (2) Go fixture: seeds the Go template + writes blank globs (no '^app/') ───────────────────────
 proj="$T/go"; mkproj "$proj" "go.mod"
 out="$(run_init "$proj")" || fail "(2) go init failed: $out"
-echo "$out" | grep -qi "language=go"                          || fail "(2) scout should report lang=go: $out"
+grep -qi "language=go" <<< "$out" || fail "(2) scout should report lang=go: $out"
 cmp -s "$proj/.herd/healthcheck.project.sh" "$REPO/templates/healthcheck.go.sh" \
   || fail "(2) seeded healthcheck should equal templates/healthcheck.go.sh"
 [ -x "$proj/.herd/healthcheck.project.sh" ]                   || fail "(2) seeded healthcheck should be executable"
@@ -79,14 +79,14 @@ ok
 
 # ── (4) Python + Node UNCHANGED: blank globs, default HEALTHCHECK_CMD, and the SAME template each ─
 proj="$T/py"; mkproj "$proj" "pyproject.toml"; out="$(run_init "$proj")" || fail "(4) py init failed: $out"
-echo "$out" | grep -qi "language=python"                     || fail "(4) scout should report lang=python: $out"
+grep -qi "language=python" <<< "$out" || fail "(4) scout should report lang=python: $out"
 cmp -s "$proj/.herd/healthcheck.project.sh" "$REPO/templates/healthcheck.project.sh" \
   || fail "(4) Python consumer must still get healthcheck.project.sh (unchanged)"
 grep -qE '^HEALTHCHECK_HEAVY_GLOB=""$' "$proj/.herd/config"  || fail "(4) python heavy glob must be blank"
 grep -q '\^app/' "$proj/.herd/config"                        && fail "(4) python config must not leak ^app/"
 
 proj="$T/node"; mkproj "$proj" "package.json"; out="$(run_init "$proj")" || fail "(4) node init failed: $out"
-echo "$out" | grep -qi "language=node"                       || fail "(4) scout should report lang=node: $out"
+grep -qi "language=node" <<< "$out" || fail "(4) scout should report lang=node: $out"
 cmp -s "$proj/.herd/healthcheck.project.sh" "$REPO/templates/healthcheck.node.sh" \
   || fail "(4) Node consumer must get healthcheck.node.sh (unchanged)"
 grep -qE '^HEALTHCHECK_HEAVY_GLOB=""$' "$proj/.herd/config"  || fail "(4) node heavy glob must be blank"

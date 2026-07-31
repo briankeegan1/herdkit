@@ -70,67 +70,67 @@ bash "$HERD" fleet register "$BETA"  >/dev/null
 # ── 1. default 24h digest: alpha's per-project aggregation ────────────────────
 out="$(bash "$HERD" fleet digest)"
 alpha_block="$(printf '%s' "$out" | awk '/^alpha$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$alpha_block" | grep -Eq 'shipped: +2' || fail "alpha should have 2 shipped (#7,#8), got: $alpha_block"
-printf '%s' "$alpha_block" | grep -q '#7'  || fail "alpha shipped list should name #7"
-printf '%s' "$alpha_block" | grep -q '#8'  || fail "alpha shipped list should name #8"
-printf '%s' "$alpha_block" | grep -Eq 'needs you: +1' || fail "alpha should have 1 needs-you (#11)"
-printf '%s' "$alpha_block" | grep -q '#11' || fail "alpha needs-you should name #11"
-printf '%s' "$alpha_block" | grep -Eq 'blocked: +1'   || fail "alpha should have 1 blocked (#12)"
-printf '%s' "$alpha_block" | grep -q '#12' || fail "alpha blocked should name #12"
-printf '%s' "$alpha_block" | grep -Eq 'in-flight: +1' || fail "alpha should have 1 in-flight (#13)"
-printf '%s' "$alpha_block" | grep -q '#13' || fail "alpha in-flight should name #13"
-printf '%s' "$alpha_block" | grep -Eq 'gate fails: +2' || fail "alpha should have 2 gate fails (BLOCK+CODEERROR)"
+grep -Eq 'shipped: +2' <<< "$alpha_block" || fail "alpha should have 2 shipped (#7,#8), got: $alpha_block"
+grep -q '#7' <<< "$alpha_block" || fail "alpha shipped list should name #7"
+grep -q '#8' <<< "$alpha_block" || fail "alpha shipped list should name #8"
+grep -Eq 'needs you: +1' <<< "$alpha_block" || fail "alpha should have 1 needs-you (#11)"
+grep -q '#11' <<< "$alpha_block" || fail "alpha needs-you should name #11"
+grep -Eq 'blocked: +1' <<< "$alpha_block" || fail "alpha should have 1 blocked (#12)"
+grep -q '#12' <<< "$alpha_block" || fail "alpha blocked should name #12"
+grep -Eq 'in-flight: +1' <<< "$alpha_block" || fail "alpha should have 1 in-flight (#13)"
+grep -q '#13' <<< "$alpha_block" || fail "alpha in-flight should name #13"
+grep -Eq 'gate fails: +2' <<< "$alpha_block" || fail "alpha should have 2 gate fails (BLOCK+CODEERROR)"
 ok
 
 # ── 2. the older merge (#99) is OUTSIDE the 24h window → excluded ─────────────
-printf '%s' "$alpha_block" | grep -q '#99' && fail "merge #99 (older than 24h cutoff) must not appear"
+grep -q '#99' <<< "$alpha_block" && fail "merge #99 (older than 24h cutoff) must not appear"
 ok
 
 # ── 3. a hold that was RELEASED does not linger as needs-you (#14 dropped) ────
-printf '%s' "$alpha_block" | grep -q '#14' && fail "#14 hold was released → must not show as needs-you"
+grep -q '#14' <<< "$alpha_block" && fail "#14 hold was released → must not show as needs-you"
 ok
 
 # ── 4. beta with an empty journal reports no activity, not a crash ────────────
 beta_block="$(printf '%s' "$out" | awk '/^beta$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$beta_block" | grep -qi "no activity" || fail "beta (empty journal) should report no activity"
+grep -qi "no activity" <<< "$beta_block" || fail "beta (empty journal) should report no activity"
 ok
 
 # ── 5. fleet summary line tallies across all projects ────────────────────────
-printf '%s' "$out" | grep -q "^Fleet:" || fail "digest missing the fleet summary line"
+grep -q "^Fleet:" <<< "$out" || fail "digest missing the fleet summary line"
 summary="$(printf '%s' "$out" | grep '^Fleet:')"
-printf '%s' "$summary" | grep -q "2 projects"     || fail "summary should count 2 projects, got: $summary"
-printf '%s' "$summary" | grep -q "2 shipped"      || fail "summary should tally 2 shipped"
-printf '%s' "$summary" | grep -q "1 need you"     || fail "summary should tally 1 need-you"
-printf '%s' "$summary" | grep -q "1 blocked"      || fail "summary should tally 1 blocked"
-printf '%s' "$summary" | grep -q "1 in-flight"    || fail "summary should tally 1 in-flight"
-printf '%s' "$summary" | grep -q "2 gate failures" || fail "summary should tally 2 gate failures"
+grep -q "2 projects" <<< "$summary" || fail "summary should count 2 projects, got: $summary"
+grep -q "2 shipped" <<< "$summary" || fail "summary should tally 2 shipped"
+grep -q "1 need you" <<< "$summary" || fail "summary should tally 1 need-you"
+grep -q "1 blocked" <<< "$summary" || fail "summary should tally 1 blocked"
+grep -q "1 in-flight" <<< "$summary" || fail "summary should tally 1 in-flight"
+grep -q "2 gate failures" <<< "$summary" || fail "summary should tally 2 gate failures"
 ok
 
 # ── 6. a WIDER --since window pulls in the older merge (#99) ──────────────────
 out7d="$(bash "$HERD" fleet digest --since 7d)"
 a7="$(printf '%s' "$out7d" | awk '/^alpha$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$a7" | grep -Eq 'shipped: +3' || fail "--since 7d should include #99 → 3 shipped, got: $a7"
-printf '%s' "$a7" | grep -q '#99' || fail "--since 7d should name #99"
-printf '%s' "$out7d" | grep '^Fleet:' | grep -q "3 shipped" || fail "7d summary should tally 3 shipped"
+grep -Eq 'shipped: +3' <<< "$a7" || fail "--since 7d should include #99 → 3 shipped, got: $a7"
+grep -q '#99' <<< "$a7" || fail "--since 7d should name #99"
+grep -q "3 shipped" <<< "$(printf '%s' "$out7d" | grep '^Fleet:')" || fail "7d summary should tally 3 shipped"
 ok
 
 # ── 7. a TIGHTER --since window narrows the set (2h → only #7 merged) ─────────
 # cutoff = 2026-07-03T10:00:00Z; only the merge at 10:00:00 (#7) is at-or-after it.
 out2h="$(bash "$HERD" fleet digest --since 2h)"
 a2="$(printf '%s' "$out2h" | awk '/^alpha$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$a2" | grep -Eq 'shipped: +1' || fail "--since 2h should include only #7 → 1 shipped, got: $a2"
-printf '%s' "$a2" | grep -q '#7'  || fail "--since 2h should name #7"
-printf '%s' "$a2" | grep -q '#8'  && fail "--since 2h (cutoff 10:00) must exclude #8 (merged 09:00)"
+grep -Eq 'shipped: +1' <<< "$a2" || fail "--since 2h should include only #7 → 1 shipped, got: $a2"
+grep -q '#7' <<< "$a2" || fail "--since 2h should name #7"
+grep -q '#8' <<< "$a2" && fail "--since 2h (cutoff 10:00) must exclude #8 (merged 09:00)"
 ok
 
 # ── 8. an UNREACHABLE (missing) project is reported, not fatal ────────────────
 printf 'ghost|%s/proj/ghost|me/ghost\n' "$T" >> "$HERD_FLEET_FILE"
 out="$(bash "$HERD" fleet digest)"
 ghost_block="$(printf '%s' "$out" | awk '/^ghost$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$ghost_block" | grep -qi "unreachable" || fail "missing project should be reported as unreachable"
-printf '%s' "$out" | grep '^Fleet:' | grep -q "3 projects" || fail "summary should still count the ghost project"
+grep -qi "unreachable" <<< "$ghost_block" || fail "missing project should be reported as unreachable"
+grep -q "3 projects" <<< "$(printf '%s' "$out" | grep '^Fleet:')" || fail "summary should still count the ghost project"
 # aggregation of the reachable projects still renders (alpha present after the ghost).
-printf '%s' "$out" | grep -q "^alpha$" || fail "digest should continue past the unreachable project"
+grep -q "^alpha$" <<< "$out" || fail "digest should continue past the unreachable project"
 ok
 
 # ── 9. a completely MISSING journal file (no journal.jsonl at all) → no activity ─
@@ -141,12 +141,12 @@ bash "$HERD" fleet register "$GAMMA" >/dev/null
 grep -v '^ghost|' "$HERD_FLEET_FILE" > "$HERD_FLEET_FILE.tmp" && mv "$HERD_FLEET_FILE.tmp" "$HERD_FLEET_FILE"
 out="$(bash "$HERD" fleet digest)"
 g_block="$(printf '%s' "$out" | awk '/^gamma$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
-printf '%s' "$g_block" | grep -qi "no activity" || fail "gamma (no journal file) should report no activity, not crash"
+grep -qi "no activity" <<< "$g_block" || fail "gamma (no journal file) should report no activity, not crash"
 ok
 
 # ── 10. empty registry is a friendly note, not a crash ───────────────────────
 out="$(HERD_FLEET_FILE="$T/none/fleet" bash "$HERD" fleet digest)"
-printf '%s' "$out" | grep -qi "no fleet registry\|register" || fail "empty-registry digest should hint how to add a project"
+grep -qi "no fleet registry\|register" <<< "$out" || fail "empty-registry digest should hint how to add a project"
 ok
 
 # ── 11. --since with no value fails loudly ───────────────────────────────────
@@ -157,7 +157,7 @@ ok
 
 # ── 12. --help renders usage without touching the registry ───────────────────
 out="$(bash "$HERD" fleet digest --help)"
-printf '%s' "$out" | grep -qi "standup\|--since" || fail "digest --help should describe the command"
+grep -qi "standup\|--since" <<< "$out" || fail "digest --help should describe the command"
 ok
 
 # ── 13. cross-seat merge leg (HERD-291, retargeted HERD-442) ─────────────────
@@ -181,10 +181,10 @@ bash "$HERD" fleet register "$DELTA" >/dev/null
 out="$(bash "$HERD" fleet digest)"
 delta_block="$(printf '%s' "$out" | awk '/^delta$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
 # #55 had a BLOCK then merge_observed → must appear as shipped, not blocked.
-printf '%s' "$delta_block" | grep -Eq 'shipped: +1' || fail "merge_observed: delta should have 1 shipped (#55), got: $delta_block"
-printf '%s' "$delta_block" | grep -q '#55'           || fail "merge_observed: #55 must appear in shipped list"
-printf '%s' "$delta_block" | grep -E 'shipped:' | grep -q '#77' && fail "merge_observed: #77 (BLOCK only, no merge_observed) must not be shipped"
-printf '%s' "$delta_block" | grep -Eq 'blocked: +1'  || fail "merge_observed: #77 (BLOCK, no merge_observed) must remain blocked"
+grep -Eq 'shipped: +1' <<< "$delta_block" || fail "merge_observed: delta should have 1 shipped (#55), got: $delta_block"
+grep -q '#55' <<< "$delta_block" || fail "merge_observed: #55 must appear in shipped list"
+grep -q '#77' <<< "$(printf '%s' "$delta_block" | grep -E 'shipped:')" && fail "merge_observed: #77 (BLOCK only, no merge_observed) must not be shipped"
+grep -Eq 'blocked: +1' <<< "$delta_block" || fail "merge_observed: #77 (BLOCK, no merge_observed) must remain blocked"
 ok
 
 echo "ALL PASS ($pass checks)"

@@ -115,11 +115,11 @@ out="$(HERD_REVIEW_AGENT_TEMP="$AGENT_TEMP2" HERD_REVIEW_RESULT_FILE="$RES2" \
 rc=$?
 [ "$rc" -eq 0 ] || fail "(2) dotted near-miss should be consumed as PASS (exit 0), got $rc"
 ok
-printf '%s\n' "$out" | grep -q '^REVIEW: PASS$' || fail "(2) should print REVIEW: PASS from the near-miss verdict"
+grep -q '^REVIEW: PASS$' <<< "$out" || fail "(2) should print REVIEW: PASS from the near-miss verdict"
 ok
 grep -q '^REVIEW: PASS$' "$RES2" || fail "(2) result file should hold the consumed near-miss verdict"
 ok
-printf '%s\n' "$out" | grep -q 'INFRA-FAIL' && fail "(2) a consumed near-miss must NOT become INFRA-FAIL" || true
+grep -q 'INFRA-FAIL' <<< "$out" && fail "(2) a consumed near-miss must NOT become INFRA-FAIL" || true
 ok
 grep -q '"event":"verdict_path_nearmiss"' "$JOURNAL_FILE" 2>/dev/null \
   || fail "(2) a verdict_path_nearmiss event should be journaled"
@@ -143,7 +143,7 @@ rc=$?
 ok
 grep -q '^REVIEW: BLOCK' "$RES3" || fail "(3) result file should hold the consumed BLOCK near-miss verdict"
 ok
-printf '%s\n' "$out" | grep -q 'off-by-one' || fail "(3) the BLOCK reason should survive near-miss consumption"
+grep -q 'off-by-one' <<< "$out" || fail "(3) the BLOCK reason should survive near-miss consumption"
 ok
 grep -q '"event":"verdict_path_nearmiss"' "$JOURNAL_FILE" 2>/dev/null \
   || fail "(3) trailing-space near-miss should also journal verdict_path_nearmiss"

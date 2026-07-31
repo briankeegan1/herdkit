@@ -147,7 +147,7 @@ line three: verify"
 enqueue slug-ok quick "$MULTI"
 echo ok > "$T/lane.mode"; : > "$LANELOG"; : > "$JLOG"
 run_drain
-ls "$T/trees/spawn-queue" | grep -q . && fail "spawned intent was not consumed ($(ls "$T/trees/spawn-queue"))"
+grep -q . <<< "$(ls "$T/trees/spawn-queue")" && fail "spawned intent was not consumed ($(ls "$T/trees/spawn-queue"))"
 grep -q "herd-quick.sh slug-ok" "$LANELOG" || fail "quick lane was not invoked for slug-ok"
 grep -q "line two: edge cases" "$LANELOG" || fail "multi-line task truncated before the lane saw it"
 grep -q "spawn_launched slug slug-ok lane quick" "$JLOG" || fail "spawn_launched not journaled ($(cat "$JLOG"))"
@@ -160,7 +160,7 @@ echo defer > "$T/lane.mode"; : > "$LANELOG"; : > "$JLOG"
 run_drain
 reqs=$(ls "$T/trees/spawn-queue"/*.req 2>/dev/null | wc -l | tr -d ' ')
 [ "$reqs" = "2" ] || fail "deferred intents must BOTH survive as .req (found $reqs; held one lost = the exact BLOCK bug)"
-ls "$T/trees/spawn-queue"/*.mine 2>/dev/null | grep -q . && fail "release left a .mine claim behind"
+grep -q . <<< "$(ls "$T/trees/spawn-queue"/*.mine 2>/dev/null)" && fail "release left a .mine claim behind"
 grep -q "spawn_deferred slug slug-held lane feature" "$JLOG" || fail "spawn_deferred not journaled ($(cat "$JLOG"))"
 [ "$(grep -c '^herd-feature.sh' "$LANELOG")" = "1" ] || fail "drain must STOP after a defer (siblings defer against the same gate)"
 pass
@@ -170,17 +170,17 @@ rm -f "$T/trees/spawn-queue"/*.req
 enqueue slug-bad quick "task that will fail to launch"
 echo fail > "$T/lane.mode"; : > "$LANELOG"; : > "$JLOG"
 run_drain
-ls "$T/trees/spawn-queue" | grep -q . && fail "hard-failed intent should be dropped (with a loud journal trail)"
+grep -q . <<< "$(ls "$T/trees/spawn-queue")" && fail "hard-failed intent should be dropped (with a loud journal trail)"
 grep -q "spawn_skipped slug slug-bad lane quick reason lane exited 1" "$JLOG" \
   || fail "spawn_skipped (lane exited 1) not journaled ($(cat "$JLOG"))"
 pass
 
 # ── Case 4: spawn-step.sh release round-trips the claim byte-identically ────────────────────────
 enqueue slug-rt quick "round trip payload"
-f=$(ls "$T/trees/spawn-queue"/*.req | head -1)
+f=$(ls "$T/trees/spawn-queue"/*.req | sed -n 1p)
 before=$(cat "$f")
 WORKTREES_DIR="$T/trees" bash "$ENG/spawn-step.sh" next >/dev/null
-mine=$(ls "$T/trees/spawn-queue"/*.mine | head -1)
+mine=$(ls "$T/trees/spawn-queue"/*.mine | sed -n 1p)
 WORKTREES_DIR="$T/trees" bash "$ENG/spawn-step.sh" release "$mine"
 after=$(cat "$f" 2>/dev/null) || fail "release did not restore the .req file"
 [ "$before" = "$after" ] || fail "release altered the intent payload"
@@ -197,7 +197,7 @@ echo slow > "$T/lane.mode"; : > "$LANELOG"; : > "$JLOG"
 run_drain_nowait
 BG="$(cat "$T/bgpid" 2>/dev/null || true)"
 [ -n "$BG" ] || fail "(5) the drain launched no background lane worker"
-mine="$(ls "$T/trees/spawn-queue"/*.req.mine 2>/dev/null | head -1)"
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine 2>/dev/null | sed -n 1p)"
 [ -n "$mine" ] || fail "(5) no claim is held while the lane runs"
 [ -f "${mine%.req.mine}.owner" ] || fail "(5) the drain did not bind the claim to its lane worker (.owner)"
 [ "$(head -1 "${mine%.req.mine}.owner")" = "$BG" ] || fail "(5) .owner names the wrong pid"
@@ -228,7 +228,7 @@ pass
 rm -f "$T/trees/spawn-queue"/* 2>/dev/null
 enqueue slug-abandoned quick "claimed by a watcher that then died"
 step next >/dev/null
-mine="$(ls "$T/trees/spawn-queue"/*.req.mine | head -1)"
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine | sed -n 1p)"
 sleep 300 & DEADPID=$!
 step own "$mine" "$DEADPID" >/dev/null
 kill "$DEADPID" 2>/dev/null; wait "$DEADPID" 2>/dev/null || true
@@ -246,7 +246,7 @@ pass
 rm -f "$T/trees/spawn-queue"/* 2>/dev/null
 enqueue slug-ghost quick "claim that will vanish under the worker"
 step next >/dev/null
-mine="$(ls "$T/trees/spawn-queue"/*.req.mine | head -1)"
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine | sed -n 1p)"
 rm -f "$mine"                                  # simulate: reclaimed (or already consumed) under us
 for verb in done release skip; do
   if step "$verb" "$mine" "reason" >/dev/null 2>&1; then
@@ -278,7 +278,7 @@ pass
 rm -f "$T/trees/spawn-queue"/* 2>/dev/null
 enqueue slug-rel quick "release round-trip"
 step next >/dev/null
-mine="$(ls "$T/trees/spawn-queue"/*.req.mine | head -1)"
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine | sed -n 1p)"
 id="$(basename "${mine%.req.mine}")"
 age "$mine"                                      # a stale-looking claim …
 before_mtime="$(python3 -c 'import os,sys;print(int(os.stat(sys.argv[1]).st_mtime))' "$mine")"

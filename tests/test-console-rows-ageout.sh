@@ -83,12 +83,12 @@ EOF
 
 build_tracker_drift
 [ -n "${TRACKER_DRIFT:-}" ] || fail "tracker drift section should render"
-printf '%s' "$TRACKER_DRIFT" | grep -q "HERD-now"   || fail "a now row must render"
-printf '%s' "$TRACKER_DRIFT" | grep -q "HERD-fresh" || fail "a 1h-old calm row must still render"
+grep -q "HERD-now" <<< "$TRACKER_DRIFT" || fail "a now row must render"
+grep -q "HERD-fresh" <<< "$TRACKER_DRIFT" || fail "a 1h-old calm row must still render"
 ok
-printf '%s' "$TRACKER_DRIFT" | grep -q "HERD-old" && fail "a 3h-old HEALED (calm) row must age out of display"
+grep -q "HERD-old" <<< "$TRACKER_DRIFT" && fail "a 3h-old HEALED (calm) row must age out of display"
 ok
-printf '%s' "$TRACKER_DRIFT" | grep -q "HERD-stuck" || fail "a 3h-old FAILED (loud) row must NEVER age out"
+grep -q "HERD-stuck" <<< "$TRACKER_DRIFT" || fail "a 3h-old FAILED (loud) row must NEVER age out"
 ok
 # The aged-out row is display-only: the LEDGER still holds it (history is never rewritten).
 grep -q "HERD-old" "$TRACKER_HEAL_FILE" || fail "age-out must not delete the ledger row"
@@ -106,7 +106,7 @@ ok
 # Fail-soft: a garbage epoch is SHOWN, never silently swallowed.
 printf 'not-an-epoch healed HERD-weird 98 open\n' > "$TRACKER_HEAL_FILE"
 build_tracker_drift
-printf '%s' "$TRACKER_DRIFT" | grep -q "HERD-weird" || fail "unparseable epoch must fail-soft to VISIBLE"
+grep -q "HERD-weird" <<< "$TRACKER_DRIFT" || fail "unparseable epoch must fail-soft to VISIBLE"
 ok
 
 # ── (1)+(3) builder notes: age-out + ack ────────────────────────────────────────────────────────
@@ -118,10 +118,10 @@ ok
 } > "$BUILDER_NOTES_LEDGER"
 
 build_builder_notes
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "now finding"   || fail "a now note must render"
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "fresh finding" || fail "a 1h-old note must render"
+grep -q "now finding" <<< "$BUILDER_NOTES_ROWS" || fail "a now note must render"
+grep -q "fresh finding" <<< "$BUILDER_NOTES_ROWS" || fail "a 1h-old note must render"
 ok
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "old finding" && fail "a 3h-old note must age out of display"
+grep -q "old finding" <<< "$BUILDER_NOTES_ROWS" && fail "a 3h-old note must age out of display"
 ok
 grep -q "old finding" "$BUILDER_NOTES_LEDGER" || fail "note age-out must not delete the ledger row"
 ok
@@ -129,9 +129,9 @@ ok
 # Ack the newest note by its verbatim ledger line → hidden immediately, ledger untouched.
 printf '%s\tslug-now\tnow finding\t2026-01-01T03:00:00Z\n' "$NOW" > "$BUILDER_NOTES_ACK"
 build_builder_notes
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "now finding" && fail "an acked note must be hidden"
+grep -q "now finding" <<< "$BUILDER_NOTES_ROWS" && fail "an acked note must be hidden"
 ok
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "fresh finding" || fail "acking one note must not hide the others"
+grep -q "fresh finding" <<< "$BUILDER_NOTES_ROWS" || fail "acking one note must not hide the others"
 ok
 grep -q "now finding" "$BUILDER_NOTES_LEDGER" || fail "ack must not delete the ledger row"
 ok
@@ -189,7 +189,7 @@ legacy_tracker_drift() {
       *)      glyph='⚠️'; color="$C_RED"   ;;
     esac
     rows="${rows}    ${color}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${color}${status}${C_RESET} ${C_DIM}#${pr} was ${state} · ${hhmm}${C_RESET}"$'\n'
-  done < <(reverse_file "$TRACKER_HEAL_FILE" | head -3)
+  done < <(reverse_file "$TRACKER_HEAL_FILE" | sed -n 1,3p)
   printf '%s' "$rows"
 }
 legacy_builder_notes() {
@@ -199,7 +199,7 @@ legacy_builder_notes() {
     [ -n "${slug:-}" ] || continue
     hhmm="$(epoch_to_hhmm "$epoch")"
     rows="${rows}    ${C_CYAN}📝${C_RESET} ${C_BOLD}${slug}${C_RESET} ${text} ${C_DIM}${hhmm}${C_RESET}"$'\n'
-  done < <(reverse_file "$BUILDER_NOTES_LEDGER" | head -5)
+  done < <(reverse_file "$BUILDER_NOTES_LEDGER" | sed -n 1,5p)
   printf '%s' "$rows"
 }
 
@@ -222,26 +222,26 @@ run_herd() { HERD_CONFIG_FILE="$MAIN/.herd/config" HERD_FAKE_NOW="$NOW" HERMETIC
   bash "$HERD_BIN" "$@" 2>&1; }
 
 out="$(cd "$MAIN" && run_herd notes)" || fail "herd notes failed: $out"
-printf '%s' "$out" | grep -q "finding b" || fail "herd notes should list the newest note (got: $out)"
-printf '%s' "$out" | grep -q "finding a" || fail "herd notes should list the older fresh note"
+grep -q "finding b" <<< "$out" || fail "herd notes should list the newest note (got: $out)"
+grep -q "finding a" <<< "$out" || fail "herd notes should list the older fresh note"
 ok
 
 # ack #1 = the newest = "finding b".
 out="$(cd "$MAIN" && run_herd notes ack 1)" || fail "herd notes ack 1 failed: $out"
-printf '%s' "$out" | grep -qi "acked" || fail "ack should confirm (got: $out)"
+grep -qi "acked" <<< "$out" || fail "ack should confirm (got: $out)"
 grep -q "finding b" "$BUILDER_NOTES_ACK" || fail "ack 1 should record the newest ledger line"
 grep -q "finding a" "$BUILDER_NOTES_ACK" && fail "ack 1 must not ack the other note"
 ok
 build_builder_notes
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "finding b" && fail "acked note must leave the console"
-printf '%s' "$BUILDER_NOTES_ROWS" | grep -q "finding a" || fail "unacked note must stay on the console"
+grep -q "finding b" <<< "$BUILDER_NOTES_ROWS" && fail "acked note must leave the console"
+grep -q "finding a" <<< "$BUILDER_NOTES_ROWS" || fail "unacked note must stay on the console"
 ok
 # The journal-facing ledger is untouched by an ack.
 grep -q "finding b" "$BUILDER_NOTES_LEDGER" || fail "ack must never rewrite the ledger"
 ok
 # The acked note is gone from the CLI listing too (one shared visibility rule).
 out="$(cd "$MAIN" && run_herd notes)" || fail "herd notes failed after ack: $out"
-printf '%s' "$out" | grep -q "finding b" && fail "herd notes must not list an acked note"
+grep -q "finding b" <<< "$out" && fail "herd notes must not list an acked note"
 ok
 
 # Bad index / bad subcommand are hard usage errors (one note is still on the console here).
@@ -255,7 +255,7 @@ build_builder_notes
 [ -z "${BUILDER_NOTES_ROWS:-}" ] || fail "ack all should clear the whole section"
 ok
 out="$(cd "$MAIN" && run_herd notes)" || fail "herd notes on an empty console should exit 0: $out"
-printf '%s' "$out" | grep -qi "no builder notes" || fail "empty console should say so (got: $out)"
+grep -qi "no builder notes" <<< "$out" || fail "empty console should say so (got: $out)"
 ok
 
 # The ack sidecar is bounded, and never keeps an ack for an evicted ledger row.

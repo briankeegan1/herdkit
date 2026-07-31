@@ -51,16 +51,16 @@ run_from() {
 
 # ── 1. from alpha, dry-run scan proposes beta (not itself) ───────────────────────────────────────
 out1="$(run_from "$ALPHA" link --scan 2>&1)" || fail "link --scan (alpha) exited non-zero: $out1"
-echo "$out1" | grep -q "beta" || fail "alpha's scan did not propose beta — got: $out1"
-echo "$out1" | grep -q "acme/beta" || fail "alpha's scan did not resolve beta's repo — got: $out1"
-echo "$out1" | grep -qE '^\s*\+\s+alpha\s' && fail "alpha's scan proposed itself — got: $out1"
+grep -q "beta" <<< "$out1" || fail "alpha's scan did not propose beta — got: $out1"
+grep -q "acme/beta" <<< "$out1" || fail "alpha's scan did not resolve beta's repo — got: $out1"
+grep -qE '^\s*\+\s+alpha\s' <<< "$out1" && fail "alpha's scan proposed itself — got: $out1"
 [ ! -f "$ALPHA/.herd/links" ] || fail "dry-run scan wrote $ALPHA/.herd/links"
 pass
 
 # ── 2. from beta, dry-run scan proposes alpha (both directions) ──────────────────────────────────
 out2="$(run_from "$BETA" link --scan 2>&1)" || fail "link --scan (beta) exited non-zero: $out2"
-echo "$out2" | grep -q "alpha" || fail "beta's scan did not propose alpha — got: $out2"
-echo "$out2" | grep -q "acme/alpha" || fail "beta's scan did not resolve alpha's repo — got: $out2"
+grep -q "alpha" <<< "$out2" || fail "beta's scan did not propose alpha — got: $out2"
+grep -q "acme/alpha" <<< "$out2" || fail "beta's scan did not resolve alpha's repo — got: $out2"
 pass
 
 # ── 3. --write applies the proposal to .herd/links ───────────────────────────────────────────────
@@ -72,14 +72,14 @@ pass
 
 # ── 4. herd link list now shows the newly-written peer ───────────────────────────────────────────
 out4="$(run_from "$ALPHA" link list 2>&1)" || fail "link list (alpha) exited non-zero: $out4"
-echo "$out4" | grep -q "acme/beta" || fail "link list did not show the scanned-in beta link — got: $out4"
+grep -q "acme/beta" <<< "$out4" || fail "link list did not show the scanned-in beta link — got: $out4"
 pass
 
 # ── 5. --write is idempotent: a second run adds nothing new ──────────────────────────────────────
 out5="$(run_from "$ALPHA" link --scan --write 2>&1)" || fail "second link --scan --write exited non-zero: $out5"
 n="$(grep -c "^beta|" "$ALPHA/.herd/links" || true)"
 [ "$n" = "1" ] || fail "second --write duplicated the beta row ($n rows) — file: $(cat "$ALPHA/.herd/links")"
-echo "$out5" | grep -qi "no new" || fail "second --write did not report a no-op — got: $out5"
+grep -qi "no new" <<< "$out5" || fail "second --write did not report a no-op — got: $out5"
 pass
 
 # ── 6. fail-soft: no fleet registry at all → soft note, exit 0 ───────────────────────────────────
@@ -87,7 +87,7 @@ NOREG="$T/noreg/fleet"
 out6="$( ( cd "$ALPHA" && HERD_CONFIG_FILE="$ALPHA/.herd/config" HERD_NONINTERACTIVE=1 \
              HERD_FLEET_FILE="$NOREG" bash "$HERD" link --scan 2>&1 ) )" \
   || fail "link --scan with no registry should exit 0 — got: $out6"
-echo "$out6" | grep -qi "no fleet registry" || fail "missing-registry case did not soft-note — got: $out6"
+grep -qi "no fleet registry" <<< "$out6" || fail "missing-registry case did not soft-note — got: $out6"
 pass
 
 # ── 7. --write onto a PRE-EXISTING, UNTERMINATED .herd/links never glues onto the last row ────────
@@ -106,8 +106,8 @@ grep -qxF 'gamma|acme/gamma|github|' "$ZETA/.herd/links" \
 n7="$(wc -l < "$ZETA/.herd/links" | tr -d ' ')"
 [ "$n7" -ge 2 ] || fail "expected at least 2 distinct lines after --write, got $n7 — file: $(cat "$ZETA/.herd/links")"
 outlist7="$(run_from "$ZETA" link list 2>&1)" || fail "link list after unterminated-file --write exited non-zero: $outlist7"
-echo "$outlist7" | grep -q "vendor/sdk" || fail "link list lost the pre-existing 'upstream' row — got: $outlist7"
-echo "$outlist7" | grep -q "acme/gamma" || fail "link list lost the newly-scanned 'gamma' row — got: $outlist7"
+grep -q "vendor/sdk" <<< "$outlist7" || fail "link list lost the pre-existing 'upstream' row — got: $outlist7"
+grep -q "acme/gamma" <<< "$outlist7" || fail "link list lost the newly-scanned 'gamma' row — got: $outlist7"
 pass
 
 # ── 8. cross-proposal collision: two registry rows proposing the SAME name dedup against each ─────
@@ -153,7 +153,7 @@ grep -q "^linkproj|$LINKPROJ|acme/linkproj$" "$REG9" \
 out9="$( cd "$LINKPROJ" && HERD_CONFIG_FILE="$LINKPROJ/.herd/config" HERD_NONINTERACTIVE=1 \
            HERD_FLEET_FILE="$REG9" bash "$HERD" link --scan 2>&1 )" \
   || fail "link --scan (logical-root self case) exited non-zero: $out9"
-echo "$out9" | grep -qi "no new" \
+grep -qi "no new" <<< "$out9" \
   || fail "logical PROJECT_ROOT defeated the self-link guard — scan proposed a self-link: $out9"
 pass
 
@@ -168,10 +168,10 @@ KAPPA="$(_make_project kappa)"
 out10="$( cd "$KAPPA" && HERD_CONFIG_FILE="$KAPPA/.herd/config" HERD_NONINTERACTIVE=1 \
             HERD_FLEET_FILE="$REG10" bash "$HERD" link --scan 2>&1 )" \
   || fail "link --scan (config.local overlay case) exited non-zero: $out10"
-echo "$out10" | grep -qE '\+\s+iota\s+acme/iota\s+\[linear\]' \
+grep -qE '\+\s+iota\s+acme/iota\s+\[linear\]' <<< "$out10" \
   || fail "config.local's SCRIBE_BACKEND=linear did not win over the base config's 'file' — got: $out10"
-echo "$out10" | grep -qi "no tracker_target" || fail "dry-run did not flag the blank linear tracker_target — got: $out10"
-echo "$out10" | grep -q "iota" || fail "tracker_target warning did not name 'iota' — got: $out10"
+grep -qi "no tracker_target" <<< "$out10" || fail "dry-run did not flag the blank linear tracker_target — got: $out10"
+grep -q "iota" <<< "$out10" || fail "tracker_target warning did not name 'iota' — got: $out10"
 pass
 
 echo "ALL PASS ($PASS checks)"

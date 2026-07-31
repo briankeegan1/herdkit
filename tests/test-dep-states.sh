@@ -128,7 +128,12 @@ pass
   build_blocked
   [ -z "$BLOCKED" ] || { echo "FAIL: build_blocked should clear BLOCKED when file absent" >&2; exit 1; }
   echo "SUBPASS"
-) | grep -q "SUBPASS" || fail "agent-watch build_blocked checks failed (see above)"
+) > "$T/subpass.log" || true
+# Capture to a FILE, not `$( )`: this block contains a $'…' ANSI-C string, and nesting that inside
+# an extra command substitution makes bash 3.2 (macOS /bin/bash, which the local gate runs) drop
+# the assignment on the next line — `plain: unbound variable`. bash 5 parses it fine, so the
+# breakage only shows under the 3.2 parser. Grepping the file keeps the producer out of a pipe.
+grep -q "SUBPASS" "$T/subpass.log" || fail "agent-watch build_blocked checks failed (see above)"
 pass
 
 echo "ALL PASS ($PASS checks)"

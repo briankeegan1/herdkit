@@ -479,7 +479,7 @@ EOF
   pipe_errs="$(herd_pipe_safety_lint ".")"; pipe_rc=$?
   if [ "$pipe_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ pipe-safety — $(printf '%s' "$pipe_errs" | grep '^PIPE-UNSAFE' | head -1)";  # pipe-ok: head in a command substitution; status not gated
-    else echo "❌ PIPE-SAFETY: '<producer> | grep -q/-m/head' is EPIPE-unsafe under pipefail (grep files/here-strings directly, or annotate '# pipe-ok: <why>' for a verified-small producer)"; printf '%s\n' "$pipe_errs" | grep '^PIPE-UNSAFE' || printf '%s\n' "$pipe_errs"; fi
+    else echo "❌ PIPE-SAFETY: '<producer> | grep -q/-m/head' is EPIPE-unsafe under pipefail (grep files/here-strings directly, or annotate '# pipe-ok: <why>' for a verified-small producer)"; printf '%s\n' "$pipe_errs" | grep '^PIPE-UNSAFE' || printf '%s\n' "$pipe_errs"; fi  # pipe-ok: the pattern appears in this line's MESSAGE TEXT, not as a pipeline
     exit 1
   fi
 

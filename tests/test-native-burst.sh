@@ -200,32 +200,32 @@ mkdir -p "$T/trees"
 # 5a — all members PASS → combined PASS (exit 0), and exactly 3 members ran (real fan-out of 3).
 r="$(_run_panel allpass 101)"
 [ "${r%%|*}" = "0" ]                            || fail "5a: all-PASS panel should exit 0 (got ${r%%|*})"
-printf '%s' "${r#*|}" | grep -qx 'REVIEW: PASS' || fail "5a: all-PASS panel should emit 'REVIEW: PASS'"
+grep -qx 'REVIEW: PASS' <<< "${r#*|}" || fail "5a: all-PASS panel should emit 'REVIEW: PASS'"
 [ "$(wc -l < "$T/calls-101" | tr -cd 0-9)" = "3" ] || fail "5a: panel should have run exactly 3 members"
 ok
 
 # 5b — all members BLOCK → combined BLOCK (exit 1), structured line preserved.
 r="$(_run_panel allblock 102)"
 [ "${r%%|*}" = "1" ]                                  || fail "5b: all-BLOCK panel should exit 1"
-printf '%s' "${r#*|}" | grep -q '^REVIEW: BLOCK — rule: off-by-one' || fail "5b: BLOCK line must survive"
+grep -q '^REVIEW: BLOCK — rule: off-by-one' <<< "${r#*|}" || fail "5b: BLOCK line must survive"
 ok
 
 # 5c — FAIL-SAFE: exactly ONE member BLOCKs among PASSes → combined BLOCK (a single finding blocks).
 r="$(_run_panel oneblock 103)"
 [ "${r%%|*}" = "1" ]                     || fail "5c: one BLOCK among PASSes MUST block the merge (exit 1)"
-printf '%s' "${r#*|}" | grep -q '^REVIEW: BLOCK' || fail "5c: combined verdict must be BLOCK"
+grep -q '^REVIEW: BLOCK' <<< "${r#*|}" || fail "5c: combined verdict must be BLOCK"
 ok
 
 # 5d — one member PASSes while the rest die with no verdict → combined PASS (one clean review = today's bar).
 r="$(_run_panel onepass 104)"
 [ "${r%%|*}" = "0" ]                            || fail "5d: one PASS + dead members should still PASS (exit 0)"
-printf '%s' "${r#*|}" | grep -qx 'REVIEW: PASS' || fail "5d: combined verdict must be PASS"
+grep -qx 'REVIEW: PASS' <<< "${r#*|}" || fail "5d: combined verdict must be PASS"
 ok
 
 # 5e — NO member reaches a verdict → INFRA-FAIL (exit 2), never a cached BLOCK.
 r="$(_run_panel noverdict 105)"
 [ "${r%%|*}" = "2" ]                                 || fail "5e: a total member wipeout must be INFRA-FAIL (exit 2)"
-printf '%s' "${r#*|}" | grep -q '^REVIEW: INFRA-FAIL' || fail "5e: combined verdict must be INFRA-FAIL"
+grep -q '^REVIEW: INFRA-FAIL' <<< "${r#*|}" || fail "5e: combined verdict must be INFRA-FAIL"
 ok
 
 ################################################################################
@@ -239,7 +239,7 @@ out="$(HERD_NO_PANE=1 HERD_REVIEW_RESULT_FILE="$T/res-default" WORKTREES_DIR="$T
       HERD_CONFIG_FILE="$T/no-such-config" JOURNAL_FILE="$T/j-default" \
       bash "$REVIEW" 200 slug-default 2>/dev/null)"; rc=$?
 [ "$rc" -eq 0 ] || fail "6: default review should exit 0"
-printf '%s\n' "$out" | grep -qx 'REVIEW: PASS' || fail "6: default review should PASS"
+grep -qx 'REVIEW: PASS' <<< "$out" || fail "6: default review should PASS"
 [ "$(wc -l < "$PANEL_CALLS" | tr -cd 0-9)" = "1" ] || fail "6: default (burst off) must run a SINGLE reviewer, not a panel"
 ok
 

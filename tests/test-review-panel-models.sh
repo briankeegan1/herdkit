@@ -131,7 +131,7 @@ _want(){
   if [ "$egrep" = "-" ]; then
     [ -z "$line" ] || fail "3 $label: expected NO verdict line, got '$line'"
   else
-    printf '%s' "$line" | grep -q "$egrep" || fail "3 $label: line '$line' does not match '$egrep'"
+    grep -q "$egrep" <<< "$line" || fail "3 $label: line '$line' does not match '$egrep'"
   fi
 }
 # rc contract: 0 = PASS, 1 = BLOCK, 2 = INFRA (no line).
@@ -236,17 +236,17 @@ _runtime claude     'REVIEW: PASS'
 _runtime stub-agent 'REVIEW: PASS'
 r="$(_run 301 REVIEW_PANEL_MODELS="bare-model stub:stub-model")"
 [ "${r%%|*}" = "0" ] || fail "4a: mixed-vendor all-PASS panel should exit 0 (got ${r%%|*}, out '${r#*|}')"
-printf '%s' "${r#*|}" | grep -qx 'REVIEW: PASS' || fail "4a: combined verdict should be 'REVIEW: PASS'"
+grep -qx 'REVIEW: PASS' <<< "${r#*|}" || fail "4a: combined verdict should be 'REVIEW: PASS'"
 [ "$(_calls 301 | grep -c .)" = "2" ]        || fail "4b: two refs must dispatch exactly 2 panelists, got: $(_calls 301 | tr '\n' ';')"
-_calls 301 | grep -qx 'claude bare-model'    || fail "4c: the BARE ref must launch 'claude' with the bare model, got: $(_calls 301 | tr '\n' ';')"
-_calls 301 | grep -qx 'stub-agent stub-model' || fail "4d: the 'stub:' ref must launch 'stub-agent' with the DRIVER-STRIPPED model, got: $(_calls 301 | tr '\n' ';')"
+grep -qx 'claude bare-model' <<< "$(_calls 301)" || fail "4c: the BARE ref must launch 'claude' with the bare model, got: $(_calls 301 | tr '\n' ';')"
+grep -qx 'stub-agent stub-model' <<< "$(_calls 301)" || fail "4d: the 'stub:' ref must launch 'stub-agent' with the DRIVER-STRIPPED model, got: $(_calls 301 | tr '\n' ';')"
 # The panel size comes from the REF COUNT — REVIEW_PANEL is not consulted once refs are set.
 r="$(_run 302 REVIEW_PANEL_MODELS="stub:a stub:b stub:c" REVIEW_PANEL="1")"
 [ "$(_calls 302 | grep -c .)" = "3" ] || fail "4e: panel size must be the ref count (3), not REVIEW_PANEL=1"
 # ...and it engages at a SINGLE ref: that panelist must run its own ref, not $REVIEW_MODEL.
 r="$(_run 303 REVIEW_PANEL_MODELS="stub:solo")"
 [ "$(_calls 303 | grep -c .)" = "1" ]         || fail "4f: a one-ref panel should dispatch exactly 1 panelist"
-_calls 303 | grep -qx 'stub-agent solo'       || fail "4g: a one-ref panel must launch THAT ref, not HERD_REVIEW_MODEL"
+grep -qx 'stub-agent solo' <<< "$(_calls 303)" || fail "4g: a one-ref panel must launch THAT ref, not HERD_REVIEW_MODEL"
 # ...without native-burst: the mixed panel still runs every panelist (serially), it just isn't concurrent.
 r="$(_run 304 REVIEW_PANEL_MODELS="stub:a stub:b")"
 [ "${r%%|*}" = "0" ]                  || fail "4h: a mixed panel must run with NATIVE_BURST off"
@@ -261,27 +261,27 @@ ok; echo "PASS (4) mixed-vendor dispatch — each panelist launches its own runt
 rm -f "$BIN/stub-agent"                      # the configured vendor is NOT installed
 r="$(_run 310 REVIEW_PANEL_MODELS="stub:gone")"
 [ "${r%%|*}" = "2" ] || fail "5a: a panel whose only vendor binary is missing must be INFRA-FAIL (exit 2), got ${r%%|*}"
-printf '%s' "${r#*|}" | grep -q '^REVIEW: INFRA-FAIL' || fail "5b: missing binary must emit INFRA-FAIL, got '${r#*|}'"
-printf '%s' "${r#*|}" | grep -q 'BLOCK' && fail "5c: a missing driver binary must NEVER surface as a BLOCK"
+grep -q '^REVIEW: INFRA-FAIL' <<< "${r#*|}" || fail "5b: missing binary must emit INFRA-FAIL, got '${r#*|}'"
+grep -q 'BLOCK' <<< "${r#*|}" && fail "5c: a missing driver binary must NEVER surface as a BLOCK"
 [ "$(_calls 310 | grep -c .)" = "0" ] || fail "5d: a missing binary must be probed BEFORE dispatch (nothing should run)"
 # any-block: a clean co-panelist still carries the merge — an absent vendor is not a veto.
 r="$(_run 311 REVIEW_PANEL_MODELS="bare-model stub:gone" REVIEW_PANEL_POLICY=any-block)"
 [ "${r%%|*}" = "0" ]                            || fail "5e: any-block + one clean panelist must PASS despite an absent vendor"
-printf '%s' "${r#*|}" | grep -qx 'REVIEW: PASS' || fail "5f: any-block combined verdict should be PASS"
+grep -qx 'REVIEW: PASS' <<< "${r#*|}" || fail "5f: any-block combined verdict should be PASS"
 # all-pass: the same absent vendor is a COVERAGE GAP → INFRA-FAIL (a bounded retry), still never a BLOCK.
 r="$(_run 312 REVIEW_PANEL_MODELS="bare-model stub:gone" REVIEW_PANEL_POLICY=all-pass)"
 [ "${r%%|*}" = "2" ]                                 || fail "5g: all-pass + an absent vendor must be INFRA-FAIL (exit 2), got ${r%%|*}"
-printf '%s' "${r#*|}" | grep -q '^REVIEW: INFRA-FAIL' || fail "5h: all-pass coverage gap must emit INFRA-FAIL"
-printf '%s' "${r#*|}" | grep -q 'BLOCK' && fail "5i: an all-pass coverage gap must NEVER surface as a BLOCK"
+grep -q '^REVIEW: INFRA-FAIL' <<< "${r#*|}" || fail "5h: all-pass coverage gap must emit INFRA-FAIL"
+grep -q 'BLOCK' <<< "${r#*|}" && fail "5i: an all-pass coverage gap must NEVER surface as a BLOCK"
 # An UNRESOLVABLE ref (unknown driver) at dispatch behaves the same way: INFRA, never BLOCK.
 r="$(_run 313 REVIEW_PANEL_MODELS="codx:gpt-5")"
 [ "${r%%|*}" = "2" ]                                  || fail "5j: an unresolvable ref must fold to INFRA-FAIL"
-printf '%s' "${r#*|}" | grep -q 'BLOCK' && fail "5k: an unresolvable ref must never surface as a BLOCK"
+grep -q 'BLOCK' <<< "${r#*|}" && fail "5k: an unresolvable ref must never surface as a BLOCK"
 # A real BLOCK from a reachable vendor still blocks, even beside an absent one (findings dominate gaps).
 _runtime stub-agent 'REVIEW: BLOCK — rule: off-by-one | why: overshoots | location: f.sh:1'
 r="$(_run 314 REVIEW_PANEL_MODELS="stub:here grok:absent" REVIEW_PANEL_POLICY=all-pass)"
 [ "${r%%|*}" = "1" ]                             || fail "5l: a genuine BLOCK must dominate an absent co-panelist (exit 1)"
-printf '%s' "${r#*|}" | grep -q '^REVIEW: BLOCK' || fail "5m: the structured BLOCK line must survive the fold"
+grep -q '^REVIEW: BLOCK' <<< "${r#*|}" || fail "5m: the structured BLOCK line must survive the fold"
 ok; echo "PASS (5) missing driver binary = INFRA, never a false BLOCK"
 
 # ── 6. PER-PANELIST PROVENANCE in the journal.
@@ -300,10 +300,10 @@ ok; echo "PASS (6) per-panelist verdict provenance + sha-keyed fold row"
 # ── 7. SHIP-DORMANT: unset REVIEW_PANEL_MODELS ⇒ a single claude reviewer, stub-agent never touched.
 r="$(_run 330 HERD_X=1)"                       # no REVIEW_PANEL_MODELS, no NATIVE_BURST
 [ "${r%%|*}" = "0" ]                            || fail "7a: the dormant default review should exit 0"
-printf '%s' "${r#*|}" | grep -qx 'REVIEW: PASS' || fail "7b: the dormant default review should PASS"
+grep -qx 'REVIEW: PASS' <<< "${r#*|}" || fail "7b: the dormant default review should PASS"
 [ "$(_calls 330 | grep -c .)" = "1" ]           || fail "7c: dormant must run a SINGLE reviewer, got $(_calls 330 | grep -c .)"
-_calls 330 | grep -qx 'claude fallback-model'   || fail "7d: dormant must run claude on HERD_REVIEW_MODEL, got: $(_calls 330 | tr '\n' ';')"
-_calls 330 | grep -q 'stub-agent'  && fail "7e: dormant must NEVER launch a non-default runtime"
+grep -qx 'claude fallback-model' <<< "$(_calls 330)" || fail "7d: dormant must run claude on HERD_REVIEW_MODEL, got: $(_calls 330 | tr '\n' ';')"
+grep -q 'stub-agent' <<< "$(_calls 330)" && fail "7e: dormant must NEVER launch a non-default runtime"
 grep -q 'review_panelist_verdict' "$T/j-330" 2>/dev/null \
   && fail "7f: dormant must emit no panelist-provenance rows (byte-identical journal)"
 grep -q 'review_panel_folded' "$T/j-330" 2>/dev/null \

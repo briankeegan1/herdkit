@@ -101,7 +101,7 @@ step() {
             JOURNAL_FILE="$JOURNAL" HERMETIC_TEST=1 \
             HERD_CREATE_RETRY_NOW="${NOW:-1000}" HERD_CREATE_RETRY_BASE="${BASE:-60}" \
             CREATE_SELFHEAL="${SELFHEAL:-on}" CREATE_RETRY_MAX="${MAXTRY:-5}" \
-            bash "$STEP" "$@" 2>&1 )"
+            bash "$STEP" "$@" 2>&1)"
   RC=$?
   set -e
 }
@@ -125,7 +125,7 @@ grep -q '^state=pending' "$RETRY/$HASH.meta"   || fail "(1) a 503 was not left p
 grep -q '^last_class=transient' "$RETRY/$HASH.meta" || fail "(1) a 503 was not classified transient"
 jhas '"event":"scribe_add_failed"'    || fail "(1) the failure was not journaled"
 jhas '"reason":"transient"'           || fail "(1) the journal did not carry the reason"
-printf '%s\n' "$OUT" | grep -q 'SAVED'|| fail "(1) the failure was not surfaced loudly ($OUT)"
+grep -q 'SAVED' <<< "$OUT" || fail "(1) the failure was not surfaced loudly ($OUT)"
 ok; echo "PASS (1)(2) a refused create is diverted to the durable queue; the text survives verbatim"
 
 # ══ (9a) `next` does NOT re-inject before the backoff elapses ════════════════════════════════════
@@ -135,10 +135,10 @@ ok; echo "PASS (9a) backoff is honored — nothing re-injected early"
 
 # ══ (1b) once the backoff elapses, `next` re-injects the SAME text and claims it ═════════════════
 NOW=2000 step next
-printf '%s\n' "$OUT" | grep -q '^CLAIMED '  || fail "(1b) the re-injected request was not claimed ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'dark-mode'  || fail "(1b) the re-injected request lost its text ($OUT)"
+grep -q '^CLAIMED ' <<< "$OUT" || fail "(1b) the re-injected request was not claimed ($OUT)"
+grep -q 'dark-mode' <<< "$OUT" || fail "(1b) the re-injected request lost its text ($OUT)"
 jhas '"event":"create_retry_reinjected"'    || fail "(1b) the re-injection was not journaled"
-CLAIMED="$(printf '%s\n' "$OUT" | sed -n 's/^CLAIMED //p' | head -n1)"
+CLAIMED="$(printf '%s\n' "$OUT" | sed -n 's/^CLAIMED //p' | sed -n 1p)"
 [ -f "$CLAIMED" ]                           || fail "(1b) the claimed path does not exist"
 ok; echo "PASS (1b) a due entry rides the drainer's own next poll"
 
@@ -187,8 +187,8 @@ grep -q '^state=permanent'  "$RETRY/$CAPHASH.meta" || fail "(3) a cap failure wa
 grep -q '^last_class=cap'   "$RETRY/$CAPHASH.meta" || fail "(3) a cap failure was not classified 'cap'"
 grep -q '^attempts=1'       "$RETRY/$CAPHASH.meta" || fail "(3) a cap failure spent more than one attempt"
 jhas '"event":"create_retry_permanent"'            || fail "(3) the permanent transition was not journaled"
-printf '%s\n' "$OUT" | grep -q 'ISSUE CAP'         || fail "(3) the cap was not labeled distinctly ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'NOT be retried'    || fail "(3) the no-spin promise was not surfaced ($OUT)"
+grep -q 'ISSUE CAP' <<< "$OUT" || fail "(3) the cap was not labeled distinctly ($OUT)"
+grep -q 'NOT be retried' <<< "$OUT" || fail "(3) the no-spin promise was not surfaced ($OUT)"
 # …and it must NEVER spin: no matter how far the clock advances, `next` re-injects nothing.
 NOW=999999 step next
 ls "$Q"/*.req >/dev/null 2>&1 && fail "(3) a PERMANENT cap failure was re-injected — it will spin forever"
@@ -205,9 +205,9 @@ done
 [ "$(entries)" = "1" ] || fail "(4) repeated failures stacked $(entries) entries instead of coalescing to 1"
 CO="$(basename "$(ls "$RETRY"/*.meta)" .meta)"
 grep -q '^attempts=3' "$RETRY/$CO.meta" || fail "(4) the coalesced entry does not carry a retry count of 3"
-ROWS="$( HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_SELFHEAL=on bash "$LIB" rows )"
+ROWS="$( HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_SELFHEAL=on bash "$LIB" rows)"
 [ "$(printf '%s\n' "$ROWS" | grep -c .)" = "1" ] || fail "(4) create_retry_rows stacked per attempt: $ROWS"
-printf '%s' "$ROWS" | grep -q 'Coalesce me'       || fail "(4) the coalesced row lost its title"
+grep -q 'Coalesce me' <<< "$ROWS" || fail "(4) the coalesced row lost its title"
 ok; echo "PASS (4) repeated failures of one request coalesce into one row with a retry count"
 
 # ══ (5) CLASSIFICATION — the trap runs BOTH ways ═════════════════════════════════════════════════
@@ -259,20 +259,20 @@ NOW=9000 step add-item "$p" "Throttled filing"
 RL="$(basename "$(ls "$RETRY"/*.meta)" .meta)"
 grep -q '^last_class=transient' "$RETRY/$RL.meta" || fail "(5b) a Linear rate limit was not classified transient"
 grep -q '^state=pending'        "$RETRY/$RL.meta" || fail "(5b) a Linear rate limit was marked PERMANENT — the self-heal never fires on it"
-printf '%s\n' "$OUT" | grep -q 'ISSUE CAP' && fail "(5b) a throttle was labeled as an issue cap ($OUT)"
+grep -q 'ISSUE CAP' <<< "$OUT" && fail "(5b) a throttle was labeled as an issue cap ($OUT)"
 NOW=99000 step next
-printf '%s\n' "$OUT" | grep -q '^CLAIMED ' || fail "(5b) the throttled request was never re-injected ($OUT)"
+grep -q '^CLAIMED ' <<< "$OUT" || fail "(5b) the throttled request was never re-injected ($OUT)"
 ok; echo "PASS (5b) a real Linear rate limit stays pending and is retried, never walled"
 
 # ══ (6) the linear backend reports WHY — the fact that was missing during the incident ═══════════
 # Sourced in a SUBSHELL: linear.sh's _backend_* ops must not leak into this test's process, or a later
 # check would see an incapable backend as capable (shell functions are inherited by subshells).
 E="$( LINEAR_API_KEY=x; . "$LINEAR" >/dev/null 2>&1
-     printf '%s' '{"errors":[{"message":"issue limit reached","extensions":{"code":"USAGE_LIMIT_EXCEEDED"}}]}' | _linear_error_text )"
+     printf '%s' '{"errors":[{"message":"issue limit reached","extensions":{"code":"USAGE_LIMIT_EXCEEDED"}}]}' | _linear_error_text)"
 case "$E" in *USAGE_LIMIT_EXCEEDED*) : ;; *) fail "(6) _linear_error_text dropped the GraphQL error code (got '$E')" ;; esac
 [ "$(create_retry_class "$E")" = cap ] || fail "(6) a real Linear cap refusal does not classify as 'cap'"
 [ -z "$( LINEAR_API_KEY=x; . "$LINEAR" >/dev/null 2>&1
-        printf '%s' '{"data":{"issueCreate":{"success":false}}}' | _linear_error_text )" ] \
+        printf '%s' '{"data":{"issueCreate":{"success":false}}}' | _linear_error_text)" ] \
   || fail "(6) a response with no errors array invented an error"
 ok; echo "PASS (6) linear.sh lifts the refusal reason out of the GraphQL response"
 
@@ -295,8 +295,8 @@ SELFHEAL=off NOW=6000 step add-item "$p" "Off means off"
 [ "$RC" -eq 0 ]                 || fail "(8) the off path exited $RC ($OUT)"
 [ ! -d "$RETRY" ]               || fail "(8) CREATE_SELFHEAL=off still created a retry directory"
 [ ! -e "$p" ]                   || fail "(8) the off path changed the claim cleanup"
-printf '%s\n' "$OUT" | grep -q 'SAVED' && fail "(8) the off path emitted the HERD-267 retry line"
-printf '%s\n' "$OUT" | grep -q 'NOCHANGE' || fail "(8) the off path did not report the old NOCHANGE result ($OUT)"
+grep -q 'SAVED' <<< "$OUT" && fail "(8) the off path emitted the HERD-267 retry line"
+grep -q 'NOCHANGE' <<< "$OUT" || fail "(8) the off path did not report the old NOCHANGE result ($OUT)"
 SELFHEAL=off NOW=6000 step next
 ls "$Q"/*.req >/dev/null 2>&1 && fail "(8) the off path re-injected something"
 ok; echo "PASS (8) CREATE_SELFHEAL=off is the pre-HERD-267 behavior, byte for byte"
@@ -306,8 +306,8 @@ rm -rf "$RETRY"; : > "$T/fail-with"
 p="$(mkreq 600 "A perfectly ordinary item")"
 NOW=7000 step add-item "$p" "A perfectly ordinary item"
 [ ! -d "$RETRY" ] || fail "(9b) a SUCCESSFUL create wrote a retry entry"
-printf '%s\n' "$OUT" | grep -q 'DONE' || fail "(9b) the success report tail changed ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'HERD-900' || fail "(9b) the backend's add stdout was swallowed ($OUT)"
+grep -q 'DONE' <<< "$OUT" || fail "(9b) the success report tail changed ($OUT)"
+grep -q 'HERD-900' <<< "$OUT" || fail "(9b) the backend's add stdout was swallowed ($OUT)"
 ok; echo "PASS (9b) the happy path is untouched — no entry, unchanged report tail"
 
 # ══ (11) A FAILED DURABLE WRITE NEVER REPORTS "SAVED" — the claim is kept, the request survives ══
@@ -321,8 +321,8 @@ p="$(mkreq 700 "Must not vanish")"
 NOW=9500 step add-item "$p" "Must not vanish"
 [ "$RC" -ne 0 ]  || fail "(11) a failed durable write exited 0 — the caller believes the text is safe"
 [ -e "$p" ]      || fail "(11) the ONLY surviving copy of the request was deleted after a failed durable write"
-printf '%s\n' "$OUT" | grep -q 'SAVED' && fail "(11) claimed the request was SAVED when the write failed ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'DURABLE WRITE FAILED' || fail "(11) the failed write was not surfaced ($OUT)"
+grep -q 'SAVED' <<< "$OUT" && fail "(11) claimed the request was SAVED when the write failed ($OUT)"
+grep -q 'DURABLE WRITE FAILED' <<< "$OUT" || fail "(11) the failed write was not surfaced ($OUT)"
 rm -f "$RETRY" "$p"
 ok; echo "PASS (11) a failed durable write keeps the claim and refuses to claim the text is safe"
 
@@ -388,7 +388,7 @@ p="$(mkreq 950 "Changelog item")"
 set +e
 OUT="$( cd "$REPO" && HERD_CONFIG_FILE="$CFG.changelog" SCRIBE_BACKEND_DIR="$FAKEDIR" SCRIBE_POLL=0 \
           JOURNAL_FILE="$JOURNAL" HERMETIC_TEST=1 CREATE_SELFHEAL=on \
-          bash "$STEP" add-item "$p" "Changelog item" 2>&1 )"
+          bash "$STEP" add-item "$p" "Changelog item" 2>&1)"
 RC=$?
 set -e
 [ "$RC" -eq 0 ]   || fail "(14) the changelog add exited $RC ($OUT)"
@@ -490,18 +490,18 @@ set -e
 [ "$SWRC" -eq 0 ] || fail "(10) sweep_leg_links subshell exited $SWRC ($(cat "$SWOUT" 2>/dev/null))"
 n="$(ls "$SWQ"/*relink*.req 2>/dev/null | grep -c . || true)"
 [ "$n" = "2" ] || fail "(10) expected 2 relink requests queued, got $n"
-ls "$SWQ" | grep -q 'relink-2' || fail "(10) the slug-only ref (PR #2) was not relinked"
-ls "$SWQ" | grep -q 'relink-3' || fail "(10) the unresolvable identifier (PR #3) was not relinked"
-ls "$SWQ" | grep -q 'relink-1' && fail "(10) PR #1's RESOLVABLE ref was wrongly relinked"
-ls "$SWQ" | grep -q 'relink-4' && fail "(10) a ref-less PR was wrongly relinked"
-ls "$SWQ" | grep -q 'relink-5' && fail "(10) a Refs: inside an HTML comment poisoned the extractor"
-ls "$SWQ" | grep -q 'relink-6' && fail "(10) 'Refs: HERD-1,' — trailing punctuation — was read as a non-identifier and relinked"
-ls "$SWQ" | grep -q 'relink-7' && fail "(10) an UNPROVEN ref (the tracker would not answer) was relinked"
+grep -q 'relink-2' <<< "$(ls "$SWQ")" || fail "(10) the slug-only ref (PR #2) was not relinked"
+grep -q 'relink-3' <<< "$(ls "$SWQ")" || fail "(10) the unresolvable identifier (PR #3) was not relinked"
+grep -q 'relink-1' <<< "$(ls "$SWQ")" && fail "(10) PR #1's RESOLVABLE ref was wrongly relinked"
+grep -q 'relink-4' <<< "$(ls "$SWQ")" && fail "(10) a ref-less PR was wrongly relinked"
+grep -q 'relink-5' <<< "$(ls "$SWQ")" && fail "(10) a Refs: inside an HTML comment poisoned the extractor"
+grep -q 'relink-6' <<< "$(ls "$SWQ")" && fail "(10) 'Refs: HERD-1,' — trailing punctuation — was read as a non-identifier and relinked"
+grep -q 'relink-7' <<< "$(ls "$SWQ")" && fail "(10) an UNPROVEN ref (the tracker would not answer) was relinked"
 grep -q '"event":"link_heal"' "$SWJOURNAL"   || fail "(10) the relink was not journaled"
 grep -q '"result":"unproven"' "$SWJOURNAL"   || fail "(10) the leg did not journal that it stood down on an unanswerable ref"
 grep -q '🔗' "$SWOUT"                        || fail "(10) the leg narrated nothing"
 grep -q '⏸' "$SWOUT"                         || fail "(10) the stand-down was not narrated"
-head -n1 "$SWQ"/*relink-2*.req | grep -q '^Relink merged PR #2' \
+grep -q '^Relink merged PR #2' <<< "$(head -n1 "$SWQ"/*relink-2*.req)" \
   || fail "(10) the relink request's first line is not a short title (linear turns it into the issue title)"
 grep -q 'SEARCH FIRST' "$SWQ"/*relink-2*.req || fail "(10) the relink request does not instruct a search before filing"
 ok; echo "PASS (10) relink acts only on a PROVABLE miss: punctuation, comments, and unanswerable refs are left alone"
@@ -548,14 +548,14 @@ for backend in down noprobe slug; do
   case "$backend" in
     down)
       [ "$m" = "1" ] || fail "(15) [down] enqueued $m relinks; expected only the slug ref (identifiers are UNPROVEN)"
-      ls "$DQ" | grep -q 'relink-2' || fail "(15) [down] the slug ref stopped relinking (it needs no lookup)"
-      ls "$DQ" | grep -q 'relink-1' && fail "(15) [down] an outage was read as proof that HERD-1 is missing"
-      ls "$DQ" | grep -q 'relink-3' && fail "(15) [down] an outage was read as proof that HERD-4242 is missing"
+      grep -q 'relink-2' <<< "$(ls "$DQ")" || fail "(15) [down] the slug ref stopped relinking (it needs no lookup)"
+      grep -q 'relink-1' <<< "$(ls "$DQ")" && fail "(15) [down] an outage was read as proof that HERD-1 is missing"
+      grep -q 'relink-3' <<< "$(ls "$DQ")" && fail "(15) [down] an outage was read as proof that HERD-4242 is missing"
       grep -q '"result":"unproven"' "$DJ" || fail "(15) [down] the stand-down was not journaled"
       grep -q '⏸' "$T/down-$backend.out"  || fail "(15) [down] a zero-finding sweep silently hid the outage" ;;
     noprobe|slug)
       [ "$m" = "0" ] || fail "(15) [$backend] enqueued $m relink(s) with nothing proven — duplicate filings incoming"
-      ls "$DQ" 2>/dev/null | grep -q 'relink-2' && fail "(15) [$backend] a slug ref was judged missing on a backend that mints no ids"
+      grep -q 'relink-2' <<< "$(ls "$DQ" 2>/dev/null)" && fail "(15) [$backend] a slug ref was judged missing on a backend that mints no ids"
       grep -q '🔗' "$T/down-$backend.out" && fail "(15) [$backend] a backend that cannot answer still narrated a relink"
       grep -q '"event":"link_heal"' "$DJ" && fail "(15) [$backend] a backend that cannot answer still journaled a link_heal" ;;
   esac

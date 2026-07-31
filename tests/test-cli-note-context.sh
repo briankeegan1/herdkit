@@ -122,8 +122,8 @@ out="$(cd "$WT1" && _run -- note "should never land anywhere")"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "(1) herd note should refuse with no .herd/config anywhere (rc=$rc, out: $out)"
-printf '%s' "$out" | grep -qi "no .herd/config" || fail "(1) refusal message missing 'no .herd/config' (got: $out)"
-printf '%s' "$out" | grep -qi "dogfood" || fail "(1) refusal message should mention refusing the dogfood config (got: $out)"
+grep -qi "no .herd/config" <<< "$out" || fail "(1) refusal message missing 'no .herd/config' (got: $out)"
+grep -qi "dogfood" <<< "$out" || fail "(1) refusal message should mention refusing the dogfood config (got: $out)"
 ok
 
 # ═══ (1b) plain (non-worktree) repo, no .herd/config anywhere → refuses the same way ════════════════
@@ -134,8 +134,8 @@ out="$(cd "$PLAIN" && _run -- note "should never land anywhere either")"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "(1b) herd note should refuse in a plain repo with no .herd/config (rc=$rc)"
-printf '%s' "$out" | grep -qi "no .herd/config" || fail "(1b) refusal message missing 'no .herd/config'"
-printf '%s' "$out" | grep -qi "dogfood" || fail "(1b) refusal message should mention the dogfood fallback"
+grep -qi "no .herd/config" <<< "$out" || fail "(1b) refusal message missing 'no .herd/config'"
+grep -qi "dogfood" <<< "$out" || fail "(1b) refusal message should mention the dogfood fallback"
 ok
 
 # ═══ (2) worktree whose PARENT main checkout HAS .herd/config → note lands in ITS pool ══════════════
@@ -159,7 +159,7 @@ JNL2="$TREES2/.herd/journal.jsonl"
 _note2_attempt() {
   out="$(cd "$WT2" && _run -- note "this red is a stale cached row")"
   rc=$?
-  [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "noted" && [ -f "$JNL2" ]
+  [ "$rc" -eq 0 ] && grep -q "noted" <<< "$out" && [ -f "$JNL2" ]
 }
 _quiet_retry _note2_attempt \
   || fail "(2) herd note should land in the PARENT project's journal ($JNL2, rc=$rc, out: $out)"
@@ -201,7 +201,7 @@ _quiet_retry _ledger4a_attempt \
   || fail "(4a) herd ledger set should land in the PARENT project's pool ($LEDGER2, rc=$rc, out: $out)"
 ok
 cli_get="$(cd "$WT2" && _run -- ledger get HERD-412)"
-printf '%s' "$cli_get" | grep -q "slug=ctx-test" || fail "(4a) ledger get should fold the item written from the worktree"
+grep -q "slug=ctx-test" <<< "$cli_get" || fail "(4a) ledger get should fold the item written from the worktree"
 ok
 
 # (4b) herd advise — resolves MODEL_FEATURE from the PARENT's config (proves the SAME config bound).
@@ -227,9 +227,9 @@ out_l="$(cd "$WT1" && _run -- ledger set HERD-999 slug x)"; rc_l=$?
 out_a="$(cd "$WT1" && _run -- advise "q?")"; rc_a=$?
 set -e
 [ "$rc_l" -ne 0 ] || fail "(4c) herd ledger should refuse with no .herd/config anywhere (rc=$rc_l)"
-printf '%s' "$out_l" | grep -qi "dogfood" || fail "(4c) ledger refusal should mention the dogfood fallback"
+grep -qi "dogfood" <<< "$out_l" || fail "(4c) ledger refusal should mention the dogfood fallback"
 [ "$rc_a" -ne 0 ] || fail "(4c) herd advise should refuse with no .herd/config anywhere (rc=$rc_a)"
-printf '%s' "$out_a" | grep -qi "dogfood" || fail "(4c) advise refusal should mention the dogfood fallback"
+grep -qi "dogfood" <<< "$out_a" || fail "(4c) advise refusal should mention the dogfood fallback"
 ok
 
 echo "ALL PASS ($pass checks)"

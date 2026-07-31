@@ -88,7 +88,7 @@ chmod +x "$BIN/gh"
 # git stub — returns worktree list from $WT_OUTPUT
 cat > "$BIN/git" <<'STUB'
 #!/usr/bin/env bash
-if printf '%s\n' "$@" | grep -q 'porcelain'; then
+if grep -q 'porcelain' <<< "$(printf '%s\n' "$@")"; then
   cat "${WT_OUTPUT:-/dev/null}" 2>/dev/null || true
 fi
 exit 0
@@ -171,9 +171,9 @@ count="$(grep -c '^sticky$' "$CLOSE_LOG")"
 [ "$count" -ge 2 ] || fail "5: expected at least 2 close attempts for sticky tab (got $count)"
 ok
 # Warning must mention the tab id and the slug.
-printf '%s' "$warn" | grep -q "sticky" || fail "5: warning should mention tab id 'sticky'"
+grep -q "sticky" <<< "$warn" || fail "5: warning should mention tab id 'sticky'"
 ok
-printf '%s' "$warn" | grep -q "my-slug" || fail "5: warning should mention slug 'my-slug'"
+grep -q "my-slug" <<< "$warn" || fail "5: warning should mention slug 'my-slug'"
 ok
 
 # ── Source agent-watch.sh in lib mode (defines _sweep_orphan_tabs) ───────────

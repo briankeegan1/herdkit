@@ -41,22 +41,22 @@ run() {  # run(platform) -> sets RC + OUT
 # (1) ubuntu: the env-sensitive test is NOT allowlisted here → counts as a real failure → rc 1.
 run ubuntu
 [ "$RC" -eq 1 ] || fail "ubuntu: expected rc 1 (real failures), got $RC"
-printf '%s\n' "$OUT" | grep -qE "real failures: +2" || fail "ubuntu: expected 2 real failures.  Got:\n$OUT"
-printf '%s\n' "$OUT" | grep -qE "passed: +1" || fail "ubuntu: expected 1 pass.  Got:\n$OUT"
+grep -qE "real failures: +2" <<< "$OUT" || fail "ubuntu: expected 2 real failures.  Got:\n$OUT"
+grep -qE "passed: +1" <<< "$OUT" || fail "ubuntu: expected 1 pass.  Got:\n$OUT"
 pass
 
 # (2) windows: test-flaky-env.sh is allowlisted → XFAIL, only test-red.sh is a real failure → rc 1.
 run windows
 [ "$RC" -eq 1 ] || fail "windows: expected rc 1 (one real failure remains), got $RC"
-printf '%s\n' "$OUT" | grep -q "XFAIL (env-sensitive) test-flaky-env.sh" || fail "windows: expected XFAIL line.  Got:\n$OUT"
-printf '%s\n' "$OUT" | grep -qE "real failures: +1" || fail "windows: expected 1 real failure.  Got:\n$OUT"
+grep -q "XFAIL (env-sensitive) test-flaky-env.sh" <<< "$OUT" || fail "windows: expected XFAIL line.  Got:\n$OUT"
+grep -qE "real failures: +1" <<< "$OUT" || fail "windows: expected 1 real failure.  Got:\n$OUT"
 pass
 
 # (3) an all-green suite exits 0 on every platform.
 rm -f "$TD/test-red.sh" "$TD/test-flaky-env.sh"
 run ubuntu
 [ "$RC" -eq 0 ] || fail "all-green: expected rc 0, got $RC.  Out:\n$OUT"
-printf '%s\n' "$OUT" | grep -q "CI SUITE CLEAN" || fail "all-green: expected CLEAN banner.  Got:\n$OUT"
+grep -q "CI SUITE CLEAN" <<< "$OUT" || fail "all-green: expected CLEAN banner.  Got:\n$OUT"
 pass
 
 # (4) `all` in the platforms column allows on any platform.
@@ -64,7 +64,7 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$TD/test-any.sh"; chmod +x "$TD/test-a
 printf 'name\tplatforms\treason\ntest-any.sh\tall\talways env-sensitive\n' > "$AL"
 run macos
 [ "$RC" -eq 0 ] || fail "all-platform allow: expected rc 0 on macos, got $RC.  Out:\n$OUT"
-printf '%s\n' "$OUT" | grep -q "XFAIL (env-sensitive) test-any.sh" || fail "all-platform allow: expected XFAIL.  Got:\n$OUT"
+grep -q "XFAIL (env-sensitive) test-any.sh" <<< "$OUT" || fail "all-platform allow: expected XFAIL.  Got:\n$OUT"
 pass
 
 # (5) empty test dir → usage/setup error (rc 2), never a silent green.
@@ -119,7 +119,7 @@ ARTDIR="$T/artroot"
 OUT="$(HERD_CI_FORCE_DIRECT=1 HERD_CI_PLATFORM=ubuntu HERD_CI_TESTS_DIR="$TD2" \
        HERD_CI_ARTIFACTS_DIR="$ARTDIR" bash "$RUNNER" 2>&1)"; RC=$?
 [ "$RC" -eq 1 ] || fail "artifacts: expected rc 1 (the red sim fails), got $RC.  Out:\n$OUT"
-printf '%s\n' "$OUT" | grep -q "FAIL checkpoint_one: something specific broke" \
+grep -q "FAIL checkpoint_one: something specific broke" <<< "$OUT" \
   || fail "artifacts: expected the failing checkpoint line surfaced (not just a tail).  Got:\n$OUT"
 [ -f "$ARTDIR/test-artifact-red-sim.sh/scorecard.json" ] \
   || fail "artifacts: expected scorecard.json to survive under $ARTDIR/test-artifact-red-sim.sh"

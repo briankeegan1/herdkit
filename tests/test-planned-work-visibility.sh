@@ -45,10 +45,10 @@ grep -q "herd backlog unqueue <#id>" "$SKILL" || fail "rendered skill missing th
 grep -q "ADVISORY: >24h" "$SKILL" || fail "rendered skill did not state the 24h-advisory rule"
 # The section references {{BACKLOG_FILE}} — it must have been substituted to the concrete filename.
 grep -q "committed onto" "$SKILL" || fail "rendered skill missing the file-backend marker description"
-grep -A2 "committed onto" "$SKILL" | grep -q "BACKLOG.md" \
+grep -q "BACKLOG.md" <<< "$(grep -A2 "committed onto" "$SKILL")" \
   || fail "{{BACKLOG_FILE}} was not substituted to the concrete filename in the planned-work section"
-if grep -n "{{[A-Z_]*}}" "$SKILL" | grep -q . ; then
-  fail "rendered skill left an unsubstituted {{token}}: $(grep -n '{{[A-Z_]*}}' "$SKILL" | head -1)"
+if grep -q . <<< "$(grep -n "{{[A-Z_]*}}" "$SKILL")"; then
+  fail "rendered skill left an unsubstituted {{token}}: $(grep -n '{{[A-Z_]*}}' "$SKILL" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
 fi
 pass
 
@@ -74,22 +74,22 @@ EOF
 # queue: publish a marker on card-csv-importer, sequenced after dark-mode-toggle.
 out="$( cd "$P2" && bash "$HERD" backlog queue card-csv-importer --after dark-mode-toggle 2>&1 )" \
   || fail "herd backlog queue exited non-zero ($out)"
-echo "$out" | grep -q "📌 queued card-csv-importer as 'alice'" || fail "queue did not confirm the marker for the resolved operator ($out)"
+grep -q "📌 queued card-csv-importer as 'alice'" <<< "$out" || fail "queue did not confirm the marker for the resolved operator ($out)"
 grep -qE '📌 queued by alice: sequenced after dark-mode-toggle \[[0-9]+\]' "$P2/BACKLOG.md" \
   || fail "queue did not commit the 📌 annotation onto the item line"
 
 # queued: list shows the marker with a fresh (non-advisory) age annotation.
 lst="$( cd "$P2" && bash "$HERD" backlog queued 2>&1 )" || fail "herd backlog queued exited non-zero"
-echo "$lst" | grep -q "queued by alice: sequenced after dark-mode-toggle" || fail "queued did not list the marker ($lst)"
-echo "$lst" | grep -q "ADVISORY" && fail "a just-written marker must NOT be flagged advisory ($lst)"
+grep -q "queued by alice: sequenced after dark-mode-toggle" <<< "$lst" || fail "queued did not list the marker ($lst)"
+grep -q "ADVISORY" <<< "$lst" && fail "a just-written marker must NOT be flagged advisory ($lst)"
 
 # The marker also shows inline in plain `herd backlog` (it's on the item's line).
 inline="$( cd "$P2" && bash "$HERD" backlog 2>&1 )" || fail "herd backlog exited non-zero"
-echo "$inline" | grep -q "📌 queued by alice" || fail "the file-backend marker should show inline in 'herd backlog'"
+grep -q "📌 queued by alice" <<< "$inline" || fail "the file-backend marker should show inline in 'herd backlog'"
 
 # unqueue: clears it.
 uq="$( cd "$P2" && bash "$HERD" backlog unqueue card-csv-importer 2>&1 )" || fail "herd backlog unqueue exited non-zero ($uq)"
-echo "$uq" | grep -q "cleared the planned marker" || fail "unqueue did not confirm the clear ($uq)"
+grep -q "cleared the planned marker" <<< "$uq" || fail "unqueue did not confirm the clear ($uq)"
 grep -q '📌' "$P2/BACKLOG.md" && fail "unqueue left a 📌 marker behind"
 lst2="$( cd "$P2" && bash "$HERD" backlog queued 2>&1 )" || fail "herd backlog queued (post-clear) exited non-zero"
 [ -z "$lst2" ] || fail "queued should be empty after unqueue ($lst2)"
@@ -107,7 +107,7 @@ BACKLOG_FILE="CHANGELOG.md"
 EOF
 printf '# Changelog\n' > "$P3/CHANGELOG.md"
 softq="$( cd "$P3" && bash "$HERD" backlog queue anything --after x 2>&1 )" || fail "queue on an unsupported backend should exit 0 (fail-soft)"
-echo "$softq" | grep -qi "no planned-marker op" || fail "queue on an unsupported backend should print a soft skip note ($softq)"
+grep -qi "no planned-marker op" <<< "$softq" || fail "queue on an unsupported backend should print a soft skip note ($softq)"
 softl="$( cd "$P3" && bash "$HERD" backlog queued 2>&1 )" || fail "queued on an unsupported backend should exit 0"
 [ -z "$softl" ] || fail "queued on an unsupported backend should print nothing ($softl)"
 pass

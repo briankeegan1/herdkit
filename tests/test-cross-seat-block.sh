@@ -134,8 +134,8 @@ _cross_seat_block_standing 42 shaB || fail "(b) a standing foreign BLOCK was not
 [ "$_XSEAT_SEAT" = "otherSeat" ]   || fail "(b) wrong blocking seat: '$_XSEAT_SEAT'"
 # The MERGE GUARD's row names the conflict AND the seat to reconcile with.
 row="$(NO_COLOR=1 _cross_seat_block_row "slugcell" " #42 ·" "$_XSEAT_SEAT")"
-printf '%s' "$row" | grep -q 'cross-seat BLOCK · needs reconcile' || fail "(b) row wording drifted: $row"
-printf '%s' "$row" | grep -q 'otherSeat'                          || fail "(b) row does not name the seat: $row"
+grep -q 'cross-seat BLOCK · needs reconcile' <<< "$row" || fail "(b) row wording drifted: $row"
+grep -q 'otherSeat' <<< "$row" || fail "(b) row does not name the seat: $row"
 # …and the SETTER GUARD withholds the blessing for the very same sha.
 post_gate_status 42 shaB success
 blessed shaB && fail "(b) a blessing was posted over a standing foreign BLOCK"

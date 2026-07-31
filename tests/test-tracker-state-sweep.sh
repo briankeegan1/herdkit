@@ -117,7 +117,7 @@ grep -q '"found_state":"in-progress"' "$JOURNAL_FILE"        || fail "heal event
 # console notes surfaced for both heals.
 grep -q ' healed HERD-67 187 in-progress$' "$HERD_TSWEEP_NOTE_FILE" || fail "no console note for the HERD-67 heal"
 grep -q ' healed HERD-69 197 open$'        "$HERD_TSWEEP_NOTE_FILE" || fail "no console note for the HERD-69 heal"
-printf '%s\n' "$out" | grep -q 'healed 2' || fail "summary did not report 2 heals ($out)"
+grep -q 'healed 2' <<< "$out" || fail "summary did not report 2 heals ($out)"
 pass
 
 # (2) the already-Done ref was NEVER written.
@@ -136,7 +136,7 @@ out2="$(run_sweep "$T/prs.tsv")" || fail "second sweep exited non-zero"
 [ -s "$STUB_UPDATES" ] && fail "idempotent sweep re-issued a state write ($(cat "$STUB_UPDATES"))"
 after_events="$(grep -c . "$JOURNAL_FILE" 2>/dev/null || echo 0)"
 [ "$before_events" -eq "$after_events" ] || fail "idempotent sweep wrote new journal events ($before_events → $after_events)"
-printf '%s\n' "$out2" | grep -q 'no tracker drift' || fail "second sweep should report no drift ($out2)"
+grep -q 'no tracker drift' <<< "$out2" || fail "second sweep should report no drift ($out2)"
 pass
 
 # ── (5) a heal that FAILS is journaled + surfaced as 'failed' and retries next sweep ─
@@ -176,7 +176,7 @@ prs = [
 open(sys.argv[1], "w").write(json.dumps(prs))
 PY
 out="$(HERD_TSWEEP_PRS_JSON_FILE="$T/prs.json" bash "$SCRIPT")" || fail "json-parse sweep exited non-zero: $out"
-printf '%s\n' "$out" | grep -q 'healed 1' || fail "json-parse run did not report the single heal ($out)"
+grep -q 'healed 1' <<< "$out" || fail "json-parse run did not report the single heal ($out)"
 grep -q '^HERD-91 done sweep 211$' "$STUB_UPDATES" \
   || fail "multi-line body: mid-body 'Refs: HERD-91' was not parsed/healed from real gh JSON ($(cat "$STUB_UPDATES"))"
 # The HTML-comment decoy ref must never be healed, and the ref-less PR must be skipped.
@@ -224,7 +224,7 @@ S
 printf '200\tHERD-100\n' > "$T/prs4.tsv"
 out="$(run_sweep "$T/prs4.tsv")" || fail "sweep (genuinely-open) exited non-zero: $out"
 grep -q '^HERD-100 done sweep 200$' "$STUB_UPDATES" || fail "a genuinely-open ref must still heal unchanged ($(cat "$STUB_UPDATES"))"
-printf '%s\n' "$out" | grep -q 'healed 1' || fail "genuinely-open ref should report 1 heal ($out)"
+grep -q 'healed 1' <<< "$out" || fail "genuinely-open ref should report 1 heal ($out)"
 pass
 
 # ── (9) HERD-411: a bare github-shaped ref under the (non-github) stub backend classifies
@@ -252,7 +252,7 @@ SCRIBE_BACKEND="file"
 EOF
 : > "$STUB_UPDATES"
 out="$(unset SCRIBE_BACKEND_DIR; run_sweep "$T/prs.tsv")" || fail "file-backend sweep exited non-zero"
-printf '%s\n' "$out" | grep -qi 'inert' || fail "file backend should report the sweep is inert ($out)"
+grep -qi 'inert' <<< "$out" || fail "file backend should report the sweep is inert ($out)"
 [ -s "$STUB_UPDATES" ] && fail "file backend must not dispatch any state write"
 pass
 

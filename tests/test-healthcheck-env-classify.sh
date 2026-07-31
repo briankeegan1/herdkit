@@ -77,13 +77,13 @@ ok 3 hermetic another-thing test passes"
 F="$(build_fixture env_only "$TAP_ENV_ONLY" 1 env)"
 run_proj "$F" --oneline
 [ "$RC" -eq 2 ] || fail "(a) env-only should exit 2, got $RC — out: $OUT"
-printf '%s\n' "$OUT" | grep -qF "not ok 2 $ENV_TEST" \
+grep -qF "not ok 2 $ENV_TEST" <<< "$OUT" \
   || fail "(a) oneline detail must quote the real 'not ok' codemap line — got: $OUT"
-printf '%s\n' "$OUT" | grep -q "another-thing" \
+grep -q "another-thing" <<< "$OUT" \
   && fail "(a) detail wrongly quoted the adjacent 'ok' line instead of the failing 'not ok' — got: $OUT"
 run_proj "$F"            # full (non-oneline) mode: same verdict, still exit 2
 [ "$RC" -eq 2 ] || fail "(a) env-only full-mode should exit 2, got $RC — out: $OUT"
-printf '%s\n' "$OUT" | grep -qF "not ok 2 $ENV_TEST" \
+grep -qF "not ok 2 $ENV_TEST" <<< "$OUT" \
   || fail "(a) full-mode detail must quote the real 'not ok' codemap line — got: $OUT"
 echo "PASS (a) env-only codemap failure → exit 2 with correct 'not ok' detail"
 
@@ -102,7 +102,7 @@ run_proj "$F" --oneline
 case "$OUT" in
   *"bats: ok "*) fail "(b) the code-error detail must never quote a PASSING 'ok' line — got: $OUT" ;;
 esac
-printf '%s' "$OUT" | grep -q "not ok 1 hermetic backlog-view rich-render test passes" \
+grep -q "not ok 1 hermetic backlog-view rich-render test passes" <<< "$OUT" \
   || fail "(b) the code-error detail must quote the FIRST 'not ok' line — got: $OUT"
 echo "PASS (b) genuine non-env test failure → exit 1, detail quotes the failing test"
 
@@ -116,9 +116,9 @@ ok 4 $ENV_TEST"
 F="$(build_fixture multi "$TAP_MULTI" 1 none)"
 run_proj "$F" --oneline
 [ "$RC" -eq 1 ] || fail "(b3) multiple genuine failures should exit 1, got $RC — out: $OUT"
-printf '%s' "$OUT" | grep -q "not ok 2 cross-driver conformance audit" \
+grep -q "not ok 2 cross-driver conformance audit" <<< "$OUT" \
   || fail "(b3) the detail must quote the FIRST failing test — got: $OUT"
-printf '%s' "$OUT" | grep -q "(2 failing)" \
+grep -q "(2 failing)" <<< "$OUT" \
   || fail "(b3) the detail must report how many tests failed — got: $OUT"
 echo "PASS (b3) multiple failures → detail names the first + the failing count"
 

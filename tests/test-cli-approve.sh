@@ -66,6 +66,6 @@ diff -q "$T/sha.out" "$T/sha-direct.out" >/dev/null || fail "herd approve <pr#> 
 grep -q "usage: herd approve" "$T/help.out" || fail "herd approve --help missing usage line"
 
 # 7. the alias is reachable from `herd help` (discoverability is the whole point).
-bash "$HERD" help 2>&1 | grep -q "herd approve" || fail "herd help does not list 'herd approve'"
+grep -q "herd approve" <<< "$(bash "$HERD" help 2>&1)" || fail "herd help does not list 'herd approve'"
 
 echo "ALL PASS"

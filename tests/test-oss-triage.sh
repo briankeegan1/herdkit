@@ -93,7 +93,7 @@ cat > "$RESEARCH_STUB" <<'RSTUB'
 #!/usr/bin/env bash
 # Args: the research question (may be multi-line via "$@").
 q="$*"
-num="$(printf '%s' "$q" | sed -nE 's/.*issue #([0-9]+).*/\1/p' | head -n1)"
+num="$(printf '%s' "$q" | sed -nE 's/.*issue #([0-9]+).*/\1/p' | sed -n 1p)"
 [ -n "$num" ] || num="x"
 rid="triage-req-${num}"
 printf '🔎 queued: OSS-TRIAGE issue #%s\n' "$num"
@@ -139,7 +139,7 @@ run_triage() {
 # ── (1) OFF is byte-inert ──
 : > "$GH_LOG"; : > "$ENQUEUE_LOG"
 out="$(OSS_TRIAGE=off run_triage run 2>&1)" || fail "(1) off run failed: %s" "$out"
-printf '%s\n' "$out" | grep -qi 'byte-inert\|OSS_TRIAGE=off' \
+grep -qi 'byte-inert\|OSS_TRIAGE=off' <<< "$out" \
   || fail "(1) expected inert message\n%s" "$out"
 [ ! -s "$GH_LOG" ] || fail "(1) gh was called while off:\n%s" "$(cat "$GH_LOG")"
 [ ! -s "$ENQUEUE_LOG" ] || fail "(1) research enqueued while off:\n%s" "$(cat "$ENQUEUE_LOG")"
@@ -149,7 +149,7 @@ ok
 # ── (2) ON enqueues research for each NEW issue ──
 : > "$GH_LOG"; : > "$ENQUEUE_LOG"
 out="$(OSS_TRIAGE=on run_triage run 2>&1)" || fail "(2) on run failed: %s" "$out"
-printf '%s\n' "$out" | grep -q 'enqueued 3' \
+grep -q 'enqueued 3' <<< "$out" \
   || fail "(2) expected 3 enqueues\n%s" "$out"
 n_enq="$(wc -l < "$ENQUEUE_LOG" | tr -d ' ')"
 [ "$n_enq" = "3" ] || fail "(2) enqueue log has %s lines, want 3\n%s" "$n_enq" "$(cat "$ENQUEUE_LOG")"
@@ -192,15 +192,15 @@ R
 : > "$GH_LOG"; : > "$ENQUEUE_LOG"
 out="$(OSS_TRIAGE=on run_triage run 2>&1)" || fail "(3) collect run failed: %s" "$out"
 body="$(cat "$TRIAGE_DIR/shortlist.md")"
-printf '%s\n' "$body" | grep -qE '## #10 — bug' \
+grep -qE '## #10 — bug' <<< "$body" \
   || fail "(3) missing bug classification for #10\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '## #11 — feature' \
+grep -qE '## #11 — feature' <<< "$body" \
   || fail "(3) missing feature for #11\n%s" "$body"
-printf '%s\n' "$body" | grep -qE '## #12 — question' \
+grep -qE '## #12 — question' <<< "$body" \
   || fail "(3) missing question for #12\n%s" "$body"
-printf '%s\n' "$body" | grep -q 'human approval only' \
+grep -q 'human approval only' <<< "$body" \
   || fail "(3) shortlist must declare human-approval-only\n%s" "$body"
-printf '%s\n' "$body" | grep -q 'Suggested reply (draft):' \
+grep -q 'Suggested reply (draft):' <<< "$body" \
   || fail "(3) missing draft replies\n%s" "$body"
 # Rank order: bug (#10) before feature (#11) before question (#12)
 python3 - "$TRIAGE_DIR/shortlist.md" <<'PY' || fail "(3) shortlist not ranked bug>feature>question"
@@ -222,7 +222,7 @@ ok
 # ── (4) re-run does not re-enqueue seen issues ──
 : > "$ENQUEUE_LOG"
 out="$(OSS_TRIAGE=on run_triage run 2>&1)" || fail "(4) rerun failed: %s" "$out"
-printf '%s\n' "$out" | grep -q 'enqueued 0' \
+grep -q 'enqueued 0' <<< "$out" \
   || fail "(4) expected 0 new enqueues\n%s" "$out"
 [ ! -s "$ENQUEUE_LOG" ] || fail "(4) research re-enqueued:\n%s" "$(cat "$ENQUEUE_LOG")"
 ok
@@ -233,7 +233,7 @@ if grep -Eiq 'issue (comment|close|edit|create)|api ' "$GH_LOG" 2>/dev/null; the
 fi
 # Also scan the full log history from the whole test (re-read accumulated — we truncated; re-assert on script source).
 # Source-level guard: oss-triage.sh must not contain issue comment/close.
-if grep -nE 'issue comment|issue close|issue edit|gh api' "$TRIAGE_SH" | grep -vE '^\s*#' | grep -v 'NEVER' | grep -q .; then
+if grep -q . <<< "$(grep -nE 'issue comment|issue close|issue edit|gh api' "$TRIAGE_SH" | grep -vE '^\s*#' | grep -v 'NEVER')"; then
   fail "(5) oss-triage.sh appears to call mutating gh:\n%s" "$(grep -nE 'issue comment|issue close|issue edit|gh api' "$TRIAGE_SH")"
 fi
 ok
@@ -253,7 +253,7 @@ cli_out="$(
     HERD_NONINTERACTIVE=1 \
     bash "$HERD_BIN" triage report 2>/dev/null
 )" || fail "(6) herd triage report CLI failed"
-printf '%s\n' "$cli_out" | grep -qE '## #10 — bug' \
+grep -qE '## #10 — bug' <<< "$cli_out" \
   || fail "(6) CLI report missing #10 bug\n%s" "$cli_out"
 ok
 
@@ -269,7 +269,7 @@ out="$(
     RESEARCH_REPORTS="$REPORTS" \
     bash "$TRIAGE_SH" run 2>&1
 )" || fail "(7) unset run failed: %s" "$out"
-printf '%s\n' "$out" | grep -qi 'byte-inert\|OSS_TRIAGE=off' \
+grep -qi 'byte-inert\|OSS_TRIAGE=off' <<< "$out" \
   || fail "(7) unset should be inert\n%s" "$out"
 [ ! -d "$T/triage-unset" ] || [ ! -f "$T/triage-unset/shortlist.md" ] \
   || fail "(7) wrote shortlist with OSS_TRIAGE unset"

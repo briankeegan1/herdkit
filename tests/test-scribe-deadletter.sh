@@ -113,9 +113,9 @@ p="$(mkreq 200 "$CLEAN_TEXT")"
 printf -- '- 🔜 clean-feature — %s\n' "$CLEAN_TEXT" >> "$REPO/BACKLOG.md"
 step on commit "$p" "add clean-feature"
 [ "$RC" -eq 0 ]                                   || fail "(2) commit exited $RC ($OUT)"
-git -C "$REPO" log -1 --name-only | grep -q BACKLOG.md \
+grep -q BACKLOG.md <<< "$(git -C "$REPO" log -1 --name-only)" \
   || fail "(2) the clean edit was not committed"
-git -C "$REPO" show HEAD:BACKLOG.md | grep -q 'clean-feature' \
+grep -q 'clean-feature' <<< "$(git -C "$REPO" show HEAD:BACKLOG.md)" \
   || fail "(2) the clean item is not in the committed BACKLOG.md"
 [ "$(dl_count)" = "0" ]                           || fail "(2) a filed request was wrongly dead-lettered"
 grep -q '"event":"scribe_drop"' "$JF" && fail "(2) a filed request wrongly journaled scribe_drop"

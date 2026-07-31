@@ -64,8 +64,8 @@ printf '  claude --model "$MODEL" --dangerously-skip-permissions "$PROMPT"\n' >>
 if out="$(bash "$LINT" "$P" 2>&1)"; then
   fail "(2) planted hardcoded claude was NOT caught: $out"
 fi
-echo "$out" | grep -qF 'herd-feature.sh' || fail "(2) violation did not name the offending file: $out"
-echo "$out" | grep -q 'NEW hardcoded claude'  || fail "(2) violation message not loud: $out"
+grep -qF 'herd-feature.sh' <<< "$out" || fail "(2) violation did not name the offending file: $out"
+grep -q 'NEW hardcoded claude' <<< "$out" || fail "(2) violation message not loud: $out"
 pass; echo "PASS (2) a planted hardcoded claude invocation is caught, named file:line"
 
 # ── 3. the same invocation, grandfathered into the baseline, scans clean ──────────────────────────

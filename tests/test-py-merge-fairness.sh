@@ -63,8 +63,8 @@ JSON
 
 # ── (2) freeze ON: the sibling is held for one window, not merged ────────────────────────────────
 OUT="$(run "$T/on.json" "$T/on.jsonl")" || fail "freeze-on dry-run exited nonzero"
-printf '%s' "$OUT" | grep -q '"1":"PENDING"' || fail "starved pr1 should still be PENDING ($OUT)"
-printf '%s' "$OUT" | grep -q '"2":"HOLD"'    || fail "sibling pr2 should be FROZEN→HOLD ($OUT)"
+grep -q '"1":"PENDING"' <<< "$OUT" || fail "starved pr1 should still be PENDING ($OUT)"
+grep -q '"2":"HOLD"' <<< "$OUT" || fail "sibling pr2 should be FROZEN→HOLD ($OUT)"
 grep -q '"event":"merge_fairness_freeze"' "$T/on.jsonl" || fail "no merge_fairness_freeze event"
 [ "$(grep -c '"event":"merge"' "$T/on.jsonl")" = 0 ] || fail "a merge leaked past the freeze"
 pass
@@ -72,7 +72,7 @@ pass
 # ── (3) byte-identical OFF: same scenario merges the sibling, no fairness event ──────────────────
 sed 's/"MERGE_FAIRNESS":"on"/"MERGE_FAIRNESS":"off"/' "$T/on.json" > "$T/off.json"
 OUT="$(run "$T/off.json" "$T/off.jsonl")" || fail "freeze-off dry-run exited nonzero"
-printf '%s' "$OUT" | grep -q '"2":"MERGE"' || fail "with the lever off pr2 must MERGE ($OUT)"
+grep -q '"2":"MERGE"' <<< "$OUT" || fail "with the lever off pr2 must MERGE ($OUT)"
 grep -Eq '"event":"(merge_fairness_freeze|pr_restale|pr_starvation)"' "$T/off.jsonl" \
   && fail "lever off leaked a fairness/restale event (must be byte-identical)"
 [ "$(grep -c '"event":"merge"' "$T/off.jsonl")" = 1 ] || fail "off: the sibling merge is missing"
@@ -86,8 +86,8 @@ cat > "$T/ready.json" <<'JSON'
    {"pr":2,"sha":"a2","slug":"sibling","review":"PASS","health":"CLEAN","worktree":"/wt/2"}]}
 JSON
 OUT="$(run "$T/ready.json" "$T/ready.jsonl")" || fail "starved-ready dry-run exited nonzero"
-printf '%s' "$OUT" | grep -q '"1":"MERGE"' || fail "a gates-ready starved pr1 must MERGE, not self-block ($OUT)"
-printf '%s' "$OUT" | grep -q '"2":"HOLD"'  || fail "sibling pr2 should still freeze ($OUT)"
+grep -q '"1":"MERGE"' <<< "$OUT" || fail "a gates-ready starved pr1 must MERGE, not self-block ($OUT)"
+grep -q '"2":"HOLD"' <<< "$OUT" || fail "sibling pr2 should still freeze ($OUT)"
 pass
 
 # ── (5) a human-verify hold never triggers a freeze (no deadlock behind a human) ─────────────────
@@ -98,7 +98,7 @@ cat > "$T/hv.json" <<'JSON'
    {"pr":2,"sha":"a2","slug":"sibling","review":"PASS","health":"CLEAN","worktree":"/wt/2"}]}
 JSON
 OUT="$(run "$T/hv.json" "$T/hv.jsonl")" || fail "human-verify dry-run exited nonzero"
-printf '%s' "$OUT" | grep -q '"2":"MERGE"' || fail "a human-held starved PR must not freeze the sibling ($OUT)"
+grep -q '"2":"MERGE"' <<< "$OUT" || fail "a human-held starved PR must not freeze the sibling ($OUT)"
 grep -q '"event":"merge_fairness_freeze"' "$T/hv.jsonl" \
   && fail "a human-verify hold must never trigger a freeze (would deadlock behind a human)"
 pass

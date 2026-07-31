@@ -52,15 +52,15 @@ run_herd() {
 
 # ── 1. herd link list shows both entries ─────────────────────────────────────────────────────────
 out="$(run_herd link list 2>&1)" || fail "link list exited non-zero: $out"
-echo "$out" | grep -q "engine" || fail "link list did not show 'engine' entry — got: $out"
-echo "$out" | grep -q "acme/engine-repo" || fail "link list did not show repo for 'engine' — got: $out"
-echo "$out" | grep -q "ci" || fail "link list did not show 'ci' entry — got: $out"
-echo "$out" | grep -q "myorg/ci-platform" || fail "link list did not show repo for 'ci' — got: $out"
+grep -q "engine" <<< "$out" || fail "link list did not show 'engine' entry — got: $out"
+grep -q "acme/engine-repo" <<< "$out" || fail "link list did not show repo for 'engine' — got: $out"
+grep -q "ci" <<< "$out" || fail "link list did not show 'ci' entry — got: $out"
+grep -q "myorg/ci-platform" <<< "$out" || fail "link list did not show repo for 'ci' — got: $out"
 pass
 
 # ── 2. herd link (no subcommand) defaults to list ────────────────────────────────────────────────
 out2="$(run_herd link 2>&1)" || fail "herd link (no args) exited non-zero: $out2"
-echo "$out2" | grep -q "engine" || fail "herd link (no args) did not default to list — got: $out2"
+grep -q "engine" <<< "$out2" || fail "herd link (no args) did not default to list — got: $out2"
 pass
 
 # ── 3. herd link list with no .herd/links file shows a helpful message ──────────────────────────
@@ -75,7 +75,7 @@ out3="$( cd "$P2" \
               HERD_NONINTERACTIVE=1 \
               bash "$HERD" link list 2>&1 )" \
   || fail "link list (no links file) exited non-zero: $out3"
-echo "$out3" | grep -qi "no .herd/links" \
+grep -qi "no .herd/links" <<< "$out3" \
   || fail "link list did not say 'no .herd/links' for a bare project — got: $out3"
 pass
 

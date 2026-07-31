@@ -92,12 +92,12 @@ pass
 ORPHAN_PR_SECTION_ROWS=""
 ORPHAN_PR_ROWS=on build_orphan_prs
 [ -n "$ORPHAN_PR_SECTION_ROWS" ] || fail "ON with orphans must populate the section"
-printf '%s' "$ORPHAN_PR_SECTION_ROWS" | grep -q "🪹 #101 add widget feat/widget · no worktree here — adopt or handle manually" \
+grep -q "🪹 #101 add widget feat/widget · no worktree here — adopt or handle manually" <<< "$ORPHAN_PR_SECTION_ROWS" \
   || fail "row 101 not rendered as expected: $ORPHAN_PR_SECTION_ROWS"
-printf '%s' "$ORPHAN_PR_SECTION_ROWS" | grep -q "#103 tidy docs feat/docs" || fail "row 103 not rendered"
-printf '%s' "$ORPHAN_PR_SECTION_ROWS" | grep -q "#102" && fail "claimed PR 102 must not render"
+grep -q "#103 tidy docs feat/docs" <<< "$ORPHAN_PR_SECTION_ROWS" || fail "row 103 not rendered"
+grep -q "#102" <<< "$ORPHAN_PR_SECTION_ROWS" && fail "claimed PR 102 must not render"
 # No network leak reached any assertion.
-printf '%s' "$ORPHAN_PR_SECTION_ROWS" | grep -q "SENTINEL-NETWORK-LEAK" && fail "a network stub was invoked"
+grep -q "SENTINEL-NETWORK-LEAK" <<< "$ORPHAN_PR_SECTION_ROWS" && fail "a network stub was invoked"
 pass
 
 # ── 5. DYNAMIC self-correction: adopt 101 (now claimed) + close 103 (gone from roster) → only 102-less

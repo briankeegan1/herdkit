@@ -87,11 +87,11 @@ BLOCK_BODY="$(printf 'Summary of the change.\n\nHUMAN-VERIFY:\n- run coordinator
 steps="$(printf '%s' "$BLOCK_BODY" | human_verify_steps)"
 [ "$(printf '%s' "$steps" | grep -c .)" = "2" ] || fail "block form should yield 2 steps, got: $steps"
 ok
-printf '%s' "$steps" | grep -q 'run coordinator.sh and confirm .herd-panes appears' || fail "step 1 text missing"
+grep -q 'run coordinator.sh and confirm .herd-panes appears' <<< "$steps" || fail "step 1 text missing"
 ok
-printf '%s' "$steps" | grep -q 'reload and confirm the panes refresh' || fail "step 2 text missing"
+grep -q 'reload and confirm the panes refresh' <<< "$steps" || fail "step 2 text missing"
 ok
-printf '%s' "$steps" | grep -q '^- ' && fail "bullet marker should be stripped from steps"
+grep -q '^- ' <<< "$steps" && fail "bullet marker should be stripped from steps"
 ok
 printf '%s' "$BLOCK_BODY" | human_verify_has || fail "block form should be a hold"
 ok
@@ -100,16 +100,16 @@ ok
 INLINE_BODY="$(printf 'Fix.\n\nHUMAN-VERIFY: run the live smoke test on port 8501\n')"
 printf '%s' "$INLINE_BODY" | human_verify_has || fail "inline form should be a hold"
 ok
-printf '%s' "$INLINE_BODY" | human_verify_steps | grep -q 'run the live smoke test on port 8501' || fail "inline step text missing"
+grep -q 'run the live smoke test on port 8501' <<< "$(printf '%s' "$INLINE_BODY" | human_verify_steps)" || fail "inline step text missing"
 ok
 
 # Decorated marker (**HUMAN-VERIFY:**) with markdown bullets and mixed case.
 DECOR_BODY="$(printf '**HUMAN-VERIFY:**\n* Confirm the reload refreshes panes\n1. Then check the backlog pane\n')"
 [ "$(printf '%s' "$DECOR_BODY" | human_verify_steps | grep -c .)" = "2" ] || fail "decorated form should yield 2 steps"
 ok
-printf '%s' "$DECOR_BODY" | human_verify_steps | grep -q '^Confirm the reload refreshes panes$' || fail "'*' bullet not stripped"
+grep -q '^Confirm the reload refreshes panes$' <<< "$(printf '%s' "$DECOR_BODY" | human_verify_steps)" || fail "'*' bullet not stripped"
 ok
-printf '%s' "$DECOR_BODY" | human_verify_steps | grep -q '^Then check the backlog pane$' || fail "'1.' ordered marker not stripped"
+grep -q '^Then check the backlog pane$' <<< "$(printf '%s' "$DECOR_BODY" | human_verify_steps)" || fail "'1.' ordered marker not stripped"
 ok
 
 # Dash- and plus-bulleted markers: a builder naturally writes the whole block as a `-` list
@@ -120,12 +120,12 @@ printf '%s' "$DASH_BODY" | human_verify_has || fail "'- HUMAN-VERIFY:' must be a
 ok
 [ "$(printf '%s' "$DASH_BODY" | human_verify_steps | grep -c .)" = "2" ] || fail "'- HUMAN-VERIFY:' block should yield 2 steps"
 ok
-printf '%s' "$DASH_BODY" | human_verify_steps | grep -q '^run the live smoke test$' || fail "'-' marker: step 1 text/de-bullet wrong"
+grep -q '^run the live smoke test$' <<< "$(printf '%s' "$DASH_BODY" | human_verify_steps)" || fail "'-' marker: step 1 text/de-bullet wrong"
 ok
 PLUS_BODY="$(printf '+ HUMAN-VERIFY: verify the reload refreshes panes\n')"
 printf '%s' "$PLUS_BODY" | human_verify_has || fail "'+ HUMAN-VERIFY:' (inline) must be a hold"
 ok
-printf '%s' "$PLUS_BODY" | human_verify_steps | grep -q '^verify the reload refreshes panes$' || fail "'+' inline marker step text wrong"
+grep -q '^verify the reload refreshes panes$' <<< "$(printf '%s' "$PLUS_BODY" | human_verify_steps)" || fail "'+' inline marker step text wrong"
 ok
 
 # Absent marker → not a hold, no steps.
@@ -247,11 +247,11 @@ rm -f "$APPROVALS"
 printf '1000 awaiting 100 %s\n' "$SHA_A" > "$APPROVALS"
 list_out="$(cd "$WORKTREES_DIR" && WORKTREES_DIR="$WORKTREES_DIR" HERD_CONFIG_FILE="$HERD_CONFIG_FILE" \
   PATH="$PATH" BODIES="$BODIES" bash "$APPROVE" list 2>&1)"
-printf '%s' "$list_out" | grep -q 'click through the new tab in the running app' \
+grep -q 'click through the new tab in the running app' <<< "$list_out" \
   || fail "herd-approve.sh list did not surface the HUMAN-VERIFY step. Output:
 $list_out"
 ok
-printf '%s' "$list_out" | grep -qi 'human-verify' \
+grep -qi 'human-verify' <<< "$list_out" \
   || fail "herd-approve.sh list should label the human-verify steps. Output:
 $list_out"
 ok
@@ -358,11 +358,11 @@ ok
 # The label the row carries, for each policy. Under auto the ONLY thing that can hold a gates-green PR
 # is a human-verify block, so the row must say so and name the release command.
 MERGE_POLICY=auto _p="$(_effective_merge_policy)"; [ "$_p" = auto ] || fail "(10) precondition"
-printf '%s' "$(_hold_ready_label 1 100 hold)" | grep -q 'human-verify pending' \
+grep -q 'human-verify pending' <<< "$(_hold_ready_label 1 100 hold)" \
   || fail "(10) an auto-policy hold must be labelled human-verify: $(_hold_ready_label 1 100 hold)"
-printf '%s' "$(_hold_ready_label 1 100 hold)" | grep -q 'approve 100' \
+grep -q 'approve 100' <<< "$(_hold_ready_label 1 100 hold)" \
   || fail "(10) the held row must name the release command"
-printf '%s' "$(_hold_ready_label "" 100)" | grep -q 'awaiting approval' \
+grep -q 'awaiting approval' <<< "$(_hold_ready_label "" 100)" \
   || fail "(10) an approve-policy hold keeps the generic wording"
 ok
 rm -f "$APPROVALS"

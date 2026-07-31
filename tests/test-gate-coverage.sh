@@ -39,8 +39,8 @@ if [ "$real_rc" -ne 0 ]; then
   printf '%s\n' "$real_out" | grep '^UNGATED' >&2
   fail "(1) real tree has ungated tests — add them to tests/gate-coverage-exempt.tsv or wire them into tests/herd.bats"
 fi
-printf '%s\n' "$real_out" | grep -q '^UNGATED' && fail "(1) UNGATED lines present despite clean exit"
-printf '%s\n' "$real_out" | grep -q '^ADVISORY:' || fail "(1) advisory summary line missing"
+grep -q '^UNGATED' <<< "$real_out" && fail "(1) UNGATED lines present despite clean exit"
+grep -q '^ADVISORY:' <<< "$real_out" || fail "(1) advisory summary line missing"
 pass
 echo "PASS (1) real tree: every tests/test-*.sh is wired in herd.bats or on the exempt list"
 
@@ -61,7 +61,7 @@ printf '#!/usr/bin/env bash\necho "ALL PASS"\n' > "$TR/tests/test-newfeature.sh"
 # No exempt file, no bats reference → must red
 out="$(herd_gate_coverage_lint "$TR")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(2) an unwired test-newfeature.sh must cause exit 1 (got $rc): $out"
-printf '%s\n' "$out" | grep -q 'UNGATED test-newfeature.sh' \
+grep -q 'UNGATED test-newfeature.sh' <<< "$out" \
   || fail "(2) should print UNGATED line for test-newfeature.sh (got: $out)"
 pass
 echo "PASS (2) unwired test → guard reds and emits UNGATED line"
@@ -70,7 +70,7 @@ echo "PASS (2) unwired test → guard reds and emits UNGATED line"
 printf 'test-newfeature.sh\n' > "$TR/tests/gate-coverage-exempt.tsv"
 out="$(herd_gate_coverage_lint "$TR")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(3) exempted test must be clean (exit 0, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'UNGATED' && fail "(3) no UNGATED lines expected after exemption (got: $out)"
+grep -q 'UNGATED' <<< "$out" && fail "(3) no UNGATED lines expected after exemption (got: $out)"
 pass
 echo "PASS (3) exempted test → guard is clean"
 
@@ -81,7 +81,7 @@ printf 'run bash "$REPO/tests/test-newfeature.sh"\n' >> "$TW/tests/herd.bats"
 # No exempt file needed — it is referenced in herd.bats
 out="$(herd_gate_coverage_lint "$TW")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(4) wired test must be clean (exit 0, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'UNGATED' && fail "(4) no UNGATED lines expected for wired test (got: $out)"
+grep -q 'UNGATED' <<< "$out" && fail "(4) no UNGATED lines expected for wired test (got: $out)"
 pass
 echo "PASS (4) wired test → guard is clean"
 
@@ -103,7 +103,7 @@ printf '#!/usr/bin/env bash\necho "ALL PASS"\n' > "$TE/tests/test-orphan.sh"
 printf '' > "$TE/tests/gate-coverage-exempt.tsv"    # empty file
 out="$(herd_gate_coverage_lint "$TE")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(6) empty exempt file should not exempt anything (exit 1, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'UNGATED test-orphan.sh' \
+grep -q 'UNGATED test-orphan.sh' <<< "$out" \
   || fail "(6) test-orphan.sh should still be UNGATED with an empty exempt file (got: $out)"
 pass
 echo "PASS (6) empty exempt file: no exemptions, unwired test still reds"
@@ -132,9 +132,9 @@ printf '#!/usr/bin/env bash\necho "ALL PASS"\n' > "$TP/tests/test-early.sh"
 out="$(herd_gate_coverage_check "$TP/tests/herd.bats" "$TP/tests")"; rc=$?
 [ "$rc" -eq 0 ] \
   || fail "(7) early-referenced test in a >64KB herd.bats must classify clean (exit 0, got $rc) — EPIPE regression: $out"
-printf '%s\n' "$out" | grep -q 'UNGATED' \
+grep -q 'UNGATED' <<< "$out" \
   && fail "(7) test-early.sh is wired — must NOT be UNGATED (EPIPE misclassification): $out"
-printf '%s\n' "$out" | grep -q '^ADVISORY:' || fail "(7) advisory summary line missing"
+grep -q '^ADVISORY:' <<< "$out" || fail "(7) advisory summary line missing"
 pass
 echo "PASS (7) EPIPE regression: early-referenced test in a >64KB herd.bats stays WIRED under pipefail"
 
@@ -158,9 +158,9 @@ printf '#!/usr/bin/env bash\necho "ALL PASS"\n' > "$TDsc/tests/test-brandnew.sh"
 # No exempt file, NOT named in herd.bats — but the discovery glob covers it.
 out="$(herd_gate_coverage_lint "$TDsc")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(8) discovery-present: an auto-discovered test must be clean (exit 0, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'UNGATED' && fail "(8) no UNGATED lines expected under dynamic discovery (got: $out)"
-printf '%s\n' "$out" | grep -q 'discovery-glob-present=1' || fail "(8) advisory should report discovery-glob-present=1 (got: $out)"
-printf '%s\n' "$out" | grep -qE 'ADVISORY:.*1 auto-discovered' || fail "(8) advisory should count 1 auto-discovered (got: $out)"
+grep -q 'UNGATED' <<< "$out" && fail "(8) no UNGATED lines expected under dynamic discovery (got: $out)"
+grep -q 'discovery-glob-present=1' <<< "$out" || fail "(8) advisory should report discovery-glob-present=1 (got: $out)"
+grep -qE 'ADVISORY:.*1 auto-discovered' <<< "$out" || fail "(8) advisory should count 1 auto-discovered (got: $out)"
 pass
 echo "PASS (8) discovery present → an unreferenced, non-exempt test is auto-discovered and clean"
 
@@ -169,8 +169,8 @@ printf '#!/usr/bin/env bash\necho ok\n' > "$TDsc/tests/test-quarantined.sh"
 printf 'test-quarantined.sh\n' > "$TDsc/tests/gate-coverage-exempt.tsv"
 out="$(herd_gate_coverage_lint "$TDsc")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(9) discovery + exempt must stay clean (exit 0, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'UNGATED' && fail "(9) exempt file must not red under discovery (got: $out)"
-printf '%s\n' "$out" | grep -qE 'ADVISORY:.*1 exempted' || fail "(9) advisory should count 1 exempted (got: $out)"
+grep -q 'UNGATED' <<< "$out" && fail "(9) exempt file must not red under discovery (got: $out)"
+grep -qE 'ADVISORY:.*1 exempted' <<< "$out" || fail "(9) advisory should count 1 exempted (got: $out)"
 pass
 echo "PASS (9) discovery present + exempt list still honored (exempt file not double-counted / not red)"
 
@@ -181,9 +181,9 @@ printf '#!/usr/bin/env bats\n@test "structural only" { run true; }\n' > "$TDrm/t
 printf '#!/usr/bin/env bash\necho "ALL PASS"\n' > "$TDrm/tests/test-brandnew.sh"
 out="$(herd_gate_coverage_lint "$TDrm")"; rc=$?
 [ "$rc" -eq 1 ] || fail "(10) removing the discovery glob must red an unreferenced test (exit 1, got $rc): $out"
-printf '%s\n' "$out" | grep -q 'UNGATED test-brandnew.sh' \
+grep -q 'UNGATED test-brandnew.sh' <<< "$out" \
   || fail "(10) should print UNGATED for test-brandnew.sh when discovery is gone (got: $out)"
-printf '%s\n' "$out" | grep -q 'discovery-glob-present=0' || fail "(10) advisory should report discovery-glob-present=0 (got: $out)"
+grep -q 'discovery-glob-present=0' <<< "$out" || fail "(10) advisory should report discovery-glob-present=0 (got: $out)"
 pass
 echo "PASS (10) discovery removed → the guard fails loudly (UNGATED), proving it still catches a deleted mechanism"
 

@@ -213,11 +213,11 @@ out="$(
 )"
 rc=$?
 [ "$rc" -eq 0 ] || fail "C: pinned review should exit 0 on PASS (got $rc)"$'\n'"$out"
-printf '%s\n' "$out" | grep -q '^REVIEW: PASS' || fail "C: should print REVIEW: PASS (got: $out)"
+grep -q '^REVIEW: PASS' <<< "$out" || fail "C: should print REVIEW: PASS (got: $out)"
 
 prompt="$(tr '\0' '\n' < "$CLAUDE_ARGS_LOG")"
 # Must instruct a git-diff against the DISPATCH sha X (not live gh pr diff for content).
-printf '%s' "$prompt" | grep -Fq "$SHA_X" \
+grep -Fq "$SHA_X" <<< "$prompt" \
   || fail "C: prompt must name dispatch sha X"$'\n'"$prompt"
 printf '%s' "$prompt" | grep -E -q "git -C .* diff .*${SHA_X}" \
   || fail "C: prompt must carry 'git … diff …<shaX>'"$'\n'"$prompt"
@@ -230,16 +230,16 @@ printf '%s' "$prompt" | grep -E -q "read its pinned dispatch-sha diff with 'git 
 printf '%s' "$prompt" | grep -E "read its (pinned dispatch-sha )?diff with 'gh pr diff" \
   && fail "C: must not instruct live 'gh pr diff' as the active read command"$'\n'"$prompt"
 # Stable preamble keeps the placeholder (prompt-cache-stable).
-printf '%s' "$prompt" | grep -Fq "git diff <merge-base>..<dispatch-sha>" \
+grep -Fq "git diff <merge-base>..<dispatch-sha>" <<< "$prompt" \
   || fail "C: preamble must keep stable <merge-base>..<dispatch-sha> placeholder"$'\n'"$prompt"
 # Content uniqueness: the X-only line must be in the pin range; Y-only must not be required.
 # (We assert the prompt range ends at X; the actual `git diff` output is what the agent would see.)
 mb="$(git -C "$MAIN" merge-base origin/main "$SHA_X")"
 diff_x="$(git -C "$MAIN" diff "${mb}..${SHA_X}")"
 diff_y="$(git -C "$MAIN" diff "${mb}..${SHA_Y}")"
-printf '%s' "$diff_x" | grep -Fq 'x-content' || fail "C: X-range diff should contain x-content"
-printf '%s' "$diff_x" | grep -Fq 'y-content' && fail "C: X-range diff must NOT contain y-content (Y is mid-review push)"
-printf '%s' "$diff_y" | grep -Fq 'y-content' || fail "C: sanity — Y-range does contain y-content"
+grep -Fq 'x-content' <<< "$diff_x" || fail "C: X-range diff should contain x-content"
+grep -Fq 'y-content' <<< "$diff_x" && fail "C: X-range diff must NOT contain y-content (Y is mid-review push)"
+grep -Fq 'y-content' <<< "$diff_y" || fail "C: sanity — Y-range does contain y-content"
 ok
 
 # ── C2 — soft fallback when pin objects missing → live gh pr diff in the command ────────────────
@@ -257,7 +257,7 @@ out2="$(
   bash "$REVIEW" 77 "slug-c2" 2>/dev/null
 )" || true
 prompt2="$(tr '\0' '\n' < "$CLAUDE_ARGS_LOG")"
-printf '%s' "$prompt2" | grep -Fq "gh pr diff 77" \
+grep -Fq "gh pr diff 77" <<< "$prompt2" \
   || fail "C2: missing pin objects must fall back to live 'gh pr diff <PR>'"$'\n'"$prompt2"
 ok
 

@@ -55,7 +55,7 @@ gh_claim() {  # $1 = ref (issue number), $2 = who
 # 1. open + unassigned → CLAIMED, and gh issue edit --add-assignee was called (no create/close).
 : > "$GHLOG"
 out="$(gh_claim 10 me-login)"
-echo "$out" | grep -q "^CLAIMED	me-login$" || fail "github claim-wins: expected CLAIMED me-login, got '$out'"
+grep -q "^CLAIMED	me-login$" <<< "$out" || fail "github claim-wins: expected CLAIMED me-login, got '$out'"
 grep -q -- "issue edit -R acme/widgets 10 --add-assignee me-login" "$GHLOG" || fail "github claim-wins: did not add the assignee ($(cat "$GHLOG"))"
 grep -q -- "issue create" "$GHLOG" && fail "github claim must never file a new issue"
 grep -q -- "issue close"  "$GHLOG" && fail "github claim must never close an issue"
@@ -64,19 +64,19 @@ pass
 # 2. assigned to another login → ALREADY (owner named), NO edit attempted.
 : > "$GHLOG"
 out="$(gh_claim 11 me-login)"
-echo "$out" | grep -q "^ALREADY	other-op$" || fail "github already: expected ALREADY other-op, got '$out'"
+grep -q "^ALREADY	other-op$" <<< "$out" || fail "github already: expected ALREADY other-op, got '$out'"
 grep -q -- "--add-assignee" "$GHLOG" && fail "github already: must NOT try to assign a contested issue"
 pass
 
 # 3. closed issue → ALREADY (shipped), no assign.
 out="$(gh_claim 12 me-login)"
-echo "$out" | grep -q "^ALREADY" || fail "github closed: expected ALREADY, got '$out'"
+grep -q "^ALREADY" <<< "$out" || fail "github closed: expected ALREADY, got '$out'"
 pass
 
 # 4. already assigned to us → SELF (idempotent re-spawn), no assign.
 : > "$GHLOG"
 out="$(gh_claim 13 me-login)"
-echo "$out" | grep -q "^SELF	me-login$" || fail "github self: expected SELF me-login, got '$out'"
+grep -q "^SELF	me-login$" <<< "$out" || fail "github self: expected SELF me-login, got '$out'"
 grep -q -- "--add-assignee" "$GHLOG" && fail "github self: must NOT re-assign"
 pass
 
@@ -93,7 +93,7 @@ esac
 EOF
 chmod +x "$T/bin/gh"
 out="$(gh_claim "no-such-title" me-login)"
-echo "$out" | grep -q "^UNREACHABLE" || fail "github unresolvable ref: expected UNREACHABLE, got '$out'"
+grep -q "^UNREACHABLE" <<< "$out" || fail "github unresolvable ref: expected UNREACHABLE, got '$out'"
 pass
 
 # ============================== Linear backend (stubbed _linear_gql) ==================================
@@ -122,25 +122,25 @@ lin_claim() {
 # 6. unassigned + started-state available → CLAIMED (re-read shows us as assignee).
 node='{"id":"iss1","identifier":"HERD-50","assignee":{"id":"me-uid","name":"Me"},"state":{"type":"unstarted"},"team":{"states":{"nodes":[{"id":"st_started"}]}}}'
 out="$(lin_claim "HERD-50" alice "$node")"
-echo "$out" | grep -q "^CLAIMED" || fail "linear claim-wins: expected CLAIMED, got '$out'"
+grep -q "^CLAIMED" <<< "$out" || fail "linear claim-wins: expected CLAIMED, got '$out'"
 pass
 
 # 7. assigned to another user → ALREADY (owner named), never mutates.
 node='{"id":"iss1","identifier":"HERD-50","assignee":{"id":"other-uid","name":"Other Op"},"state":{"type":"started"},"team":{"states":{"nodes":[{"id":"st_started"}]}}}'
 out="$(lin_claim "HERD-50" alice "$node")"
-echo "$out" | grep -q "^ALREADY	Other Op$" || fail "linear already: expected ALREADY 'Other Op', got '$out'"
+grep -q "^ALREADY	Other Op$" <<< "$out" || fail "linear already: expected ALREADY 'Other Op', got '$out'"
 pass
 
 # 8. completed issue → ALREADY (shipped).
 node='{"id":"iss1","identifier":"HERD-50","assignee":null,"state":{"type":"completed"},"team":{"states":{"nodes":[]}}}'
 out="$(lin_claim "HERD-50" alice "$node")"
-echo "$out" | grep -q "^ALREADY" || fail "linear completed: expected ALREADY, got '$out'"
+grep -q "^ALREADY" <<< "$out" || fail "linear completed: expected ALREADY, got '$out'"
 pass
 
 # 9. already assigned to us AND started → SELF.
 node='{"id":"iss1","identifier":"HERD-50","assignee":{"id":"me-uid","name":"Me"},"state":{"type":"started"},"team":{"states":{"nodes":[{"id":"st_started"}]}}}'
 out="$(lin_claim "HERD-50" alice "$node")"
-echo "$out" | grep -q "^SELF" || fail "linear self: expected SELF, got '$out'"
+grep -q "^SELF" <<< "$out" || fail "linear self: expected SELF, got '$out'"
 pass
 
 # 10. gh #169: claiming into a workspace with MULTIPLE started-type states must move the issue to the
@@ -151,7 +151,7 @@ CLAIMLOG="$T/claim.log"; export CLAIMLOG
 node='{"id":"iss1","identifier":"HERD-50","assignee":null,"state":{"type":"unstarted"},"team":{"states":{"nodes":[{"id":"st_review","name":"In Review","position":2},{"id":"st_progress","name":"In Progress","position":1}]}}}'
 : > "$CLAIMLOG"
 out="$(lin_claim "HERD-50" alice "$node")"
-echo "$out" | grep -q "^CLAIMED" || fail "linear claim (multi started): expected CLAIMED, got '$out'"
+grep -q "^CLAIMED" <<< "$out" || fail "linear claim (multi started): expected CLAIMED, got '$out'"
 grep -q "st_progress" "$CLAIMLOG" || fail "linear claim (multi started) did not start into 'In Progress' by NAME (gh #169)"
 grep -q "st_review" "$CLAIMLOG" && fail "linear claim (multi started) started into 'In Review' — the exact gh #169 regression"
 pass
@@ -161,7 +161,7 @@ pass
 node='{"id":"iss1","identifier":"HERD-50","assignee":null,"state":{"type":"unstarted"},"team":{"states":{"nodes":[{"id":"st_review","name":"In Review","position":2},{"id":"st_doing","name":"Doing","position":1}]}}}'
 : > "$CLAIMLOG"
 out="$(lin_claim "HERD-50" alice "$node")"
-echo "$out" | grep -q "^CLAIMED" || fail "linear claim (position fallback): expected CLAIMED, got '$out'"
+grep -q "^CLAIMED" <<< "$out" || fail "linear claim (position fallback): expected CLAIMED, got '$out'"
 grep -q "st_doing" "$CLAIMLOG" || fail "linear claim (position fallback) did not start into the LOWEST-position started state (gh #169)"
 grep -q "st_review" "$CLAIMLOG" && fail "linear claim (position fallback) started into higher-position 'In Review' — gh #169 regression"
 unset CLAIMLOG
@@ -172,7 +172,7 @@ out="$( cd "$T" && . "$BACKENDS/changelog.sh"
   _CLAIM_RESULT=""; _CLAIM_OWNER=""
   _backend_claim_item "anything" whoever
   printf '%s\n' "${_CLAIM_RESULT:-}" )"
-echo "$out" | grep -q "^UNREACHABLE$" || fail "changelog claim: expected UNREACHABLE (no claim concept), got '$out'"
+grep -q "^UNREACHABLE$" <<< "$out" || fail "changelog claim: expected UNREACHABLE (no claim concept), got '$out'"
 pass
 
 echo "ALL PASS ($PASS checks)"

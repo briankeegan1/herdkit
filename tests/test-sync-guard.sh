@@ -23,7 +23,7 @@ sync_guard() {
   manifest_touched=0
   case "$changed" in *"templates/capabilities.tsv"*) manifest_touched=1 ;; esac
 
-  if printf '%s\n' "$changed" | grep -qxE 'bin/herd'; then
+  if grep -qxE 'bin/herd' <<< "$changed"; then
     new_cmds="$(git -C "$root" diff "$base" -- bin/herd 2>/dev/null \
       | grep -E '^\+[[:space:]]*cmd_[a-z_]+\(\)' || true)"
     if [ -n "$new_cmds" ] && [ "$manifest_touched" -eq 0 ]; then
@@ -31,7 +31,7 @@ sync_guard() {
     fi
   fi
 
-  if printf '%s\n' "$changed" | grep -qxE 'scripts/herd/herd-config\.sh'; then
+  if grep -qxE 'scripts/herd/herd-config\.sh' <<< "$changed"; then
     new_keys="$(git -C "$root" diff "$base" -- scripts/herd/herd-config.sh 2>/dev/null \
       | grep -E '^\+[[:space:]]*:[[:space:]]+"?\$\{[A-Z_]+:=' || true)"
     if [ -n "$new_keys" ] && [ "$manifest_touched" -eq 0 ]; then

@@ -281,8 +281,8 @@ poll_state() {
 ordered() {
   local scn="$1" early="$2" late="$3" a="" b="" i=0
   while [ "$i" -lt 30 ]; do
-    a="$(grep -n -- "$early" "$scn/actions.log" 2>/dev/null | head -1 | cut -d: -f1)"
-    b="$(grep -n -- "$late"  "$scn/actions.log" 2>/dev/null | head -1 | cut -d: -f1)"
+    a="$(grep -nm1 -- "$early" "$scn/actions.log" 2>/dev/null | cut -d: -f1)"
+    b="$(grep -nm1 -- "$late"  "$scn/actions.log" 2>/dev/null | cut -d: -f1)"
     { [ -n "$a" ] && [ -n "$b" ]; } && break
     i=$((i+1)); sleep 0.1
   done

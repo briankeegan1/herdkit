@@ -99,28 +99,28 @@ export HERD_SWEEP_PS_CMD="$T/ps-all"
 MAINS="$(watcher_list_mains)"
 
 # ── (a) canonical + transient child fork ────────────────────────────────────────────────────────
-printf '%s\n' "$MAINS" | grep -qx "$CANON" || fail "(a) the canonical watcher was not listed: '$MAINS'"
-printf '%s\n' "$MAINS" | grep -qx "$FORK" \
+grep -qx "$CANON" <<< "$MAINS" || fail "(a) the canonical watcher was not listed: '$MAINS'"
+grep -qx "$FORK" <<< "$MAINS" \
   && fail "(a) a transient tick fork (ppid == canonical) was counted as a watcher main — the false alarm"
 ok; echo "PASS (a) a transient tick fork is exempt; the canonical watcher is listed"
 
 # ── (d) the marker-owned exemption (HERD-185 / HERD-217 / HERD-237 / HERD-245) ──────────────────
-printf '%s\n' "$MAINS" | grep -qx "$MARKED_REAL" \
+grep -qx "$MARKED_REAL" <<< "$MAINS" \
   && fail "(d) a LIVE inflight-marker worker was listed as a duplicate watcher — the kill path would sever it"
-printf '%s\n' "$MAINS" | grep -qx "$HCPID" && fail "(d) an untagged healthcheck worker was mistaken for a watcher"
-printf '%s\n' "$MAINS" | grep -qx 900001 && fail "(d) ANOTHER workspace's tagged watcher was listed (issue #60)"
+grep -qx "$HCPID" <<< "$MAINS" && fail "(d) an untagged healthcheck worker was mistaken for a watcher"
+grep -qx 900001 <<< "$MAINS" && fail "(d) ANOTHER workspace's tagged watcher was listed (issue #60)"
 ok; echo "PASS (d) a marker-owned gate worker is exempt; a foreign workspace is never listed"
 
 # ── (g) THE SAFETY RAIL: a gate-running stray is NEVER exempt from the listing ──────────────────
 # GATEFORK parents a live healthcheck. sweep.sh's detection surface spares it (assertion (e)); the
 # LISTING must not, because that same list is what _stop_project_watcher SIGTERMs.
-printf '%s\n' "$MAINS" | grep -qx "$GATEFORK" \
+grep -qx "$GATEFORK" <<< "$MAINS" \
   || fail "(g) a tagged main that had dispatched a gate worker was EXEMPTED from the kill list — \
 'herd reload' would report 'no running watcher found', drop the lock, and spawn a second main on top of it"
 ok; echo "PASS (g) a gate-running stray stays on the kill list (the duplicate safety rail holds)"
 
 # ── (b) a genuine orphan duplicate is STILL listed ──────────────────────────────────────────────
-printf '%s\n' "$MAINS" | grep -qx "$ORPHAN" \
+grep -qx "$ORPHAN" <<< "$MAINS" \
   || fail "(b) a GENUINE orphan duplicate (parent dead, no gate child, no marker) was silenced: '$MAINS'"
 [ "$(printf '%s\n' "$MAINS" | grep -c .)" -eq 3 ] \
   || fail "(b) expected exactly 3 mains (canonical + gate-running stray + orphan), got: '$(printf '%s' "$MAINS" | tr '\n' ' ')'"
@@ -138,7 +138,7 @@ watcher_handoff_active || fail "(c) a fresh handoff marker did not read as activ
 HERD_STATUS_DUP_SAMPLES=3 HERD_STATUS_DUP_SLEEP=0 _status_dup_verified "$MAINS" >/dev/null \
   && fail "(c) the duplicate alarm fired DURING a self-restart generation handoff (false red)"
 # The pids are still LISTED through the handoff — `herd reload` must still be able to stop them.
-printf '%s\n' "$(watcher_list_mains)" | grep -qx "$ORPHAN" \
+grep -qx "$ORPHAN" <<< "$(watcher_list_mains)" \
   || fail "(c) the handoff removed a pid from watcher_list_mains — the kill path would go blind"
 # A crashed exec's marker ages out and stops masking a real duplicate.
 printf '%s\n%s\n' "$CANON" "$(( $(date +%s) - WATCHER_HANDOFF_TTL - 5 ))" > "$TREESDIR/.watcher-handoff"
@@ -187,11 +187,11 @@ EOF
 STRAY="$( cd "$T/proj" && HERD_HERMETIC_GUARD=1 AGENT_WATCH_LIB=1 \
   bash -c '. "'"$REPO"'/scripts/herd/sweep.sh" >/dev/null 2>&1; sweep_stray_watchers' 2>/dev/null )"
 if [ -n "$STRAY" ]; then
-  printf '%s\n' "$STRAY" | grep -qx "$ORPHAN" \
+grep -qx "$ORPHAN" <<< "$STRAY" \
     || fail "(e) sweep_stray_watchers did not list the genuine orphan the shared check lists: '$STRAY'"
-  printf '%s\n' "$STRAY" | grep -qx "$CANON" && fail "(e) sweep_stray_watchers listed the canonical watcher"
-  printf '%s\n' "$STRAY" | grep -qx "$FORK"  && fail "(e) sweep_stray_watchers listed a transient tick fork"
-  printf '%s\n' "$STRAY" | grep -qx "$GATEFORK" \
+grep -qx "$CANON" <<< "$STRAY" && fail "(e) sweep_stray_watchers listed the canonical watcher"
+grep -qx "$FORK" <<< "$STRAY" && fail "(e) sweep_stray_watchers listed a transient tick fork"
+grep -qx "$GATEFORK" <<< "$STRAY" \
     && fail "(e) sweep_stray_watchers listed a fork parenting a live healthcheck — leg 5 would SIGKILL in-flight gate work (HERD-217)"
   ok; echo "PASS (e) sweep spares a gate-parenting fork that the kill list still counts"
 else
@@ -203,8 +203,7 @@ else
   grep -q '_sweep_watcher_has_gate_child "$pid" "$table" && continue' "$REPO/scripts/herd/sweep.sh" \
     || fail "(e) sweep_stray_watchers lost its detection-only gate-child guard (HERD-217)"
   grep -q 'watcher_has_gate_child' "$REPO/scripts/herd/watcher-exempt.sh" \
-    && grep -qE '^_wx_exempt\(\)' -A8 "$REPO/scripts/herd/watcher-exempt.sh" \
-    | grep -q 'watcher_has_gate_child' \
+    && grep -q 'watcher_has_gate_child' <<< "$(grep -E '^_wx_exempt\(\)' -A8 "$REPO/scripts/herd/watcher-exempt.sh" || true)" \
     && fail "(e) the gate-child guard leaked back into _wx_exempt — it would blind _stop_project_watcher"
   ok; echo "PASS (e) the gate-child guard lives on sweep's detection surface only (structural)"
 fi

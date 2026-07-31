@@ -913,7 +913,7 @@ WAKEHERDR
       ) ; W_RC=$?
       _w_st="$(agent_status_of rp-builder)"
       _w_woke=no; grep -q '"event":"refix_wake_result"' "$W_JOURNAL" 2>/dev/null \
-        && grep 'refix_wake_result' "$W_JOURNAL" | tail -1 | grep -q '"woke":1' && _w_woke=yes
+        && grep -q '"woke":1' <<< "$(grep 'refix_wake_result' "$W_JOURNAL" | tail -1)" && _w_woke=yes
       _w_enter=no; [ ! -f "$W_MARK" ] && _w_enter=yes   # mark consumed ⇒ Enter path ran
       if [ "$W_RC" = 0 ] && [ "$_w_woke" = yes ] && [ "$_w_st" = working ]; then
         checkpoint builder_retask_wakes_on_enter pass \
@@ -1000,7 +1000,7 @@ print(pi.get("foreground_process_group_id") or "")
         printf '%s' "${DISPLAY[0]:-}" > "$BV_DISPLAY"
       ) ; BV_RC=$?
       _bv_disp="$(cat "$BV_DISPLAY" 2>/dev/null || true)"
-      _bv_escalated=no; printf '%s' "$_bv_disp" | grep -q "agent dead" && _bv_escalated=yes
+      _bv_escalated=no; grep -q "agent dead" <<< "$_bv_disp" && _bv_escalated=yes
       _bv_journaled=no; grep -q '"event":"refix_escalated_dead"' "$BV_JOURNAL" 2>/dev/null && _bv_journaled=yes
       # "escalates instead of waking": the escalation event is present AND the wake-result event is NOT.
       _bv_no_wake=no; grep -q '"event":"refix_wake_result"' "$BV_JOURNAL" 2>/dev/null || _bv_no_wake=yes

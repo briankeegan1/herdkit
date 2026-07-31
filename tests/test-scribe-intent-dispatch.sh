@@ -120,7 +120,7 @@ step skip "$p" "not a backlog add or state change — free-form aside"
 [ "$RC" -eq 0 ]                                              || fail "5: skip exited $RC ($OUT)"
 [ ! -s "$DISPATCH" ]                                         || fail "5: skip filed something to the backend ($(cat "$DISPATCH"))"
 grep -qi 'SKIPPED (not filed)' "$INBOX"                      || fail "5: skip did not record a loud SKIP line in the scribe report ($(cat "$INBOX" 2>/dev/null))"
-printf '%s\n' "$OUT" | grep -qi 'SKIPPED (not filed)'        || fail "5: skip did not warn loudly on stderr ($OUT)"
+grep -qi 'SKIPPED (not filed)' <<< "$OUT" || fail "5: skip did not warn loudly on stderr ($OUT)"
 [ ! -e "$p" ]                                                || fail "5: claimed file not cleaned up after skip"
 ok
 
@@ -135,15 +135,15 @@ OUT="$( cd "$REPO" && HERD_CONFIG_FILE="$CFG.file" SCRIBE_BACKEND_DIR="$HERE/../
 RC=$?
 set -e
 [ "$RC" -eq 0 ]                                              || fail "6: file-backend update-state exited $RC ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'issue #139'                 || fail "6: file-backend update-state did not warn about the misroute ($OUT)"
+grep -q 'issue #139' <<< "$OUT" || fail "6: file-backend update-state did not warn about the misroute ($OUT)"
 grep -qi 'SKIPPED (not filed)' "$INBOX"                      || fail "6: file-backend update-state did not record a SKIP ($(cat "$INBOX" 2>/dev/null))"
 [ ! -e "$p" ]                                                || fail "6: claimed file not cleaned up"
 ok
 
 # ══ 7. usage line documents the new verbs ════════════════════════════════════════════════════════
 step bogus-verb
-printf '%s\n' "$OUT" | grep -q 'update-state' || fail "7: usage does not mention update-state ($OUT)"
-printf '%s\n' "$OUT" | grep -q 'skip'         || fail "7: usage does not mention skip ($OUT)"
+grep -q 'update-state' <<< "$OUT" || fail "7: usage does not mention update-state ($OUT)"
+grep -q 'skip' <<< "$OUT" || fail "7: usage does not mention skip ($OUT)"
 ok
 
 echo "ALL PASS ($pass checks)"

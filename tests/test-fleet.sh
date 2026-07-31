@@ -90,11 +90,11 @@ BETA="$(_make_project beta)"
 bash "$HERD" fleet register "$ALPHA" >/dev/null
 bash "$HERD" fleet register "$BETA"  >/dev/null
 out="$(bash "$HERD" fleet list)"
-printf '%s' "$out" | grep -q "alpha" || fail "list missing registered project alpha"
-printf '%s' "$out" | grep -q "beta"  || fail "list missing registered project beta"
+grep -q "alpha" <<< "$out" || fail "list missing registered project alpha"
+grep -q "beta" <<< "$out" || fail "list missing registered project beta"
 # The registry repo field is the TARGET's own origin remote (acme/alpha), NOT its config HERD_REPO
 # (me/alpha) — issue #128. Assert the remote won and HERD_REPO did NOT leak in.
-printf '%s' "$out" | grep -q "acme/alpha" || fail "list missing alpha's repo (from its origin remote)"
+grep -q "acme/alpha" <<< "$out" || fail "list missing alpha's repo (from its origin remote)"
 grep -q "|me/alpha$" "$HERD_FLEET_FILE" && fail "config HERD_REPO leaked into the registry repo field"
 grep -q "^alpha|$ALPHA|acme/alpha$" "$HERD_FLEET_FILE" \
   || fail "registry line for alpha not in name|path|repo form with the remote-derived repo"
@@ -108,7 +108,7 @@ HERD_FLEET_FILE="$REG_ALIAS" bash "$HERD" fleet register "$ALPHA" --alias alpha-
 grep -q "^alpha|$ALPHA|acme/alpha|alpha-svc,Alpha Service$" "$REG_ALIAS" \
   || fail "register --alias should append a comma-joined aliases field, got: $(grep '^alpha|' "$REG_ALIAS" || true)"
 out="$(HERD_FLEET_FILE="$REG_ALIAS" bash "$HERD" fleet list)"
-printf '%s' "$out" | grep -q "alpha-svc" || fail "list should surface a registered alias"
+grep -q "alpha-svc" <<< "$out" || fail "list should surface a registered alias"
 # A plain re-register (no --alias) must PRESERVE the existing aliases, not silently wipe them.
 HERD_FLEET_FILE="$REG_ALIAS" bash "$HERD" fleet register "$ALPHA" >/dev/null
 grep -q "^alpha|$ALPHA|acme/alpha|alpha-svc,Alpha Service$" "$REG_ALIAS" \
@@ -130,30 +130,30 @@ ok
 
 # ── 4. status renders a per-project row for each project ─────────────────────
 out="$(bash "$HERD" fleet status)"
-printf '%s' "$out" | grep -q "PROJECT" || fail "status missing header row"
-printf '%s' "$out" | grep -q "alpha" || fail "status missing alpha row"
-printf '%s' "$out" | grep -q "beta"  || fail "status missing beta row"
+grep -q "PROJECT" <<< "$out" || fail "status missing header row"
+grep -q "alpha" <<< "$out" || fail "status missing alpha row"
+grep -q "beta" <<< "$out" || fail "status missing beta row"
 # branch, PR count, and last journal activity render per project.
-printf '%s' "$out" | grep -q "feat/alpha" || fail "status missing alpha's branch"
-printf '%s' "$out" | grep -qi "merge" || fail "status missing last journal activity"
+grep -q "feat/alpha" <<< "$out" || fail "status missing alpha's branch"
+grep -qi "merge" <<< "$out" || fail "status missing last journal activity"
 ok
 
 # ── 5. watcher liveness: alpha alive (stubbed pgrep/ps), beta down ───────────
 alpha_row="$(printf '%s' "$out" | grep '^alpha' || true)"
 beta_row="$(printf '%s' "$out" | grep '^beta' || true)"
-printf '%s' "$alpha_row" | grep -qi "alive" || fail "alpha's watcher should read alive (stubbed)"
-printf '%s' "$beta_row"  | grep -qi "down"  || fail "beta's watcher should read down"
+grep -qi "alive" <<< "$alpha_row" || fail "alpha's watcher should read alive (stubbed)"
+grep -qi "down" <<< "$beta_row" || fail "beta's watcher should read down"
 ok
 
 # ── 6. status open-PR count uses gh (stubbed to 2) ───────────────────────────
-printf '%s' "$alpha_row" | grep -q "2" || fail "status should show gh's open-PR count (2)"
+grep -q "2" <<< "$alpha_row" || fail "status should show gh's open-PR count (2)"
 ok
 
 # ── 7. discover finds projects under a root ──────────────────────────────────
 out="$(bash "$HERD" fleet discover "$T/proj")"
-printf '%s' "$out" | grep -q "alpha" || fail "discover missed alpha under root"
-printf '%s' "$out" | grep -q "beta"  || fail "discover missed beta under root"
-printf '%s' "$out" | grep -q "2 project(s) found" || fail "discover count wrong"
+grep -q "alpha" <<< "$out" || fail "discover missed alpha under root"
+grep -q "beta" <<< "$out" || fail "discover missed beta under root"
+grep -q "2 project(s) found" <<< "$out" || fail "discover count wrong"
 ok
 
 # ── 8. discover --register into a fresh registry ─────────────────────────────
@@ -178,12 +178,12 @@ chmod +x "$STUB"
 set +e
 out="$(HERD_FLEET_HERD_BIN="$STUB" bash "$HERD" fleet upgrade)"; rc=$?
 set -e
-printf '%s' "$out" | grep -q "alpha" || fail "upgrade missing alpha outcome"
-printf '%s' "$out" | grep -q "beta"  || fail "upgrade missing beta outcome"
-printf '%s' "$out" | grep -Eq "alpha.*ok"      || fail "alpha should report ok"
-printf '%s' "$out" | grep -Eq "beta.*failed"   || fail "beta should report failed"
-printf '%s' "$out" | grep -q "1 ok"     || fail "upgrade summary should tally 1 ok"
-printf '%s' "$out" | grep -q "1 failed" || fail "upgrade summary should tally 1 failed"
+grep -q "alpha" <<< "$out" || fail "upgrade missing alpha outcome"
+grep -q "beta" <<< "$out" || fail "upgrade missing beta outcome"
+grep -Eq "alpha.*ok" <<< "$out" || fail "alpha should report ok"
+grep -Eq "beta.*failed" <<< "$out" || fail "beta should report failed"
+grep -q "1 ok" <<< "$out" || fail "upgrade summary should tally 1 ok"
+grep -q "1 failed" <<< "$out" || fail "upgrade summary should tally 1 failed"
 [ "$rc" -ne 0 ] || fail "upgrade should exit non-zero when a project failed"
 ok
 
@@ -192,9 +192,9 @@ printf 'ghost|%s/proj/ghost|me/ghost\n' "$T" >> "$HERD_FLEET_FILE"
 set +e
 out="$(HERD_FLEET_HERD_BIN="$STUB" bash "$HERD" fleet upgrade)"; rc=$?
 set -e
-printf '%s' "$out" | grep -Eq "ghost.*skipped" || fail "missing project should be reported as skipped"
-printf '%s' "$out" | grep -q "alpha" || fail "fan-out should continue past a missing project (alpha)"
-printf '%s' "$out" | grep -q "1 skipped" || fail "summary should tally the skipped project"
+grep -Eq "ghost.*skipped" <<< "$out" || fail "missing project should be reported as skipped"
+grep -q "alpha" <<< "$out" || fail "fan-out should continue past a missing project (alpha)"
+grep -q "1 skipped" <<< "$out" || fail "summary should tally the skipped project"
 ok
 
 # ── 11. reload fan-out delegates to 'herd reload' too ────────────────────────
@@ -206,15 +206,15 @@ echo "reloaded ($1) in $PWD"; exit 0
 STUB
 chmod +x "$STUB"
 out="$(HERD_FLEET_HERD_BIN="$STUB" bash "$HERD" fleet reload)"
-printf '%s' "$out" | grep -q "reloaded (reload)" || fail "reload should delegate the 'reload' subcommand"
-printf '%s' "$out" | grep -q "2 ok" || fail "reload summary should tally 2 ok"
+grep -q "reloaded (reload)" <<< "$out" || fail "reload should delegate the 'reload' subcommand"
+grep -q "2 ok" <<< "$out" || fail "reload summary should tally 2 ok"
 ok
 
 # ── 12. empty registry is a friendly note, not a crash ───────────────────────
 out="$(HERD_FLEET_FILE="$T/none/fleet" bash "$HERD" fleet list)"
-printf '%s' "$out" | grep -qi "no fleet registry\|register" || fail "empty registry list should hint how to add a project"
+grep -qi "no fleet registry\|register" <<< "$out" || fail "empty registry list should hint how to add a project"
 out="$(HERD_FLEET_FILE="$T/none/fleet" bash "$HERD" fleet status)"
-printf '%s' "$out" | grep -qi "no fleet registry\|PROJECT" || fail "empty registry status should not crash"
+grep -qi "no fleet registry\|PROJECT" <<< "$out" || fail "empty registry status should not crash"
 ok
 
 # ── 13. unknown subcommand fails loudly ──────────────────────────────────────
@@ -260,7 +260,7 @@ REG14B="$T/registry14b/fleet"
 note14b="$(HERD_FLEET_FILE="$REG14B" bash "$HERD" fleet register "$same_real" 2>&1 >/dev/null)"
 grep -q "^samename|$same_real|eslint/eslint$" "$REG14B" \
   || fail "owner==repo slug must record eslint/eslint, got: $(grep '^samename|' "$REG14B" || true)"
-printf '%s' "$note14b" | grep -qi "no parseable origin remote" \
+grep -qi "no parseable origin remote" <<< "$note14b" \
   && fail "owner==repo slug must NOT emit the 'no parseable origin remote' note, got: $note14b"
 ok
 
@@ -308,7 +308,7 @@ REG15="$T/registry15/fleet"
 note="$(HERD_FLEET_FILE="$REG15" bash "$HERD" fleet register "$noremote_real" 2>&1 >/dev/null)"
 grep -q "^noremote|$noremote_real|$" "$REG15" \
   || fail "remote-less target should record an EMPTY repo field, got: $(grep '^noremote|' "$REG15" || true)"
-printf '%s' "$note" | grep -qi "empty repo\|origin remote" \
+grep -qi "empty repo\|origin remote" <<< "$note" \
   || fail "remote-less register should emit a note about the empty repo field, got: $note"
 ok
 

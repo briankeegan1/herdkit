@@ -73,9 +73,9 @@ printf '%s 601 pending-slug HERD-601\n' "$RECENT" > "$STATE"
 : > "$TRACKER_SWEEP_LEDGER"
 build_reconcile_pending
 [ -n "${RECONCILE_PENDING:-}" ] || fail "(1) an unconfirmed recent merge must render a pending row"
-printf '%s' "$RECONCILE_PENDING" | grep -q "HERD-601" || fail "(1) the row must name HERD-601"
-printf '%s' "$RECONCILE_PENDING" | grep -q "pending" || fail "(1) a recent row must say 'pending'"
-printf '%s' "$RECONCILE_PENDING" | grep -q "still pending" && fail "(1) a recent row must NOT say 'still pending' yet"
+grep -q "HERD-601" <<< "$RECONCILE_PENDING" || fail "(1) the row must name HERD-601"
+grep -q "pending" <<< "$RECONCILE_PENDING" || fail "(1) a recent row must say 'pending'"
+grep -q "still pending" <<< "$RECONCILE_PENDING" && fail "(1) a recent row must NOT say 'still pending' yet"
 ok
 
 # ── (2) confirmed via TRACKER_SWEEP_LEDGER → omitted ────────────────────────────────────────────────
@@ -109,8 +109,8 @@ printf '%s 604 overdue-slug HERD-604\n' "$OLD" > "$STATE"
 : > "$TRACKER_SWEEP_LEDGER"
 build_reconcile_pending
 [ -n "${RECONCILE_PENDING:-}" ] || fail "(5) an overdue unconfirmed row must still render"
-printf '%s' "$RECONCILE_PENDING" | grep -q "HERD-604" || fail "(5) the row must name HERD-604"
-printf '%s' "$RECONCILE_PENDING" | grep -q "still pending" || fail "(5) an overdue row must say 'still pending'"
+grep -q "HERD-604" <<< "$RECONCILE_PENDING" || fail "(5) the row must name HERD-604"
+grep -q "still pending" <<< "$RECONCILE_PENDING" || fail "(5) an overdue row must say 'still pending'"
 ok
 
 # ── (6) an unresolvable-marked ledger row does NOT count as confirmed ───────────────────────────────
@@ -118,7 +118,7 @@ printf '%s 605 unresolvable-slug HERD-605\n' "$RECENT" > "$STATE"
 printf '%s HERD-605 605 unresolvable\n' "$NOW" > "$TRACKER_SWEEP_LEDGER"
 build_reconcile_pending
 [ -n "${RECONCILE_PENDING:-}" ] || fail "(6) an unresolvable-marked ref must still render as pending"
-printf '%s' "$RECONCILE_PENDING" | grep -q "HERD-605" || fail "(6) the row must name HERD-605"
+grep -q "HERD-605" <<< "$RECONCILE_PENDING" || fail "(6) the row must name HERD-605"
 ok
 
 # ── (7) SCRIBE_BACKEND=file is byte-inert ────────────────────────────────────────────────────────

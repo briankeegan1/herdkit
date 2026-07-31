@@ -78,8 +78,8 @@ ok 1 alpha
 not ok 2 beta" 1)"
 run_gate "$PR_FAIL" "$BASE_GREEN"
 [ "$RC" -eq 1 ] || fail "(1) base-green + PR fail must BLOCK (exit 1), got $RC — $OUT"
-printf '%s\n' "$OUT" | grep -q "CODE ERROR" || fail "(1) must print the classic CODE ERROR — $OUT"
-printf '%s\n' "$OUT" | grep -qi "INHERITED" && fail "(1) must NOT surface INHERITED when base is green — $OUT"
+grep -q "CODE ERROR" <<< "$OUT" || fail "(1) must print the classic CODE ERROR — $OUT"
+grep -qi "INHERITED" <<< "$OUT" && fail "(1) must NOT surface INHERITED when base is green — $OUT"
 ok "(1) base green + PR failure → BLOCK, byte-identical classic code error"
 
 # ── (2) base fails {A,B}, PR fails ONLY {B} (inherited) → PASS (surfaced ⚠️ INHERITED) ───────────────
@@ -93,7 +93,7 @@ not ok 2 test beta
 ok 3 test gamma" 1)"
 run_gate "$PR_B_ONLY" "$BASE_AB"
 [ "$RC" -eq 0 ] || fail "(2) inherited-only failure must PASS (exit 0), got $RC — $OUT"
-printf '%s\n' "$OUT" | grep -q "INHERITED BASE FAILURE" || fail "(2) must surface INHERITED — $OUT"
+grep -q "INHERITED BASE FAILURE" <<< "$OUT" || fail "(2) must surface INHERITED — $OUT"
 ok "(2) PR failing only an inherited base failure → PASS the gate"
 
 # ── (3) base fails {A}, PR fails {A (inherited), C (introduced)} → BLOCK ─────────────────────────────
@@ -107,7 +107,7 @@ ok 2 test beta
 not ok 3 test gamma" 1)"
 run_gate "$PR_AC" "$BASE_A"
 [ "$RC" -eq 1 ] || fail "(3) an INTRODUCED failure must BLOCK (exit 1), got $RC — $OUT"
-printf '%s\n' "$OUT" | grep -q "CODE ERROR" || fail "(3) introduced failure must print CODE ERROR — $OUT"
+grep -q "CODE ERROR" <<< "$OUT" || fail "(3) introduced failure must print CODE ERROR — $OUT"
 ok "(3) PR introducing a NEW failure (alongside an inherited one) → BLOCK"
 
 # ── (4) renumber-robust: same failing test, different 'not ok N' number → still inherited ────────────
@@ -124,7 +124,7 @@ ok 5 test new-four
 not ok 6 test beta" 1)"
 run_gate "$PR_RENUM" "$BASE_RENUM"
 [ "$RC" -eq 0 ] || fail "(4) a renumbered-but-same inherited failure must PASS, got $RC — $OUT"
-printf '%s\n' "$OUT" | grep -q "INHERITED BASE FAILURE" || fail "(4) must surface INHERITED — $OUT"
+grep -q "INHERITED BASE FAILURE" <<< "$OUT" || fail "(4) must surface INHERITED — $OUT"
 ok "(4) inherited failure matched by description, not TAP number → PASS"
 
 # ── (5) fail-soft: no base resolvable (base ref bogus, no HERD_BASELINE_DIR) → BLOCK ─────────────────
@@ -132,13 +132,13 @@ PR_FAIL2="$(mk_fixture pr_fail2 "1..1
 not ok 1 test beta" 1)"
 run_gate "$PR_FAIL2" "-"
 [ "$RC" -eq 1 ] || fail "(5) unresolvable base must fail-soft to BLOCK (exit 1), got $RC — $OUT"
-printf '%s\n' "$OUT" | grep -qi "INHERITED" && fail "(5) must NOT surface INHERITED with no base — $OUT"
+grep -qi "INHERITED" <<< "$OUT" && fail "(5) must NOT surface INHERITED with no base — $OUT"
 ok "(5) unresolvable base → fail-soft BLOCK (no false green)"
 
 # ── (6) BASELINE_AWARE_GATE=off restores the classic absolute gate (inherited failure BLOCKS) ────────
 run_gate "$PR_B_ONLY" "$BASE_AB" off
 [ "$RC" -eq 1 ] || fail "(6) with the feature off an inherited failure must BLOCK (exit 1), got $RC — $OUT"
-printf '%s\n' "$OUT" | grep -qi "INHERITED" && fail "(6) feature off must NOT surface INHERITED — $OUT"
+grep -qi "INHERITED" <<< "$OUT" && fail "(6) feature off must NOT surface INHERITED — $OUT"
 ok "(6) BASELINE_AWARE_GATE=off → classic absolute gate (byte-identical)"
 
 # ── (7) both green → PASS (sanity: the common path is untouched) ─────────────────────────────────────
@@ -147,7 +147,7 @@ ok 1 alpha
 ok 2 beta" 0)"
 run_gate "$PR_GREEN" "$BASE_GREEN"
 [ "$RC" -eq 0 ] || fail "(7) green PR must PASS (exit 0), got $RC — $OUT"
-printf '%s\n' "$OUT" | grep -q "HEALTHCHECK CLEAN" || fail "(7) green PR must print HEALTHCHECK CLEAN — $OUT"
+grep -q "HEALTHCHECK CLEAN" <<< "$OUT" || fail "(7) green PR must print HEALTHCHECK CLEAN — $OUT"
 ok "(7) green PR on green base → PASS unchanged"
 
 # ── (8) sha-keyed cache: the base suite is run ONCE per base sha (the two-fix-PR deadlock reuse) ──────

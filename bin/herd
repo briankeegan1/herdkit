@@ -2340,6 +2340,55 @@ _config_validate_value() {
   esac
 }
 
+# _config_shape_wellformed <shape> — exit 0 when the shape cell is one this validator can enforce,
+# 1 when it is MALFORMED (HERD-456). `free`/empty/`numeric`/`glob` are the reserved tokens; anything
+# else is read as a closed pipe-separated enum, so every member must look like a LITERAL value a
+# shell config line can hold: word characters plus . _ - / (an empty member is legal — it admits the
+# empty string). A cell written as PROSE instead — WORK_UNIT_KIND shipped as
+# `git-pr, doc-apply (python only)` — parses as ONE giant member and would refuse every real value
+# the key accepts, turning a documentation slip into a key nobody can set. The caller treats a
+# malformed cell as fail-soft (warn + skip validation, today's free-form behavior) rather than
+# blocking the write; test-config-manifest.sh check (h) reds the shipped manifest so the cell gets
+# FIXED instead of silently skipped forever.
+_config_shape_wellformed() {
+  local shape="${1:-}"
+  case "$shape" in
+    ''|free|numeric|glob) return 0 ;;
+  esac
+  # Walk members with the SAME split idiom as _config_validate_value, so a trailing/leading/double
+  # pipe yields the same (empty) member set on both sides — a shape this says is well-formed is
+  # exactly the shape the validator enforces.
+  local _sw_rest="$shape" _sw_mem _sw_last=0
+  while :; do
+    case "$_sw_rest" in
+      *'|'*) _sw_mem="${_sw_rest%%|*}"; _sw_rest="${_sw_rest#*|}" ;;
+      *)     _sw_mem="$_sw_rest";       _sw_last=1 ;;
+    esac
+    case "$_sw_mem" in
+      *[!A-Za-z0-9._/-]*) return 1 ;;
+    esac
+    [ "$_sw_last" -eq 1 ] && break
+  done
+  return 0
+}
+
+# _config_shape_render <shape> → print an enum shape as an operator-readable VALID SET for a refusal
+# message (HERD-456): members separated by " | " with an empty member rendered as `""` so
+# `|github-issues` reads as `"" | github-issues` instead of a leading pipe the operator has to decode.
+_config_shape_render() {
+  local _sr_rest="${1:-}" _sr_mem _sr_last=0 out=""
+  while :; do
+    case "$_sr_rest" in
+      *'|'*) _sr_mem="${_sr_rest%%|*}"; _sr_rest="${_sr_rest#*|}" ;;
+      *)     _sr_mem="$_sr_rest";       _sr_last=1 ;;
+    esac
+    [ -n "$_sr_mem" ] || _sr_mem='""'
+    out="${out:+$out | }$_sr_mem"
+    [ "$_sr_last" -eq 1 ] && break
+  done
+  printf '%s' "$out"
+}
+
 # _config_key_scope <caps> <KEY> → print the key's WRITE SCOPE (HERD-47): "machine" for keys that
 # hold per-user/per-machine state and therefore DEFAULT to the gitignored .herd/config.local overlay
 # (driver binding, model tiers / token budget, operator-posture opt-ins), or "project" for keys that
@@ -2812,9 +2861,17 @@ cmd_config_set() {
   fi
 
   # 2b. VALUE-SHAPE validation (HERD-159): refuse an out-of-shape value at write time so a typo
-  #     (MERGE_POLICY=aprove, HEALTH_CONCURRENCY=two) never lands in .herd/config. Shape comes from
-  #     the capabilities.tsv value_shape column (enum list | numeric | glob | free). free/empty → no
-  #     check; glob is enforced by its whitelist charset (HERD-413).
+  #     (MERGE_POLICY=aprove, HEALTH_CONCURRENCY=two, SCRIBE_BACKEND=linaer) never lands in
+  #     .herd/config. Shape comes from the capabilities.tsv value_shape column (enum list | numeric |
+  #     glob | free). free/empty → no check; glob is enforced by its whitelist charset (HERD-413).
+  #     FAIL-SOFT (HERD-456): a MALFORMED shape cell — prose where a pipe-separated enum belongs —
+  #     parses as one unmatchable member and would refuse every real value the key accepts. A
+  #     manifest slip must never wedge a key, so warn and skip the check (free-form, today's
+  #     behavior) instead of blocking the write; the manifest lint reds the cell so it gets fixed.
+  if ! _config_shape_wellformed "$shape"; then
+    warn "capabilities.tsv value_shape for $key is malformed (\"$shape\") — skipping value validation for this set; fix the manifest cell (enum members are pipe-separated literals, or use numeric/glob/free)"
+    shape=free
+  fi
   if ! _config_validate_value "$shape" "$val"; then
     case "$shape" in
       numeric)
@@ -2824,7 +2881,9 @@ cmd_config_set() {
         die "invalid value for $key: \"$val\" — glob keys accept only word characters and . * + ? [ ] ( ) { } | ^ \$ \\ / , - (see capabilities.tsv value_shape)"
         ;;
       *)
-        die "invalid value for $key: \"$val\" — allowed: ${shape} (see capabilities.tsv value_shape)"
+        # PRINT THE VALID SET (HERD-456 / GH #570): the refusal is only useful if it tells the
+        # operator what to type instead — an empty member renders as "" rather than a bare pipe.
+        die "invalid value for $key: \"$val\" — allowed: $(_config_shape_render "$shape") (see capabilities.tsv value_shape)"
         ;;
     esac
   fi

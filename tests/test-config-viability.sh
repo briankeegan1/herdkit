@@ -180,8 +180,8 @@ OUT="$(cd "$P" && PATH="$BIN:$PATH" HERD_CAPABILITIES_FILE= HERD_DRIVERS_DIR= \
 RC=$?
 set -e
 [ "$RC" -ne 0 ] || fail "(6a) setting a repo-disallowed MERGE_METHOD must be REFUSED (rc=0, out=$OUT)"
-printf '%s\n' "$OUT" | grep -qi 'refusing to set MERGE_METHOD' || fail "(6b) refusal must mention 'refusing to set MERGE_METHOD' (out=$OUT)"
-printf '%s\n' "$OUT" | grep -q 'allow_merge_commit=false' || fail "(6c) refusal must name the repo side (allow_merge_commit=false) (out=$OUT)"
+grep -qi 'refusing to set MERGE_METHOD' <<< "$OUT" || fail "(6b) refusal must mention 'refusing to set MERGE_METHOD' (out=$OUT)"
+grep -q 'allow_merge_commit=false' <<< "$OUT" || fail "(6c) refusal must name the repo side (allow_merge_commit=false) (out=$OUT)"
 grep -qE '^MERGE_METHOD="merge"' "$P/.herd/config" && fail "(6d) the refused value must NOT be written to config"
 grep -qE '^MERGE_METHOD="squash"' "$P/.herd/config" || fail "(6e) the prior value must remain (out: $(cat "$P/.herd/config"))"
 ok; echo "PASS (6) config set refuses a proven merge-method mismatch, naming both sides, no write"
@@ -213,9 +213,9 @@ CFG
 DOCOUT="$(HERD_CAPABILITIES_FILE="$STUBCAPS" HERD_CONFIG_FILE="$P/.herd/config" \
   HERD_CV_GH="$GH" HERD_CV_REPO="acme/widgets" GH_ALLOW_MERGE=false HERD_HERDR_ATTACH_CLI=yes \
   bash -c '. "'"$PREFLIGHT"'"; . "'"$DRIVER"'"; . "'"$JOURNAL"'"; . "'"$CV"'"; herd_config_viability_doctor_section' 2>&1 || true)"
-printf '%s\n' "$DOCOUT" | grep -qi 'Config viability' || fail "(8a) doctor section header missing (out=$DOCOUT)"
-printf '%s\n' "$DOCOUT" | grep -q 'MERGE_METHOD=merge' || fail "(8b) doctor section did not render the MERGE_METHOD row (out=$DOCOUT)"
-printf '%s\n' "$DOCOUT" | grep -qi 'attach spawn CLI' || fail "(8c) doctor section did not render the HERD-407 driver-CLI row (out=$DOCOUT)"
+grep -qi 'Config viability' <<< "$DOCOUT" || fail "(8a) doctor section header missing (out=$DOCOUT)"
+grep -q 'MERGE_METHOD=merge' <<< "$DOCOUT" || fail "(8b) doctor section did not render the MERGE_METHOD row (out=$DOCOUT)"
+grep -qi 'attach spawn CLI' <<< "$DOCOUT" || fail "(8c) doctor section did not render the HERD-407 driver-CLI row (out=$DOCOUT)"
 ok; echo "PASS (8) doctor Config-viability section renders per-key verdicts, including the driver-CLI row"
 
 # ══ (9) journal event + machine-readable report ═══════════════════════════════════════════════════

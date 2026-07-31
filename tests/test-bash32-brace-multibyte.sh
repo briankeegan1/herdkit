@@ -22,7 +22,7 @@ pass() { PASS=$((PASS + 1)); echo "PASS ($PASS) $1"; }
 # Prefer a UTF-8 locale so the multibyte path is real. Fall back to C.UTF-8 / en_US.UTF-8.
 _utf8_locale=""
 for _cand in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
-  if LC_ALL="$_cand" locale charmap 2>/dev/null | grep -qi 'utf-8'; then
+  if grep -qi 'utf-8' <<< "$(LC_ALL="$_cand" locale charmap 2>/dev/null)"; then
     _utf8_locale="$_cand"
     break
   fi
@@ -42,7 +42,7 @@ out="$(
   ' 2>&1
 )" || fail "(1) braced multibyte interpolation exited non-zero under set -u: $out"
 # Expected: literal open-paren, 1, U+2192 RIGHTWARDS ARROW, 2, close-paren.
-printf '%s' "$out" | grep -qF '(1→2)' \
+grep -qF '(1→2)' <<< "$out" \
   || fail "(1) expected '(1→2)' from braced interpolation under set -u (got: $out)"
 pass "braced \${before}→\${after} prints under set -u + UTF-8 locale ($_utf8_locale)"
 

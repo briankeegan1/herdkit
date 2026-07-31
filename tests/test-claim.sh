@@ -58,7 +58,7 @@ run_file_claim() {
 # ── 1. claim-wins: a fresh clone claims the open item ───────────────────────────────────────────────
 seed_origin win; clone_from win "$T/alice"
 out="$(run_file_claim "$T/alice" "repo#item-a" alice)"
-echo "$out" | grep -q "^CLAIMED	alice$" || fail "claim-wins: expected 'CLAIMED alice', got '$out'"
+grep -q "^CLAIMED	alice$" <<< "$out" || fail "claim-wins: expected 'CLAIMED alice', got '$out'"
 grep -q "🚧 item-a.*(claimed by alice)" "$T/alice/BACKLOG.md" || fail "claim-wins: line not flipped to 🚧 + stamped ($(grep item-a "$T/alice/BACKLOG.md"))"
 grep -q "🔜 item-a" "$T/alice/BACKLOG.md" && fail "claim-wins: item still shows 🔜 (not flipped)"
 [ "$(cd "$T/alice" && git rev-parse main)" = "$(cd "$T/alice" && git rev-parse origin/main)" ] \
@@ -71,12 +71,12 @@ pass
 
 # ── 2. self-claim: re-claiming our OWN in-progress item is a no-op proceed (SELF) ────────────────────
 out="$(run_file_claim "$T/alice" "repo#item-a" alice)"
-echo "$out" | grep -q "^SELF	alice$" || fail "self-claim: alice re-claiming her own item should be SELF, got '$out'"
+grep -q "^SELF	alice$" <<< "$out" || fail "self-claim: alice re-claiming her own item should be SELF, got '$out'"
 pass
 
 # ── 3. missing item → UNREACHABLE (fail soft; nothing to claim) ──────────────────────────────────────
 out="$(run_file_claim "$T/alice" "repo#no-such-slug" alice)"
-echo "$out" | grep -q "^UNREACHABLE" || fail "missing item should be UNREACHABLE, got '$out'"
+grep -q "^UNREACHABLE" <<< "$out" || fail "missing item should be UNREACHABLE, got '$out'"
 pass
 
 # ── 4. claim-loses-abort (real remote race): bob's claim landed first; alice must back off ──────────
@@ -85,7 +85,7 @@ pass
 seed_origin race; clone_from race "$T/race_alice"; clone_from race "$T/race_bob"
 run_file_claim "$T/race_bob" "repo#item-a" bob >/dev/null
 out="$(run_file_claim "$T/race_alice" "repo#item-a" alice)"
-echo "$out" | grep -q "^ALREADY	bob$" || fail "claim-loses (race): alice should see ALREADY owned by bob, got '$out'"
+grep -q "^ALREADY	bob$" <<< "$out" || fail "claim-loses (race): alice should see ALREADY owned by bob, got '$out'"
 grep -q "(claimed by alice)" "$T/race_alice/BACKLOG.md" && fail "claim-loses (race): alice must NOT stamp her own claim over bob's"
 pass
 
@@ -102,7 +102,7 @@ PY
   git commit -qam "carol claims"
   git push -q origin main )
 out="$(run_file_claim "$T/prestamped" "repo#item-a" dave)"
-echo "$out" | grep -q "^ALREADY	carol$" || fail "pre-claimed: dave should see ALREADY owned by carol, got '$out'"
+grep -q "^ALREADY	carol$" <<< "$out" || fail "pre-claimed: dave should see ALREADY owned by carol, got '$out'"
 grep -q "(claimed by dave)" "$T/prestamped/BACKLOG.md" && fail "pre-claimed: dave must NOT overwrite carol's claim"
 pass
 
@@ -123,29 +123,29 @@ lane_claim() {
 # ── 6. CLAIM_REQUIRED on + open item + WATCHER_OWNER identity → CLAIMED, proceed (rc 0) ──────────────
 seed_origin lane; clone_from lane "$T/lane_win"
 out="$(CLAIM_REQUIRED=on HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=erin lane_claim "$T/lane_win")"
-echo "$out" | grep -q "RC=0" || fail "lane claim-wins: expected rc 0, got '$out'"
-echo "$out" | grep -q "🔒 claimed repo#item-a as 'erin'" || fail "lane claim-wins: missing claim announcement ($out)"
+grep -q "RC=0" <<< "$out" || fail "lane claim-wins: expected rc 0, got '$out'"
+grep -q "🔒 claimed repo#item-a as 'erin'" <<< "$out" || fail "lane claim-wins: missing claim announcement ($out)"
 grep -q "🚧 item-a.*(claimed by erin)" "$T/lane_win/BACKLOG.md" || fail "lane claim-wins: item not flipped/stamped"
 pass
 
 # ── 7. ALREADY → lane ABORTS (rc non-zero), creating nothing ─────────────────────────────────────────
 out="$(CLAIM_REQUIRED=on HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=frank lane_claim "$T/lane_win")"
-echo "$out" | grep -q "RC=1" || fail "lane already-claimed: expected rc 1 (abort), got '$out'"
-echo "$out" | grep -q "already claimed by 'erin' — backing off" || fail "lane already-claimed: missing loud abort ($out)"
+grep -q "RC=1" <<< "$out" || fail "lane already-claimed: expected rc 1 (abort), got '$out'"
+grep -q "already claimed by 'erin' — backing off" <<< "$out" || fail "lane already-claimed: missing loud abort ($out)"
 pass
 
 # ── 8. no-id passthrough: CLAIM_REQUIRED on but NO id → skip claim, proceed (rc 0), backend untouched ─
 seed_origin noid; clone_from noid "$T/lane_noid"
 out="$(CLAIM_REQUIRED=on WATCHER_OWNER=gail lane_claim "$T/lane_noid")"   # no HERD_CLAIM_ID / HERD_ITEM_REF
-echo "$out" | grep -q "RC=0" || fail "no-id passthrough: expected rc 0, got '$out'"
-echo "$out" | grep -q "claimed" && fail "no-id passthrough: should NOT attempt a claim ($out)"
+grep -q "RC=0" <<< "$out" || fail "no-id passthrough: expected rc 0, got '$out'"
+grep -q "claimed" <<< "$out" && fail "no-id passthrough: should NOT attempt a claim ($out)"
 grep -q "🔜 item-a" "$T/lane_noid/BACKLOG.md" || fail "no-id passthrough: backend must be untouched (still 🔜)"
 pass
 
 # ── 9. CLAIM_REQUIRED off passthrough: even WITH an id, off → today's behavior (rc 0, no claim) ───────
 seed_origin off; clone_from off "$T/lane_off"
 out="$(CLAIM_REQUIRED=off HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=hank lane_claim "$T/lane_off")"
-echo "$out" | grep -q "RC=0" || fail "off passthrough: expected rc 0, got '$out'"
+grep -q "RC=0" <<< "$out" || fail "off passthrough: expected rc 0, got '$out'"
 grep -q "🔜 item-a" "$T/lane_off/BACKLOG.md" || fail "off passthrough: backend must be untouched (still 🔜)"
 pass
 
@@ -157,14 +157,14 @@ out="$( exec 2>&1; cd "$T/lane_off"
   export DEFAULT_BRANCH="origin/main" HERD_REMOTE="origin" HERD_BRANCH_NAME="main"
   . "$CLAIM_SH"
   if CLAIM_REQUIRED=on HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=iris herd_claim_or_abort s; then echo "RC=0"; else echo "RC=$?"; fi )"
-echo "$out" | grep -q "RC=0" || fail "backend-down passthrough: expected rc 0 (fail soft), got '$out'"
-echo "$out" | grep -q "could not verify a claim" || fail "backend-down passthrough: missing fail-soft warning ($out)"
+grep -q "RC=0" <<< "$out" || fail "backend-down passthrough: expected rc 0 (fail soft), got '$out'"
+grep -q "could not verify a claim" <<< "$out" || fail "backend-down passthrough: missing fail-soft warning ($out)"
 pass
 
 # ── 11. HERD_ITEM_REF is honored when HERD_CLAIM_ID is unset (reuse of the threaded tracker id) ──────
 seed_origin ref; clone_from ref "$T/lane_ref"
 out="$(CLAIM_REQUIRED=on HERD_ITEM_REF="repo#item-a" WATCHER_OWNER=jill lane_claim "$T/lane_ref")"
-echo "$out" | grep -q "RC=0" || fail "HERD_ITEM_REF path: expected rc 0, got '$out'"
+grep -q "RC=0" <<< "$out" || fail "HERD_ITEM_REF path: expected rc 0, got '$out'"
 grep -q "🚧 item-a.*(claimed by jill)" "$T/lane_ref/BACKLOG.md" || fail "HERD_ITEM_REF path: item not claimed via threaded ref"
 pass
 
@@ -192,11 +192,11 @@ seed_done_origin() {
 # ── 12. claiming a ✅ (Done) item → REFUSE loudly + journal claim_refused, abort (rc 1), never reopen ──
 seed_done_origin done1; clone_from done1 "$T/lane_done"
 out="$(JOURNAL_FILE="$T/j-done.jsonl" CLAIM_REQUIRED=on HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=kai lane_claim "$T/lane_done")"
-echo "$out" | grep -q "RC=1" || fail "done-refuse: expected rc 1 (abort), got '$out'"
-echo "$out" | grep -q "refusing to claim repo#item-a" || fail "done-refuse: missing loud refusal ($out)"
-echo "$out" | grep -qi "Done/Canceled" || fail "done-refuse: refusal must name the Done/Canceled state ($out)"
-echo "$out" | grep -q "HERD_FORCE_SPAWN=1" || fail "done-refuse: refusal must name the override escape hatch ($out)"
-echo "$out" | grep -qi "herd backlog" || fail "done-refuse: refusal must point at re-grounding the pick ($out)"
+grep -q "RC=1" <<< "$out" || fail "done-refuse: expected rc 1 (abort), got '$out'"
+grep -q "refusing to claim repo#item-a" <<< "$out" || fail "done-refuse: missing loud refusal ($out)"
+grep -qi "Done/Canceled" <<< "$out" || fail "done-refuse: refusal must name the Done/Canceled state ($out)"
+grep -q "HERD_FORCE_SPAWN=1" <<< "$out" || fail "done-refuse: refusal must name the override escape hatch ($out)"
+grep -qi "herd backlog" <<< "$out" || fail "done-refuse: refusal must point at re-grounding the pick ($out)"
 grep -q "^✅ item-a" "$T/lane_done/BACKLOG.md" || fail "done-refuse: item must stay ✅ (never reopened)"
 grep -q "🚧 item-a" "$T/lane_done/BACKLOG.md" && fail "done-refuse: item must NOT flip 🚧 (Done→In Progress is forbidden)"
 grep -q "(claimed by" "$T/lane_done/BACKLOG.md" && fail "done-refuse: item must NOT be stamped with a claim"
@@ -207,8 +207,8 @@ pass
 # ── 13. claiming a 🔜 (open) item is BYTE-IDENTICAL with the guard present: flip+stamp, no refusal ────
 seed_origin guard_open; clone_from guard_open "$T/lane_gopen"
 out="$(JOURNAL_FILE="$T/j-open.jsonl" CLAIM_REQUIRED=on HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=lena lane_claim "$T/lane_gopen")"
-echo "$out" | grep -q "RC=0" || fail "guard open: expected rc 0, got '$out'"
-echo "$out" | grep -q "🔒 claimed repo#item-a as 'lena'" || fail "guard open: open item not claimed identically ($out)"
+grep -q "RC=0" <<< "$out" || fail "guard open: expected rc 0, got '$out'"
+grep -q "🔒 claimed repo#item-a as 'lena'" <<< "$out" || fail "guard open: open item not claimed identically ($out)"
 grep -q "🚧 item-a.*(claimed by lena)" "$T/lane_gopen/BACKLOG.md" || fail "guard open: open item not flipped/stamped identically"
 [ -f "$T/j-open.jsonl" ] && grep -q "claim_refused" "$T/j-open.jsonl" && fail "guard open: an OPEN claim must NOT journal claim_refused"
 pass
@@ -216,8 +216,8 @@ pass
 # ── 14. HERD_FORCE_SPAWN=1 on a ✅ item → proceed (rc 0) WITHOUT reopening, journal claim_forced ──────
 seed_done_origin done2; clone_from done2 "$T/lane_force"
 out="$(JOURNAL_FILE="$T/j-force.jsonl" CLAIM_REQUIRED=on HERD_FORCE_SPAWN=1 HERD_CLAIM_ID="repo#item-a" WATCHER_OWNER=mo lane_claim "$T/lane_force")"
-echo "$out" | grep -q "RC=0" || fail "force-spawn: expected rc 0 (build anyway), got '$out'"
-echo "$out" | grep -q "HERD_FORCE_SPAWN=1" || fail "force-spawn: missing override note ($out)"
+grep -q "RC=0" <<< "$out" || fail "force-spawn: expected rc 0 (build anyway), got '$out'"
+grep -q "HERD_FORCE_SPAWN=1" <<< "$out" || fail "force-spawn: missing override note ($out)"
 grep -q "^✅ item-a" "$T/lane_force/BACKLOG.md" || fail "force-spawn: item must stay ✅ (force must NOT reopen it)"
 grep -q "🚧 item-a" "$T/lane_force/BACKLOG.md" && fail "force-spawn: force must NOT flip Done→In Progress"
 grep -q '"event":"claim_forced"' "$T/j-force.jsonl" || fail "force-spawn: claim_forced not journaled ($(cat "$T/j-force.jsonl" 2>/dev/null))"

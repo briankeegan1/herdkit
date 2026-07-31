@@ -60,7 +60,7 @@ run_proj() {
 run_proj "1|EMPTY
 0|"
 [ "$RC" -eq 0 ] || fail "(1) empty-then-clean should exit 0, got $RC — out: $OUT"
-printf '%s\n' "$OUT" | grep -qF "shellcheck: clean (retried=yes)" \
+grep -qF "shellcheck: clean (retried=yes)" <<< "$OUT" \
   || fail "(1) expected a 'shellcheck: clean (retried=yes)' note — got: $OUT"
 [ "$CALLS" -eq 2 ] || fail "(1) expected exactly 2 shellcheck invocations (run + one retry), got $CALLS"
 ok
@@ -69,11 +69,11 @@ ok
 run_proj "1|EMPTY
 1|EMPTY"
 [ "$RC" -eq 1 ] || fail "(2) empty-twice should exit 1, got $RC — out: $OUT"
-printf '%s\n' "$OUT" | grep -qF "SHELLCHECK ERRORS" \
+grep -qF "SHELLCHECK ERRORS" <<< "$OUT" \
   || fail "(2) expected a SHELLCHECK ERRORS header — got: $OUT"
-printf '%s\n' "$OUT" | grep -qF "EMPTY output" \
+grep -qF "EMPTY output" <<< "$OUT" \
   || fail "(2) expected the empty-output evidence line — got: $OUT"
-printf '%s\n' "$OUT" | grep -qF "retried=yes" \
+grep -qF "retried=yes" <<< "$OUT" \
   || fail "(2) expected a retried=yes marker even on a still-empty red — got: $OUT"
 [ "$CALLS" -eq 2 ] || fail "(2) expected exactly 2 shellcheck invocations (run + one retry), got $CALLS"
 ok
@@ -81,9 +81,9 @@ ok
 # ── (3) real findings on the FIRST run → immediate red, findings printed, NO retry ──────────────────
 run_proj "1|scripts/herd/example.sh:12:3: error: foo is unused [SC2034]"
 [ "$RC" -eq 1 ] || fail "(3) real findings should exit 1, got $RC — out: $OUT"
-printf '%s\n' "$OUT" | grep -qF "SC2034" \
+grep -qF "SC2034" <<< "$OUT" \
   || fail "(3) expected the finding text in the log — got: $OUT"
-printf '%s\n' "$OUT" | grep -qF "retried=yes" \
+grep -qF "retried=yes" <<< "$OUT" \
   && fail "(3) a first-run finding must NOT retry — got: $OUT"
 [ "$CALLS" -eq 1 ] || fail "(3) real findings must red on a SINGLE run, got $CALLS calls"
 ok

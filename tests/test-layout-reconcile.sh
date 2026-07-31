@@ -75,7 +75,7 @@ _pane(){ local S="$1" p="$2" tab="$3" cmd="${4:-}"; mkdir -p "$S/panes/$p"; prin
 # snapshot assertion helper: does the snapshot contain a "<role>\t<pane>" line?
 _snap_has(){ printf '%s\n' "$1" | awk -F'\t' -v r="$2" -v p="$3" '$1==r&&$2==p{f=1} END{exit !f}'; }
 # reconcile assertion helper: does the reconcile output contain "<key>=<val>" exactly?
-_rec_is(){ printf '%s\n' "$1" | grep -qx "$2=$3"; }
+_rec_is(){ grep -qx "$2=$3" <<< "$(printf '%s\n' "$1")"; }
 
 # ── 1. layout_snapshot classifies every pane by its live foreground process ──
 S="$T/s1"; mkdir -p "$S"; export HERDR_STATE="$S"
