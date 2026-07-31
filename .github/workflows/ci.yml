@@ -17,6 +17,14 @@ name: CI
 # headless leg when a hermetic test leaks a background process holding bats's FD 3 (see the runner's
 # header). Known env-sensitive tests are marked XFAIL via tests/known-env-sensitive.tsv (never hacked
 # green); any other failure — including a per-test timeout — is a real red.
+#
+# SHARDING (HERD-463): ~350 curated tests ran serially per platform (macos 24m, ubuntu 13m on PR
+# #579) — the #1 operator pain after HERD-437/440/441 re-armed 168 previously-exempt tests.
+# `shard` fans each platform out across 4 machines via a stable filename hash
+# (scripts/herd/suite-shard.sh: HERD_CI_SHARD_INDEX of HERD_CI_SHARD_COUNT); the two literal `4`s
+# below (the `shard:` array length and HERD_CI_SHARD_COUNT) MUST stay in sync — mutation-proven
+# membership (every test lands in exactly one shard, the union == the full curated set) lives in
+# tests/test-suite-shard.sh, not in this workflow. DOES NOT REDUCE what runs — only wall-clock.
 
 on:
   push:
@@ -41,20 +49,24 @@ env:
 
 jobs:
   suite:
-    name: suite (${{ matrix.platform }})
+    name: suite (${{ matrix.platform }}, shard ${{ matrix.shard }}/4)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        platform: [ubuntu, macos]
+        shard: [1, 2, 3, 4]   # keep this length in sync with HERD_CI_SHARD_COUNT below
         include:
-          - os: ubuntu-latest   # doubles as the WSL2 coverage (WSL2 == Linux semantics)
-            platform: ubuntu
+          - platform: ubuntu   # doubles as the WSL2 coverage (WSL2 == Linux semantics)
+            os: ubuntu-latest
             locale: C.UTF-8         # glibc ships C.UTF-8
-          - os: macos-latest
-            platform: macos
+          - platform: macos
+            os: macos-latest
             locale: en_US.UTF-8     # BSD libc has no C.UTF-8 — use a real UTF-8 locale
     env:
       HERD_CI_PLATFORM: ${{ matrix.platform }}
+      HERD_CI_SHARD_INDEX: ${{ matrix.shard }}
+      HERD_CI_SHARD_COUNT: 4
       LANG: ${{ matrix.locale }}
       LC_ALL: ${{ matrix.locale }}
     steps:
@@ -104,7 +116,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: suite-failure-${{ matrix.platform }}
+          name: suite-failure-${{ matrix.platform }}-shard${{ matrix.shard }}
           path: |
             ${{ env.HERD_CI_LOGDIR }}
             ${{ env.HERD_CI_ARTIFACTS_DIR }}

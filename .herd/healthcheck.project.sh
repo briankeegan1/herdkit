@@ -423,6 +423,38 @@ _hk_dh_verdict() {
   [ -n "$_hk_jh_dir" ] && rm -rf "$_hk_jh_dir"
 }
 
+# ── HERD-463 SUITE PARALLELISM ────────────────────────────────────────────────────────────────────
+# Local heavy-gate wall-clock (~20m) was the #1 operator pain after HERD-437/440/441 re-armed 168
+# previously-exempt tests: ~350 hermetic tests ran fully SERIALLY. Hermeticity is now established
+# (per-test isolation, no shared $WORKTREES_DIR pool writes — HERD-437/440/441 + the env-seal), so
+# intra-suite parallelism is legitimate. This is ORTHOGONAL to HEALTH_CONCURRENCY, which serializes
+# CONCURRENT SUITES sharing one git object store — a different layer this change does not touch;
+# every worker below runs INSIDE one suite invocation, already holding its one HEALTH_CONCURRENCY slot.
+#
+# HEALTHCHECK_SUITE_WORKERS bounds the fan-out (default 4, never above the box's own core count so a
+# small/shared runner is never oversubscribed). This is a dogfood-only env knob (like
+# HEALTHCHECK_SUITE_TIMEOUT / HERD_SHELLCHECK_RETRY_SECS above) — not a herd-config.sh capability, since
+# this file is herdkit's OWN health command, not the generic engine surface.
+_hk_suite_cores() {
+  local n=""
+  n="$(nproc 2>/dev/null)" || n=""
+  [ -n "$n" ] || n="$(sysctl -n hw.ncpu 2>/dev/null)" || n=""
+  [ -n "$n" ] || n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" || n=""
+  case "$n" in ''|*[!0-9]*) n=1 ;; esac
+  [ "$n" -ge 1 ] 2>/dev/null || n=1
+  printf '%s' "$n"
+}
+_hk_suite_workers() {
+  local cores req w
+  cores="$(_hk_suite_cores)"
+  req="${HEALTHCHECK_SUITE_WORKERS:-4}"
+  case "$req" in ''|*[!0-9]*) req=4 ;; esac
+  [ "$req" -ge 1 ] 2>/dev/null || req=1
+  w="$req"; [ "$w" -le "$cores" ] || w="$cores"
+  printf '%s' "$w"
+}
+_HK_SUITE_WORKERS="$(_hk_suite_workers)"
+
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   # HANG-PROOF SUITE (HERD-185) + DAEMON-HERMETICITY SANDBOX (HERD-189) + JOURNAL HERMETICITY (HERD-223):
@@ -438,16 +470,34 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   # on even after bats is killed) is the guaranteed backstop. All env-overridable.
   _hk_bats_out="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/hk-bats.$$")"
   BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
+  # HERD-463: bats-core's `--jobs N` parallelizes WITHIN tests/herd.bats's ~350 dynamically-registered
+  # tests via its own flock/shlock semaphore (bats-exec-file), but the top-level `--jobs` dispatch it
+  # sits under still shells out to the GNU `parallel` binary (confirmed live: `bats --jobs 4` on a
+  # single .bats file errors "parallel: command not found" without it) — an OPTIONAL dep, same class as
+  # shellcheck/bats itself (herd doctor's soft-deps list), so this degrades to today's exact serial
+  # invocation when absent. TAP output shape is unchanged under --jobs (spot-checked: "not ok N <desc>"
+  # lines are identical, order aside), so _hk_bats_notok / _hk_bats_first_notok / _hk_bats_env_only
+  # below need no changes. A wedged worker (the HERD-462 bats-FD3 class) blocks only ITS OWN semaphore
+  # slot — bats keeps draining the remaining queued tests through the other slots — so one leaked
+  # process no longer serializes the whole suite behind it; the outer `timeout` below is still the
+  # backstop either way, unchanged from before this change.
+  _hk_bats_jobs=()
+  _hk_jobs_note=" (serial — install GNU 'parallel' for a bats --jobs speedup)"
+  if [ "$_HK_SUITE_WORKERS" -gt 1 ] && command -v parallel >/dev/null 2>&1; then
+    _hk_bats_jobs=(--jobs "$_HK_SUITE_WORKERS")
+    _hk_jobs_note=" (jobs=$_HK_SUITE_WORKERS)"
+  fi
   if command -v timeout >/dev/null 2>&1; then
     PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
       JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
       BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
-      timeout -k 15 "${HEALTHCHECK_SUITE_TIMEOUT:-1800}" bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
+      timeout -k 15 "${HEALTHCHECK_SUITE_TIMEOUT:-1800}" \
+        bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
   else
     PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
       JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
       BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
-      bats tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
+      bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" tests/*.bats </dev/null >"$_hk_bats_out" 2>&1
   fi
   _hk_bats_rc=$?
   to="$(cat "$_hk_bats_out" 2>/dev/null)"; rm -f "$_hk_bats_out" 2>/dev/null || true
@@ -460,7 +510,7 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
     exit 2
   fi
   if [ "$_hk_bats_rc" -eq 0 ]; then
-    t_note="tests: bats pass"
+    t_note="tests: bats pass$_hk_jobs_note"
   elif _hk_bats_env_only "$to"; then
     # KNOWN data/env condition (HERD-187): tolerated → exit 2, quoting the REAL failing 'not ok' line.
     _hk_notok="$(_hk_bats_notok_line "$to" "$_HK_ENV_TEST")"
@@ -480,14 +530,31 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
     exit 1
   fi
 elif ls tests/test-*.sh >/dev/null 2>&1; then
-  fails=0
-  for t in tests/test-*.sh; do
-    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$(basename "$t")" \
+  # HERD-463: no bats on this box — the pre-existing bats-absent fallback ran every test-*.sh fully
+  # serially. Fan it out with the SAME bounded-concurrency primitive the review/research lanes already
+  # use (scripts/herd/burst.sh's herd_burst: bash-3.2-safe, batch-fill-then-drain, never exceeds its
+  # bound) rather than inventing a second one. A worker can't mutate this shell's `fails` counter (it
+  # runs in a background subshell), so each failing test drops a marker FILE instead — burst.sh's own
+  # documented contract for how a worker communicates back. Selection is UNCHANGED (every tests/test-*.sh,
+  # no exemption filtering) — only the fan-out is new.
+  _hk_par_dir="$(mktemp -d 2>/dev/null || echo "${TMPDIR:-/tmp}/hk-par-$$")"; mkdir -p "$_hk_par_dir"
+  [ -f scripts/herd/burst.sh ] && . scripts/herd/burst.sh
+  _hk_run_one_direct_test() {
+    local t="$1" base
+    base="$(basename "$t")"
+    PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" HERMETIC_TEST="$base" \
       JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
-      bash "$t" >/dev/null 2>&1 || fails=$((fails+1))
-  done
+      bash "$t" >/dev/null 2>&1 || : > "$_hk_par_dir/$base.fail"
+  }
+  if [ "$_HK_SUITE_WORKERS" -gt 1 ] && command -v herd_burst >/dev/null 2>&1; then
+    herd_burst "$_HK_SUITE_WORKERS" _hk_run_one_direct_test tests/test-*.sh
+  else
+    for t in tests/test-*.sh; do _hk_run_one_direct_test "$t"; done
+  fi
+  fails="$(find "$_hk_par_dir" -name '*.fail' 2>/dev/null | wc -l | tr -d ' ')"
+  rm -rf "$_hk_par_dir"
   _hk_dh_verdict
-  if [ "$fails" -eq 0 ]; then t_note="tests: hermetic suite pass"; else
+  if [ "$fails" -eq 0 ]; then t_note="tests: hermetic suite pass (workers=$_HK_SUITE_WORKERS)"; else
     [ -n "$ONELINE" ] && echo "tests: $fails failed" || echo "TESTS FAILED: $fails"
     exit 1
   fi
