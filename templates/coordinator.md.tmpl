@@ -670,16 +670,41 @@ for the full operational playbook.
 
 ### Diagnostic-first — before any gate intervention
 
-Always read the record BEFORE acting. In order:
+Always read the record BEFORE acting, and never propose an intervention without naming the
+**exact blocker it resolves** — "re-task: review BLOCKed on `<rule>`, no autofix round in
+flight" or "approve: gates green, sha-keyed approval matches head" — never a bare "re-task" or
+"needs a nudge". A proposal that cannot name its blocker is a guess, not a diagnosis.
+
+Run the full **blocker triage**, in order:
 
 1. `herd notes` (or `herd log | grep builder_note`) — drain and route builder notes.
    A note often names the reason a row is red; route before you act.
-2. `herd why <pr#>` — read the full chronological gate history for the PR you are
-   about to act on. It surfaces infra transients, autofix rounds already in progress,
-   and self-healing holds — all of which resolve without coordinator intervention.
-3. Only THEN: re-task, override a gate, or escalate.
+2. `herd why <pr#>` — the full chronological gate history for the PR you are about to
+   act on, oldest-first. Read the **tail** (the most recent lines): they carry the current
+   blocker (a BLOCK verdict, a CODEERROR, an infra transient, or an autofix round already in
+   flight) — the rows above it are prior laps that already resolved.
+3. `bash {{SCRIPTS_DIR}}/herd-approve.sh list` — cross-check the sha-keyed approval ledger
+   against the PR's *current* head sha. Approval is sha-keyed (see *Approve pending merges*):
+   an `awaiting` row for a sha that is no longer HEAD means the PR moved on since the row was
+   written, and it holds nothing — read the row's sha, not just its presence.
+4. Compare the PR's **newest hold comment against its current head sha**
+   (`gh pr view <n> --comments` or `--json comments,headRefOid`). A hold comment names the
+   commit it was posted for. Since HERD-464 the engine edits a hold comment IN PLACE the tick
+   it stops matching HEAD (`hold_comment_superseded` in the journal, contract §5.6) — but a
+   comment from before that shipped, or one whose edit failed (`hold_comment_edit_failed`),
+   can still be describing a superseded commit. Never act on a hold comment's instructions
+   without confirming its sha still matches HEAD.
+5. `gh pr checks <n>` (or `gh pr view <n> --json statusCheckRollup`) — the LIVE CI/check-run
+   states. The console's row summary is a snapshot from the last poll; checks can flip between
+   polls, and a row that read red a minute ago may already be green.
+6. Under `MERGE_QUEUE=on`, `herd why <pr#>` surfaces `merge_queue_hold` /
+   `merge_queue_window` events — read the PR's **slot position** (is it `front_pr`, or waiting
+   behind one) before proposing a re-task: a PR waiting its turn in queue order is not blocked
+   on anything a re-task fixes.
+7. Only THEN: re-task, override a gate, or escalate — stating the blocker step 1–6 surfaced.
 
-See *Builder notes* (read → route → ack) and *Diagnose a gate* (`herd why` FIRST).
+See *Builder notes* (read → route → ack), *Diagnose a gate* (`herd why` FIRST), and *Approve
+pending merges* (sha-keyed approval semantics).
 
 ### Don't double-intervene when autofix is on
 

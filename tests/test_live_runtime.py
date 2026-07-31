@@ -5320,6 +5320,7 @@ class _RecordingHoldActuator(DryRunActuator):
         super().__init__(journal)
         self.comments = []   # (pr, kind, body)
         self.notifies = []   # (title, body, sound)
+        self.edits = []      # (pr, kind, body) — HERD-464 supersession edits
 
     def post_comment(self, cand, kind, body):
         self.comments.append((cand.pr, kind, body))
@@ -5327,6 +5328,10 @@ class _RecordingHoldActuator(DryRunActuator):
 
     def notify(self, title, body, sound="default"):
         self.notifies.append((title, body, sound))
+
+    def edit_comment(self, cand, kind, body):
+        self.edits.append((cand.pr, kind, body))
+        return True
 
 
 class TestHoldNotifyActuator(LiveCase):
@@ -5455,6 +5460,7 @@ class TestHoldNotifyActuator(LiveCase):
         act = DryRunActuator(journal)
         cand = LiveCandidate(1, "sha1", slug="pr-1", hv_body=_HV_BODY, hv_hold=True)
         self.assertTrue(act.post_comment(cand, "human-verify", "body text"))
+        self.assertTrue(act.edit_comment(cand, "superseded", "body text"))
         self.assertIsNone(act.notify("title", "body"))
         ev = events(self.jpath) if os.path.exists(self.jpath) else []
         self.assertFalse(ev)   # no gh, no driver.sh, no journal line of its own
@@ -5505,6 +5511,41 @@ class TestLiveHoldCommentActuator(LiveCase):
         # Called exactly once — "never retried" is the CALLER's once-guard, not this method's job.
         self.assertEqual(len(sub.calls), 1)
 
+    def test_edit_comment_uses_gh_pr_comment_edit_last_shape(self):
+        sub = _RecordingSub()
+        act = self._actuator(sub)
+        cand = LiveCandidate(7, "deadbeef", slug="feat-x")
+        self.assertTrue(act.edit_comment(cand, "superseded", "the superseded body"))
+        calls = [c for c in sub.calls if c[:3] == ["gh", "pr", "comment"]]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0],
+                         ["gh", "pr", "comment", "7", "--edit-last", "--body", "the superseded body"])
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertFalse([o for o in ev if o["event"] == "hold_comment_edit_failed"])
+
+    def test_failed_edit_journals_hold_comment_edit_failed_and_never_retries(self):
+        class _FailingCommentSub:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, argv, *a, **k):
+                self.calls.append(list(argv))
+                if argv[:3] == ["gh", "pr", "comment"]:
+                    raise subprocess.CalledProcessError(1, argv)
+                return _FakeCompleted("")
+
+        sub = _FailingCommentSub()
+        act = self._actuator(sub)
+        cand = LiveCandidate(7, "deadbeef", slug="feat-x")
+        self.assertFalse(act.edit_comment(cand, "superseded", "body"))
+        failed = [o for o in events(self.jpath) if o["event"] == "hold_comment_edit_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(str(failed[0]["pr"]), "7")
+        self.assertEqual(str(failed[0]["sha"]), "deadbeef")
+        self.assertEqual(failed[0]["slug"], "feat-x")
+        self.assertEqual(failed[0]["kind"], "superseded")
+        self.assertEqual(len(sub.calls), 1)
+
     def test_notify_shells_out_through_the_driver_seam(self):
         sub = _RecordingSub()
         act = self._actuator(sub)
@@ -5521,6 +5562,123 @@ class TestLiveHoldCommentActuator(LiveCase):
 
         act = self._actuator(_BoomSub())
         act.notify("title", "body")   # must not raise
+
+
+class TestHoldCommentSupersession(LiveCase):
+    """HERD-464: a hold comment self-updates when it stops reflecting reality — a new sha lands, an
+    approval lands, or a policy change makes re-holding it impossible — instead of standing stale
+    and misleading an operator into thinking a merge-ready PR is still gated. Mutation-proven:
+    neutralizing LiveTick._supersede_hold_comment (or its call site in _walk) drops every
+    hold_comment_superseded event and every act.edits entry these tests assert on."""
+
+    def tick_live(self, act, sha, config=None, **kw):
+        cand = self.one(1, sha=sha, **kw)
+        scenario = {"candidates": [cand], "config": config or {"MERGE_POLICY": "auto"}}
+        journal = LiveJournal(self.jpath)
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     act, journal, state=LiveState(self.tmp))
+        res = t.run()
+        return res["outcomes"]["1"]
+
+    def _superseded_events(self):
+        return [o for o in events(self.jpath) if o["event"] == "hold_comment_superseded"]
+
+    # ── (a) a new sha lands — the OLD comment now names the wrong commit ───────────────────────────
+    # NOTE: sha values here are deliberately hyphen-free — LiveState.stale_inflight extracts a
+    # marker's sha with `rsplit("-", 1)`, exactly like every other rail's supersession scan, and a
+    # hyphenated fixture sha (unlike a real hex git sha) would corrupt that split.
+    def test_new_sha_supersedes_a_human_verify_hold(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        cfg = {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"}
+        out1 = self.tick_live(act, "shaaaa1", config=cfg, hv_hold=True, review="PASS", health="CLEAN")
+        self.assertEqual(out1, "HOLD")
+        self.assertEqual(len(act.comments), 1)
+        self.assertFalse(act.edits)
+
+        out2 = self.tick_live(act, "shabbb2", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
+        self.assertEqual(out2, "MERGE")
+        self.assertEqual(len(act.edits), 1)
+        pr, kind, body = act.edits[0]
+        self.assertEqual(kind, "superseded")
+        self.assertIn("superseded", body)
+        self.assertIn("sha advanced", body)
+        sup = self._superseded_events()
+        self.assertEqual(len(sup), 1)
+        self.assertEqual(sup[0]["old_sha"], "shaaaa1")
+        self.assertEqual(str(sup[0]["sha"]), "shabbb2")
+
+    # ── (b) an approval lands at the SAME sha — no new commit, but the hold is resolved ─────────────
+    def test_approval_at_the_same_sha_supersedes_an_approve_hold(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        cfg = {"MERGE_POLICY": "approve"}
+        out1 = self.tick_live(act, "shaccc3", config=cfg, review="PASS", health="CLEAN")
+        self.assertEqual(out1, "HOLD")
+        pr, kind, _ = act.comments[0]
+        self.assertEqual(kind, "approve")
+
+        out2 = self.tick_live(act, "shaccc3", config=cfg, approved=True, review="PASS", health="CLEAN")
+        self.assertEqual(out2, "MERGE")
+        self.assertEqual(len(act.edits), 1)
+        pr, kind, body = act.edits[0]
+        self.assertEqual(kind, "superseded")
+        self.assertIn("approved", body)
+        self.assertNotIn("sha advanced", body)
+
+    # ── (c) a policy change at the SAME sha makes re-holding it impossible ──────────────────────────
+    def test_policy_change_at_the_same_sha_supersedes_a_human_verify_hold(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out1 = self.tick_live(act, "shaddd4", config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"},
+                              hv_hold=True, review="PASS", health="CLEAN")
+        self.assertEqual(out1, "HOLD")
+
+        out2 = self.tick_live(act, "shaddd4", config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"},
+                              hv_hold=True, review="PASS", health="CLEAN")
+        self.assertEqual(out2, "MERGE")
+        self.assertEqual(len(act.edits), 1)          # the STALE human-verify comment, edited
+        self.assertEqual(len(act.comments), 2)        # tick1's human-verify + tick2's hv-auto
+        pr, kind, body = act.edits[0]
+        self.assertEqual(kind, "superseded")
+        self.assertIn("policy=auto", body)
+        self.assertNotIn("sha advanced", body)        # same commit both ticks
+
+    # ── idempotency: the SAME stale comment is never edited twice ──────────────────────────────────
+    def test_never_double_edits_across_reticks(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        cfg = {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"}
+        self.tick_live(act, "shaeee5", config=cfg, hv_hold=True, review="PASS", health="CLEAN")
+        self.tick_live(act, "shafff6", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
+        self.tick_live(act, "shafff6", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
+        self.assertEqual(len(act.edits), 1)
+        self.assertEqual(len(self._superseded_events()), 1)
+
+    # ── a candidate that never held has nothing to supersede — byte-inert ──────────────────────────
+    def test_plain_merge_with_no_prior_hold_supersedes_nothing(self):
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        out = self.tick_live(act, "shaggg7", review="PASS", health="CLEAN")
+        self.assertEqual(out, "MERGE")
+        self.assertFalse(act.edits)
+        self.assertFalse(self._superseded_events())
+
+    # ── DryRunActuator: journals the terminal event like every other hold side effect, edits nothing ─
+    def test_dry_run_journals_the_supersession_with_no_real_edit(self):
+        cfg = {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"}
+        self.tick([self.one(1, sha="shahhh8", hv_hold=True, review="PASS", health="CLEAN")], config=cfg)
+        res2, ev2 = self.tick(
+            [self.one(1, sha="shaiii9", hv_hold=False, review="PASS", health="CLEAN")], config=cfg)
+        self.assertEqual(res2["outcomes"]["1"], "MERGE")
+        self.assertTrue([o for o in ev2 if o["event"] == "hold_comment_superseded"])
+
+    # ── no state dir (a hermetic fixture with a black-hole state) — never crashes, never journals ──
+    def test_no_state_dir_is_byte_inert(self):
+        journal = LiveJournal(self.jpath)
+        act = _RecordingHoldActuator(journal)
+        cand = self.one(1, sha="shajjj10", hv_hold=True, review="PASS", health="CLEAN")
+        scenario = {"candidates": [cand], "config": {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"}}
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     act, journal, state=LiveState(None))
+        res = t.run()
+        self.assertEqual(res["outcomes"]["1"], "HOLD")
+        self.assertFalse(act.edits)
 
 
 class TestApprovalsLedger(LiveCase):
