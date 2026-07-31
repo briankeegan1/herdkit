@@ -88,6 +88,8 @@ herd why <pr#>	unit	tests/test-journal.sh
 herd approve [<pr#|slug>] [--sha <sha>]	unit	tests/test-cli-approve.sh
 herd status	unit	tests/test-status.sh
 herd sweep	unit	tests/test-sweep.sh
+herd sweep	unit	tests/test-sweep-origin-reachable.sh
+herd sweep	unit	tests/test-sweep-once-guards.sh
 herd cost [--pr N]	unit	tests/test-cost.sh
 herd stats [--today|--since <date>|--pr N]	unit	tests/test-stats.sh
 herd changelog [generate|tag <ver>]	unit	tests/test-changelog.sh

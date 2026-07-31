@@ -544,6 +544,16 @@ BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # watcher is byte-identical to before this feature.
 ORPHAN_PR_LEDGER="$TREES/.agent-watch-orphan-prs"
 ORPHAN_PR_ROWS_LIMIT=5    # most-recent orphan rows rendered (display bound; the ledger is rewritten whole each tick)
+# UNGATED PRs (HERD-460, GitHub issue #574) — the sibling of ORPHAN_PR_LEDGER above, but UNCONDITIONAL:
+# an open PR with no builder/worktree record sits invisible to the merge gate whether or not an
+# operator opted into the ORPHAN_PR_ROWS nicety. This section carries no config gate at all (mirrors
+# MAIN_HEALTH's unconditional style) — it is a truth about the control room's safety posture, not a
+# preference. Rewritten whole each tick from the SAME already-fetched diff ORPHAN_PR_LEDGER uses (zero
+# extra gh), minus any (pr,sha) the adopt leg already recorded as adopted (see _ungated_prs_scan), so a
+# PR the adopt leg is handling is never double-reported. Empty ledger → no section → byte-identical
+# console when every open PR has a builder record.
+UNGATED_PR_LEDGER="$TREES/.agent-watch-ungated-prs"
+UNGATED_PR_ROWS_LIMIT=5
 # Adopt-remote-PRs ledgers (HERD-369), sibling of the orphan-PR ledger above. Under ADOPT_REMOTE_PRS=on
 # the tick's ADOPT leg (built on top of the SAME orphan diff) attempts `git fetch` + `git worktree add`
 # per orphan PR. TWO separate ledgers, ADVISED (herd-advise.sh) against conflating "succeeded" with
@@ -691,6 +701,7 @@ TRACKER_DRIFT=""
 SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
+UNGATED_PR_SECTION_ROWS=""  # HERD-460: the UNCONDITIONAL "ungated PRs" truth section rows (empty when none → render omits it)
 ENGINE_DOWN_ROW=""     # HERD-306: the "engine down · manual intervention" alarm row set by the engine watchdog past a fault streak (empty while the Python engine is ticking)
 ENGINE_PAUSE_ROW=""    # HERD-347: the "⏸ engine paused by operator" banner set by _engine_tick_watchdog while ENGINE_PAUSE=on (empty — byte-identical console — while the lever is off/unset)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
@@ -1855,6 +1866,113 @@ build_orphan_prs() {
   return 0
 }
 
+# ── Ungated PRs (HERD-460, GitHub issue #574) ────────────────────────────────────────────────────
+# An open PR against the default branch with NO builder/worktree record bypasses the merge gate
+# ENTIRELY — MERGE_POLICY=auto reads as "green PRs merge automatically", but the watcher only ever
+# gates a PR it discovered via a git worktree. A hand-created PR (`gh pr create`), a collaborator's
+# PR, or a PR whose worktree was already reaped all sit MERGEABLE/CLEAN forever, silently un-health-
+# checked and un-reviewed, unless an operator happens to notice and merge by hand (GH #574).
+#
+# UNLIKE ORPHAN_PR_ROWS (an opt-in nicety this section builds on top of), this row is UNCONDITIONAL —
+# no config gate, computed every tick, mirroring MAIN_HEALTH's always-on style. Whether a PR is
+# ungated is a fact about the control room's safety posture, not a preference an operator can turn
+# off; the ORPHAN_PR_ROWS/ADOPT_REMOTE_PRS levers stay exactly as they were (this never flips their
+# defaults — see the PR body for why NOT flipping ORPHAN_PR_ROWS's default here is deliberate).
+_ungated_pr_classify() {
+  local _ug_epoch
+  IFS=$'\t' read -r _ug_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tcalm' "${_ug_epoch:-}"
+}
+
+# _ungated_pr_row <line>  ("<epoch>\t<pr>\t<title>\t<branch>") → one themed console row. Fail-soft: a
+# row missing its PR number renders nothing (drops out of the section).
+_ungated_pr_row() {
+  local _ug_epoch _ug_pr _ug_title _ug_branch
+  IFS=$'\t' read -r _ug_epoch _ug_pr _ug_title _ug_branch <<EOF
+$1
+EOF
+  [ -n "${_ug_pr:-}" ] || return 0
+  printf '    %s🔓%s %s#%s%s %s %s%s · ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree add to adopt%s' \
+    "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
+    "$C_DIM" "${_ug_branch:-}" "$C_RESET"
+}
+
+# _ungated_prs_scan <prs-json> <claimed-pr-numbers-newline-list> — REWRITE the ungated-PR ledger,
+# UNCONDITIONALLY (no ORPHAN_PR_ROWS/ADOPT_REMOTE_PRS gate — see the header comment above). One row
+# per OPEN PR in $1 whose number is not in the claimed set $2 — the SAME open-PR-vs-pool diff
+# _orphan_prs_scan computes (reused, not recomputed; zero extra `gh`) — MINUS any (pr,sha) the adopt
+# leg already recorded as SUCCESSFULLY adopted (_adopt_pr_recorded, HERD-369's once-guard): that PR
+# already has a worktree as of this tick's adopt pass and will drop out of the claimed-set diff on the
+# very next tick's worktree-rediscovery, so excluding it here avoids one tick of a stale "ungated" row
+# for a PR that is, in fact, already being handled. A PR ADOPT_REMOTE_PRS has not yet attempted, has
+# attempted and FAILED (journaled `adopt_failed`, retried every scan — see _adopt_journal_failed), or
+# that ADOPT_REMOTE_PRS is simply off for, all correctly keep showing here: it is, right now, ungated.
+# Fail-soft exactly like _orphan_prs_scan: a failed open-PR fetch (PRS_LOOKUP_OK=0) never fabricates
+# "nothing ungated", and malformed JSON yields an empty ledger, never a crash.
+_ungated_prs_scan() {
+  [ "${PRS_LOOKUP_OK:-1}" = "1" ] || return 0
+  local _ug_json="${1:-[]}" _ug_claimed="${2:-}" _ug_epoch _ug_out _ug_adopted=""
+  _ug_epoch="$(_console_now_epoch)"
+  [ -s "$ADOPT_PR_LEDGER" ] && _ug_adopted="$(cat "$ADOPT_PR_LEDGER" 2>/dev/null || true)"
+  _ug_out="$(PRS_JSON="$_ug_json" CLAIMED="$_ug_claimed" EPOCH="$_ug_epoch" ADOPTED="$_ug_adopted" python3 -c '
+import os, sys, json
+try:
+    prs = json.loads(os.environ.get("PRS_JSON") or "[]")
+    if not isinstance(prs, list): raise ValueError
+except Exception:
+    sys.exit(0)   # malformed roster → empty ledger (fail-soft), never a crash
+claimed = set(n for n in (os.environ.get("CLAIMED") or "").split() if n)
+adopted = set()
+for line in (os.environ.get("ADOPTED") or "").splitlines():
+    f = line.split("\t")
+    if len(f) >= 2:
+        adopted.add((f[0], f[1]))
+epoch = os.environ.get("EPOCH", "")
+def flat(s):
+    return " ".join(str(s or "").split())
+for pr in prs:
+    if not isinstance(pr, dict):
+        continue
+    num = pr.get("number")
+    if num is None:
+        continue
+    num = str(num)
+    if num in claimed:
+        continue
+    sha = flat(pr.get("headRefOid"))
+    if (num, sha) in adopted:
+        continue
+    title = flat(pr.get("title"))
+    if len(title) > 80:
+        title = title[:79].rstrip() + "…"
+    branch = flat(pr.get("headRefName"))
+    print("%s\t%s\t%s\t%s" % (epoch, num, title, branch))
+' 2>/dev/null)" || _ug_out=""
+  if [ -n "$_ug_out" ]; then
+    printf '%s\n' "$_ug_out" > "$UNGATED_PR_LEDGER" 2>/dev/null || true
+  else
+    : > "$UNGATED_PR_LEDGER" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# build_ungated_prs — the "ungated PRs" truth section: the ungated-PR ledger tail, newest-first, one
+# row each, bounded to UNGATED_PR_ROWS_LIMIT via the shared helper. Empty (UNGATED_PR_SECTION_ROWS="")
+# whenever no PR is ungated, so render() omits the section and a fully-gated control room's console is
+# byte-identical to before this feature. A pure renderer — the discovery (and its only write) is
+# _ungated_prs_scan.
+build_ungated_prs() {
+  UNGATED_PR_SECTION_ROWS=""
+  [ -s "$UNGATED_PR_LEDGER" ] || return 0
+  local rows
+  rows="$(herd_console_section "$UNGATED_PR_LEDGER" "$UNGATED_PR_ROWS_LIMIT" \
+    _ungated_pr_classify _ungated_pr_row)"
+  [ -n "$rows" ] && UNGATED_PR_SECTION_ROWS="${rows}"$'\n'
+  return 0
+}
+
 # ── Adopt remote PRs (HERD-369) ──────────────────────────────────────────────────────────────────
 # Builds ON TOP of the HERD-330 orphan diff above (the same open-PR-vs-pool computation, zero extra
 # `gh pr list`): for every OPEN, NON-DRAFT PR that diff finds no discovered worktree owns, `git fetch`
@@ -2168,6 +2286,12 @@ render() {
   # ORPHAN_PR_ROWS is on AND at least one open PR is orphaned this tick, so byte-identical when unused.
   if [ -n "${ORPHAN_PR_SECTION_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}orphan PRs${C_RESET}"$'\n'"${ORPHAN_PR_SECTION_ROWS}"$'\n'
+  fi
+  # UNGATED PRs (HERD-460) — open PRs with no builder/worktree record, needs-you-adjacent. UNLIKE the
+  # section above, this one carries NO config gate: empty unless at least one such PR is observed this
+  # tick, so byte-identical when every open PR has a builder record.
+  if [ -n "${UNGATED_PR_SECTION_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}ungated PRs${C_RESET}"$'\n'"${UNGATED_PR_SECTION_ROWS}"$'\n'
   fi
   # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
   # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
@@ -14175,22 +14299,29 @@ EOF
   # self-gates on ORPHAN_PR_ROWS (no scan, no ledger write when off) and on PRS_LOOKUP_OK (never
   # fabricates on a failed fetch); build_orphan_prs leaves ORPHAN_PR_SECTION_ROWS empty when off/none, so
   # the frame is byte-identical to before the feature. Zero extra gh — no new `gh pr list`.
-  # HERD-369 reuses this SAME claimed-set diff for the adopt leg below, so the computation now also
-  # runs under ADOPT_REMOTE_PRS alone — when BOTH levers are off (the ship default) this is byte-
-  # identical to before either feature: the condition is false||false, same as false.
+  # HERD-369 reuses this SAME claimed-set diff for the adopt leg below, and HERD-460's unconditional
+  # ungated-PR truth row (further below) reuses it too — so the claimed set is now computed
+  # UNCONDITIONALLY every tick. This is a pure in-memory loop over this tick's already-discovered
+  # FEATS records (no I/O, no gh), so making it unconditional costs nothing observable; it is the
+  # scans that consult it (_orphan_prs_scan, the adopt leg) that stay individually gated.
   _orphan_claimed=""
-  if _orphan_pr_rows_enabled || _adopt_remote_prs_enabled; then
-    for _orphan_rec in ${FEATS[@]+"${FEATS[@]}"}; do
-      IFS=$'\037' read -r _ _ _ _orphan_prnum _ <<EOF
+  for _orphan_rec in ${FEATS[@]+"${FEATS[@]}"}; do
+    IFS=$'\037' read -r _ _ _ _orphan_prnum _ <<EOF
 $_orphan_rec
 EOF
-      [ -n "${_orphan_prnum:-}" ] && _orphan_claimed="${_orphan_claimed}${_orphan_prnum} "
-    done
-  fi
+    [ -n "${_orphan_prnum:-}" ] && _orphan_claimed="${_orphan_claimed}${_orphan_prnum} "
+  done
   if _orphan_pr_rows_enabled; then
     _orphan_prs_scan "$PRS_JSON" "$_orphan_claimed"
   fi
   build_orphan_prs
+
+  # HERD-460 (GitHub issue #574) ungated PRs — the UNCONDITIONAL sibling of the orphan-PR section
+  # above: no ORPHAN_PR_ROWS/ADOPT_REMOTE_PRS gate, computed every tick from the SAME claimed-set diff
+  # (zero extra gh). Renders whenever an open PR carries no builder/worktree record and the adopt leg
+  # has not (yet, or ever will) picked it up — see _ungated_prs_scan's header comment.
+  _ungated_prs_scan "$PRS_JSON" "$_orphan_claimed"
+  build_ungated_prs
 
   # HERD-369 adopt remote PRs — throttled to the ~60 s scan cadence (network + git mutation, unlike
   # the zero-network orphan render above): `git fetch` + `git worktree add` each orphan PR's branch
