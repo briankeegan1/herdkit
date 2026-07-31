@@ -1060,6 +1060,32 @@ build_main_freshness() {
   fi
 }
 
+# build_watcher_singleton — the HERD-450 SINGLETON-VIOLATION row, read from the state file
+# reconcile_watcher_singleton writes (absent on the happy path → renders NOTHING, so the console is
+# byte-identical whenever the invariant holds). GATED on the lever like build_main_health: flipping
+# WATCHER_SINGLETON_RECONCILE=off stops the row immediately, with no tick left to clear a stale file.
+#
+# The row must carry BOTH the blocker and the remedy, because the operator cannot act on "something
+# is wrong with the watcher": a DUPLICATE names the pids so they can be identified in `ps` and points
+# at `herd reload` (whose stop leg is the ONE place with the fork/orphan discrimination and the
+# verified kill); a drifted lockfile it could not repair names what the lock records versus what is
+# actually running. A HANDOFF is a benign self-restart exec window — informational wording, no alarm.
+build_watcher_singleton() {
+  WATCHER_SINGLETON=""
+  case "${WATCHER_SINGLETON_RECONCILE:-off}" in on|true|1) : ;; *) return 0 ;; esac
+  [ -s "${WATCHER_SINGLETON_STATE:-}" ] || return 0
+  local _bw_state _bw_lock _bw_mains
+  read -r _bw_state _bw_lock _bw_mains < "$WATCHER_SINGLETON_STATE" 2>/dev/null || return 0
+  case "$_bw_state" in
+    DUPLICATE)
+      WATCHER_SINGLETON="    ${C_RED}🚨 ${C_BOLD}DUPLICATE WATCHER${C_RESET}${C_RED} — pids ${_bw_mains:-?} both carry the argv0 ${HERD_WATCH_ARGV0:-of this workspace} (lock records ${_bw_lock:--}) · they gate the same PRs and double-count every slot · run 'herd reload' to stop them and start one${C_RESET}"$'\n' ;;
+    HANDOFF)
+      WATCHER_SINGLETON="    ${C_YELLOW}⟳${C_RESET}  ${C_DIM}self-restart handoff in flight — pids ${_bw_mains:-?} briefly co-exist while the outgoing image drains (expires on its own)${C_RESET}"$'\n' ;;
+    LOCK_DRIFT)
+      WATCHER_SINGLETON="    ${C_RED}⚠️${C_RESET}  ${C_BOLD}WATCHER LOCK DRIFT${C_RESET}${C_RED} — the lockfile records ${_bw_lock:--} but pid ${_bw_mains:-?} is the running watcher · every seat's adopt/refuse/stop check reads that record, so it is blind until this heals · run 'herd reload'${C_RESET}"$'\n' ;;
+  esac
+}
+
 # build_checkout_cleanliness — the HERD-361 shared-checkout cleanliness row, read from the state file
 # reconcile_checkout_cleanliness writes (absent on the happy path → renders NOTHING, console stays
 # byte-identical). A LOUD row when $MAIN carries staged/tracked contamination (the fingerprint of a
@@ -2040,6 +2066,13 @@ render() {
   # after a pull carried new engine code. Both empty on the happy path.
   if [ -n "${MAIN_HEALTH:-}" ] || [ -n "${MAIN_FRESHNESS:-}" ] || [ -n "${CHECKOUT_CLEAN:-}" ]; then
     frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH:-}${MAIN_FRESHNESS:-}${CHECKOUT_CLEAN:-}"$'\n'
+  fi
+  # Watcher SINGLETON violation (HERD-450) — its own section directly under the default-branch block:
+  # a second watcher (or a lockfile that names nobody) invalidates every OTHER row on this console,
+  # since two mains double-count slots and race the shared object store. Empty while the invariant
+  # holds — and unreachable with WATCHER_SINGLETON_RECONCILE off — so the console stays byte-identical.
+  if [ -n "${WATCHER_SINGLETON:-}" ]; then
+    frame="${frame}  ${C_RED}control room${C_RESET}"$'\n'"${WATCHER_SINGLETON}"$'\n'
   fi
   # Merge CELEBRATION (HERD-147 flair) — below any MAIN RED alarm (a red state always leads), above the
   # rollup. Empty unless a merge landed since the last tick AND flair is on, so byte-identical otherwise.
@@ -5669,6 +5702,7 @@ MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"   # one line: the sha whos
 MAIN_DETACHED_STATE="$TREES/.agent-watch-main-detached" # HERD-336: the detached-HEAD sha, deduped so a persisting detachment journals once
 CHECKOUT_CLEAN_STATE="$TREES/.agent-watch-checkout-clean" # HERD-361: the shared-checkout cleanliness violation signature (absent = clean); drives the row + dedups the journal
 CHECKOUT_CLEAN_PENDING="$TREES/.agent-watch-checkout-clean.pending" # HERD-414: one-tick-old offender signature; a signature must repeat here before it is promoted into CHECKOUT_CLEAN_STATE
+WATCHER_SINGLETON_STATE="$TREES/.agent-watch-singleton"  # HERD-450: the standing singleton violation ("<state> <lockpid> <mains>"); absent = invariant holds. Drives the row + dedups the journal
 
 # _watch_gate_inflight — true when a review/health worker is live. The shared mid-op probe: both the
 # MAIN-freshness and the map reconcile must keep their hands off the tree while a gate runs.
@@ -6236,6 +6270,80 @@ reconcile_checkout_cleanliness() {
     detached "${_cc_detached:-no}" \
     paths "${_cc_paths:-none}" \
     result violation component audit
+  return 0
+}
+
+# ── Tick-level SINGLETON reconcile (HERD-450) ─────────────────────────────────────────────────────
+# Multi-seat doctrine, applied to the watcher itself: "exactly one watcher per workspace" was an
+# ASSERTION MADE AT LAUNCH (the acquire gate) and never re-checked afterwards. Launch-time assertions
+# decay — the 2026-07-31 incident is what decay looks like: a watcher survived a `herd reload`, ran 41
+# minutes re-parented to init alongside its replacement, both ticking the same PRs and both counting
+# the same concurrency slots, while the lockfile sat EMPTY the whole time. Nothing was watching the
+# watcher, so nothing said a word for 41 minutes.
+#
+# This is the reconcile that makes it an INVARIANT instead: every tick, re-derive the truth from the
+# observed process table through the ONE shared identity seam (watcher-exempt.sh's
+# watcher_singleton_verdict) and act on the verdict.
+#
+#   DUPLICATE  → journal ONCE per signature + hold a loud persistent console row until it clears.
+#                NEVER auto-killed. A "duplicate" is very often a legitimate REVIEW-TICK FORK (the
+#                tick loop forks constantly and every fork inherits the argv0); reaping one caches a
+#                bogus BLOCK verdict against a PR nobody reviewed. The fork/orphan discrimination
+#                lives in _wx_exempt (fork = ppid is the canonical watcher, or marker-owned; genuine
+#                orphan = ppid 1, unowned) and the KILLING lives in `herd reload`'s stop leg, which is
+#                an explicit operator action with the full SIGTERM→verify→SIGKILL sequence. A tick
+#                that reaped on its own reading would be one refactor away from reaping a fork.
+#   LOCK_DRIFT → the empty-lockfile half. REPAIRABLE and repaired here, but ONLY by the sole live main
+#                and ONLY when that main is US ($$): recording our own pid is a statement we can make
+#                truthfully. Every other seat — `herd status`, the sweep, the launch paths' adopt-or-
+#                refuse read, clause (2) of the fork exemption — keys off that recorded pid, so an
+#                empty lockfile blinds all of them simultaneously; one write un-blinds all of them.
+#   HANDOFF    → a WATCHER_SELF_RESTART exec window. Benign and TTL-bounded; journaled once, no row.
+#   OK / NONE  → clear any standing state (the row is re-derived from the file each tick).
+#
+# SHIP-DORMANT: WATCHER_SINGLETON_RECONCILE=off (default) returns before the ps sample, so there is no
+# journal event, no row, no lockfile write — byte-identical to before this item. Also inert in dry-run.
+reconcile_watcher_singleton() {
+  case "${WATCHER_SINGLETON_RECONCILE:-off}" in on|true|1) : ;; *) return 0 ;; esac
+  [ -n "${DRYRUN:-}" ] && return 0
+  declare -f watcher_singleton_verdict >/dev/null 2>&1 || return 0
+  local _ws_line _ws_state _ws_lock _ws_mains _ws_count _ws_prev
+  _ws_line="$(watcher_singleton_verdict 2>/dev/null || true)"
+  [ -n "$_ws_line" ] || return 0
+  IFS=$'\t' read -r _ws_state _ws_lock _ws_mains _ws_count <<< "$_ws_line"
+  mkdir -p "$TREES" 2>/dev/null || true
+  _ws_prev="$(sed -n '1p' "$WATCHER_SINGLETON_STATE" 2>/dev/null || true)"
+
+  case "$_ws_state" in
+    LOCK_DRIFT)
+      # Sole live main. Repair the record only when that main is this very process — another main's
+      # pid is not ours to assert, and writing it would hand the singleton to a process that never
+      # acquired it. When it is not us we fall through to the standing-row path below, so a drifted
+      # lock nobody can repair is still SEEN rather than silently tolerated.
+      if [ "$_ws_mains" = "$$" ]; then
+        printf '%s\n' "$$" > "$HERD_WATCHER_LOCK" 2>/dev/null || true
+        rm -f "$WATCHER_SINGLETON_STATE" 2>/dev/null || true
+        [ "$_ws_prev" = "LOCK_DRIFT $_ws_lock $_ws_mains" ] && return 0
+        journal_append watcher_lock_repaired \
+          recorded "${_ws_lock:--}" pid "$$" workspace "${WORKSPACE_NAME:-}" \
+          component agent-watch
+        return 0
+      fi
+      ;;
+    OK|NONE)
+      rm -f "$WATCHER_SINGLETON_STATE" 2>/dev/null || true
+      return 0
+      ;;
+  esac
+
+  # DUPLICATE, HANDOFF, or a LOCK_DRIFT we are not entitled to repair: hold the signature so the row
+  # paints every tick and the journal fires only on a CHANGE (a persisting violation must not spam).
+  local _ws_key="$_ws_state $_ws_lock $_ws_mains"
+  printf '%s\n' "$_ws_key" > "$WATCHER_SINGLETON_STATE" 2>/dev/null || true
+  [ "$_ws_prev" = "$_ws_key" ] && return 0
+  journal_append watcher_singleton_violation \
+    state "$_ws_state" recorded "${_ws_lock:--}" mains "${_ws_mains:--}" count "${_ws_count:-0}" \
+    self "$$" workspace "${WORKSPACE_NAME:-}" component agent-watch
   return 0
 }
 
@@ -13075,6 +13183,28 @@ _acquire_watcher_singleton() {
       local _wl_bh _wl_ba
       _wl_bh="$(_watcher_lock_flock_holder 2>/dev/null || true)"
       _wl_ba="$(_watcher_holder_argv "$_wl_bh" 2>/dev/null || true)"
+      # HERD-450: REFUSE, never bypass, when the flock holder is itself a live WATCHER MAIN.
+      # The bypass exists for an orphaned GATE WORKER that inherited fd 9 (HERD-344) — it re-keys to a
+      # fresh inode, which by construction defeats the singleton for whoever holds the old one. That is
+      # correct against a worker and catastrophic against a watcher: reaching here means the recorded
+      # pid was EMPTY or dead, and an empty lockfile is exactly the state the 2026-07-31 incident ran
+      # in (a live watcher holding the lock while the file named nobody — the pid write lost to a
+      # racing launcher's unlink). Bypassing there hands a SECOND main the canonical path and leaves
+      # two watchers gating the same PRs. The holder's argv0 is the same per-workspace attribution the
+      # stop leg reaps by, so this can only ever match OUR workspace's watcher.
+      # An orphaned gate WORKER has exec'd its suite, so its argv0 is `bash …/healthcheck.sh`, not our
+      # marker — and the shared watcher_pid_exempt predicate (HERD-266) is what tells the two apart, so
+      # the HERD-344 adoption this branch exists for still takes the bypass below unchanged.
+      local _wl_bargv0="${_wl_ba%%[[:space:]]*}" _wl_bpp
+      if [ -n "$_wl_bh" ] && [ -n "${HERD_WATCH_ARGV0:-}" ] \
+         && [ "$_wl_bargv0" = "$HERD_WATCH_ARGV0" ] && [ "$_wl_bh" != "$$" ] \
+         && kill -0 "$_wl_bh" 2>/dev/null; then
+        _wl_bpp="$(ps -o ppid= -p "$_wl_bh" 2>/dev/null | tr -d '[:space:]')" || _wl_bpp="0"
+        if ! watcher_pid_exempt "$_wl_bh" "${_wl_bpp:-0}" 2>/dev/null; then
+          _watcher_singleton_refuse "$_wl_bh"
+          return 1
+        fi
+      fi
       journal_append watcher_singleton_bypass \
         holder_pid "${_wl_bh:-unknown}" \
         holder_argv "$_wl_ba" \
@@ -13299,6 +13429,7 @@ _tick_render_reconcile() {
   _main_fresh_recheck
   build_main_freshness
   build_checkout_cleanliness   # HERD-361: the shared-checkout cleanliness row (empty unless contaminated)
+  build_watcher_singleton      # HERD-450: the duplicate-watcher / lock-drift row (empty unless violated)
   build_sweep_note
   build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
 
@@ -13856,6 +13987,12 @@ EOF
   # a loud console row + one journal event naming the offending paths, and NEVER auto-discarded (evidence
   # preservation). Keyed off observed git state each tick, so it holds no matter which seat caused it.
   reconcile_checkout_cleanliness
+
+  # SINGLETON INVARIANT (HERD-450): exactly one live process carries this workspace's argv0 AND the
+  # lockfile names it. Classified through the shared watcher-exempt.sh seam, journaled + painted on a
+  # violation, and REPAIRED when the sole live main is us and the lockfile drifted. Never kills.
+  # Byte-inert when WATCHER_SINGLETON_RECONCILE=off; guarded so nothing in it can end the watch loop.
+  reconcile_watcher_singleton || true
 
   # Watcher SELF-RESTART (HERD-251): the reconcile above may have left a "new engine code" note. With
   # WATCHER_SELF_RESTART=on that note arms a QUIESCE (no new gate dispatch) and, once the in-flight

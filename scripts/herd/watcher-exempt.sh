@@ -289,4 +289,64 @@ $table
 EOF
 }
 
+# ── The reconciled SINGLETON INVARIANT (HERD-450) ────────────────────────────────────────────────
+#
+# watcher_list_mains answers "which pids are watcher mains". The INVARIANT this workspace actually
+# needs is stronger, and until HERD-450 nothing checked it anywhere:
+#
+#     EXACTLY ONE live process carries this workspace's argv0, AND the lockfile NAMES that process.
+#
+# The 2026-07-31 incident is what the second half buys: a watcher SURVIVED a `herd reload`, kept
+# ticking 41 minutes re-parented to init alongside its replacement — and the lockfile was EMPTY the
+# whole time. An empty lockfile is not a cosmetic diagnostic gap: `_watcher_lock_pid_if_live`,
+# `_acquire_watcher_singleton`'s recorded-pid refuse, `herd status`, the sweep and clause (2) of
+# _wx_exempt above ALL key off the recorded pid, so an empty lockfile blinds every one of them at
+# once — the guard "held" nothing, and each seat independently concluded there was no watcher to
+# refuse, stop, or count.
+#
+# watcher_singleton_verdict is the ONE place that reconciles the two halves, so no surface can grow
+# its own opinion. It CLASSIFIES ONLY — it never kills, never writes, never repairs. The caller
+# decides what a verdict means: agent-watch.sh's per-tick reconcile journals + paints a row (and
+# repairs a drifted lockfile when it is provably the sole main), `herd status` counts. Nothing here
+# may kill, because the fork/orphan discrimination that makes killing safe lives in _wx_exempt and a
+# classifier that also reaped would be one refactor away from reaping a review-tick fork.
+#
+# Output: one tab-separated line  "<state>\t<lockpid|->\t<mains csv|->\t<count>"
+#   OK        exactly one main, and the lockfile records exactly that pid — the healthy state
+#   NONE      no main is running (a stopped control room; the lockfile is irrelevant)
+#   LOCK_DRIFT exactly one main, but the lockfile is EMPTY, absent, dead, or names someone else —
+#             the blind-guard state above. Repairable: the sole main can simply record itself.
+#   DUPLICATE more than one main carries this workspace's argv0 — the 41-minute incident. NEVER
+#             auto-resolved here: telling a genuine orphan from a review-tick fork is _wx_exempt's
+#             job, and a wrong reap caches a bogus BLOCK verdict (memory: 2026-07-08 incident).
+#   HANDOFF   >1 main DURING a recorded self-restart exec window (watcher_handoff_active). The
+#             outgoing image's forks are momentarily neither marker-owned nor children of a settled
+#             lock, so this is the ONE benign multi-main sample. Reported distinctly rather than
+#             folded into OK, so a caller can still journal it and a stuck handoff stays visible
+#             (the marker ages out after WATCHER_HANDOFF_TTL and the verdict flips to DUPLICATE).
+watcher_singleton_verdict() {
+  local table="${1:-}" lockpid mains="" count=0 pid state
+  [ -n "$table" ] || table="$(watcher_ps_table)"
+  lockpid="$(watcher_lock_pid)"
+  # ONE table sample feeds the listing, so the argv0 match and the exemptions resolve against the
+  # same instant the verdict describes — never two racy `ps` calls.
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    count=$((count + 1))
+    mains="${mains:+$mains,}$pid"
+  done < <(watcher_list_mains "$table")
+
+  if [ "$count" -eq 0 ]; then
+    state=NONE
+  elif [ "$count" -gt 1 ]; then
+    state=DUPLICATE
+    watcher_handoff_active && state=HANDOFF
+  elif [ -n "$lockpid" ] && [ "$lockpid" = "$mains" ]; then
+    state=OK
+  else
+    state=LOCK_DRIFT
+  fi
+  printf '%s\t%s\t%s\t%s\n' "$state" "${lockpid:--}" "${mains:--}" "$count"
+}
+
 fi
