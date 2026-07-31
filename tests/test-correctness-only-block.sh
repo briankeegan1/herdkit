@@ -117,7 +117,7 @@ ok
 : > "$JOURNAL"
 _big="$(printf 'x%.0s' {1..500})"
 _record_advisory_notes 5 sha5 "REVIEW: PASS — advisory: $_big"
-_len="$(grep -o '"note":"x*"' "$JOURNAL" | head -1 | sed -E 's/.*"note":"(x*)".*/\1/' | tr -d '\n' | wc -c)"
+_len="$(grep -o '"note":"x*"' "$JOURNAL" | sed -n 1p | sed -E 's/.*"note":"(x*)".*/\1/' | tr -d '\n' | wc -c)"
 [ "$_len" -le 200 ] || fail "(5) advisory note should be capped at 200 chars (got $_len)"
 [ "$_len" -eq 200 ] || fail "(5) a 500-char note should truncate to exactly 200 (got $_len)"
 ok

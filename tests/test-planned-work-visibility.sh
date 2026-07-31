@@ -48,7 +48,7 @@ grep -q "committed onto" "$SKILL" || fail "rendered skill missing the file-backe
 grep -q "BACKLOG.md" <<< "$(grep -A2 "committed onto" "$SKILL")" \
   || fail "{{BACKLOG_FILE}} was not substituted to the concrete filename in the planned-work section"
 if grep -q . <<< "$(grep -n "{{[A-Z_]*}}" "$SKILL")"; then
-  fail "rendered skill left an unsubstituted {{token}}: $(grep -n '{{[A-Z_]*}}' "$SKILL" | head -1)"
+  fail "rendered skill left an unsubstituted {{token}}: $(grep -n '{{[A-Z_]*}}' "$SKILL" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
 fi
 pass
 

@@ -287,8 +287,8 @@ RESULT="pass"; [ "$_fail" -gt 0 ] && RESULT="fail"
 SCARD="$(write_scorecard "$RESULT")"
 
 # Read the verdict BACK from the file (the item's "scorecard green, read from file" acceptance).
-FILE_RESULT="$(sed -n 's/.*"result": "\([a-z]*\)".*/\1/p' "$SCARD" | head -1)"
-FILE_CROSS="$(sed -n 's/.*"cross_mismatch_writes": \([0-9]*\).*/\1/p' "$SCARD" | head -1)"
+FILE_RESULT="$(sed -n 's/.*"result": "\([a-z]*\)".*/\1/p' "$SCARD" | sed -n 1p)"
+FILE_CROSS="$(sed -n 's/.*"cross_mismatch_writes": \([0-9]*\).*/\1/p' "$SCARD" | sed -n 1p)"
 
 printf '\n%s══ scorecard ══%s\n' "$c_bold" "$c_rst"
 printf '  scenario:                %s\n' "$SCENARIO"

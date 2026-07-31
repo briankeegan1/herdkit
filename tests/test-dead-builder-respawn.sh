@@ -278,9 +278,9 @@ grep -q "agent start corpse-slug" "$HERDR_AGENT_LOG"     || fail "(7) the respaw
 respawn_recorded corpse-slug                             || fail "(7) a SUCCESSFUL respawn spends the at-most-once budget"
 
 # ORDERING is the whole fix: the corpse's pane and tab close BEFORE `tab create` ever runs.
-create_at="$(grep -n '^tab create' "$HERDR_ACTION_LOG" | head -1 | cut -d: -f1)"
-pane_at="$(grep -n '^pane close pane-corpse' "$HERDR_ACTION_LOG" | head -1 | cut -d: -f1)"
-tab_at="$(grep -n '^tab close tab-corpse' "$HERDR_ACTION_LOG" | head -1 | cut -d: -f1)"
+create_at="$(grep -nm1 '^tab create' "$HERDR_ACTION_LOG" | cut -d: -f1)"
+pane_at="$(grep -nm1 '^pane close pane-corpse' "$HERDR_ACTION_LOG" | cut -d: -f1)"
+tab_at="$(grep -nm1 '^tab close tab-corpse' "$HERDR_ACTION_LOG" | cut -d: -f1)"
 [ -n "$create_at" ] && [ -n "$pane_at" ] && [ -n "$tab_at" ] \
   || fail "(7) expected pane close + tab close + tab create in the action log; got:$(printf '\n%s' "$(cat "$HERDR_ACTION_LOG")")"
 [ "$pane_at" -lt "$create_at" ] || fail "(7) the corpse PANE was closed AFTER the new tab was created (the HERD-114 bug)"

@@ -74,7 +74,7 @@ fi
 
 n="$(printf '%s\n' "$errs" | wc -l | tr -d ' ')"
 if [ -n "$ONELINE" ]; then
-  echo "code error — $n markdown issue(s): $(printf '%s' "$errs" | head -1)"
+  echo "code error — $n markdown issue(s): $(printf '%s' "$errs" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
 else
   echo "CODE ERROR"
   printf '%s\n' "$errs"

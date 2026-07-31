@@ -164,7 +164,7 @@ pass
 
 # 2b. list_open (project scoped OFF) → no project clause, so it spans every project the token can see.
 : > "$APILOG"
-open2="$( unset JIRA_PROJECT_KEY; run _backend_list_open )"
+open2="$( unset JIRA_PROJECT_KEY; run _backend_list_open)"
 grep -q 'statusCategory != Done' "$APILOG" || fail "list_open (no project) did not issue the open JQL"
 grep -q 'project = ' "$APILOG" && fail "list_open (no project) must NOT scope by project — it leaked a project clause"
 grep -q "^#ENG-7 first open issue$" <<< "$open2" || fail "list_open (no project) missing '#ENG-7 first open issue' ($open2)"
@@ -180,7 +180,7 @@ rich="$(run _backend_list_open_rich)"
 grep -q '"status"' "$APILOG" || fail "list_open_rich did not request the status field"
 grep -q '"assignee"' "$APILOG" || fail "list_open_rich did not request the assignee field"
 grep -q '"description"' "$APILOG" || fail "list_open_rich did not request the description field"
-echo "$rich" | grep '^#' | head -n1 | grep -q "^#ENG-9" \
+grep -q "^#ENG-9" <<< "$(grep '^#' <<< "$rich" | sed -n 1p)" \
   || fail "list_open_rich did not sort the in-progress issue first ($rich)"
 grep -q "^#ENG-9${TAB}indeterminate${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase${TAB}https://acme.atlassian.net/browse/ENG-9$" <<< "$rich" \
   || fail "list_open_rich TSV shape wrong for ENG-9 (assignee Chase 6th, url 7th) ($rich)"
@@ -281,7 +281,7 @@ pass
 #     must resolve 'done' to the transition NAMED 'Done', never whichever done-category one is first.
 : > "$APILOG"
 us4="$( TRANSITIONS='[{"id":"41","name":"Cancel","to":{"name":"Cancelled","statusCategory":{"key":"done"}}},{"id":"31","name":"Done","to":{"name":"Done","statusCategory":{"key":"done"}}}]' \
-        run _backend_update_state ENG-7 done )"
+        run _backend_update_state ENG-7 done)"
 grep -q "RESULT=DONE" <<< "$us4" || fail "update_state (multi done) did not report DONE ($us4)"
 grep -q '"id": "31"' "$APILOG" || fail "update_state (multi done) did not pick the 'Done' transition by NAME"
 pass
@@ -290,7 +290,7 @@ pass
 #     A rejected transition (error envelope) must be NOCHANGE — not an optimistic DONE — so agent-watch
 #     falls back to the fuzzy scribe retry instead of journaling a false verified transition.
 : > "$APILOG"
-usf="$( TRANSITION_FAILS=1 run _backend_update_state ENG-7 done 2>/dev/null )"
+usf="$( TRANSITION_FAILS=1 run _backend_update_state ENG-7 done 2>/dev/null)"
 grep -q "RESULT=NOCHANGE" <<< "$usf" || fail "update_state must be NOCHANGE when the transition is rejected ($usf)"
 grep -q 'transitions' "$APILOG" || fail "update_state (rejected) should still ATTEMPT the transition"
 grep -q 'M<<POST>>P<<\/rest\/api\/3\/issue>>' "$APILOG" && fail "update_state (rejected) must NOT fall back to filing a new issue"
@@ -299,7 +299,7 @@ pass
 # 4i. HERD-70: the same verification guards mark_shipped — a rejected Done transition is NOCHANGE, even
 #     though the PR-link comment already posted.
 : > "$APILOG"
-shipf="$( TRANSITION_FAILS=1 run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null )"
+shipf="$( TRANSITION_FAILS=1 run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null)"
 grep -q "RESULT=NOCHANGE" <<< "$shipf" || fail "mark_shipped must be NOCHANGE when the Done transition is rejected ($shipf)"
 grep -q '/comment' "$APILOG" || fail "mark_shipped (rejected) should still post the PR-link comment"
 pass

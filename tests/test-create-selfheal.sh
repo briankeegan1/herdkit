@@ -101,7 +101,7 @@ step() {
             JOURNAL_FILE="$JOURNAL" HERMETIC_TEST=1 \
             HERD_CREATE_RETRY_NOW="${NOW:-1000}" HERD_CREATE_RETRY_BASE="${BASE:-60}" \
             CREATE_SELFHEAL="${SELFHEAL:-on}" CREATE_RETRY_MAX="${MAXTRY:-5}" \
-            bash "$STEP" "$@" 2>&1 )"
+            bash "$STEP" "$@" 2>&1)"
   RC=$?
   set -e
 }
@@ -138,7 +138,7 @@ NOW=2000 step next
 grep -q '^CLAIMED ' <<< "$OUT" || fail "(1b) the re-injected request was not claimed ($OUT)"
 grep -q 'dark-mode' <<< "$OUT" || fail "(1b) the re-injected request lost its text ($OUT)"
 jhas '"event":"create_retry_reinjected"'    || fail "(1b) the re-injection was not journaled"
-CLAIMED="$(printf '%s\n' "$OUT" | sed -n 's/^CLAIMED //p' | head -n1)"
+CLAIMED="$(printf '%s\n' "$OUT" | sed -n 's/^CLAIMED //p' | sed -n 1p)"
 [ -f "$CLAIMED" ]                           || fail "(1b) the claimed path does not exist"
 ok; echo "PASS (1b) a due entry rides the drainer's own next poll"
 
@@ -205,7 +205,7 @@ done
 [ "$(entries)" = "1" ] || fail "(4) repeated failures stacked $(entries) entries instead of coalescing to 1"
 CO="$(basename "$(ls "$RETRY"/*.meta)" .meta)"
 grep -q '^attempts=3' "$RETRY/$CO.meta" || fail "(4) the coalesced entry does not carry a retry count of 3"
-ROWS="$( HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_SELFHEAL=on bash "$LIB" rows )"
+ROWS="$( HERD_CONFIG_FILE="$CFG" HERMETIC_TEST=1 JOURNAL_FILE="$JOURNAL" CREATE_SELFHEAL=on bash "$LIB" rows)"
 [ "$(printf '%s\n' "$ROWS" | grep -c .)" = "1" ] || fail "(4) create_retry_rows stacked per attempt: $ROWS"
 grep -q 'Coalesce me' <<< "$ROWS" || fail "(4) the coalesced row lost its title"
 ok; echo "PASS (4) repeated failures of one request coalesce into one row with a retry count"
@@ -268,11 +268,11 @@ ok; echo "PASS (5b) a real Linear rate limit stays pending and is retried, never
 # Sourced in a SUBSHELL: linear.sh's _backend_* ops must not leak into this test's process, or a later
 # check would see an incapable backend as capable (shell functions are inherited by subshells).
 E="$( LINEAR_API_KEY=x; . "$LINEAR" >/dev/null 2>&1
-     printf '%s' '{"errors":[{"message":"issue limit reached","extensions":{"code":"USAGE_LIMIT_EXCEEDED"}}]}' | _linear_error_text )"
+     printf '%s' '{"errors":[{"message":"issue limit reached","extensions":{"code":"USAGE_LIMIT_EXCEEDED"}}]}' | _linear_error_text)"
 case "$E" in *USAGE_LIMIT_EXCEEDED*) : ;; *) fail "(6) _linear_error_text dropped the GraphQL error code (got '$E')" ;; esac
 [ "$(create_retry_class "$E")" = cap ] || fail "(6) a real Linear cap refusal does not classify as 'cap'"
 [ -z "$( LINEAR_API_KEY=x; . "$LINEAR" >/dev/null 2>&1
-        printf '%s' '{"data":{"issueCreate":{"success":false}}}' | _linear_error_text )" ] \
+        printf '%s' '{"data":{"issueCreate":{"success":false}}}' | _linear_error_text)" ] \
   || fail "(6) a response with no errors array invented an error"
 ok; echo "PASS (6) linear.sh lifts the refusal reason out of the GraphQL response"
 
@@ -388,7 +388,7 @@ p="$(mkreq 950 "Changelog item")"
 set +e
 OUT="$( cd "$REPO" && HERD_CONFIG_FILE="$CFG.changelog" SCRIBE_BACKEND_DIR="$FAKEDIR" SCRIBE_POLL=0 \
           JOURNAL_FILE="$JOURNAL" HERMETIC_TEST=1 CREATE_SELFHEAL=on \
-          bash "$STEP" add-item "$p" "Changelog item" 2>&1 )"
+          bash "$STEP" add-item "$p" "Changelog item" 2>&1)"
 RC=$?
 set -e
 [ "$RC" -eq 0 ]   || fail "(14) the changelog add exited $RC ($OUT)"

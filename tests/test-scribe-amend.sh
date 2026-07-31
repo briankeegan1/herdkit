@@ -71,7 +71,7 @@ step() {
   local bdir="$1" backend="$2"; shift 2
   set +e
   OUT="$( cd "$REPO" && HERD_CONFIG_FILE="$CFG" SCRIBE_BACKEND_DIR="$bdir" SCRIBE_BACKEND="$backend" \
-            JOURNAL_FILE="$JF" SCRIBE_POLL=0 bash "$STEP" "$@" 2>&1 )"
+            JOURNAL_FILE="$JF" SCRIBE_POLL=0 bash "$STEP" "$@" 2>&1)"
   RC=$?
   set -e
 }
@@ -88,8 +88,8 @@ BL="$REPO/BACKLOG.md"
 [ "$(grep -c '↳' "$BL")" -eq 1 ]                            || fail "1: expected exactly one ↳ note ($(grep -n '↳' "$BL"))"
 grep -qE '^  ↳ \[[0-9]{4}-[0-9]{2}-[0-9]{2}\] blocked on the new API' "$BL" || fail "1: ↳ note is not indented+dated ($(grep -n '↳' "$BL"))"
 # It sits DIRECTLY under HERD-11 (item line + 1), not under HERD-10 or HERD-12.
-item_ln="$(grep -n 'HERD-11 Refactor the scheduler core' "$BL" | head -1 | cut -d: -f1)"
-note_ln="$(grep -n 'blocked on the new API' "$BL" | head -1 | cut -d: -f1)"
+item_ln="$(grep -nm1 'HERD-11 Refactor the scheduler core' "$BL" | cut -d: -f1)"
+note_ln="$(grep -nm1 'blocked on the new API' "$BL" | cut -d: -f1)"
 [ -n "$item_ln" ] && [ "$note_ln" -eq "$((item_ln + 1))" ] || fail "1: ↳ note not directly under HERD-11 (item=$item_ln note=$note_ln)"
 # State + title of HERD-11 are UNCHANGED (still 🚧, same text), and the neighbours are untouched.
 grep -qE '^- 🚧 HERD-11 Refactor the scheduler core$' "$BL" || fail "1: HERD-11 line changed (state/title must be untouched)"

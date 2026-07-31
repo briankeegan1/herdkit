@@ -189,7 +189,7 @@ legacy_tracker_drift() {
       *)      glyph='⚠️'; color="$C_RED"   ;;
     esac
     rows="${rows}    ${color}${glyph}${C_RESET} ${C_BOLD}${ref}${C_RESET} ${color}${status}${C_RESET} ${C_DIM}#${pr} was ${state} · ${hhmm}${C_RESET}"$'\n'
-  done < <(reverse_file "$TRACKER_HEAL_FILE" | head -3)
+  done < <(reverse_file "$TRACKER_HEAL_FILE" | sed -n 1,3p)
   printf '%s' "$rows"
 }
 legacy_builder_notes() {
@@ -199,7 +199,7 @@ legacy_builder_notes() {
     [ -n "${slug:-}" ] || continue
     hhmm="$(epoch_to_hhmm "$epoch")"
     rows="${rows}    ${C_CYAN}📝${C_RESET} ${C_BOLD}${slug}${C_RESET} ${text} ${C_DIM}${hhmm}${C_RESET}"$'\n'
-  done < <(reverse_file "$BUILDER_NOTES_LEDGER" | head -5)
+  done < <(reverse_file "$BUILDER_NOTES_LEDGER" | sed -n 1,5p)
   printf '%s' "$rows"
 }
 

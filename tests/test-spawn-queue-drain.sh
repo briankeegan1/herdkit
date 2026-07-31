@@ -177,10 +177,10 @@ pass
 
 # ── Case 4: spawn-step.sh release round-trips the claim byte-identically ────────────────────────
 enqueue slug-rt quick "round trip payload"
-f=$(ls "$T/trees/spawn-queue"/*.req | head -1)
+f=$(ls "$T/trees/spawn-queue"/*.req | sed -n 1p)
 before=$(cat "$f")
 WORKTREES_DIR="$T/trees" bash "$ENG/spawn-step.sh" next >/dev/null
-mine=$(ls "$T/trees/spawn-queue"/*.mine | head -1)
+mine=$(ls "$T/trees/spawn-queue"/*.mine | sed -n 1p)
 WORKTREES_DIR="$T/trees" bash "$ENG/spawn-step.sh" release "$mine"
 after=$(cat "$f" 2>/dev/null) || fail "release did not restore the .req file"
 [ "$before" = "$after" ] || fail "release altered the intent payload"
@@ -197,7 +197,7 @@ echo slow > "$T/lane.mode"; : > "$LANELOG"; : > "$JLOG"
 run_drain_nowait
 BG="$(cat "$T/bgpid" 2>/dev/null || true)"
 [ -n "$BG" ] || fail "(5) the drain launched no background lane worker"
-mine="$(ls "$T/trees/spawn-queue"/*.req.mine 2>/dev/null | head -1)"
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine 2>/dev/null | sed -n 1p)"
 [ -n "$mine" ] || fail "(5) no claim is held while the lane runs"
 [ -f "${mine%.req.mine}.owner" ] || fail "(5) the drain did not bind the claim to its lane worker (.owner)"
 [ "$(head -1 "${mine%.req.mine}.owner")" = "$BG" ] || fail "(5) .owner names the wrong pid"
@@ -228,7 +228,7 @@ pass
 rm -f "$T/trees/spawn-queue"/* 2>/dev/null
 enqueue slug-abandoned quick "claimed by a watcher that then died"
 step next >/dev/null
-mine="$(ls "$T/trees/spawn-queue"/*.req.mine | head -1)"
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine | sed -n 1p)"
 sleep 300 & DEADPID=$!
 step own "$mine" "$DEADPID" >/dev/null
 kill "$DEADPID" 2>/dev/null; wait "$DEADPID" 2>/dev/null || true
@@ -246,7 +246,7 @@ pass
 rm -f "$T/trees/spawn-queue"/* 2>/dev/null
 enqueue slug-ghost quick "claim that will vanish under the worker"
 step next >/dev/null
-mine="$(ls "$T/trees/spawn-queue"/*.req.mine | head -1)"
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine | sed -n 1p)"
 rm -f "$mine"                                  # simulate: reclaimed (or already consumed) under us
 for verb in done release skip; do
   if step "$verb" "$mine" "reason" >/dev/null 2>&1; then
@@ -278,7 +278,7 @@ pass
 rm -f "$T/trees/spawn-queue"/* 2>/dev/null
 enqueue slug-rel quick "release round-trip"
 step next >/dev/null
-mine="$(ls "$T/trees/spawn-queue"/*.req.mine | head -1)"
+mine="$(ls "$T/trees/spawn-queue"/*.req.mine | sed -n 1p)"
 id="$(basename "${mine%.req.mine}")"
 age "$mine"                                      # a stale-looking claim …
 before_mtime="$(python3 -c 'import os,sys;print(int(os.stat(sys.argv[1]).st_mtime))' "$mine")"

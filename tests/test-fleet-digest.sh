@@ -111,7 +111,7 @@ out7d="$(bash "$HERD" fleet digest --since 7d)"
 a7="$(printf '%s' "$out7d" | awk '/^alpha$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
 grep -Eq 'shipped: +3' <<< "$a7" || fail "--since 7d should include #99 → 3 shipped, got: $a7"
 grep -q '#99' <<< "$a7" || fail "--since 7d should name #99"
-printf '%s' "$out7d" | grep '^Fleet:' | grep -q "3 shipped" || fail "7d summary should tally 3 shipped"
+grep -q "3 shipped" <<< "$(printf '%s' "$out7d" | grep '^Fleet:')" || fail "7d summary should tally 3 shipped"
 ok
 
 # ── 7. a TIGHTER --since window narrows the set (2h → only #7 merged) ─────────
@@ -128,7 +128,7 @@ printf 'ghost|%s/proj/ghost|me/ghost\n' "$T" >> "$HERD_FLEET_FILE"
 out="$(bash "$HERD" fleet digest)"
 ghost_block="$(printf '%s' "$out" | awk '/^ghost$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
 grep -qi "unreachable" <<< "$ghost_block" || fail "missing project should be reported as unreachable"
-printf '%s' "$out" | grep '^Fleet:' | grep -q "3 projects" || fail "summary should still count the ghost project"
+grep -q "3 projects" <<< "$(printf '%s' "$out" | grep '^Fleet:')" || fail "summary should still count the ghost project"
 # aggregation of the reachable projects still renders (alpha present after the ghost).
 grep -q "^alpha$" <<< "$out" || fail "digest should continue past the unreachable project"
 ok
@@ -183,7 +183,7 @@ delta_block="$(printf '%s' "$out" | awk '/^delta$/{f=1;next} /^[a-zA-Z]/{f=0} f'
 # #55 had a BLOCK then merge_observed → must appear as shipped, not blocked.
 grep -Eq 'shipped: +1' <<< "$delta_block" || fail "merge_observed: delta should have 1 shipped (#55), got: $delta_block"
 grep -q '#55' <<< "$delta_block" || fail "merge_observed: #55 must appear in shipped list"
-printf '%s' "$delta_block" | grep -E 'shipped:' | grep -q '#77' && fail "merge_observed: #77 (BLOCK only, no merge_observed) must not be shipped"
+grep -q '#77' <<< "$(printf '%s' "$delta_block" | grep -E 'shipped:')" && fail "merge_observed: #77 (BLOCK only, no merge_observed) must not be shipped"
 grep -Eq 'blocked: +1' <<< "$delta_block" || fail "merge_observed: #77 (BLOCK, no merge_observed) must remain blocked"
 ok
 

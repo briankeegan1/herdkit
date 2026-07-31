@@ -93,7 +93,7 @@ grep -qi "co-authored-by: claude" <<< "$out" \
 pass
 
 # ── 1b. violation line includes the commit sha (12-char prefix) ──────────────────────────────────
-sha="$(cd "$T/vio/repo" && git log --format="%H" origin/main..HEAD | head -1)"
+sha="$(cd "$T/vio/repo" && git log -1 --format="%H" origin/main..HEAD)"
 short="$(printf '%.12s' "$sha")"
 grep -qF "$short" <<< "$out" \
   || fail "(1b) violation must name the offending sha ($short); got: $out"

@@ -93,7 +93,7 @@ cat > "$RESEARCH_STUB" <<'RSTUB'
 #!/usr/bin/env bash
 # Args: the research question (may be multi-line via "$@").
 q="$*"
-num="$(printf '%s' "$q" | sed -nE 's/.*issue #([0-9]+).*/\1/p' | head -n1)"
+num="$(printf '%s' "$q" | sed -nE 's/.*issue #([0-9]+).*/\1/p' | sed -n 1p)"
 [ -n "$num" ] || num="x"
 rid="triage-req-${num}"
 printf '🔎 queued: OSS-TRIAGE issue #%s\n' "$num"
@@ -233,7 +233,7 @@ if grep -Eiq 'issue (comment|close|edit|create)|api ' "$GH_LOG" 2>/dev/null; the
 fi
 # Also scan the full log history from the whole test (re-read accumulated — we truncated; re-assert on script source).
 # Source-level guard: oss-triage.sh must not contain issue comment/close.
-if grep -nE 'issue comment|issue close|issue edit|gh api' "$TRIAGE_SH" | grep -vE '^\s*#' | grep -v 'NEVER' | grep -q .; then
+if grep -q . <<< "$(grep -nE 'issue comment|issue close|issue edit|gh api' "$TRIAGE_SH" | grep -vE '^\s*#' | grep -v 'NEVER')"; then
   fail "(5) oss-triage.sh appears to call mutating gh:\n%s" "$(grep -nE 'issue comment|issue close|issue edit|gh api' "$TRIAGE_SH")"
 fi
 ok

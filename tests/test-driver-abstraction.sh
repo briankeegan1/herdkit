@@ -97,7 +97,7 @@ render "$Q" >/dev/null || fail "explicit-default render failed"
 # normalize the only legitimate difference (PROJECT_ROOT path) before comparing.
 sed "s#$P#PROOT#g" "$SK" > "$T/a"
 sed "s#$Q#PROOT#g" "$Q/.claude/commands/coordinator.md" > "$T/b"
-diff -q "$T/a" "$T/b" >/dev/null || { echo "--- unset vs explicit differ ---"; diff "$T/a" "$T/b" | head; fail "explicit herdr-claude not byte-identical to unset"; }
+diff -q "$T/a" "$T/b" >/dev/null || { echo "--- unset vs explicit differ ---"; diff "$T/a" "$T/b" | head; fail "explicit herdr-claude not byte-identical to unset"; }  # pipe-ok: diff|head only prints a dump on the way to fail; the pipeline status is not gated
 ok; echo "PASS (2) HERD_DRIVER=herdr-claude renders byte-identical to the default (unset)"
 
 # ── 3. Unknown HERD_DRIVER fails LOUDLY and lists the drivers that ship. ──────────────────────────

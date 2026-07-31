@@ -63,11 +63,11 @@ ok
 BLOCK_BODY="$(printf 'Some PR prose above.\n\n<!-- herd-handoff:v1 -->\n### Builder handoff\n- **Changed:** adds the handoff emitter\n- **Files:** scripts/herd/handoff.sh, tests/test-handoff-summary.sh\n- **Decisions:** self-contained script, no preamble edit\n- **Verification:** healthcheck.sh -> PASS\n- **Follow-ups:** none\n<!-- /herd-handoff:v1 -->\n')"
 printf '%s' "$BLOCK_BODY" | handoff_has || fail "present block should satisfy handoff_has"
 ok
-printf '%s' "$BLOCK_BODY" | handoff_extract | grep -q '<!-- herd-handoff:v1 -->' || fail "extract missing begin sentinel"
-printf '%s' "$BLOCK_BODY" | handoff_extract | grep -q '<!-- /herd-handoff:v1 -->' || fail "extract missing end sentinel"
+grep -q '<!-- herd-handoff:v1 -->' <<< "$(printf '%s' "$BLOCK_BODY" | handoff_extract)" || fail "extract missing begin sentinel"
+grep -q '<!-- /herd-handoff:v1 -->' <<< "$(printf '%s' "$BLOCK_BODY" | handoff_extract)" || fail "extract missing end sentinel"
 ok
 # extract must NOT include the surrounding prose
-printf '%s' "$BLOCK_BODY" | handoff_extract | grep -q 'Some PR prose above' && fail "extract leaked prose outside the block"
+grep -q 'Some PR prose above' <<< "$(printf '%s' "$BLOCK_BODY" | handoff_extract)" && fail "extract leaked prose outside the block"
 ok
 fields="$(printf '%s' "$BLOCK_BODY" | handoff_fields)"
 grep -q '^changed=adds the handoff emitter$' <<< "$fields" || fail "changed field wrong: $fields"
@@ -128,12 +128,12 @@ ok
 base="$(printf 'Original PR body.\n\nRefs: HERD-106\n')"
 once="$(printf '%s' "$base" | HANDOFF_CHANGED="first" handoff_upsert_body)"
 grep -q 'Original PR body' <<< "$once" || fail "upsert dropped the original body"
-[ "$(printf '%s' "$once" | grep -c 'herd-handoff:v1' )" = "2" ] || fail "upsert should add exactly one block (2 sentinels)"
+[ "$(printf '%s' "$once" | grep -c 'herd-handoff:v1')" = "2" ] || fail "upsert should add exactly one block (2 sentinels)"
 [ "$(printf '%s' "$once" | handoff_field changed)" = "first" ] || fail "upsert appended wrong Changed"
 ok
 # re-emit REPLACES, never stacks — still exactly one block, new value wins
 twice="$(printf '%s' "$once" | HANDOFF_CHANGED="second" handoff_upsert_body)"
-[ "$(printf '%s' "$twice" | grep -c 'herd-handoff:v1' )" = "2" ] || fail "re-emit must not stack blocks"
+[ "$(printf '%s' "$twice" | grep -c 'herd-handoff:v1')" = "2" ] || fail "re-emit must not stack blocks"
 [ "$(printf '%s' "$twice" | handoff_field changed)" = "second" ] || fail "re-emit should replace the value"
 grep -q 'Original PR body' <<< "$twice" || fail "re-emit dropped the original body"
 ok

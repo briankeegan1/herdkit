@@ -203,8 +203,7 @@ else
   grep -q '_sweep_watcher_has_gate_child "$pid" "$table" && continue' "$REPO/scripts/herd/sweep.sh" \
     || fail "(e) sweep_stray_watchers lost its detection-only gate-child guard (HERD-217)"
   grep -q 'watcher_has_gate_child' "$REPO/scripts/herd/watcher-exempt.sh" \
-    && grep -qE '^_wx_exempt\(\)' -A8 "$REPO/scripts/herd/watcher-exempt.sh" \
-    | grep -q 'watcher_has_gate_child' \
+    && grep -q 'watcher_has_gate_child' <<< "$(grep -E '^_wx_exempt\(\)' -A8 "$REPO/scripts/herd/watcher-exempt.sh" || true)" \
     && fail "(e) the gate-child guard leaked back into _wx_exempt — it would blind _stop_project_watcher"
   ok; echo "PASS (e) the gate-child guard lives on sweep's detection surface only (structural)"
 fi

@@ -193,7 +193,7 @@ ok
 [ -f "$JOURNAL_FILE" ] || fail "rotation: a fresh live journal should exist after rotating"
 ok
 # No events were lost across the rotation boundary: total lines (archives + live) == 12.
-total="$(cat "$T"/j4/journal-*.jsonl "$JOURNAL_FILE" 2>/dev/null | grep -c . )"
+total="$(cat "$T"/j4/journal-*.jsonl "$JOURNAL_FILE" 2>/dev/null | grep -c .)"
 [ "$total" -eq 12 ] || fail "rotation: expected 12 total events across archive+live, got $total"
 ok
 unset JOURNAL_MAX_BYTES
@@ -259,8 +259,8 @@ ok
 grep -q "BLOCK" <<< "$why_out" && fail "herd why 54: must not include PR #55's BLOCK"
 ok
 # Chronological order: dispatch line appears before the merge line.
-disp_ln="$(printf '%s\n' "$why_out" | grep -n "review dispatched" | head -1 | cut -d: -f1)"
-merge_ln="$(printf '%s\n' "$why_out" | grep -n "MERGED" | head -1 | cut -d: -f1)"
+disp_ln="$(printf '%s\n' "$why_out" | grep -n "review dispatched" | sed -n 1p | cut -d: -f1)"
+merge_ln="$(printf '%s\n' "$why_out" | grep -n "MERGED" | sed -n 1p | cut -d: -f1)"
 [ -n "$disp_ln" ] && [ -n "$merge_ln" ] && [ "$disp_ln" -lt "$merge_ln" ] \
   || fail "herd why: events must be chronological (dispatch before merge)"
 ok

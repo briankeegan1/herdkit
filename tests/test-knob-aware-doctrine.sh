@@ -69,7 +69,7 @@ grep -q '## Operating posture' "$(skill "$H2")" && fail "(1b) unset autonomy mus
 sed "s#$H#PROOT#g" "$HS" > "$T/h-a"
 sed "s#$H2#PROOT#g" "$(skill "$H2")" > "$T/h-b"
 diff -q "$T/h-a" "$T/h-b" >/dev/null \
-  || { echo "--- human vs unset differ ---"; diff "$T/h-a" "$T/h-b" | head -20; fail "(1c) explicit human not byte-identical to unset default"; }
+  || { echo "--- human vs unset differ ---"; diff "$T/h-a" "$T/h-b" | head -20; fail "(1c) explicit human not byte-identical to unset default"; }  # pipe-ok: diff|head only prints a dump on the way to fail; the pipeline status is not gated
 ok; echo "PASS (1) COORDINATOR_AUTONOMY=human → no Operating posture (byte-identical default)"
 
 # ── (2) full + autofix suite on → FULL doctrine ──────────────────────────────────────────────────

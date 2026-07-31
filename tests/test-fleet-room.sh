@@ -108,8 +108,8 @@ grep -qi "fall back\|fallback" "$SKILL" \
   || fail "rendered skill should say LLM judgment is only the FALLBACK, after the resolver refuses"
 # The resolver-first instruction must appear BEFORE the coordinator-pane lookup step it feeds —
 # a room agent reading top-to-bottom must not be told to guess a pane before it is told to resolve.
-resolve_line="$(grep -n "herd fleet resolve" "$SKILL" | head -1 | cut -d: -f1)"
-pane_line="$(grep -n "herdr agent list" "$SKILL" | head -1 | cut -d: -f1)"
+resolve_line="$(grep -nm1 "herd fleet resolve" "$SKILL" | cut -d: -f1)"
+pane_line="$(grep -nm1 "herdr agent list" "$SKILL" | cut -d: -f1)"
 [ -n "$resolve_line" ] && [ -n "$pane_line" ] && [ "$resolve_line" -lt "$pane_line" ] \
   || fail "the resolver call should be instructed BEFORE the coordinator-pane lookup"
 ok

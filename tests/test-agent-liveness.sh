@@ -316,7 +316,7 @@ ok
 grep -q "coordinator-proj" <<< "$out" && fail "E5: a multi-pane control room must NOT be flagged (out: $out)"
 ok
 # every flagged row carries a bare|gone role
-printf '%s\n' "$out" | grep "review·featx" | grep -qE '	(bare|gone)$' || fail "E6: a flagged row must record the dead role"
+grep -qE '	(bare|gone)$' <<< "$(printf '%s\n' "$out" | grep "review·featx")" || fail "E6: a flagged row must record the dead role"
 ok
 
 echo "ALL PASS ($pass checks)"

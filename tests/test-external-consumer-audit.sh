@@ -78,7 +78,7 @@ for p in d["probes"]:
     assert p["status"] in ("leak","clean","skip"), p
 print("scorecard ok: leaks=%d clean=%d skip=%d (Leak B closed)" % (d["leaks"],d["clean"],d["skipped"]))
 PY
-echo "PASS (b) all documented leaks reproduce — $(sed -n 's/.*"result": *"\([^"]*\)".*/\1/p' "$SC" | head -1)"
+echo "PASS (b) all documented leaks reproduce — $(sed -n 's/.*"result": *"\([^"]*\)".*/\1/p' "$SC" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
 
 # ── (c) THE HEADLINE LEAK, DIRECTLY AGAINST healthcheck.sh — now CLOSED ───────────
 # Build a fresh fixture, break a .go file, and confirm the light profile NO LONGER green-lights it.

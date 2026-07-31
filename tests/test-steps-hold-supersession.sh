@@ -89,8 +89,8 @@ check "an awaiting row now also exists for SHA2"          "grep -q 'awaiting wed
 # succeeds (HEAD==SHA2). Before the fix this whole sequence wedged: approve→SHA1, release→refuse.
 approve_out="$(run_approve wedge 2>&1)"; arc=$?
 check "approve succeeds (rc 0) after the supersession"   "[ '$arc' -eq 0 ]"
-check "approve BOUND + PRINTED the CURRENT sha (SHA2)"   "printf '%s' \"\$approve_out\" | grep -q '$SHA2'"
-check "approve did NOT bind the stale sha (SHA1)"        "! printf '%s' \"\$approve_out\" | grep -q '$SHA1'"
+check "approve BOUND + PRINTED the CURRENT sha (SHA2)"   "grep -q '$SHA2' <<< \"\$approve_out\""
+check "approve did NOT bind the stale sha (SHA1)"        "! grep -q '$SHA1' <<< \"\$approve_out\""
 check "the CURRENT sha (SHA2) is released"               "grep -q 'released wedge $SHA2 human-check' '$HOLDS'"
 check "the stale sha (SHA1) was never released/wedged"   "! grep -q 'released wedge $SHA1 human-check' '$HOLDS'"
 # After releasing the only step, a fresh re-tick proceeds (rc 0 ⇒ the merge would go through).
@@ -143,13 +143,13 @@ check "pin: pre-merge holds (rc 20)" "[ '$rc' -eq 20 ]"
 badsha="0000000000000000000000000000000000000000"
 prc=0; pinbad="$(approve3_env bash "$APPROVE" approve pin --sha "$badsha" 2>&1)" || prc=$?
 check "--sha mismatch REFUSES (non-zero rc)"        "[ '$prc' -ne 0 ]"
-check "--sha mismatch prints a refusal"             "printf '%s' \"\$pinbad\" | grep -qi 'Refusing'"
+check "--sha mismatch prints a refusal"             "grep -qi 'Refusing' <<< \"\$pinbad\""
 check "--sha mismatch recorded NO approval"         "! grep -q 'approved pin' '$HOLDS3'"
 
 # Correct full --sha ⇒ approves (consumes the hold) + prints the bound (full) sha.
 grc=0; pinok="$(approve3_env bash "$APPROVE" approve pin --sha "$CURSHA" 2>&1)" || grc=$?
 check "--sha full match approves (rc 0)"            "[ '$grc' -eq 0 ]"
-check "matched approve prints the full bound sha"   "printf '%s' \"\$pinok\" | grep -q '$CURSHA'"
+check "matched approve prints the full bound sha"   "grep -q '$CURSHA' <<< \"\$pinok\""
 check "matched approve recorded the approval"       "grep -q 'approved pin $CURSHA human-check' '$HOLDS3'"
 
 # A short PREFIX (what `list` shows as sha:XXXXXXXX) is also accepted — fresh slug so the hold is live.
@@ -202,7 +202,7 @@ dg_env bash "$APPROVE" approve dgone >/dev/null 2>&1 || true   # approve is fine
 rm -rf "$GONEREPO"
 drc=0; dgout="$(dg_env bash "$STEPS" release dgone 2>&1)" || drc=$?
 check "dir-gone release REFUSES (non-zero rc)"   "[ '$drc' -ne 0 ]"
-check "dir-gone release says the worktree is gone" "printf '%s' \"\$dgout\" | grep -qi 'gone'"
+check "dir-gone release says the worktree is gone" "grep -qi 'gone' <<< \"\$dgout\""
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
 echo

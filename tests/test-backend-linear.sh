@@ -153,7 +153,7 @@ pass
 
 # 2b. list_open (team scoped OFF) → no team filter, so it spans every team the key can see.
 : > "$GQLLOG"
-open2="$( unset LINEAR_TEAM_ID; run _backend_list_open )"
+open2="$( unset LINEAR_TEAM_ID; run _backend_list_open)"
 grep -q "issues(" "$GQLLOG" || fail "list_open (no team) did not issue an 'issues' query"
 grep -q 'team: { id:' "$GQLLOG" && fail "list_open (no team) must NOT scope by team — it leaked a team filter"
 grep -q "^#ENG-7 first open issue$" <<< "$open2" || fail "list_open (no team) missing '#ENG-7 first open issue' ($open2)"
@@ -170,7 +170,7 @@ rich="$(run _backend_list_open_rich)"
 grep -q "description url state { name type }" "$GQLLOG" || fail "list_open_rich did not request description + url + state name/type"
 grep -q "assignee { displayName }" "$GQLLOG" || fail "list_open_rich did not request assignee displayName"
 grep -q 'team: { id: { eq: $team }' "$GQLLOG" || fail "list_open_rich (team set) did not scope the query to the team"
-echo "$rich" | grep '^#' | head -n1 | grep -q "^#ENG-9" \
+grep -q "^#ENG-9" <<< "$(grep '^#' <<< "$rich" | sed -n 1p)" \
   || fail "list_open_rich did not sort the started (in-progress) issue first ($rich)"
 grep -q "^#ENG-9${TAB}started${TAB}In Progress${TAB}second open issue${TAB}${TAB}Chase${TAB}https://linear.app/acme/issue/ENG-9$" <<< "$rich" \
   || fail "list_open_rich TSV shape wrong for ENG-9 (assignee Chase 6th field, url 7th field) ($rich)"
@@ -316,7 +316,7 @@ pass
 #     stub BOTH started states with 'In Review' listed first AND at a higher position — name wins.
 : > "$GQLLOG"
 us4="$( STATES_NODES='[{"id":"st_review","name":"In Review","position":2},{"id":"st_progress","name":"In Progress","position":1}]' \
-        run _backend_update_state ENG-7 in-progress )"
+        run _backend_update_state ENG-7 in-progress)"
 grep -q "RESULT=DONE" <<< "$us4" || fail "update_state (multi started) did not report DONE ($us4)"
 grep -q "issueUpdate" "$GQLLOG" || fail "update_state (multi started) did not move the issue"
 grep -q "st_progress" "$GQLLOG" || fail "update_state (multi started) did not pick the 'In Progress' state by NAME (gh #169)"
@@ -327,7 +327,7 @@ pass
 #     position (Linear's canonical order = the earliest started state), still never 'In Review'.
 : > "$GQLLOG"
 us5="$( STATES_NODES='[{"id":"st_review","name":"In Review","position":2},{"id":"st_doing","name":"Doing","position":1}]' \
-        run _backend_update_state ENG-7 in-progress )"
+        run _backend_update_state ENG-7 in-progress)"
 grep -q "RESULT=DONE" <<< "$us5" || fail "update_state (position fallback) did not report DONE ($us5)"
 grep -q "st_doing" "$GQLLOG" || fail "update_state (position fallback) did not pick the LOWEST-position started state (gh #169)"
 grep -q "st_review" "$GQLLOG" && fail "update_state (position fallback) picked the higher-position 'In Review' — gh #169 regression"
@@ -337,7 +337,7 @@ pass
 #     lowest-position one — never an arbitrary completed state (e.g. 'Duplicate').
 : > "$GQLLOG"
 us6="$( STATES_NODES='[{"id":"st_dup","name":"Duplicate","position":2},{"id":"st_done","name":"Done","position":1}]' \
-        run _backend_update_state ENG-7 done )"
+        run _backend_update_state ENG-7 done)"
 grep -q "RESULT=DONE" <<< "$us6" || fail "update_state (multi completed) did not report DONE ($us6)"
 grep -q "st_done" "$GQLLOG" || fail "update_state (multi completed) did not pick the 'Done' state by NAME (gh #169)"
 grep -q "st_dup"  "$GQLLOG" && fail "update_state (multi completed) picked 'Duplicate' — gh #169 regression"
@@ -348,7 +348,7 @@ pass
 #     optimistic DONE — so agent-watch's _reconcile_via_ref returns non-zero and falls back to the fuzzy
 #     scribe retry instead of journaling a false verified transition (the PR #187/HERD-67 incident).
 : > "$GQLLOG"
-usf="$( ISSUEUPDATE_SUCCESS=false run _backend_update_state ENG-7 done 2>/dev/null )"
+usf="$( ISSUEUPDATE_SUCCESS=false run _backend_update_state ENG-7 done 2>/dev/null)"
 grep -q "RESULT=NOCHANGE" <<< "$usf" || fail "update_state must return NOCHANGE when issueUpdate is not confirmed ($usf)"
 grep -q "issueUpdate" "$GQLLOG" || fail "update_state (failed mutation) should still ATTEMPT the issueUpdate before reporting NOCHANGE"
 grep -q "issueCreate" "$GQLLOG" && fail "update_state (failed mutation) must NOT fall back to filing a new issue"
@@ -357,7 +357,7 @@ pass
 # 4k. HERD-70: the same verification guards mark_shipped — a failed Done-move issueUpdate is NOCHANGE,
 #     never a false 'shipped', even though the PR-link comment already posted.
 : > "$GQLLOG"
-shipf="$( ISSUEUPDATE_SUCCESS=false run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null )"
+shipf="$( ISSUEUPDATE_SUCCESS=false run _backend_mark_shipped ENG-7 https://github.com/acme/widgets/pull/5 2>/dev/null)"
 grep -q "RESULT=NOCHANGE" <<< "$shipf" || fail "mark_shipped must return NOCHANGE when the Done-move issueUpdate is not confirmed ($shipf)"
 grep -q "commentCreate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still post the PR-link comment"
 grep -q "issueUpdate" "$GQLLOG" || fail "mark_shipped (failed mutation) should still ATTEMPT the Done-move issueUpdate"

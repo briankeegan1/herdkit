@@ -609,7 +609,7 @@ done
 
 # Fold the observed max live-healthcheck count from the stub's interleaving log.
 if [ -s "$STUB_HC_MARKERCOUNT_LOG" ]; then
-  MAX_HEALTH_INFLIGHT="$(sort -nr "$STUB_HC_MARKERCOUNT_LOG" | head -1)"
+  MAX_HEALTH_INFLIGHT="$(sort -nr "$STUB_HC_MARKERCOUNT_LOG" | sed -n 1p)"
 fi
 HEALTH_RUNS="$(wc -l < "$STUB_HC_MARKERCOUNT_LOG" | tr -d ' ')"
 

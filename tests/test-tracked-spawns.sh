@@ -132,7 +132,7 @@ pass; echo "PASS (9) spawn.sh refuses a ref-less intent under required — queue
 reset_q
 out="$(TRACKED_SPAWNS=required HERD_ITEM_REF=HERD-64 run_spawn build-it quick "build the thing")"
 grep -q "SPAWN_RC=0" <<< "$out" || fail "(10) tracked spawn.sh must exit 0, got '$out'"
-req="$(ls "$Q"/*.req 2>/dev/null | head -1)"; [ -n "$req" ] || fail "(10) tracked intent was not enqueued"
+req="$(ls "$Q"/*.req 2>/dev/null | sed -n 1p)"; [ -n "$req" ] || fail "(10) tracked intent was not enqueued"
 ref="${req%.req}.ref"
 [ -f "$ref" ] || fail "(10) ref sidecar not written next to the intent"
 [ "$(cat "$ref")" = "HERD-64" ] || fail "(10) ref sidecar content wrong: '$(cat "$ref")'"
@@ -161,7 +161,7 @@ pass; echo "PASS (11) spawn-step threads the ref on line 3 and done reaps both i
 reset_q
 out="$(TRACKED_SPAWNS=off run_spawn plain-item quick "plain task")"
 grep -q "SPAWN_RC=0" <<< "$out" || fail "(12) off + no ref must enqueue (rc 0), got '$out'"
-req="$(ls "$Q"/*.req 2>/dev/null | head -1)"; [ -n "$req" ] || fail "(12) intent not enqueued under off"
+req="$(ls "$Q"/*.req 2>/dev/null | sed -n 1p)"; [ -n "$req" ] || fail "(12) intent not enqueued under off"
 [ -f "${req%.req}.ref" ] && fail "(12) an untracked spawn must NOT write a ref sidecar"
 c0=""; c1=""; c2=""; c3=""; c4=""; c5=""
 { IFS= read -r c0; IFS= read -r c1; IFS= read -r c2; IFS= read -r c3; IFS= read -r c4; c5="$(cat)"; } < <(run_step next)

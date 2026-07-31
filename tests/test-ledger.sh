@@ -125,7 +125,7 @@ ok
 L rm HERD-20 >/dev/null || fail "(4) rm failed"
 if L get HERD-20 >/dev/null 2>&1; then fail "(4) get of a tombstoned id must exit non-zero"; fi
 ok
-L list | cut -f1 | grep -qx HERD-20 && fail "(4) tombstoned id must not appear in list"
+grep -qx HERD-20 <<< "$(L list | cut -f1)" && fail "(4) tombstoned id must not appear in list"
 ok
 L set HERD-20 slug feat-y status respawned >/dev/null || fail "(4) revive set failed"
 rev="$(L get HERD-20)" || fail "(4) revived id should be gettable"
@@ -143,7 +143,7 @@ ok
 # One line per live id (HERD-05, HERD-10, HERD-20) → 3 lines; superseded history + no tombstone lines.
 [ "$(_all_valid_json "$LEDGER_FILE")" = "3" ] || fail "(5) compact should leave exactly 3 lines (one per live id)"
 ok
-L list | cut -f1 | grep -qx HERD-20 || fail "(5) a revived id must survive compaction"
+grep -qx HERD-20 <<< "$(L list | cut -f1)" || fail "(5) a revived id must survive compaction"
 ok
 
 # ── (6) DEFAULT-DORMANT: no file → get exit 1, list empty exit 0, path creates nothing ──

@@ -104,7 +104,7 @@ grep -q "herd backlog --rich" "$LOG" || fail "viewer did not ask for the rich li
 grep -q '## 🚧 in progress (1)' <<<"$out1" || fail "missing in-progress group header ($out1)"
 grep -q '## 🔜 queued (2)' <<<"$out1"      || fail "missing queued group header (unstarted+backlog merged)"
 # started renders first
-first_group="$(grep -n '##' <<<"$out1" | head -n1)"
+first_group="$(grep -nm1 '##' <<<"$out1")"
 grep -q 'in progress' <<<"$first_group" || fail "in-progress group must render before queued ($first_group)"
 # chip + bold TITLE ONLY + italic state name; description is a plain top-level paragraph line, never bold
 grep -q -- '- `#HERD-8` \*\*Externalized work queue\*\* _(In Progress)_' <<<"$out1" \

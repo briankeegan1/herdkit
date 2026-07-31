@@ -133,7 +133,7 @@ bl="$(wc -l < "$BOUT" | tr -d ' ')"; pl="$(wc -l < "$POUT" | tr -d ' ')"
 [ "$pl" = "$ncases" ] || fail "python produced $pl lines, expected $ncases cases"
 
 if ! cmp -s "$BOUT" "$POUT"; then
-  ln="$(diff "$BOUT" "$POUT" | grep -m1 -oE '^[0-9]+' || echo '?')"
+  ln="$(grep -m1 -oE '^[0-9]+' <<< "$(diff "$BOUT" "$POUT" || true)" || echo '?')"
   echo "---- first divergence at output line $ln ----" >&2
   echo "case : $(sed -n "${ln}p" "$CASES" | tr "$SEP" ' ')" >&2
   echo "bash : $(sed -n "${ln}p" "$BOUT")" >&2

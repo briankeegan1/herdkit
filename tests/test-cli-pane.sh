@@ -395,8 +395,8 @@ printf 'bash /x/backlog-view.sh' > "$S/panes/pL/cmd"
 out="$(_pane_run "$P" "$S" backlog)" || fail "pane backlog failed (input-clear path)"
 grep -q "pane send-keys pL ctrl+c ctrl+u" "$S/log" || fail "restart did not flush pending input (ctrl+c ctrl+u) on the backlog pane"
 # Ordering: the clear must precede the run in the invocation log.
-clear_ln="$(grep -n "pane send-keys pL ctrl+c ctrl+u" "$S/log" | head -1 | cut -d: -f1)"
-run_ln="$(grep -n "pane run pL" "$S/log" | head -1 | cut -d: -f1)"
+clear_ln="$(grep -nm1 "pane send-keys pL ctrl+c ctrl+u" "$S/log" | cut -d: -f1)"
+run_ln="$(grep -nm1 "pane run pL" "$S/log" | cut -d: -f1)"
 [ -n "$clear_ln" ] && [ -n "$run_ln" ] && [ "$clear_ln" -lt "$run_ln" ] \
   || fail "input clear did not precede the pane run (clear=$clear_ln run=$run_ln)"
 grep -q "visible ✓" <<< "$out" || fail "backlog restart with input-clear did not report visible"
@@ -475,7 +475,7 @@ git -C "$P" init -q; git -C "$P" config user.email t@t.t; git -C "$P" config use
 S="$T/s8"; mkdir -p "$S/tabs"
 set +e
 out="$( cd "$P" && env PATH="$RICH:$BIN:$PATH" HERDR_STATE="$S" FAKE_WS_LABEL="panetest" \
-    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1 )"
+    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1)"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "pane watch should fail without a .herd/config"
@@ -525,7 +525,7 @@ ok
 P="$T/p12"; mkdir -p "$P/sub"   # plain directories, no git repo anywhere
 set +e
 out="$( cd "$P/sub" && env PATH="$RICH:$BIN:$PATH" HERDR_STATE="$T/s12" FAKE_WS_LABEL="panetest" \
-    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1 )"
+    HERD_NONINTERACTIVE=1 bash "$HERD" pane watch 2>&1)"
 rc=$?
 set -e
 [ "$rc" -ne 0 ] || fail "pane watch should fail outside any git repo"

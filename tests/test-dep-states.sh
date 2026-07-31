@@ -108,7 +108,7 @@ pass
 pass
 
 # ── 5. agent-watch build_blocked renders the dep-state surface (console display) ─────────────────
-(
+_subpass_out="$(
   export AGENT_WATCH_LIB=1
   # shellcheck source=/dev/null
   . "$WATCH" || { echo "FAIL: sourcing agent-watch.sh (lib mode) failed" >&2; exit 1; }
@@ -128,7 +128,8 @@ pass
   build_blocked
   [ -z "$BLOCKED" ] || { echo "FAIL: build_blocked should clear BLOCKED when file absent" >&2; exit 1; }
   echo "SUBPASS"
-) | grep -q "SUBPASS" || fail "agent-watch build_blocked checks failed (see above)"
+)"
+grep -q "SUBPASS" <<< "$_subpass_out" || fail "agent-watch build_blocked checks failed (see above)"
 pass
 
 echo "ALL PASS ($PASS checks)"

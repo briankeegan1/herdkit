@@ -187,7 +187,7 @@ d="${DISPLAY[0]:-}"
 grep -q "refixing" <<< "$d" \
   || fail "B: a delayed-but-successful wake should show 'refixing' (got: $d)"
 ok
-grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1 | grep -q '"woke":1' \
+grep -q '"woke":1' <<< "$(grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1)" \
   || fail "B: a delayed wake must still record woke=1"
 ok
 unset STUB_WAKE_COUNTDOWN_FILE
@@ -209,10 +209,10 @@ d="${DISPLAY[0]:-}"
 grep -q "needs you · auto-refix failed" <<< "$d" \
   || fail "C: a submit that never wakes must escalate to 'needs you · auto-refix failed' (got: $d)"
 ok
-grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1 | grep -q '"woke":0' \
+grep -q '"woke":0' <<< "$(grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1)" \
   || fail "C: a failed wake must record woke=0"
 ok
-grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1 | grep -q '"escalated":"true"' \
+grep -q '"escalated":"true"' <<< "$(grep 'refix_wake_result' "$JOURNAL_FILE" | tail -1)" \
   || fail "C: a failed wake must record escalated=true"
 ok
 

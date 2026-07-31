@@ -53,7 +53,7 @@ command -v python3 >/dev/null 2>&1 || fail "python3 required"
 # exists and that no bash action-pass callsite lingers (the ordering is single-owner: Python).
 ( AGENT_WATCH_LIB=1 . "$WATCH" >/dev/null 2>&1; declare -F _merge_fairness_reorder >/dev/null ) \
   || fail "(0) the _merge_fairness_reorder helper must survive (retained for the acceptance sim + the checks below)"
-grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }' | grep -q . \
+grep -q . <<< "$(grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }')" \
   && fail "(0) the deleted bash action pass (_tick_act) must not be referenced in code — the ordering is Python-owned now"
 ok "(0) the reorder helper survives for the behavioral + sim proofs; the live ordering is Python-owned (no bash action pass)"
 
@@ -394,7 +394,7 @@ USES="$(grep -nE 'restale_count|_starvation_row' "$WATCH" | grep -vE '^\s*[0-9]+
 [ "$USES" -ge 1 ] || fail "(13) the counter is never read — the row would never render"
 # Every call sits inside the two display helpers; nothing in a gate/merge decision.
 grep -nE 'if .*restale_count|\[ .*restale_count.* \] (&&|\|\|) (do_merge|record_|post_gate)' "$WATCH" \
-  | grep -vE '_starvation_row\(\)' | grep -q . && fail "(13) restale_count appears in a gate/merge decision"
+grep -q . <<< "$(| grep -vE '_starvation_row\(\)')" && fail "(13) restale_count appears in a gate/merge decision"
 ok "(13) the re-stale counter is display + journal only — nothing gates on it"
 
 echo "ALL PASS ($pass checks) — merge fairness: ready-PR priority + starvation surfacing (HERD-231)"

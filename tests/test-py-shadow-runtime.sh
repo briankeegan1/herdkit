@@ -101,7 +101,7 @@ PY
 bl="$(wc -l < "$BOUT" | tr -d ' ')"; pl="$(wc -l < "$POUT" | tr -d ' ')"
 [ "$bl" = "$pl" ] || fail "line count mismatch: journal.sh=$bl shadow_journal=$pl"
 if ! cmp -s "$BOUT" "$POUT"; then
-  ln="$(diff "$BOUT" "$POUT" | grep -m1 -oE '^[0-9]+' || echo '?')"
+  ln="$(grep -m1 -oE '^[0-9]+' <<< "$(diff "$BOUT" "$POUT" || true)" || echo '?')"
   echo "---- first journal-encoding divergence at line $ln ----" >&2
   echo "journal.sh    : $(sed -n "${ln}p" "$BOUT")" >&2
   echo "shadow_journal: $(sed -n "${ln}p" "$POUT")" >&2

@@ -72,7 +72,7 @@ ok
 # ── 3. everything is `new` when the registry is empty ─────────────────────────────────────────────
 grep -q "2 new" <<< "$out" || fail "with an empty registry both projects should be 'new'"
 # Isolate alpha's row (color codes make a positional regex fragile — match the word plainly).
-printf '%s' "$out" | grep '^alpha' | grep -q "new" || fail "alpha should be marked new"
+grep -q "new" <<< "$(printf '%s' "$out" | grep '^alpha')" || fail "alpha should be marked new"
 ok
 
 # ── 4. --register ADDS the discovered projects to the registry ────────────────────────────────────
@@ -89,7 +89,7 @@ out="$(bash "$HERD" fleet discover "$ROOT")"
 grep -q "2 project(s) found" <<< "$out" || fail "re-discover should still find 2 projects"
 grep -q "0 new" <<< "$out" || fail "already-registered projects should not be counted as new"
 grep -q "2 already registered" <<< "$out" || fail "both projects should be marked already registered"
-printf '%s' "$out" | grep '^alpha' | grep -q "registered" || fail "alpha should show status 'registered'"
+grep -q "registered" <<< "$(printf '%s' "$out" | grep '^alpha')" || fail "alpha should show status 'registered'"
 ok
 
 # ── 6. DEDUP is per-project: a fresh project mixed with registered ones is the only 'new' one ─────

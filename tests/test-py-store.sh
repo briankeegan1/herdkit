@@ -117,8 +117,7 @@ unset STORE_BACKEND
 grep -q '^backend: flat$' <<< "$(WORKTREES_DIR="$OFF" python3 -m herd.store --status)" \
   || fail "default backend must resolve flat (ship-dormant)"
 # shadow-runtime stdout must OMIT the store_backend key under the default (byte-identical to pre-seam).
-WORKTREES_DIR="$OFF" python3 -m herd.shadow_runtime --fixture "$T/scenario.json" \
-  | grep -q 'store_backend' && fail "shadow stdout leaked store_backend under the default (not byte-identical)"
+grep -q 'store_backend' <<< "$(WORKTREES_DIR="$OFF" python3 -m herd.shadow_runtime --fixture "$T/scenario.json")" && fail "shadow stdout leaked store_backend under the default (not byte-identical)"
 pass
 
 echo "PASS ($PASS checks) — herd.store: accessors parity + lossless round-trip + concurrent-claim +"

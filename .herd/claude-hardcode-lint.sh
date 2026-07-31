@@ -128,7 +128,7 @@ if [ -n "$NEW" ]; then
             done <<< "$NEW")"
   n="$(printf '%s\n' "$NEW" | grep -c .)"
   if [ -n "$ONELINE" ]; then
-    echo "claude-hardcode: $n NEW hardcoded claude invocation(s) outside the driver seam — $(printf '%s' "$report" | head -1 | sed 's/^[[:space:]]*//')"
+    echo "claude-hardcode: $n NEW hardcoded claude invocation(s) outside the driver seam — $(printf '%s' "$report" | head -1 | sed 's/^[[:space:]]*//')"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
   else
     echo "❌ CLAUDE-HARDCODE LINT: NEW hardcoded claude invocation(s) outside the driver seam"
     echo "   Route the call through scripts/herd/driver.sh (the runtime seam) or a {{DRIVER_*}}"

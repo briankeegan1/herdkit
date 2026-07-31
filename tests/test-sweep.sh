@@ -399,7 +399,7 @@ _pid_starttime() {
 ROWS="$(HERD_SWEEP_PS_CMD="$T/ps-recycle" sweep_orphan_procs)"
 [ "$(printf '%s' "$ROWS" | awk -F'\t' '{print NF; exit}')" = "4" ] \
   || fail "(14) sweep_orphan_procs must emit pid/pgid/STARTTIME/cmd — got: $ROWS"
-printf '%s' "$ROWS" | cut -f3 | grep -qx 'ST-A' || fail "(14) the row must carry the LISTING-time token"
+grep -qx 'ST-A' <<< "$(printf '%s' "$ROWS" | cut -f3)" || fail "(14) the row must carry the LISTING-time token"
 rm -f "$ST_DIR/$RECYCLED"                # re-arm: the coming sweep_leg_procs does its own listing
 HERD_SWEEP_PS_CMD="$T/ps-recycle" sweep_leg_procs "" >/dev/null 2>&1
 kill -0 "$RECYCLED" 2>/dev/null \

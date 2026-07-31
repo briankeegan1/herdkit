@@ -82,7 +82,8 @@ WT_A="$T/a"; write_journal "$WT_A"
   [ "$rc" -eq 0 ] || fail "7.50 must EXCEED a 5 ceiling"
   case "$msg" in 7.5*" 5") : ;; *) fail "exceeded budget must echo '<spent> <cap>', got '$msg'" ;; esac
   echo "PART-A-OK"
-) | grep -q PART-A-OK || exit 1
+) > "$T/parta.log" || exit 1
+grep -q PART-A-OK "$T/parta.log" || exit 1
 pass
 
 # ══ Part B — watcher drain PAUSE (real budget predicate + fixture journal, extracted drain) ═══════

@@ -271,7 +271,7 @@ for line in (os.environ.get("WT") or "").splitlines():
         if wt and wt!=main and br==want: print(wt); break
         wt=None; br=None
 if wt and wt!=main and br==want: print(wt)
-' | head -1)"
+' | sed -n 1p)"
 if [ -n "$DISC" ]; then DISC_DIR="$DISC"; DISC_BRANCH="$BRANCH"; fi
 # The PR list (what the watcher fetches each tick) maps this branch → an open, mergeable PR.
 PR_MAPPED=0

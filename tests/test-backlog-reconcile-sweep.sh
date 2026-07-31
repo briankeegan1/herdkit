@@ -98,7 +98,7 @@ grep -q 'enqueued 2 scribe reconcile request' <<< "$out" \
 reqs=( "$REQDIR"/*.txt )
 [ "${#reqs[@]}" -eq 2 ] || fail "expected exactly TWO scribe requests (one per HIGH item), got ${#reqs[@]}"
 # The auto-refix request must be present, well-formed, and verify-first.
-REQ="$(grep -l 'Auto-refix resumes a done builder' "$REQDIR"/*.txt | head -1)"
+REQ="$(grep -l 'Auto-refix resumes a done builder' "$REQDIR"/*.txt | sed -n 1p)"
 [ -n "$REQ" ] || fail "no request references the auto-refix item"
 grep -q 'PR #71'               "$REQ" || fail "request lacks the matching PR reference"
 grep -q 'gh pr view 71'        "$REQ" || fail "request lacks the verify command"

@@ -171,7 +171,7 @@ run_lane() {
 }
 
 # viewer_run_line <log> — the logged `pane run <pane> bash …task-spec-view.sh …` call, if any.
-viewer_run_line() { grep -E 'pane run [^ ]+ bash .*task-spec-view\.sh' "$1" 2>/dev/null | head -1; }
+viewer_run_line() { grep -Em1 'pane run [^ ]+ bash .*task-spec-view\.sh' "$1" 2>/dev/null; }
 
 # 2a. herd-quick, TASK_PANE_VIEW default (unset → on) → viewer sent into the ROOT pane (rTest).
 CFG="$(make_cfg 'APP_PREVIEW_CMD=""')"

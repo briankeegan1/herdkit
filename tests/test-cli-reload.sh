@@ -670,8 +670,7 @@ grep -q "herd-watch.sh" "$S/panes/pW/cmd" 2>/dev/null \
 grep -q "backlog-view.sh" "$S/panes/pL/cmd" 2>/dev/null \
   || fail "migration: backlog script not in coordinator-tab pane"
 # No standalone watch tab should have been created.
-grep "tab create" "$S/log" 2>/dev/null \
-  | grep -q "watch-reloadtest" && fail "migration: standalone watch tab created — fallback not suppressed" || true
+grep -q "watch-reloadtest" <<< "$(grep "tab create" "$S/log" 2>/dev/null || true)" && fail "migration: standalone watch tab created — fallback not suppressed" || true
 # Registry must be written with the pane IDs actually used.
 [ -f "$P21_REAL/trees/.herd-panes" ] \
   || fail "migration: .herd-panes not written after seeding run"

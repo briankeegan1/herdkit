@@ -48,7 +48,7 @@ assert_before(){
 # Extract just the then-branch SPEC value so the `[ -n "$TASK" ]` guard's own $TASK doesn't count.
 lane_check(){
   local script="$1" name; name="$(basename "$script")"
-  local line; line="$(grep -E 'then[[:space:]]+SPEC=' "$script" | head -1)"
+  local line; line="$(grep -Em1 'then[[:space:]]+SPEC=' "$script")"
   [ -n "$line" ] || fail "$name: no 'then SPEC=' assignment found (prompt assembly moved?)"
   local seg="${line#*then SPEC=}"; seg="${seg%%; else*}"    # isolate the SPEC value in the non-empty branch
   # $RULES (stable) must lead; $TASK (unique caller content) must trail. Match the exact variable
@@ -63,7 +63,7 @@ lane_check "$FEATURE"
 #    unique per-PR content (PR number, branch slug, private result-file path).
 review_check(){
   local var="$1"
-  local line; line="$(grep -E "^${var}=" "$REVIEW" | head -1)"
+  local line; line="$(grep -Em1 "^${var}=" "$REVIEW")"
   [ -n "$line" ] || fail "herd-review.sh: no '^${var}=' assignment found (prompt assembly moved?)"
   local seg="${line#*=}"                                    # the assigned prompt value
   # ${CHECKLIST_TEXT} is the stable risk checklist that anchors the shared preamble; ${PR}, ${SLUG}

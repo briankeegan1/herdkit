@@ -223,7 +223,7 @@ for _b in /bin/bash /usr/bin/bash /usr/local/bin/bash /opt/homebrew/bin/bash "$(
   case " $_bashes " in *" $_b "*) continue ;; esac
   [ -x "$_b" ] || continue
   _bashes="$_bashes $_b"
-  "$_b" -n "$LINT" 2>/dev/null || fail "(14) $LINT does not parse under $_b ($("$_b" --version | head -1))"
+  "$_b" -n "$LINT" 2>/dev/null || fail "(14) $LINT does not parse under $_b ($("$_b" --version | head -1))"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
 done
 [ -n "$_bashes" ] || fail "(14) no bash found to syntax-check with"
 ok

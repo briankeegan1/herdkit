@@ -913,7 +913,7 @@ WAKEHERDR
       ) ; W_RC=$?
       _w_st="$(agent_status_of rp-builder)"
       _w_woke=no; grep -q '"event":"refix_wake_result"' "$W_JOURNAL" 2>/dev/null \
-        && grep 'refix_wake_result' "$W_JOURNAL" | tail -1 | grep -q '"woke":1' && _w_woke=yes
+        && grep -q '"woke":1' <<< "$(grep 'refix_wake_result' "$W_JOURNAL" | tail -1)" && _w_woke=yes
       _w_enter=no; [ ! -f "$W_MARK" ] && _w_enter=yes   # mark consumed ⇒ Enter path ran
       if [ "$W_RC" = 0 ] && [ "$_w_woke" = yes ] && [ "$_w_st" = working ]; then
         checkpoint builder_retask_wakes_on_enter pass \

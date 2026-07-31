@@ -185,7 +185,7 @@ printf 'realq\t@hourly\tfeature\tShip {item}\tcat %s\n' "$REALIN" > "$FIX"
 ( cd "$PROJ2" && HERD_CONFIG_FILE="$PROJ2/.herd/config" HERD_TRIGGERS_FILE="$FIX" \
     HERD_TRIGGERS_STATE_DIR="$T/rstate" HERD_TRIGGERS_INPUT_DIR="$T" \
     bash "$TRIG" tick --now "$NOW" >/dev/null 2>&1 )
-req="$(ls "$QTREES/spawn-queue"/*.req 2>/dev/null | head -1)"
+req="$(ls "$QTREES/spawn-queue"/*.req 2>/dev/null | sed -n 1p)"
 [ -n "$req" ] || fail "(7) the real spawn.sh must land a .req intent on the durable queue"
 [ "$(sed -n '1p' "$req")" = "realq-alpha" ] || fail "(7) queued intent slug wrong ($(sed -n '1p' "$req"))"
 [ "$(sed -n '2p' "$req")" = "feature" ]     || fail "(7) queued intent lane wrong ($(sed -n '2p' "$req"))"

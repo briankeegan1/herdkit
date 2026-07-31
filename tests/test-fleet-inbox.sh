@@ -104,26 +104,26 @@ beta_block="$(printf '%s'  "$out" | awk '/^beta$/{f=1;next}  /^[a-zA-Z]/{f=0} f'
 
 # ── 1. review BLOCK surfaces on the right project with the right action ────────
 grep -q '#12' <<< "$alpha_block" || fail "alpha should surface blocked PR #12"
-printf '%s' "$alpha_block" | grep '#12' | grep -qi 'BLOCK'          || fail "#12 should be labelled a review BLOCK"
-printf '%s' "$alpha_block" | grep '#12' | grep -q 'herd why 12'     || fail "#12 action should be 'herd why 12'"
+grep -qi 'BLOCK' <<< "$(printf '%s' "$alpha_block" | grep '#12')" || fail "#12 should be labelled a review BLOCK"
+grep -q 'herd why 12' <<< "$(printf '%s' "$alpha_block" | grep '#12')" || fail "#12 action should be 'herd why 12'"
 ok
 
 # ── 2. human-verify hold surfaces with the approve action ─────────────────────
 grep -q '#11' <<< "$alpha_block" || fail "alpha should surface human-verify hold PR #11"
-printf '%s' "$alpha_block" | grep '#11' | grep -qi 'human-verify'   || fail "#11 should be labelled a human-verify hold"
-printf '%s' "$alpha_block" | grep '#11' | grep -q 'herd-approve.sh approve 11' || fail "#11 action should be 'herd-approve.sh approve 11'"
+grep -qi 'human-verify' <<< "$(printf '%s' "$alpha_block" | grep '#11')" || fail "#11 should be labelled a human-verify hold"
+grep -q 'herd-approve.sh approve 11' <<< "$(printf '%s' "$alpha_block" | grep '#11')" || fail "#11 action should be 'herd-approve.sh approve 11'"
 ok
 
 # ── 3. failed health gate surfaces with the inspect action ────────────────────
 grep -q '#13' <<< "$alpha_block" || fail "alpha should surface failed health gate PR #13"
-printf '%s' "$alpha_block" | grep '#13' | grep -qi 'health'         || fail "#13 should be labelled a failed health gate"
-printf '%s' "$alpha_block" | grep '#13' | grep -q 'herd why 13'     || fail "#13 action should be 'herd why 13'"
+grep -qi 'health' <<< "$(printf '%s' "$alpha_block" | grep '#13')" || fail "#13 should be labelled a failed health gate"
+grep -q 'herd why 13' <<< "$(printf '%s' "$alpha_block" | grep '#13')" || fail "#13 action should be 'herd why 13'"
 ok
 
 # ── 4. CONFLICTING PR (from gh) surfaces with the resolve action + slug ───────
 grep -q '#14' <<< "$alpha_block" || fail "alpha should surface CONFLICTING PR #14"
-printf '%s' "$alpha_block" | grep '#14' | grep -qi 'CONFLICTING'    || fail "#14 should be labelled CONFLICTING"
-printf '%s' "$alpha_block" | grep '#14' | grep -q 'herd-resolve.sh widget' || fail "#14 action should resolve slug 'widget' (from feat/widget)"
+grep -qi 'CONFLICTING' <<< "$(printf '%s' "$alpha_block" | grep '#14')" || fail "#14 should be labelled CONFLICTING"
+grep -q 'herd-resolve.sh widget' <<< "$(printf '%s' "$alpha_block" | grep '#14')" || fail "#14 action should resolve slug 'widget' (from feat/widget)"
 ok
 
 # ── 5. a MERGEABLE PR (#8) is NOT an attention item ───────────────────────────
@@ -172,7 +172,7 @@ printf 'ghost|%s/proj/ghost|me/ghost\n' "$T" >> "$HERD_FLEET_FILE"
 out2="$(bash "$HERD" fleet inbox)"
 ghost_block="$(printf '%s' "$out2" | awk '/^ghost$/{f=1;next} /^[a-zA-Z]/{f=0} f')"
 grep -qi 'unreachable' <<< "$ghost_block" || fail "missing project should be reported as unreachable"
-printf '%s' "$out2" | grep '^Fleet:' | grep -q '1 unreachable' || fail "summary should count the ghost as unreachable"
+grep -q '1 unreachable' <<< "$(printf '%s' "$out2" | grep '^Fleet:')" || fail "summary should count the ghost as unreachable"
 grep -q '^alpha$' <<< "$out2" || fail "inbox should continue past the unreachable project"
 # drop the ghost line so later runs are clean
 grep -v '^ghost|' "$HERD_FLEET_FILE" > "$HERD_FLEET_FILE.tmp" && mv "$HERD_FLEET_FILE.tmp" "$HERD_FLEET_FILE"

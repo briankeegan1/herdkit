@@ -213,7 +213,7 @@ bl="$(wc -l < "$BOUT" | tr -d ' ')"; pl="$(wc -l < "$POUT" | tr -d ' ')"
 
 if ! cmp -s "$BOUT" "$POUT"; then
   # Find and show the first divergent case for a precise repro.
-  ln="$(diff "$BOUT" "$POUT" | grep -m1 -oE '^[0-9]+' || echo '?')"
+  ln="$(grep -m1 -oE '^[0-9]+' <<< "$(diff "$BOUT" "$POUT" || true)" || echo '?')"
   echo "---- first divergence at output line $ln ----" >&2
   echo "case : $(sed -n "${ln}p" "$CASES" | tr "$SEP" ' ')" >&2
   echo "bash : $(sed -n "${ln}p" "$BOUT")" >&2

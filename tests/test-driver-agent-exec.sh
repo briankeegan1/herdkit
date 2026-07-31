@@ -124,7 +124,7 @@ SKP="$P/.claude/commands/coordinator.md"; SKQ="$Q/.claude/commands/coordinator.m
 sed "s#$P#PROOT#g" "$SKP" > "$T/withexec.md"
 sed "s#$Q#PROOT#g" "$SKQ" > "$T/noexec.md"
 diff -q "$T/withexec.md" "$T/noexec.md" >/dev/null \
-  || { echo "--- present vs stripped differ ---"; diff "$T/withexec.md" "$T/noexec.md" | head; fail "agent-exec bindings changed the render (NOT byte-identical)"; }
+  || { echo "--- present vs stripped differ ---"; diff "$T/withexec.md" "$T/noexec.md" | head; fail "agent-exec bindings changed the render (NOT byte-identical)"; }  # pipe-ok: diff|head only prints a dump on the way to fail; the pipeline status is not gated
 ok; echo "PASS (4) render is byte-identical with vs without the agent-exec block"
 
 # ── 5. No agent-exec binding value LEAKS into the rendered skill (nothing consumes them). ──────────

@@ -228,7 +228,7 @@ fi
 step gate "run fixture health gate (app/greet.test.sh)"
 git -C "$REPO" checkout -q "$BUILDER_BRANCH"
 gate_rc=0
-gate_out="$( (cd "$REPO" && bash app/greet.test.sh) 2>&1 )" || gate_rc=$?
+gate_out="$( (cd "$REPO" && bash app/greet.test.sh) 2>&1)" || gate_rc=$?
 git -C "$REPO" checkout -q main
 if [ "$gate_rc" -eq 0 ]; then
   checkpoint gate_passed pass "gate clean: $gate_out"
@@ -493,7 +493,7 @@ XSDRV
 ]}
 XSJSON
   XS_HELD="$(xs_drive "$XS/held.json")"
-  _xs_get() { printf '%s\n' "$1" | grep "^$2=" | head -1 | cut -d= -f2- ; }
+  _xs_get() { printf '%s\n' "$1" | grep "^$2=" | sed -n 1p | cut -d= -f2- ; }
   if [ "$(_xs_get "$XS_HELD" STANDING)" = "yes" ] && [ "$(_xs_get "$XS_HELD" SEAT)" = "seat-a" ] \
      && grep -q 'cross-seat BLOCK · needs reconcile' <<< "$XS_HELD"; then
     checkpoint cross_seat_block_held pass "our PASS did NOT overwrite seat-a's standing BLOCK: scenario ends HELD with the reconcile row"
@@ -571,7 +571,7 @@ RPSTUB
                 HERD_REVIEW_MODEL="sim-review-model" \
                 WORKTREES_DIR="$RP/trees" HERD_CONFIG_FILE="$RP/.no-such-config" \
                 JOURNAL_FILE="$RP/journal-$leg.jsonl" \
-                bash "$REVIEW_SH" "77$leg" "sim-panel-$leg" 2>/dev/null )"
+                bash "$REVIEW_SH" "77$leg" "sim-panel-$leg" 2>/dev/null)"
     rc=$?
     printf '%s|%s' "$rc" "$out"
   }
@@ -694,7 +694,7 @@ for line in open(jpath, encoding="utf-8"):
         model = obj.get("model", "")
 print(model)
 PY
-      ' 2>/dev/null | tail -1 )"
+      ' 2>/dev/null | tail -1)"
   if [ "$_erm_model" = "sim-effective-review-model" ]; then
     checkpoint engine_review_model pass "review_dispatched.model resolved the effective config MODEL_REVIEW (non-empty, exact match): $_erm_model"
   else
@@ -881,9 +881,9 @@ else
 
   # (D) EXECUTION ORDER: in the journal, the block step's step_run precedes the approve step's, which
   #     precedes the skill step's — the declared file order, honored across the hold/resume boundary.
-  _ln_gate="$(grep -n '"name":"gate-lint".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
-  _ln_peer="$(grep -n '"name":"peer-review".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
-  _ln_doc="$(grep -n '"name":"doc-pass".*"outcome":"pass"' "$ST_JN" 2>/dev/null | head -1 | cut -d: -f1)"
+  _ln_gate="$(grep -nm1 '"name":"gate-lint".*"outcome":"pass"' "$ST_JN" 2>/dev/null | cut -d: -f1)"
+  _ln_peer="$(grep -nm1 '"name":"peer-review".*"outcome":"pass"' "$ST_JN" 2>/dev/null | cut -d: -f1)"
+  _ln_doc="$(grep -nm1 '"name":"doc-pass".*"outcome":"pass"' "$ST_JN" 2>/dev/null | cut -d: -f1)"
   if [ -n "$_ln_gate" ] && [ -n "$_ln_peer" ] && [ -n "$_ln_doc" ] \
      && [ "$_ln_gate" -lt "$_ln_peer" ] && [ "$_ln_peer" -lt "$_ln_doc" ]; then
     checkpoint pipeline_steps_order pass "step_run journal order held: gate-lint < peer-review < doc-pass"

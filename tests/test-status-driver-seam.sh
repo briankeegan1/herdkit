@@ -90,8 +90,8 @@ pass
 
 # The classification MUST differ: the seam-fed roster (agent working) is NOT the empty-roster DEAD
 # signature. Compare only the myslug line so unrelated output (watcher pid, timing) can't mask it.
-line_seam="$(printf '%s\n' "$with_seam" | "$GREP" 'myslug' | head -1)"
-line_none="$(printf '%s\n' "$no_seam"   | "$GREP" 'myslug' | head -1)"
+line_seam="$(printf '%s\n' "$with_seam" | "$GREP" 'myslug' | sed -n 1p)"
+line_none="$(printf '%s\n' "$no_seam"   | "$GREP" 'myslug' | sed -n 1p)"
 [ "$line_seam" != "$line_none" ] \
   || fail "builder classification identical with/without the seam — status.sh is not consuming herd_driver_agent_list_json
   seam: $line_seam

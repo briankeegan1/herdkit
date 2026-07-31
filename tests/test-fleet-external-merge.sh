@@ -99,7 +99,7 @@ ok
 
 # ── 4. INBOX with gh DOWN: the genuinely-blocked control #12 STILL surfaces ────────────────────
 grep -q '#12' <<< "$alpha_i" || fail "inbox (gh down): genuinely-blocked #12 must still surface, got: $alpha_i"
-printf '%s' "$alpha_i" | grep '#12' | grep -qi 'BLOCK' || fail "inbox: #12 should be labelled a review BLOCK"
+grep -qi 'BLOCK' <<< "$(printf '%s' "$alpha_i" | grep '#12')" || fail "inbox: #12 should be labelled a review BLOCK"
 ok
 
 echo "ALL PASS ($pass checks)"

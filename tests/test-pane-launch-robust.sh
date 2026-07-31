@@ -27,20 +27,17 @@ ok; echo "PASS (1a) herd_pane_launch defined in driver.sh"
 
 # The leading-space guard: the pane run line inside herd_pane_launch must prepend ' $cmd', not '$cmd'.
 # Grep for the herdr pane run call inside the function — it must pass " \$cmd" (space before $cmd).
-awk '/^herd_pane_launch\(\)/,/^}/' "$DRIVER" \
-  | grep -qE 'herdr pane run.*" \$cmd"' \
+grep -qE 'herdr pane run.*" \$cmd"' <<< "$(awk '/^herd_pane_launch\(\)/,/^}/' "$DRIVER")" \
   || fail "herd_pane_launch must pass \" \$cmd\" (leading space) to herdr pane run — the first-char-drop guard"
 ok; echo "PASS (1b) herd_pane_launch passes a leading-space-prefixed command to herdr pane run"
 
 # The explicit Enter: the function must also send-keys Enter to submit the command.
-awk '/^herd_pane_launch\(\)/,/^}/' "$DRIVER" \
-  | grep -qE 'herdr pane send-keys.*Enter' \
+grep -qE 'herdr pane send-keys.*Enter' <<< "$(awk '/^herd_pane_launch\(\)/,/^}/' "$DRIVER")" \
   || fail "herd_pane_launch must send-keys Enter after pane run to ensure the shell executes the command"
 ok; echo "PASS (1c) herd_pane_launch sends an explicit Enter after pane run"
 
 # The headless guard: must be a no-op when headless (HERD-322 requirement, avoids orphan fallbacks).
-awk '/^herd_pane_launch\(\)/,/^}/' "$DRIVER" \
-  | grep -qE '_herd_driver_is_headless' \
+grep -qE '_herd_driver_is_headless' <<< "$(awk '/^herd_pane_launch\(\)/,/^}/' "$DRIVER")" \
   || fail "herd_pane_launch must check _herd_driver_is_headless and return early"
 ok; echo "PASS (1d) herd_pane_launch has a headless guard (no-op on HERD_DRIVER=headless)"
 
@@ -64,20 +61,17 @@ ok; echo "PASS (2c) coordinator.sh has no bare herdr pane run for backlog-view o
 
 # ── 3. _reload_pane_run_verified in bin/herd sends an explicit Enter ─────────────────────────────
 # Find the function and verify both the leading space and the send-keys Enter are present.
-awk '/^_reload_pane_run_verified\(\)/,/^}/' "$HERD" \
-  | grep -qE 'herdr pane run.*" \$cmd"' \
+grep -qE 'herdr pane run.*" \$cmd"' <<< "$(awk '/^_reload_pane_run_verified\(\)/,/^}/' "$HERD")" \
   || fail "_reload_pane_run_verified must pass \" \$cmd\" (leading space) to herdr pane run"
 ok; echo "PASS (3a) _reload_pane_run_verified passes a leading-space-prefixed command to herdr pane run"
 
-awk '/^_reload_pane_run_verified\(\)/,/^}/' "$HERD" \
-  | grep -qE 'herdr pane send-keys.*Enter' \
+grep -qE 'herdr pane send-keys.*Enter' <<< "$(awk '/^_reload_pane_run_verified\(\)/,/^}/' "$HERD")" \
   || fail "_reload_pane_run_verified must send-keys Enter after pane run"
 ok; echo "PASS (3b) _reload_pane_run_verified sends an explicit Enter after pane run"
 
 # ── 4. cmd_pane_watch has a non-zero exit path for watcher-start failure ─────────────────────────
 # The `return 1` (or equivalent) must appear somewhere inside cmd_pane_watch.
-awk '/^cmd_pane_watch\(\)/,/^}/' "$HERD" \
-  | grep -qE 'return 1' \
+grep -qE 'return 1' <<< "$(awk '/^cmd_pane_watch\(\)/,/^}/' "$HERD")" \
   || fail "cmd_pane_watch must have a return 1 path for when the watcher fails to start (HERD-322)"
 ok; echo "PASS (4a) cmd_pane_watch has a return 1 path"
 

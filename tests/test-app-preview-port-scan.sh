@@ -97,7 +97,7 @@ run_lane() {
 # preview_port <log> — the PORT app-monitor.sh was launched with (the tail token of the logged
 # `pane run rTest bash …/app-monitor.sh <PORT>` call), empty if the preview was never launched.
 preview_port() {
-  grep -E 'pane run rTest bash .*app-monitor\.sh [0-9]+' "$1" 2>/dev/null | head -1 | awk '{print $NF}'
+  grep -Em1 'pane run rTest bash .*app-monitor\.sh [0-9]+' "$1" 2>/dev/null | awk '{print $NF}'
 }
 
 # occupy_port <port> — bind + listen on 127.0.0.1:<port> in the background so the scan must skip it.

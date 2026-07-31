@@ -100,16 +100,16 @@ ok
 INLINE_BODY="$(printf 'Fix.\n\nHUMAN-VERIFY: run the live smoke test on port 8501\n')"
 printf '%s' "$INLINE_BODY" | human_verify_has || fail "inline form should be a hold"
 ok
-printf '%s' "$INLINE_BODY" | human_verify_steps | grep -q 'run the live smoke test on port 8501' || fail "inline step text missing"
+grep -q 'run the live smoke test on port 8501' <<< "$(printf '%s' "$INLINE_BODY" | human_verify_steps)" || fail "inline step text missing"
 ok
 
 # Decorated marker (**HUMAN-VERIFY:**) with markdown bullets and mixed case.
 DECOR_BODY="$(printf '**HUMAN-VERIFY:**\n* Confirm the reload refreshes panes\n1. Then check the backlog pane\n')"
 [ "$(printf '%s' "$DECOR_BODY" | human_verify_steps | grep -c .)" = "2" ] || fail "decorated form should yield 2 steps"
 ok
-printf '%s' "$DECOR_BODY" | human_verify_steps | grep -q '^Confirm the reload refreshes panes$' || fail "'*' bullet not stripped"
+grep -q '^Confirm the reload refreshes panes$' <<< "$(printf '%s' "$DECOR_BODY" | human_verify_steps)" || fail "'*' bullet not stripped"
 ok
-printf '%s' "$DECOR_BODY" | human_verify_steps | grep -q '^Then check the backlog pane$' || fail "'1.' ordered marker not stripped"
+grep -q '^Then check the backlog pane$' <<< "$(printf '%s' "$DECOR_BODY" | human_verify_steps)" || fail "'1.' ordered marker not stripped"
 ok
 
 # Dash- and plus-bulleted markers: a builder naturally writes the whole block as a `-` list
@@ -120,12 +120,12 @@ printf '%s' "$DASH_BODY" | human_verify_has || fail "'- HUMAN-VERIFY:' must be a
 ok
 [ "$(printf '%s' "$DASH_BODY" | human_verify_steps | grep -c .)" = "2" ] || fail "'- HUMAN-VERIFY:' block should yield 2 steps"
 ok
-printf '%s' "$DASH_BODY" | human_verify_steps | grep -q '^run the live smoke test$' || fail "'-' marker: step 1 text/de-bullet wrong"
+grep -q '^run the live smoke test$' <<< "$(printf '%s' "$DASH_BODY" | human_verify_steps)" || fail "'-' marker: step 1 text/de-bullet wrong"
 ok
 PLUS_BODY="$(printf '+ HUMAN-VERIFY: verify the reload refreshes panes\n')"
 printf '%s' "$PLUS_BODY" | human_verify_has || fail "'+ HUMAN-VERIFY:' (inline) must be a hold"
 ok
-printf '%s' "$PLUS_BODY" | human_verify_steps | grep -q '^verify the reload refreshes panes$' || fail "'+' inline marker step text wrong"
+grep -q '^verify the reload refreshes panes$' <<< "$(printf '%s' "$PLUS_BODY" | human_verify_steps)" || fail "'+' inline marker step text wrong"
 ok
 
 # Absent marker → not a hold, no steps.
