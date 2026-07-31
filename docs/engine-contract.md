@@ -437,6 +437,22 @@ writer: stale-dup `stale_dup_held_noted` (`agent-watch.sh:3306`) / `record_stale
 `agent-watch.sh:3274`; hv-informed `agent-watch.sh:12311`). The port models "notify once per
 state per version key" as a first-class idempotent effect.
 
+**The journal is a side effect too** (HERD-459, GH #573). A tick's in-memory lifecycle map
+(`live_runtime.py:LiveTick._state`) lives exactly one tick, so every poll re-walks a still-open
+candidate from `INTAKE` and re-derives the identical chain of edges off the *cached* verdicts.
+Journaling that replay is the same "noisy side effect fired every tick" the rule above forbids —
+measured at ~88k events/day from one idle blocked PR, which buries the real history `herd why` is
+read for and ages it out through `JOURNAL_MAX_MB` rotation. So `live_state` is journaled once per
+`(pr, sha, state_from, state_to, trigger)` **per re-entry generation** (`LiveState.once`, keyed
+through `LiveTick._transition_generation` — the lifetime refix-bounce count, so a *re-dispatch*
+after a bounce re-journals even on an unchanged sha), and the standing "still waiting" phases
+`health_pending` / `health_queued` fire once per `(pr, sha, phase)`. Per-tick liveness stays
+available in `live_tick_start` / `live_tick_end`, which is what it is for. Every GENUINE change —
+new sha, new edge, a different trigger on the same edge, a re-entry after a bounce — still
+journals in full, and a tick with no state dir (every sim, fixture and dry-run) never suppresses
+at all. The READ side of the same defect is a `herd why` fold: a consecutive run of identical
+blocks renders once with a `×N` note, which also rescues journals written before the guard.
+
 ### 5.4 sha-keyed human-verify hold
 
 A `HUMAN-VERIFY:` block in the PR body flips a gates-green PR into a hold. The parser is shared

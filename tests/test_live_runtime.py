@@ -314,6 +314,135 @@ class TestGateOutcomes(LiveCase):
                          "same sha walked 5 times must produce 1 bounce, got %d" % total_bounces)
 
 
+class TestTransitionDedupe(LiveCase):
+    """HERD-459 (GH #573): the watcher must journal a lifecycle transition when it CHANGES, not once
+    per poll tick that re-derives the same cached conclusion.
+
+    ``LiveTick._state`` is in-memory and a LiveTick lives exactly one tick, so every ~6s tick re-walks
+    a still-open candidate from INTAKE and replays the identical chain of edges — measured at ~88k
+    events/day from ONE idle blocked PR, which buries the real history `herd why` exists to show and
+    ages it out through JOURNAL_MAX_MB rotation. The guard is a reconciled once-marker keyed by
+    (pr, sha, from, to, trigger, re-entry generation), so every GENUINE change still journals."""
+
+    def _tick(self, cand, config, state_dir, tag):
+        """One fresh tick (its own LiveTick + journal) over ``cand``, against a SHARED durable state
+        dir — the process boundary is the whole point: an in-memory dedupe would not survive it."""
+        scenario = {"candidates": [cand], "config": config}
+        jpath = os.path.join(self.tmp, "dedupe-%s.jsonl" % tag)
+        j = LiveJournal(jpath)
+        t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                     DryRunActuator(j), j, state=LiveState(state_dir))
+        t.run()
+        return events(jpath) if os.path.exists(jpath) else []
+
+    @staticmethod
+    def _chain(evs):
+        return [(o["state_from"], o["state_to"], o["trigger"])
+                for o in evs if o["event"] == "live_state"]
+
+    def _state_dir(self, name):
+        d = os.path.join(self.tmp, name)
+        os.makedirs(d)
+        return d
+
+    # A parked PR: gates green, held for human verify under auto — the shape that sits for hours
+    # re-deriving the same chain off cached verdicts, with no bounce to re-arm anything.
+    _PARKED = dict(pr=12, sha="75068de0", slug="feat-parked",
+                   health="CLEAN", review="PASS", hv_hold=True)
+    _CONFIG = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "5"}
+
+    def test_n_identical_ticks_journal_exactly_one_chain(self):
+        state_dir = self._state_dir("identical")
+        chains = [self._chain(self._tick(dict(self._PARKED), self._CONFIG, state_dir, i))
+                  for i in range(20)]
+        self.assertEqual(chains[0],
+                         [("INTAKE", "HEALTH", "dispatch_health"),
+                          ("HEALTH", "REVIEW", "health_clean"),
+                          ("REVIEW", "BLESSED", "review_pass"),
+                          ("BLESSED", "HOLD", "decide_hold")],
+                         "the FIRST tick must journal the whole chain, unchanged")
+        for i, c in enumerate(chains[1:], 1):
+            self.assertEqual(c, [], "tick %d re-journaled an unchanged chain: %s" % (i, c))
+
+    def test_a_new_sha_re_journals_the_whole_chain(self):
+        state_dir = self._state_dir("new-sha")
+        first = self._chain(self._tick(dict(self._PARKED), self._CONFIG, state_dir, "a"))
+        again = self._chain(self._tick(dict(self._PARKED), self._CONFIG, state_dir, "b"))
+        pushed = dict(self._PARKED, sha="9c1f77aa")
+        after = self._chain(self._tick(pushed, self._CONFIG, state_dir, "c"))
+        self.assertEqual(len(first), 4)
+        self.assertEqual(again, [], "the unchanged re-walk must stay silent")
+        self.assertEqual(after, first, "a new head sha is a genuine re-entry — journal it in full")
+
+    def test_a_refix_bounce_re_journals_the_chain_once(self):
+        # A review BLOCK bounces the builder; the sha has NOT moved, but the re-dispatch is a genuine
+        # re-entry the operator must see, so the NEXT tick journals the chain again — exactly once.
+        # Further identical ticks (the once-guard holds the bounce) go quiet again.
+        state_dir = self._state_dir("bounce")
+        cand = dict(pr=13, sha="c0ffee11", slug="feat-bounced", health="CLEAN", review="BLOCK")
+        chains = [self._chain(self._tick(dict(cand), self._CONFIG, state_dir, "b%d" % i))
+                  for i in range(5)]
+        expected = [("INTAKE", "HEALTH", "dispatch_health"),
+                    ("HEALTH", "REVIEW", "health_clean"),
+                    ("REVIEW", "BLOCKED", "review_block")]
+        self.assertEqual(chains[0], expected, "the bouncing tick journals its chain")
+        self.assertEqual(chains[1], expected,
+                         "the tick AFTER a bounce is a re-entry and must re-journal")
+        for i, c in enumerate(chains[2:], 2):
+            self.assertEqual(c, [], "tick %d re-journaled with no new bounce: %s" % (i, c))
+
+    def test_no_state_dir_never_suppresses(self):
+        # Every sim / fixture / dry-run tick runs with no durable state dir (LiveState(None)) — the
+        # once-guard always proceeds there, so those journals are BYTE-IDENTICAL to before HERD-459.
+        # TREES/WORKTREES_DIR are scrubbed because LiveState(None) falls back to them, and a
+        # watcher- or gate-wrapper-descended environment exports one (tests/test-py-live-runtime.sh
+        # runs this suite with WORKTREES_DIR set) — which would hand this "stateless" tick a real
+        # ledger and make the assertion read the opposite invariant.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for k in ("TREES", "WORKTREES_DIR"):
+                os.environ.pop(k, None)
+            self.assertIsNone(LiveState(None).dir, "the fixture column must have no state dir")
+            chains = [self._chain(self._tick(dict(self._PARKED), self._CONFIG, None, "sim%d" % i))
+                      for i in range(3)]
+        self.assertEqual([len(c) for c in chains], [4, 4, 4],
+                         "a stateless tick must journal every transition, exactly as before")
+
+    def test_a_different_trigger_on_the_same_edge_still_journals(self):
+        # BLESSED→HOLD is reached by four DISTINCT triggers (merge_frozen / queue_wait /
+        # cross_seat_block / decide_hold) and which one fired is the forensic bit `herd why` is read
+        # for — so the trigger is part of the dedupe key, and a second cause is never swallowed.
+        state_dir = self._state_dir("triggers")
+        jpath = os.path.join(self.tmp, "dedupe-triggers.jsonl")
+        j = LiveJournal(jpath)
+        scenario = {"candidates": [], "config": self._CONFIG}
+        t = LiveTick(self._CONFIG, FixtureDiscovery(scenario), FixtureGates(scenario),
+                     DryRunActuator(j), j, state=LiveState(state_dir))
+        cand = LiveCandidate(pr=14, sha="deadbeef", slug="feat-edges")
+        t._state[cand.pr] = "BLESSED"
+        t._advance(cand, "decide_hold")
+        t._state[cand.pr] = "BLESSED"
+        t._advance(cand, "decide_hold")          # the SAME cause again — suppressed
+        t._state[cand.pr] = "BLESSED"
+        t._advance(cand, "cross_seat_block")     # a DIFFERENT cause, same edge — journaled
+        triggers = [o["trigger"] for o in events(jpath) if o["event"] == "live_state"]
+        self.assertEqual(triggers, ["decide_hold", "cross_seat_block"])
+
+    def test_health_pending_is_journaled_once_per_sha(self):
+        # "still waiting on the suite" is a PHASE, not a per-tick event (GH #573: live_tick_start /
+        # live_tick_end already carry per-tick liveness).
+        state_dir = self._state_dir("pending")
+        cand = dict(pr=15, sha="ab12cd34", slug="feat-waiting", health=WAIT)
+        pend = 0
+        for i in range(6):
+            pend += sum(1 for o in self._tick(dict(cand), self._CONFIG, state_dir, "p%d" % i)
+                        if o["event"] == "health_pending")
+        self.assertEqual(pend, 1, "6 ticks on one in-flight suite must journal 1 health_pending")
+        pushed = dict(cand, sha="ef56ab78")
+        after = sum(1 for o in self._tick(pushed, self._CONFIG, state_dir, "p-new")
+                    if o["event"] == "health_pending")
+        self.assertEqual(after, 1, "a new sha re-arms the phase marker")
+
+
 class TestInfraBreakerGate(LiveCase):
     """HERD-447: HERD-306's P5b deleted the bash action pass (_tick_act) that consulted
     ``_breaker_gate`` at the top of every candidate — the HERD-442 audit found the breaker's READ
@@ -3107,6 +3236,28 @@ class TestMainHealthSlotPriority(unittest.TestCase):
             evs = [json.loads(l) for l in fh if l.strip()]
         queued = [e for e in evs if e.get("event") == "health_queued"]
         self.assertEqual(len(queued), 1, "health_queued must be journaled for the deferred PR")
+
+    def test_health_queued_is_journaled_once_per_sha(self):
+        """HERD-459: "queued behind a full slot budget" is a standing condition, not a per-tick event —
+        journal it once per (pr, sha, phase), and re-arm on a new sha."""
+        os.environ["MAIN_HEALTH_TICK"] = "on"
+        self._main_repo()
+        _make_worktree(self.tmp, "feat-q")
+        jpath = os.path.join(self.tmp, "jq.jsonl")
+        gates = self._make_gates(jpath)
+        wt = os.path.join(self.tmp, "feat-q")
+        for _ in range(5):
+            self.assertEqual(gates.health(LiveCandidate(pr=9, sha="q1", slug="feat-q", worktree=wt)),
+                             WAIT)
+        with open(jpath, encoding="utf-8") as fh:
+            evs = [json.loads(l) for l in fh if l.strip()]
+        self.assertEqual(len([e for e in evs if e.get("event") == "health_queued"]), 1,
+                         "5 queued ticks on one sha must journal 1 health_queued")
+        gates.health(LiveCandidate(pr=9, sha="q2", slug="feat-q", worktree=wt))
+        with open(jpath, encoding="utf-8") as fh:
+            evs = [json.loads(l) for l in fh if l.strip()]
+        self.assertEqual(len([e for e in evs if e.get("event") == "health_queued"]), 2,
+                         "a new sha re-arms the phase marker")
 
     def test_pr_health_proceeds_when_main_done(self):
         """Main-health done (run-once marker written) → PR health proceeds past the slot check."""

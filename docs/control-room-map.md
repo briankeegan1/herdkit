@@ -253,7 +253,10 @@ herd why <pr#>
 
 It replays that one PR's whole gate history from the engine journal, chronologically: every dispatch,
 every verdict with its provenance, every healthcheck attempt and outcome, every auto-refix bounce and
-whether the wake landed, and the merge and reap. Only when `herd why` comes up empty should you widen
+whether the wake landed, and the merge and reap. A consecutive run of identical blocks is folded into
+one rendering plus a `… ×N (identical …, through <ts>)` note (HERD-459), so a PR that sat parked for
+hours reads as its handful of real transitions rather than screens of re-derived duplicates — the
+header still counts every raw event. Only when `herd why` comes up empty should you widen
 to `herd log` (the raw journal) or `herd status` (a one-shot, read-only health snapshot of this
 project: watcher alive? builders dead? PRs blocked?).
 

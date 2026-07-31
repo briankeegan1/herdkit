@@ -10,6 +10,11 @@ import sys, os, json
 
 from herd.shadow_journal import NOT_YET_SURFACED_KEYS
 
+# The longest repeating BLOCK the ×N fold will look for (HERD-459). A tick's re-derived chain is a
+# handful of events; the cap keeps the scan linear and stops a long history from folding into
+# something an operator can no longer read chronologically.
+MAX_BLOCK = 12
+
 
 def main():
     pr = os.environ["HERD_WHY_PR"]
@@ -88,10 +93,43 @@ def main():
                          if k not in ("ts","event","pr") and k not in NOT_YET_SURFACED_KEYS)
         return ev, extra
 
-    print("PR #%s — gate history (%d event%s)" % (pr, len(rows), "" if len(rows)==1 else "s"))
+    # HERD-459 read side: fold a CONSECUTIVE run of identical blocks into one rendering plus a ×N
+    # note. The watcher re-derives a parked PR's whole chain every poll tick, so the noise is not a
+    # repeated LINE but a repeated BLOCK (INTAKE→HEALTH, HEALTH→REVIEW, REVIEW→BLOCKED, over and
+    # over) — collapsing needs the period, not just adjacent-line equality. Two rows are "identical"
+    # when they RENDER identically ignoring the timestamp (the timestamps are exactly what differs
+    # between ticks); the note carries the last one, so the time range is never lost. This also
+    # rescues journals written BEFORE the write-side guard landed. A history with no repetition is
+    # byte-identical to before.
+    keys, stamps, lines = [], [], []
     for o in rows:
         label, detail = describe(o)
-        print("  %s  %-20s %s" % (str(o.get("ts","")), label, detail))
+        ts = str(o.get("ts", ""))
+        keys.append((label, detail))
+        stamps.append(ts)
+        lines.append("  %s  %-20s %s" % (ts, label, detail))
+
+    print("PR #%s — gate history (%d event%s)" % (pr, len(rows), "" if len(rows)==1 else "s"))
+    n, i = len(rows), 0
+    while i < n:
+        # The winning period is the one that swallows the MOST rows (ties → the shortest block), so
+        # A,A,B,A,A,B folds as one 3-event block rather than two stray ×2 lines.
+        best_k, best_reps = 1, 1
+        for k in range(1, MAX_BLOCK + 1):
+            if i + 2 * k > n or keys[i:i+k] != keys[i+k:i+2*k]:
+                continue
+            reps = 2
+            while i + (reps+1) * k <= n and keys[i:i+k] == keys[i+reps*k:i+(reps+1)*k]:
+                reps += 1
+            if k * reps > best_k * best_reps:
+                best_k, best_reps = k, reps
+        for j in range(i, i + best_k):
+            print(lines[j])
+        if best_reps > 1:
+            shape = "line" if best_k == 1 else "%d-event block" % best_k
+            print("  … ×%d  (identical %s repeated, through %s)"
+                  % (best_reps, shape, stamps[i + best_k * best_reps - 1]))
+        i += best_k * best_reps
 
 
 if __name__ == "__main__":

@@ -1941,8 +1941,11 @@ class LiveGates:
         # any env error (missing MAIN, no git, etc.) so a misconfigured seat never blocks the PR rail.
         _effective_max = self._health_max - (1 if self._main_health_pending_memo(st.dir) else 0)
         if _hc_n >= _effective_max:
-            self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "inflight", _hc_n, "limit", self._health_max)
+            # HERD-459: once per (pr, sha, phase) — see the health_pending guard in LiveTick._walk.
+            # "queued behind a full slot budget" is a standing condition, not a per-tick event.
+            if st.once(cand.pr, cand.sha, "health_queued"):
+                self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                    "inflight", _hc_n, "limit", self._health_max)
             return WAIT
         # 4. DISPATCH the async suite worker + lay the marker → wait.
         self._dispatch_health(cand)
@@ -2051,8 +2054,11 @@ class LiveGates:
         _hc_n = _total_health_inflight(st.dir)
         _effective_max = self._health_max - (1 if self._main_health_pending_memo(st.dir) else 0)
         if _hc_n >= _effective_max:
-            self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
-                                "inflight", _hc_n, "limit", self._health_max)
+            # HERD-459: once per (pr, sha, phase) — the SAME marker the classic rail's slot check uses,
+            # so a candidate that queues on both rails for one sha still journals `health_queued` once.
+            if st.once(cand.pr, cand.sha, "health_queued"):
+                self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                    "inflight", _hc_n, "limit", self._health_max)
             return WAIT
         # 4. MATERIALIZE + DISPATCH.
         return self._dispatch_merge_result(cand, base_sha)
@@ -3044,6 +3050,11 @@ class LiveTick:
         # caching here caps the cross-seat identity probe (`gh api user`) at ONE call per tick no
         # matter how many blessed candidates walk the guard this round (mirrors _main_health_pending_memo).
         self._xseat_identity_cache = None
+        # HERD-459 transition-dedupe memo. The lifecycle RE-ENTRY generation (:meth:`_transition_generation`)
+        # is read from the shared refix ledger; like the identity probe above it is resolved at most ONCE
+        # per tick (the ledger is a single global file, so one parse serves every candidate this round).
+        self._refix_rows_cache = None
+        self._transition_gen_cache = {}
         self._merge_policy = D.effective_merge_policy(
             self.config.get("MERGE_POLICY"), self.config.get("WATCHER_AUTOMERGE"))
         self._hv_policy = self.config.get("HUMAN_VERIFY_POLICY", "hold")
@@ -3299,6 +3310,32 @@ class LiveTick:
             self._xseat_identity_cache = _resolve_owner(self.config) or ""
         return self._xseat_identity_cache
 
+    # ── the lifecycle RE-ENTRY generation (HERD-459) ──────────────────────────────────────────────
+    def _transition_generation(self, pr):
+        """How many times this PR's gate walk has genuinely been RE-ENTERED — the lifetime refix-bounce
+        count from the shared ledger (``D.refix_total_count``), memoized for the life of the tick.
+
+        This is the second half of the transition-dedupe key (:meth:`_advance`). ``self._state`` is
+        in-memory and a LiveTick lives exactly ONE tick, so every tick re-walks a still-open candidate
+        from :data:`_S_INTAKE` and re-derives the SAME chain of edges off the same cached verdicts —
+        that replay is what HERD-459 stops journaling. A new head sha re-arms the guard on its own (the
+        sha is in the key), but a refix bounce that re-dispatches the SAME sha is also a genuine
+        re-entry the operator must see, and the bounce ledger is exactly the durable record of one:
+        it grows by one row per bounce and a rail RESET never refunds it, so it is a monotonic
+        generation counter with no new state file of its own.
+
+        Read ORDER matters: every ``_advance`` of a tick sees the generation as it stood at the START
+        of that tick (this tick's own bounce row is appended by ``_refix_check_and_record`` AFTER the
+        edges leading into the block were journaled), so the bumped generation lands on the NEXT tick —
+        the tick that actually re-dispatches. Fail-soft: no ledger / no state dir reads as generation 0.
+        """
+        key = str(pr)
+        if key not in self._transition_gen_cache:
+            if self._refix_rows_cache is None:
+                self._refix_rows_cache = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
+            self._transition_gen_cache[key] = D.refix_total_count(self._refix_rows_cache, key)
+        return self._transition_gen_cache[key]
+
     # lifecycle transition through SM; journal it, never let a disagreement sink the tick (as shadow).
     def _advance(self, cand, event):
         prev = self._state.get(cand.pr, _S_INTAKE)
@@ -3309,8 +3346,21 @@ class LiveTick:
                                 "state", prev, "attempted_event", event, "detail", str(exc))
             return prev
         self._state[cand.pr] = nxt
-        self.journal.append("live_state", "pr", cand.pr, "sha", cand.sha, "trigger", event,
-                            "state_from", prev, "state_to", nxt)
+        # HERD-459: journal this edge ONCE per (pr, sha, from, to, trigger, re-entry generation) — the
+        # same reconciled once-guard ledger the §5.3 holds use, not a new substrate. Without it a PR
+        # parked on one verdict re-journals its whole INTAKE→…→BLOCKED chain every ~6s poll tick (GH
+        # #573 measured ~88k events/day from ONE idle blocked PR): `herd why` — the doctrine-mandated
+        # first diagnostic — drowns, and the journal ages real history out through JOURNAL_MAX_MB
+        # rotation. A genuinely CHANGING lifecycle is byte-identical to before: a new sha, a new edge,
+        # a new trigger on the same edge, or a re-entry after a bounce all miss the marker and journal.
+        # ``trigger`` is in the key deliberately (the §6 holds share the BLESSED→HOLD edge across four
+        # distinct triggers — merge_frozen / queue_wait / cross_seat_block / decide_hold — and which
+        # one fired is exactly the forensic bit `herd why` is read for). With NO state dir — every sim,
+        # fixture and dry-run tick — ``once`` always proceeds, so those journals never change at all.
+        if self.state.once(cand.pr, cand.sha, "state_%s_%s_%s_%s" % (
+                self._transition_generation(cand.pr), prev, nxt, event)):
+            self.journal.append("live_state", "pr", cand.pr, "sha", cand.sha, "trigger", event,
+                                "state_from", prev, "state_to", nxt)
         return nxt
 
     # ── merge fairness / starvation freeze (§6.2, HERD-340) ───────────────────────────────────────
@@ -3545,7 +3595,13 @@ class LiveTick:
             return HOLD
         health = health if health in ("CLEAN", "FLAKY", "CODEERROR", WAIT) else "CLEAN"
         if health == WAIT:
-            self.journal.append("health_pending", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
+            # HERD-459: "still waiting" is a PHASE, not an event — journal it once per (pr, sha, phase),
+            # not once per poll tick. A suite can sit in flight for many minutes and the 100th identical
+            # row tells the operator nothing the 1st did not; live_tick_start/live_tick_end already carry
+            # per-tick liveness. Re-arms on a new sha (the key is sha-scoped), and the phase CHANGE is
+            # still visible because `health_queued` (LiveGates.health) carries its own separate marker.
+            if self.state.once(cand.pr, cand.sha, "health_pending"):
+                self.journal.append("health_pending", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
             self._advance(cand, "dispatch_health")
             return PENDING
         self._advance(cand, "dispatch_health")
