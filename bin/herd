@@ -3523,6 +3523,251 @@ cmd_governance_apply() {
   _gov_apply_pairs "$root" "$cfg" "$caps" "$pairs" "$assume_yes" "$file"
 }
 
+# ── herd posture: apply a CANONICAL POSTURE to an already-initialised project (HERD-466) ─────────
+# `herd init --posture <name>` renders a templates/postures.tsv bundle at STAND-UP time. There was no
+# way to move a LIVE control room onto a named posture afterwards — an operator had to hand-set every
+# key, which is how a control room ends up on a silent, never-exercised custom combo (the exact drift
+# `herd doctor --posture` reports). These subcommands close that gap on the EXISTING seams: the
+# posture table is read through scripts/herd/sim/posture-lib.sh (the single bundle definition), and
+# every write goes through the validated `herd config set` via _gov_apply_pairs — the same atomic
+# apply path `herd governance apply` uses. Nothing new decides what a value may be.
+#
+# ATOMIC by construction: the WHOLE bundle is validated first (key known to templates/capabilities.tsv,
+# value admitted by that key's value_shape, no secret-shaped/DENY_PATHS key, no shell-active char) and
+# a single defect refuses the command with ZERO writes. Only then is the full current→new delta
+# printed and the bundle applied.
+#
+# FRESH WATCHER (the sticky-env hazard): a running watcher inherits the environment it was STARTED
+# with, so a lever flipped in .herd/config underneath it can be shadowed by the stale exported value
+# for the rest of that watcher's life — the apply looks applied and the lever never takes. Applying a
+# posture therefore ends by rebuilding the control room (`herd reload`), so every key in the bundle is
+# read fresh. Fail-soft: a reload that cannot run (no control room, no multiplexer) warns and leaves
+# the config change in place; `--no-reload` opts out for a scripted/sandbox apply.
+
+# _posture_table_ready — true when posture-lib.sh loaded and the table is readable. The lib is sourced
+# best-effort at startup (an install without it must not break every other subcommand), so the posture
+# subcommands check here and fail LOUDLY with the reason rather than dying on an undefined function.
+_posture_table_ready() {
+  type posture_names >/dev/null 2>&1 || return 1
+  local f; f="$(posture_file)"
+  [ -f "$f" ]
+}
+_posture_require_table() {
+  _posture_table_ready \
+    || die "no posture table available — expected scripts/herd/sim/posture-lib.sh + templates/postures.tsv under $HERDKIT_HOME (override the table with POSTURES_FILE)"
+}
+
+cmd_posture_list() {
+  [ "$#" -eq 0 ] || die "usage: herd posture list"
+  _posture_require_table
+  local n
+  say "${c_bold}canonical operating postures${c_rst} ${c_dim}($(posture_file))${c_rst}"
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    say ""
+    say "  ${c_bold}${n}${c_rst}"
+    say "    ${c_dim}$(posture_intent "$n")${c_rst}"
+  done < <(posture_names)
+  say ""
+  say "  ${c_dim}detail: herd posture show <name> · apply: herd posture apply <name>${c_rst}"
+}
+
+cmd_posture_show() {
+  local name="${1:-}"
+  { [ -n "$name" ] && [ "$#" -le 1 ]; } || die "usage: herd posture show <name>"
+  _posture_require_table
+  posture_exists "$name" || die "unknown posture '$name' — see 'herd posture list'"
+  local kv k v steps
+  say "${c_bold}${name}${c_rst}"
+  say "  ${c_dim}$(posture_intent "$name")${c_rst}"
+  say ""
+  say "  ${c_bold}config bundle${c_rst}"
+  # Field-split the bundle with globbing OFF: a value_shape=glob member (docs-lab's DOCS_ONLY_GLOB)
+  # is an egrep pattern, and pathname expansion must never rewrite it into a matching filename.
+  local restore_f=1; case "$-" in *f*) restore_f=0 ;; esac
+  set -f
+  for kv in $(posture_keys "$name" 2>/dev/null); do
+    case "$kv" in *=*) ;; *) continue ;; esac
+    k="${kv%%=*}"; v="${kv#*=}"
+    if [ "$k" = "STEPS_PROFILE" ]; then
+      say "    ${c_dim}STEPS_PROFILE=${v} (pipeline-steps profile, not a .herd/config key)${c_rst}"
+    else
+      say "    ${k}=\"${v}\""
+    fi
+  done
+  [ "$restore_f" -eq 1 ] && set +f
+  steps="$(posture_steps_profile "$name")"
+  say ""
+  say "  ${c_dim}apply to this project: herd posture apply $name${c_rst}"
+  [ -n "$steps" ] && say "  ${c_dim}(also seeds .herd/steps.tsv from STEPS_PROFILE=$steps when absent)${c_rst}"
+  return 0
+}
+
+# _posture_effective_value <cfg> <local_cfg> <key> — the value that WINS at load time: the per-user
+# overlay .herd/config.local when it pins the key, else the committed baseline. The delta must be
+# printed against what the engine actually reads, not against the baseline a `--local` key shadows.
+_posture_effective_value() {
+  local cfg="$1" local_cfg="$2" key="$3"
+  if [ -f "$local_cfg" ] && grep -qE "^[[:space:]]*$key=" "$local_cfg" 2>/dev/null; then
+    _config_file_value "$local_cfg" "$key"; return 0
+  fi
+  _config_file_value "$cfg" "$key"
+}
+
+cmd_posture_apply() {
+  local assume_yes=0 no_reload=0 name=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --yes|-y)    assume_yes=1; shift ;;
+      --no-reload) no_reload=1; shift ;;
+      --)          shift; break ;;
+      -?*)         die "unknown flag '$1' — usage: herd posture apply [--yes] [--no-reload] <name>" ;;
+      *)           name="$1"; shift; break ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: herd posture apply [--yes] [--no-reload] <name>"
+  [ "$#" -eq 0 ] || die "unexpected argument '$1' — usage: herd posture apply [--yes] [--no-reload] <name>"
+  _posture_require_table
+  posture_exists "$name" \
+    || die "unknown posture '$name' — see 'herd posture list' for the canonical names"
+
+  local root cfg local_cfg; root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  local caps; caps="$(_config_caps_file)"
+
+  # ── 1. VALIDATE THE WHOLE BUNDLE FIRST — a single defect refuses with zero writes ──────────────
+  local pairs="" problems="" steps_profile="" kv k v shape
+  local restore_f=1; case "$-" in *f*) restore_f=0 ;; esac
+  set -f
+  for kv in $(posture_keys "$name" 2>/dev/null); do
+    case "$kv" in
+      STEPS_PROFILE=*) steps_profile="${kv#STEPS_PROFILE=}"; continue ;;
+      *=*)             ;;
+      *)               problems="${problems}  ${kv} — not a KEY=VALUE pair"$'\n'; continue ;;
+    esac
+    k="${kv%%=*}"; v="${kv#*=}"
+    case "$k" in
+      *[!A-Za-z0-9_]*) problems="${problems}  ${k} — not a valid config key name"$'\n'; continue ;;
+    esac
+    if [ "$k" = "DENY_PATHS" ]; then
+      problems="${problems}  DENY_PATHS — scopes secrets away from git; a posture may never set it"$'\n'; continue
+    fi
+    if _config_secret_key "$k"; then
+      problems="${problems}  ${k} — secret-shaped; credentials belong in .herd/secrets, never a posture"$'\n'; continue
+    fi
+    if ! _config_key_requires "$caps" "$k" >/dev/null 2>&1; then
+      problems="${problems}  ${k} — unknown config key (absent from $(basename "$caps"))"$'\n'; continue
+    fi
+    shape="$(_config_key_value_shape "$caps" "$k")"
+    _config_shape_wellformed "$shape" || shape=free
+    if [ "$shape" != "glob" ]; then
+      case "$v" in
+        *'$'*|*'`'*|*'\'*|*'"'*)
+          problems="${problems}  ${k}=\"${v}\" — contains a shell-active character (\$ \` \\ or \"); .herd/config is sourced as shell"$'\n'
+          continue ;;
+      esac
+    fi
+    if ! _config_validate_value "$shape" "$v"; then
+      case "$shape" in
+        numeric) problems="${problems}  ${k}=\"${v}\" — want a non-negative integer"$'\n' ;;
+        glob)    problems="${problems}  ${k}=\"${v}\" — not an accepted glob pattern"$'\n' ;;
+        *)       problems="${problems}  ${k}=\"${v}\" — allowed: $(_config_shape_render "$shape")"$'\n' ;;
+      esac
+      continue
+    fi
+    pairs="${pairs}$(printf '%s\t%s' "$k" "$v")"$'\n'
+  done
+  [ "$restore_f" -eq 1 ] && set +f
+
+  if [ -n "$problems" ]; then
+    say "${c_bold}herd posture apply $name${c_rst} ${c_dim}— refused; NOTHING was written${c_rst}"
+    printf '%s' "$problems" | while IFS= read -r kv; do [ -n "$kv" ] && say "$kv"; done
+    die "posture '$name' carries a key/value the manifest does not accept — fix templates/postures.tsv (or templates/capabilities.tsv's value_shape) and re-run"
+  fi
+
+  local n; n="$(printf '%s' "$pairs" | grep -c . || true)"
+  say "${c_bold}herd posture apply $name${c_rst} ${c_dim}— $(posture_intent "$name")${c_rst}"
+  say ""
+
+  # ── 2. THE FULL DELTA — every key in the bundle, changing or not, against the EFFECTIVE value ──
+  local i rec cur changed=0 watcher_affecting=0 requires changed_pairs=""
+  say "  ${c_bold}config delta${c_rst} ${c_dim}($n key(s) from $(basename "$(posture_file)"))${c_rst}"
+  for (( i=1; i<=n; i++ )); do
+    rec="$(printf '%s' "$pairs" | sed -n "${i}p")"
+    IFS=$'\t' read -r k v <<< "$rec"
+    [ -n "$k" ] || continue
+    cur="$(_posture_effective_value "$cfg" "$local_cfg" "$k")"
+    requires="$(_config_key_requires "$caps" "$k" 2>/dev/null || true)"
+    if [ "$cur" = "$v" ]; then
+      say "    ${c_dim}${k}  \"${v}\"  (unchanged)${c_rst}"
+    else
+      changed=$((changed+1))
+      changed_pairs="${changed_pairs}${rec}"$'\n'
+      say "    ${c_bold}${k}${c_rst}  \"${cur}\" ${c_dim}→${c_rst} \"${v}\""
+      case "$requires" in watcher|render) watcher_affecting=1 ;; esac
+    fi
+  done
+  [ -n "$steps_profile" ] && say "    ${c_dim}STEPS_PROFILE=${steps_profile} — seeds .herd/steps.tsv when absent${c_rst}"
+  say ""
+  if [ "$changed" -eq 0 ]; then
+    ok "already on posture '$name' — every key already holds its bundle value (config untouched)"
+    [ -n "$steps_profile" ] && _posture_seed_steps "$root" "$steps_profile"
+    return 0
+  fi
+  say "  ${c_dim}$changed key(s) change · every write goes through the validated 'herd config set'${c_rst}"
+
+  # ── 3. ONE confirmation for the WHOLE bundle — a posture is all-or-nothing, never per-key ──────
+  if [ "$assume_yes" -ne 1 ]; then
+    if ! _posture_interactive; then
+      die "refusing to apply posture '$name' non-interactively without --yes — a posture flips $changed key(s) at once; re-run 'herd posture apply --yes $name' if that is what you want"
+    fi
+    local ans; ans="$(_posture_ask "  apply all $changed change(s)? (y/N)" "n")"
+    case "$(printf '%s' "$ans" | tr '[:upper:]' '[:lower:]')" in
+      y|yes) : ;;
+      *) say "  ${c_dim}declined — config untouched${c_rst}"; return 0 ;;
+    esac
+  fi
+  say ""
+
+  # ── 4. APPLY through the shared, already-validated governance apply path (assume_yes: atomic) ──
+  # Only the CHANGED pairs go in, so the applied count matches the delta the operator just accepted.
+  # HERD_INIT_DEFER_APPLY=1 for the whole batch: it suppresses the per-key watcher restart AND
+  # _gov_apply_pairs's trailing "run herd reload" hint, because this command owns the reload itself
+  # (step 5) rather than leaving it as a chore.
+  export HERD_INIT_DEFER_APPLY=1
+  _gov_apply_pairs "$root" "$cfg" "$caps" "$changed_pairs" 1 "$(posture_file)"
+  unset HERD_INIT_DEFER_APPLY
+  [ -n "$steps_profile" ] && _posture_seed_steps "$root" "$steps_profile"
+
+  # ── 5. FRESH WATCHER — defeat the sticky-env shadow (see the header note) ──────────────────────
+  if [ "$no_reload" -eq 1 ]; then
+    say "  ${c_dim}--no-reload: the running watcher keeps the environment it was STARTED with, so a"
+    say "  flipped lever may not take until you run 'herd reload' yourself.${c_rst}"
+  elif [ "$watcher_affecting" -eq 0 ]; then
+    say "  ${c_dim}(no watcher/render-affecting key changed — no reload needed)${c_rst}"
+  else
+    say ""
+    say "  ${c_bold}rebuilding the control room${c_rst} ${c_dim}— a FRESH watcher, so every applied lever is read anew${c_rst}"
+    if ( cmd_reload ); then
+      ok "posture '$name' applied and the control room rebuilt"
+    else
+      warn "posture '$name' applied, but 'herd reload' did not complete — the running watcher may still hold the PREVIOUS values in its environment. Run 'herd reload' from the control room to make every lever take."
+    fi
+  fi
+  return 0
+}
+
+cmd_posture() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    list)         cmd_posture_list "$@" ;;
+    show)         cmd_posture_show "$@" ;;
+    apply)        cmd_posture_apply "$@" ;;
+    ""|-h|--help) say "usage: herd posture list | show <name> | apply [--yes] [--no-reload] <name>" ;;
+    *)            die "unknown 'herd posture' subcommand '$sub' — usage: herd posture list | show <name> | apply [--yes] [--no-reload] <name>" ;;
+  esac
+}
+
 cmd_config_sync() {
   local root cfg; root="$(pwd)"; cfg="$root/.herd/config"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
@@ -7563,6 +7808,19 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       applies all, journaled); malformed → refused,
                                                       zero writes. Also: herd init --governance <file>,
                                                       herd fleet set --profile <file>
+  herd posture <list|show|apply>      move an ALREADY-INITIALISED project onto a CANONICAL OPERATING
+                                      POSTURE (templates/postures.tsv — the same bundles
+                                      'herd init --posture' offers at stand-up):
+                                        list                every posture + its intent
+                                        show <name>         the posture's full KEY=VALUE bundle
+                                        apply [--yes]       validate the WHOLE bundle first (a single
+                                             [--no-reload]  bad key/value refuses with zero writes),
+                                             <name>         print the full current→new delta, apply
+                                                      every key via the validated 'herd config set',
+                                                      then rebuild a FRESH watcher so no lever stays
+                                                      shadowed by the running watcher's stale
+                                                      environment. 'yolo' is the all-auto-levers
+                                                      posture that pairs with coordinator DRAIN MODE
   herd governance hooks render        render SESSION-TIME Claude Code hooks from the governance map's
               [--shared]              hook rows (dual-surface: the same rules the merge gate enforces,
                                       now blocking at the keyboard). Propose-then-write, per-hook
@@ -7735,6 +7993,7 @@ case "${1:-help}" in
   theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;
   governance) shift; cmd_governance "$@" ;;
+  posture) shift; cmd_posture "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;

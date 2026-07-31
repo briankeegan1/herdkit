@@ -102,6 +102,7 @@ herd link <list|--scan>	unit	tests/test-cli-link-scan.sh
 herd depend <link>#<id>	unit	tests/test-dispatch-deps.sh
 herd deps <list|rm|demote>	unit	tests/test-dispatch-deps.sh
 herd governance <export|apply>	unit	tests/test-governance-profiles.sh
+herd posture <list|show|apply>	unit	tests/test-yolo-drain-mode.sh
 herd fleet new <path> [--archetype X --posture Y --no-remote]	unit	tests/test-fleet-new.sh
 herd init	unit	tests/test-init-flags.sh
 herd fleet <register|list|discover|status|digest|inbox|upgrade|reload>	unit	tests/test-fleet.sh
@@ -421,6 +422,7 @@ herd config models	unit	tests/test-model-matrix.sh
 # these levers hold their invariant under their posture. An explicit nightly-candidate run, not a
 # per-merge gate.
 templates/postures.tsv	sim	tests/test-sandbox-posture-matrix.sh
+templates/postures.tsv	sim	tests/test-yolo-drain-mode.sh
 MERGE_POLICY	sim	tests/test-sandbox-posture-matrix.sh
 HUMAN_VERIFY_POLICY	sim	tests/test-sandbox-posture-matrix.sh
 PUSH_GATE	sim	tests/test-sandbox-posture-matrix.sh

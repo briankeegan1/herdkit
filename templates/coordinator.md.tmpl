@@ -725,6 +725,83 @@ Full autonomy requires context to persist across sessions without human briefing
   in the coordinator's current session is a session artifact and evaporates on session
   boundary.
 
+## Drain mode — `{{COORDINATOR_CMD}} yolo`
+
+**What it is.** A standing instruction to drain the open backlog end-to-end without stopping
+between items. Invoked as `{{COORDINATOR_CMD}} yolo` (or any drain argument — "drain",
+"drain the backlog", "yolo"). Drain mode is the codified form of the manual loop this seat ran
+on 2026-07-30/31 to drain ~20 items: parallel builders collision-mapped by file surface, held
+items sequenced behind shared files, builder notes routed every cycle. Codifying it makes ANY
+seat able to run it — invariance over seat-local skill, per `docs/multi-seat-doctrine.md`.
+
+**YOLO is NOT gateless.** The healthcheck and the adversarial pre-merge review still gate every
+single PR, `TRACKED_SPAWNS`/`CLAIM_REQUIRED` still make every spawn file-then-claim, and you still
+never self-merge. What disappears is the *pause* between the gates — the "shall I spawn?",
+"shall I re-task?", "shall I merge?" checkpoints. The gates are unchanged; only the waiting is gone.
+
+**The config half.** The matching config posture is `yolo` in `templates/postures.tsv` — every
+auto lever at once (`MERGE_POLICY=auto`, `HUMAN_VERIFY_POLICY=auto`, `REVIEW_AUTOFIX=true`,
+`HEALTHCHECK_AUTOFIX=true`, `STALE_BASE_AUTOFIX=on`, `DRAFT_AUTO_PROMOTE=on`,
+`DEAD_BUILDER_AUTORESPAWN=on`, `WEDGE_AUTOWAKE=on`, `MAIN_HEALTH_AUTOFIX=on`, `CI_AUTOREPAIR=on`,
+`MERGE_FAIRNESS=on`, `SWEEP_AUTO=auto`, `WATCHER_SELF_RESTART=on`, `COORDINATOR_WATCHDOG=on`,
+`ADOPT_REMOTE_PRS=on`, `COORDINATOR_AUTONOMY=full`, plus `TRACKED_SPAWNS=required` and
+`CLAIM_REQUIRED=on`). Apply it in one atomic, validated, delta-printing step:
+
+    herd posture show yolo      # the full bundle, before you touch anything
+    herd posture apply --yes yolo
+
+`apply` validates the whole bundle before any write (one bad key/value ⇒ zero writes), prints the
+full current→new delta, writes every key through the validated `herd config set`, and then rebuilds
+a **fresh watcher** — a running watcher keeps the environment it was started with, so without that
+rebuild a flipped lever can stay shadowed by the stale exported value and silently never take.
+Drain mode still runs (more slowly, with more of the duties on you) under a weaker posture; the
+posture is what removes the engine-side pauses, this section removes the coordinator-side ones.
+
+### The loop
+
+While open tracker items remain, repeat:
+
+1. **Drain, route and ack builder notes.** `herd notes` (or `herd log | grep builder_note`).
+   A note is often the reason a row is red and it is state no pane transcript will hand you —
+   route it *before* acting on any red row, then ack it. See *Builder notes*.
+2. **Collision-map every open item's file surface** against the in-flight worktrees
+   (`git worktree list`). Use the graphify pre-spawn impact analysis where it is available (see
+   *Pre-spawn impact/conflict analysis*); where it is not, map by the paths each item names.
+3. **Spawn to capacity on disjoint surfaces.** Honor `REVIEW_CONCURRENCY` — review bandwidth, not
+   builder count, is the real ceiling. **Bundle same-surface items into ONE builder** rather than
+   racing two builders over one file; publish each plan with `herd backlog queue <#id>` before the
+   lane command, and file-then-spawn every unit (`HERD_ITEM_REF` on every spawn).
+4. **Dispatch the resolver for any DIRTY PR whose builder is done** —
+   `bash {{SCRIPTS_DIR}}/herd-resolve.sh <slug>`. A conflicted PR with an idle builder is the
+   single most common way a drain stalls silently; it never resolves itself.
+5. **Let the gates merge.** Never self-merge, in drain mode least of all. Read `herd why <pr#>`
+   before touching any row: autofix rounds already in progress, infra transients and self-healing
+   holds all clear without you. Act only on `needs you` (see *Row truth* and *Don't
+   double-intervene when autofix is on*).
+6. **Reconcile and close.** Close or mark-shipped the tracker item on every merge, and close the
+   mirrored GitHub issue where the project keeps one, so the tracker stays the single truthful
+   picture of what is being built.
+7. **Repeat** — go back to step 1. Do not stop to report progress between cycles.
+
+### Stop conditions — the only three
+
+Drain mode runs until exactly one of these fires. Nothing else interrupts it.
+
+1. **Backlog empty.** Report a **completion digest** and stop: items drained, PRs merged, gate
+   verdicts, refix bounces, recorded cost, and anything left deliberately unspawned. `herd stats`
+   and `herd cost` supply the numbers; do not estimate them.
+2. **`BUDGET_DAILY` ceiling hit — the one brake YOLO must respect.** ENFORCE it, do not merely
+   measure it: before each spawn cycle check spend against the ceiling (`herd cost`), and when the
+   next cycle would cross it, **stop spawning** and report the ceiling as the stop reason with the
+   remaining items still open. Work already in flight runs to its gate; nothing new is started.
+3. **Genuine escalation.** A semantically-ambiguous conflict the resolver punts (`ESCALATE`), or
+   an engine red that no autofix rail owns. Stop, name the item, and say precisely what judgment
+   is needed. A red that *is* owned by a rail (a refix round, a stale-base heal, a CI repair) is
+   not an escalation — it is the engine working; wait for it.
+
+Anything else — a BLOCK review, a red healthcheck, a stale base, a dead builder, a wedged pane, a
+red default branch, a dirty PR — has an owner under the `yolo` posture. Route it and keep going.
+
 ## Rules
 
 - **You own `{{BACKLOG_FILE}}`.** Sub-agents never edit it. You make every backlog change.
