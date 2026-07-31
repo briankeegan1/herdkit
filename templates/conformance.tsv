@@ -203,6 +203,7 @@ gate-coverage-lint.sh	unit	tests/test-gate-coverage.sh
 pipe-safety-lint.sh	unit	tests/test-pipe-safety.sh
 git-scope-lint.sh	unit	tests/test-git-scope-lint.sh
 git-scope-lint.sh	unit	tests/test-nested-repo-isolation.sh
+env-export-lint.sh	unit	tests/test-env-export-lint.sh
 doc-drift-lint.sh	unit	tests/test-doc-drift.sh
 HERDKIT_HOME	unit	tests/test-doc-drift.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh
@@ -285,6 +286,7 @@ review-panel.sh	unit	tests/test-review-panel-models.sh
 SPAWN_AHEAD	unit	tests/test-spawn-rate-match.sh
 HEALTH_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 HEALTH_CONCURRENCY	sim	tests/test-gate-reconciler-chaos-sim.sh
+HEALTH_CONCURRENCY	unit	tests/test_live_runtime.py
 REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_TIMEOUT_HEADROOM	sim	scripts/herd/sim/sandbox-suite-timeout-headroom-sim.sh
@@ -301,6 +303,8 @@ REVIEW_AUTOFIX	sim	tests/test-sandbox-real-panes.sh
 REFIX_MAX_ROUNDS	unit	tests/test-auto-refix.sh
 REFIX_MAX_ROUNDS	sim	tests/test-gate-reconciler-chaos-sim.sh
 REFIX_COMPLETE_MIN	unit	tests/test-py-live-refix-complete.sh
+HERD_REFIX_WAIT_TIMEOUT	unit	tests/test-refix-wake.sh
+HERD_REFIX_WAIT_TIMEOUT	unit	tests/test-agent-liveness.sh
 STALE_DUP_DETECT	unit	tests/test-stale-dup-detect.sh
 STALE_DUP_DETECT	unit	tests/test-gate-order-stale-dup.sh
 STALE_DUP_DETECT	sim	tests/test-sandbox-self-restart.sh
@@ -310,6 +314,7 @@ CI_AUTOREPAIR	unit	tests/test-ci-autorepair.sh
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh
+MERGE_FAIRNESS_STARVE_THRESHOLD	unit	tests/test_live_runtime.py
 MERGE_RESULT_GATE	unit	tests/test_live_runtime.py
 MERGE_RESULT_GATE	sim	tests/test-merge-result-gate-sim.sh
 MERGE_QUEUE	unit	tests/test_live_runtime.py

@@ -141,6 +141,17 @@ else
   HERD_GIT_SCOPE_SKIP_REASON="git-scope-lint.sh not present"
   herd_git_scope_lint() { return 2; }
 fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# env-export guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/env-export-lint.sh"
+[ -f "$DIR/scripts/herd/env-export-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/env-export-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_ENV_EXPORT_SKIP_REASON="env-export-lint.sh not present"
+  herd_env_export_lint() { return 2; }
+fi
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
@@ -474,6 +485,19 @@ EOF
   if [ "$gscope_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ git-scope — $(printf '%s' "$gscope_errs" | grep '^GIT-SCOPE' | head -1)";  # pipe-ok: head in a command substitution; status not gated
     else echo "❌ GIT-SCOPE: a production engine path stages repo-wide or commits without a pathspec (name the paths, or annotate '# herd-scope-ok: <why>')"; printf '%s\n' "$gscope_errs" | grep '^GIT-SCOPE' || printf '%s\n' "$gscope_errs"; fi
+    exit 1
+  fi
+
+  # env-export guard (HERD-449) — a config knob the Python engine core reads from os.environ
+  # (pysrc/herd/live_runtime.py's _CORE_ENV_KEYS) must be `export`ed by herd-config.sh, or the
+  # `live_runtime --tick` CHILD process never sees it and silently defaults (the bug that starved
+  # HEALTH_CONCURRENCY/REVIEW_CONCURRENCY). Same red semantics as caps-sync / git-scope. Skipped
+  # (never red) when the shared lint is absent or the tree has no herd-config.sh + pysrc.
+  local eexp_errs eexp_rc
+  eexp_errs="$(herd_env_export_lint ".")"; eexp_rc=$?
+  if [ "$eexp_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ env-export — $(printf '%s' "$eexp_errs" | head -1) set but not exported";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ ENV-EXPORT: a config key the Python engine core reads from os.environ is set but not \`export\`ed by herd-config.sh (the child tick process never sees it)"; printf '%s\n' "$eexp_errs"; fi
     exit 1
   fi
 
