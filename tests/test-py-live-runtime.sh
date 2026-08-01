@@ -181,11 +181,11 @@ for _ in $(seq 1 200); do [ -s "$SIMT/cur" ] && break; sleep 0.02; done
 read curpid < "$SIMT/cur"
 [ -n "${curpid:-}" ] || fail "supersession sim: current-sha worker did not report its pid"
 # Lay both in-flight markers (line 4 = the worker's SESSION id, HERD-348 → whole-subtree killable): PR 77
-# has moved to head 'newsha', so the 'oldsha' worker is doomed and the 'newsha' worker is the head. Each
+# has moved to head 'bbbbbb2', so the 'aaaaaa1' worker is doomed and the 'bbbbbb2' worker is the head. Each
 # worker setsid'd, so its session == its own pid.
-printf '%s\n%s\n%s\n%s\n' "$wpid" "" "0" "$wpid"       > "$SIMT/.health-inflight-77-oldsha"
-printf '%s\n%s\n%s\n%s\n' "$curpid" "" "0" "$curpid"   > "$SIMT/.health-inflight-77-newsha"
-# Drive the discovery→cancel pass for PR 77 now at head 'newsha'.
+printf '%s\n%s\n%s\n%s\n' "$wpid" "" "0" "$wpid"       > "$SIMT/.health-inflight-77-aaaaaa1"
+printf '%s\n%s\n%s\n%s\n' "$curpid" "" "0" "$curpid"   > "$SIMT/.health-inflight-77-bbbbbb2"
+# Drive the discovery→cancel pass for PR 77 now at head 'bbbbbb2'.
 HERD_HEALTH_TERM_SLEEP=0.02 TREES="$SIMT" HERD_JOURNAL_NOW="2026-07-10T00:00:00Z" \
   PYTHONPATH="$REPO/pysrc" python3 - "$SIMT/j.jsonl" <<'PY' || fail "supersession driver errored"
 import sys
@@ -195,18 +195,18 @@ journal = LiveJournal(sys.argv[1])
 state = LiveState()                                    # reads $TREES
 t = LiveTick({"MERGE_POLICY": "observe"}, FixtureDiscovery({"candidates": []}),
              FixtureGates({"candidates": []}), DryRunActuator(journal), journal, state=state)
-t._supersede_stale([LiveCandidate(77, "newsha")])
+t._supersede_stale([LiveCandidate(77, "bbbbbb2")])
 PY
 # The doomed leader AND its child subtree are gone — the SESSION kill, not a single-pid kill.
 for _ in $(seq 1 200); do kill -0 "$wpid" 2>/dev/null || break; sleep 0.02; done
 kill -0 "$wpid" 2>/dev/null && fail "supersession sim: stale worker leader survived the cancel"
 for _ in $(seq 1 200); do kill -0 "$cpid" 2>/dev/null || break; sleep 0.02; done
 kill -0 "$cpid" 2>/dev/null && fail "supersession sim: stale worker CHILD survived (single-pid kill, not a session kill)"
-[ -e "$SIMT/.health-inflight-77-oldsha" ] && fail "supersession sim: stale marker not reaped"
+[ -e "$SIMT/.health-inflight-77-aaaaaa1" ] && fail "supersession sim: stale marker not reaped"
 grep -q '"event":"gate_superseded"' "$SIMT/j.jsonl" || fail "supersession sim: no gate_superseded journaled"
 # The CURRENT-sha worker and its marker are untouched.
 kill -0 "$curpid" 2>/dev/null || fail "supersession sim: current-sha worker was wrongly terminated"
-[ -e "$SIMT/.health-inflight-77-newsha" ] || fail "supersession sim: current-sha marker wrongly removed"
+[ -e "$SIMT/.health-inflight-77-bbbbbb2" ] || fail "supersession sim: current-sha marker wrongly removed"
 kill -9 "$wpid" "$cpid" "$curpid" 2>/dev/null || true
 pass
 

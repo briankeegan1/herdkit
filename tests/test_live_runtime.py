@@ -2679,32 +2679,32 @@ class TestSupersessionCancel(unittest.TestCase):
     # ── health rail: a superseded sha's suite worker is session-killed + journaled ──
     def test_stale_health_worker_terminated_and_journaled(self):
         p = self._worker()
-        marker = self.state._sha_path(".health-inflight", 5, "oldsha")
+        marker = self.state._sha_path(".health-inflight", 5, "aaaaaa1")
         _marker_write(marker, p.pid)                       # records the worker's session (line 4)
         # scratch the worker left behind, keyed to the OLD sha, must be reaped too.
-        for f in (self.state.health_dispatch_file_sha(5, "oldsha"),
-                  self.state.health_result_file_sha(5, "oldsha")):
+        for f in (self.state.health_dispatch_file_sha(5, "aaaaaa1"),
+                  self.state.health_result_file_sha(5, "aaaaaa1")):
             open(f, "w").close()
         self._tick()._supersede_stale([LiveCandidate(5, "newsha")])
         self.assertFalse(self._alive(p.pid))              # the doomed worker is dead
         self.assertFalse(os.path.exists(marker))          # marker reaped
-        self.assertFalse(os.path.exists(self.state.health_dispatch_file_sha(5, "oldsha")))
+        self.assertFalse(os.path.exists(self.state.health_dispatch_file_sha(5, "aaaaaa1")))
         gs = [o for o in self._events() if o["event"] == "gate_superseded"]
         self.assertEqual(len(gs), 1)
         self.assertEqual((gs[0]["rail"], gs[0]["old_sha"], gs[0]["new_sha"], gs[0]["action"]),
-                         ("health", "oldsha", "newsha", "session_kill"))
+                         ("health", "aaaaaa1", "newsha", "session_kill"))
 
     # ── review rail: a superseded reviewer is terminated + its stamped pane retired ──
     def test_stale_reviewer_terminated_pane_retired_and_journaled(self):
         p = self._worker()
-        marker = self.state._sha_path(".review-inflight", 8, "old8")
+        marker = self.state._sha_path(".review-inflight", 8, "aaaaaa8")
         _marker_write(marker, p.pid)
-        with open(self.state.review_registry_file_sha(8, "old8"), "w") as fh:
+        with open(self.state.review_registry_file_sha(8, "aaaaaa8"), "w") as fh:
             fh.write("%s review-pane-42\n" % p.pid)        # the reviewer's STAMPED pane
         self._tick()._supersede_stale([LiveCandidate(8, "new8")])
         self.assertFalse(self._alive(p.pid))
         self.assertFalse(os.path.exists(marker))
-        self.assertFalse(os.path.exists(self.state.review_registry_file_sha(8, "old8")))
+        self.assertFalse(os.path.exists(self.state.review_registry_file_sha(8, "aaaaaa8")))
         gs = [o for o in self._events() if o["event"] == "gate_superseded" and o["rail"] == "review"]
         self.assertEqual(len(gs), 1)
         self.assertEqual(gs[0]["action"], "pane_retired")
@@ -2713,9 +2713,9 @@ class TestSupersessionCancel(unittest.TestCase):
     # ── the CURRENT sha's worker is NEVER touched ──
     def test_current_sha_worker_is_preserved(self):
         p = self._worker()
-        marker = self.state._sha_path(".health-inflight", 5, "cur")
+        marker = self.state._sha_path(".health-inflight", 5, "ccccccc")
         _marker_write(marker, p.pid)
-        self._tick()._supersede_stale([LiveCandidate(5, "cur")])
+        self._tick()._supersede_stale([LiveCandidate(5, "ccccccc")])
         self.assertTrue(self._alive(p.pid))               # still running — its sha IS the head
         self.assertTrue(os.path.exists(marker))
         self.assertEqual([o for o in self._events() if o["event"] == "gate_superseded"], [])
@@ -2723,7 +2723,7 @@ class TestSupersessionCancel(unittest.TestCase):
     # ── a foreign PR's stale worker is not touched by an unrelated candidate ──
     def test_only_matching_pr_is_superseded(self):
         p = self._worker()
-        marker = self.state._sha_path(".health-inflight", 7, "old7")
+        marker = self.state._sha_path(".health-inflight", 7, "aaaaaa7")
         _marker_write(marker, p.pid)
         self._tick()._supersede_stale([LiveCandidate(5, "newsha")])   # candidate is PR 5, not 7
         self.assertTrue(self._alive(p.pid))
@@ -2731,7 +2731,7 @@ class TestSupersessionCancel(unittest.TestCase):
 
     # ── a dead/recycled marker is reaped with no signal, no false gate_superseded ──
     def test_dead_marker_reaped_without_signal(self):
-        marker = self.state._sha_path(".health-inflight", 5, "old")
+        marker = self.state._sha_path(".health-inflight", 5, "aaaaaaa")
         with open(marker, "w") as fh:
             fh.write("999999\n\n0\n999999\n")             # a pid that isn't alive
         self.assertTrue(_terminate_worker(marker))        # already gone → True
@@ -2758,7 +2758,7 @@ class TestSupersessionCancel(unittest.TestCase):
                 break
             time.sleep(0.01)
         child = int(open(pidfile).read().strip())
-        marker = self.state._sha_path(".health-inflight", 9, "old9")
+        marker = self.state._sha_path(".health-inflight", 9, "aaaaaa9")
         _marker_write(marker, leader.pid)                 # records the leader's session
         self._tick()._supersede_stale([LiveCandidate(9, "new9")])
         self.assertFalse(self._alive(leader.pid))
@@ -2780,7 +2780,7 @@ class TestSupersessionCancel(unittest.TestCase):
     # ── end-to-end: a full tick supersedes a stale worker, then walks the fresh candidate to merge ──
     def test_full_tick_supersedes_then_walks(self):
         p = self._worker()
-        _marker_write(self.state._sha_path(".health-inflight", 3, "old3"), p.pid)
+        _marker_write(self.state._sha_path(".health-inflight", 3, "aaaaaa3"), p.pid)
         scenario = {"candidates": [{"pr": 3, "sha": "new3", "review": "PASS", "health": "CLEAN"}],
                     "config": {"MERGE_POLICY": "auto"}}
         t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
@@ -2791,6 +2791,63 @@ class TestSupersessionCancel(unittest.TestCase):
         ev = self._events()
         self.assertTrue([o for o in ev if o["event"] == "gate_superseded"])
         self.assertTrue([o for o in ev if o["event"] == "merge"])
+
+
+class TestMarkerShaParsing(unittest.TestCase):
+    """HERD-471: a marker's sha field is sliced off the KNOWN ``<prefix>-<pr>-`` stem and shape-checked
+    ([0-9a-f]{7,40}) by the shared ``_parse_marker_sha`` helper — not a blind ``rsplit("-", 1)`` on the
+    basename's last hyphen. A real git sha never contains a hyphen, so any hyphenated (or otherwise
+    non-hex) sha field names a malformed marker; the old rsplit code silently truncated it to whatever
+    followed the LAST hyphen — a plausible-looking but WRONG sha — instead of recognizing it as
+    unparseable. The fix must never do that: a malformed name is skipped, loud-journaled, never yielded."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+        self.journal = LiveJournal(self.jpath)
+        self.state = LiveState(self.tmp)
+
+    def _events(self):
+        return events(self.jpath) if os.path.exists(self.jpath) else []
+
+    def test_well_formed_hex_sha_parses_byte_identical(self):
+        marker = self.state._p(".health-inflight-5-1a2b3c4")
+        open(marker, "w").close()
+        self.assertEqual(
+            LR._parse_marker_sha(marker, ".health-inflight", 5, journal=self.journal), "1a2b3c4")
+        self.assertEqual(self._events(), [])   # no malformed-skip noise for a well-formed marker
+
+    # ── MUTATION PROOF: a hyphenated non-hex sha is skipped, never truncated into a wrong-but-plausible
+    #    value. Under the pre-fix rsplit("-", 1)[-1], this basename would silently yield "def456" — a
+    #    fragment of the real field — instead of being caught as malformed.
+    def test_hyphenated_non_hex_sha_is_skipped_not_corrupted(self):
+        marker = self.state._p(".health-inflight-5-abc123-def456")
+        open(marker, "w").close()
+        got = LR._parse_marker_sha(marker, ".health-inflight", 5, journal=self.journal)
+        self.assertIsNone(got)
+        self.assertNotEqual(got, "def456")      # never the corrupted rsplit fragment
+        evs = self._events()
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["event"], "marker_sha_malformed")
+        self.assertEqual(evs[0]["path"], marker)
+        self.assertEqual(evs[0]["prefix"], ".health-inflight")
+        self.assertEqual(evs[0]["pr"], 5)
+
+    def test_malformed_skip_without_journal_does_not_raise(self):
+        marker = self.state._p(".health-inflight-5-not-a-sha")
+        open(marker, "w").close()
+        self.assertIsNone(LR._parse_marker_sha(marker, ".health-inflight", 5))   # no journal passed
+
+    def test_stale_inflight_yields_only_the_well_formed_marker(self):
+        good = self.state._p(".health-inflight-5-1a2b3c4")
+        bad = self.state._p(".health-inflight-5-abc123-def456")
+        open(good, "w").close()
+        open(bad, "w").close()
+        found = list(self.state.stale_inflight(".health-inflight", 5, "9999999", journal=self.journal))
+        self.assertEqual(found, [(good, "1a2b3c4")])
+        malformed = [e for e in self._events() if e["event"] == "marker_sha_malformed"]
+        self.assertEqual(len(malformed), 1)
+        self.assertEqual(malformed[0]["path"], bad)
 
 
 class TestSlugDerivation(unittest.TestCase):
@@ -4903,22 +4960,22 @@ class TestMergeResultGateSupersession(unittest.TestCase):
     def test_stale_merge_result_worker_terminated_and_journaled(self):
         journal = LiveJournal(self.jpath)
         state = LiveState(self.tmp)
-        # A DEAD marker for a superseded sha ("oldsha") — _terminate_worker treats a dead/recycled
+        # A DEAD marker for a superseded sha ("aaaaaa1") — _terminate_worker treats a dead/recycled
         # marker as already-gone, so this exercises the cancel WITHOUT spawning a real process.
-        old_inflight = state._p(".merge-result-inflight-77-oldsha")
+        old_inflight = state._p(".merge-result-inflight-77-aaaaaa1")
         _marker_write(old_inflight, 999999)   # a pid that (almost certainly) is not alive
-        open(state._p(".merge-result-dispatch-77-oldsha"), "w").close()
-        open(state._p(".merge-result-log-77-oldsha"), "w").close()
+        open(state._p(".merge-result-dispatch-77-aaaaaa1"), "w").close()
+        open(state._p(".merge-result-log-77-aaaaaa1"), "w").close()
         t = LiveTick({"MERGE_POLICY": "observe"}, None, None, DryRunActuator(journal), journal,
                     state=state)
         t._supersede_stale([LiveCandidate(pr=77, sha="newsha")])
         self.assertFalse(os.path.exists(old_inflight))
-        self.assertFalse(os.path.exists(state._p(".merge-result-dispatch-77-oldsha")))
-        self.assertFalse(os.path.exists(state._p(".merge-result-log-77-oldsha")))
+        self.assertFalse(os.path.exists(state._p(".merge-result-dispatch-77-aaaaaa1")))
+        self.assertFalse(os.path.exists(state._p(".merge-result-log-77-aaaaaa1")))
         evs = events(self.jpath)
         superseded = [e for e in evs if e["event"] == "gate_superseded" and e.get("rail") == "merge_result"]
         self.assertEqual(len(superseded), 1)
-        self.assertEqual(superseded[0]["old_sha"], "oldsha")
+        self.assertEqual(superseded[0]["old_sha"], "aaaaaa1")
         self.assertEqual(superseded[0]["new_sha"], "newsha")
 
     def test_off_lever_leaves_nothing_to_supersede(self):
@@ -5584,18 +5641,18 @@ class TestHoldCommentSupersession(LiveCase):
         return [o for o in events(self.jpath) if o["event"] == "hold_comment_superseded"]
 
     # ── (a) a new sha lands — the OLD comment now names the wrong commit ───────────────────────────
-    # NOTE: sha values here are deliberately hyphen-free — LiveState.stale_inflight extracts a
-    # marker's sha with `rsplit("-", 1)`, exactly like every other rail's supersession scan, and a
-    # hyphenated fixture sha (unlike a real hex git sha) would corrupt that split.
+    # NOTE: sha values here are real-hex-shaped ([0-9a-f]{7,40}) — LiveState.stale_inflight validates
+    # a marker's sha via the shared _parse_marker_sha helper (HERD-471) and loud-skips anything that
+    # doesn't parse as one, so a fixture sha must look like a real git sha to be discovered as stale.
     def test_new_sha_supersedes_a_human_verify_hold(self):
         act = _RecordingHoldActuator(LiveJournal(self.jpath))
         cfg = {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"}
-        out1 = self.tick_live(act, "shaaaa1", config=cfg, hv_hold=True, review="PASS", health="CLEAN")
+        out1 = self.tick_live(act, "aaaaaa1", config=cfg, hv_hold=True, review="PASS", health="CLEAN")
         self.assertEqual(out1, "HOLD")
         self.assertEqual(len(act.comments), 1)
         self.assertFalse(act.edits)
 
-        out2 = self.tick_live(act, "shabbb2", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
+        out2 = self.tick_live(act, "bbbbbb2", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
         self.assertEqual(out2, "MERGE")
         self.assertEqual(len(act.edits), 1)
         pr, kind, body = act.edits[0]
@@ -5604,19 +5661,19 @@ class TestHoldCommentSupersession(LiveCase):
         self.assertIn("sha advanced", body)
         sup = self._superseded_events()
         self.assertEqual(len(sup), 1)
-        self.assertEqual(sup[0]["old_sha"], "shaaaa1")
-        self.assertEqual(str(sup[0]["sha"]), "shabbb2")
+        self.assertEqual(sup[0]["old_sha"], "aaaaaa1")
+        self.assertEqual(str(sup[0]["sha"]), "bbbbbb2")
 
     # ── (b) an approval lands at the SAME sha — no new commit, but the hold is resolved ─────────────
     def test_approval_at_the_same_sha_supersedes_an_approve_hold(self):
         act = _RecordingHoldActuator(LiveJournal(self.jpath))
         cfg = {"MERGE_POLICY": "approve"}
-        out1 = self.tick_live(act, "shaccc3", config=cfg, review="PASS", health="CLEAN")
+        out1 = self.tick_live(act, "ccccccc3", config=cfg, review="PASS", health="CLEAN")
         self.assertEqual(out1, "HOLD")
         pr, kind, _ = act.comments[0]
         self.assertEqual(kind, "approve")
 
-        out2 = self.tick_live(act, "shaccc3", config=cfg, approved=True, review="PASS", health="CLEAN")
+        out2 = self.tick_live(act, "ccccccc3", config=cfg, approved=True, review="PASS", health="CLEAN")
         self.assertEqual(out2, "MERGE")
         self.assertEqual(len(act.edits), 1)
         pr, kind, body = act.edits[0]
@@ -5627,11 +5684,11 @@ class TestHoldCommentSupersession(LiveCase):
     # ── (c) a policy change at the SAME sha makes re-holding it impossible ──────────────────────────
     def test_policy_change_at_the_same_sha_supersedes_a_human_verify_hold(self):
         act = _RecordingHoldActuator(LiveJournal(self.jpath))
-        out1 = self.tick_live(act, "shaddd4", config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"},
+        out1 = self.tick_live(act, "ddddddd4", config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"},
                               hv_hold=True, review="PASS", health="CLEAN")
         self.assertEqual(out1, "HOLD")
 
-        out2 = self.tick_live(act, "shaddd4", config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"},
+        out2 = self.tick_live(act, "ddddddd4", config={"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "auto"},
                               hv_hold=True, review="PASS", health="CLEAN")
         self.assertEqual(out2, "MERGE")
         self.assertEqual(len(act.edits), 1)          # the STALE human-verify comment, edited
@@ -5645,16 +5702,16 @@ class TestHoldCommentSupersession(LiveCase):
     def test_never_double_edits_across_reticks(self):
         act = _RecordingHoldActuator(LiveJournal(self.jpath))
         cfg = {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"}
-        self.tick_live(act, "shaeee5", config=cfg, hv_hold=True, review="PASS", health="CLEAN")
-        self.tick_live(act, "shafff6", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
-        self.tick_live(act, "shafff6", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
+        self.tick_live(act, "eeeeeee5", config=cfg, hv_hold=True, review="PASS", health="CLEAN")
+        self.tick_live(act, "fffffff6", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
+        self.tick_live(act, "fffffff6", config=cfg, hv_hold=False, review="PASS", health="CLEAN")
         self.assertEqual(len(act.edits), 1)
         self.assertEqual(len(self._superseded_events()), 1)
 
     # ── a candidate that never held has nothing to supersede — byte-inert ──────────────────────────
     def test_plain_merge_with_no_prior_hold_supersedes_nothing(self):
         act = _RecordingHoldActuator(LiveJournal(self.jpath))
-        out = self.tick_live(act, "shaggg7", review="PASS", health="CLEAN")
+        out = self.tick_live(act, "aaaaaaa7", review="PASS", health="CLEAN")
         self.assertEqual(out, "MERGE")
         self.assertFalse(act.edits)
         self.assertFalse(self._superseded_events())
@@ -5662,9 +5719,9 @@ class TestHoldCommentSupersession(LiveCase):
     # ── DryRunActuator: journals the terminal event like every other hold side effect, edits nothing ─
     def test_dry_run_journals_the_supersession_with_no_real_edit(self):
         cfg = {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"}
-        self.tick([self.one(1, sha="shahhh8", hv_hold=True, review="PASS", health="CLEAN")], config=cfg)
+        self.tick([self.one(1, sha="aaaaaaa8", hv_hold=True, review="PASS", health="CLEAN")], config=cfg)
         res2, ev2 = self.tick(
-            [self.one(1, sha="shaiii9", hv_hold=False, review="PASS", health="CLEAN")], config=cfg)
+            [self.one(1, sha="bbbbbbb9", hv_hold=False, review="PASS", health="CLEAN")], config=cfg)
         self.assertEqual(res2["outcomes"]["1"], "MERGE")
         self.assertTrue([o for o in ev2 if o["event"] == "hold_comment_superseded"])
 
@@ -5672,7 +5729,7 @@ class TestHoldCommentSupersession(LiveCase):
     def test_no_state_dir_is_byte_inert(self):
         journal = LiveJournal(self.jpath)
         act = _RecordingHoldActuator(journal)
-        cand = self.one(1, sha="shajjj10", hv_hold=True, review="PASS", health="CLEAN")
+        cand = self.one(1, sha="aaaaaaaa10", hv_hold=True, review="PASS", health="CLEAN")
         scenario = {"candidates": [cand], "config": {"MERGE_POLICY": "auto", "HUMAN_VERIFY_POLICY": "hold"}}
         t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
                      act, journal, state=LiveState(None))
