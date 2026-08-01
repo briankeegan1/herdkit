@@ -168,10 +168,11 @@ case "$ROW" in *"awaiting task"*) fail "an ambiguous row must never claim 'await
 [ "$(_br ambig)" = "scratch4" ] || fail "ambiguity must never trigger a repair"
 ok
 
-# ── 5. Names already match: the record is byte-identical to the pre-HERD-226 join. ──────────────────
+# ── 5. Names already match: the record is byte-identical to the pre-HERD-226 join, plus HERD-470's
+#    trailing is_draft field — empty here too: this fixture's PRs never set isDraft at all. ───────────
 R="$(_rec "$OUT" beta)"
 BETA_DIR="$(cd "$TREES/beta" && pwd -P)"   # git stores worktree paths symlink-resolved (macOS $TMPDIR)
-EXPECT="$(printf '%s\037beta\037feat/beta\03712\037MERGEABLE\037CLEAN\037\037%s\037briankeegan1\037branch\037' \
+EXPECT="$(printf '%s\037beta\037feat/beta\03712\037MERGEABLE\037CLEAN\037\037%s\037briankeegan1\037branch\037\037' \
   "$BETA_DIR" "$SHA_BETA")"
 [ "$R" = "$EXPECT" ] || fail "a name-matched record must be unchanged (+matchkind=branch).
   want: $(printf '%s' "$EXPECT" | cat -v)
