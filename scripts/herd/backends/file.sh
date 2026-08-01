@@ -10,6 +10,37 @@
 #   _backend_list_open                — print open items
 #   _backend_item_state REF           — sets ITEM_STATE=open|closed|in-progress
 
+# _file_path_denied <path> — HERD-381/HERD-475: success iff <path> sits under DENY_PATHS (the
+# space-separated never-committed prefixes, herd-config.sh) or under .herd/secrets — the two things
+# the scribe/local lane is structurally scoped away from. <path> is repo-root-relative (as `git
+# status --porcelain` prints it). A trailing '/' on a DENY_PATHS entry is tolerated (matches
+# templates/config.example's `DENY_PATHS="data/"` convention). Pure: no side effects.
+_file_path_denied() {
+    local path="$1" deny
+    case "$path" in
+        .herd/secrets|.herd/secrets/*) return 0 ;;
+    esac
+    for deny in ${DENY_PATHS:-}; do
+        deny="${deny%/}"
+        [ -n "$deny" ] || continue
+        case "$path" in
+            "$deny"|"$deny"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# _file_path_is_nested_repo <path> — HERD-435/GH #547 (tests/test-nested-repo-isolation.sh): success
+# iff <path> is a directory that is ITSELF a git repository (has its own .git) — an unrelated foreign
+# repo sitting inside this one. `git add <dir>` on such a path stages it as a GITLINK regardless of
+# whether the add is a NAMED single-path add or a repo-wide '-A' — the hazard is behavioral, not just
+# the textual '-A'/'.'/':/' shape git-scope-lint.sh scans for — so the auto-staging loop below must
+# refuse it exactly like that test's counterfactual (§7) documents. <path> is repo-root-relative, as
+# `git status --porcelain` prints it; a trailing '/' on an untracked directory is stripped first.
+_file_path_is_nested_repo() {
+    [ -e "${1%/}/.git" ]
+}
+
 # _backend_tw_journal — HERD-85 tracker-write attribution (mirror of the linear/github backends'). Emit
 # ONE journal event per tracker STATE WRITE so `herd log | grep tracker_write` attributes it in one
 # line. Attribution is the caller's HERD_COMPONENT ('manual' by default). FAIL-SOFT: a silent no-op when
@@ -101,21 +132,66 @@ PY
 
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID); $2 = short commit summary.
-    # The agent has already edited $BACKLOG_FILE. Rotate stale shipped items into the archive,
-    # then stage both files, commit, and push. Sets _BACKEND_RESULT=DONE|NOCHANGE.
-    local mine="$1" sum="$2"
+    # The agent has already edited $BACKLOG_FILE — and, for a multi-file request ("move this item to
+    # GRAVEYARD.md", "add a gate to docs/bet-screen.md"), other files too. Rotate stale shipped items
+    # into the archive, then stage EVERY changed path, commit, and push. Sets
+    # _BACKEND_RESULT=DONE|NOCHANGE.
+    local mine="$1" sum="$2" _changed _dirty_after _dirty_real
     _backend_archive_shipped
     git add "$BACKLOG_FILE"
     # The archive file only exists once something has rotated out; stage it when present so the
     # rotation lands in the SAME commit as the backlog edit (never a dangling untracked file).
     [ -f "${BACKLOG_FILE%.md}.archive.md" ] && git add "${BACKLOG_FILE%.md}.archive.md"
+    # HERD-475 (GH #566): staging only the two names above dropped the REST of a multi-file request —
+    # a field report reproduced it 3/3 times: the commit landed the BACKLOG.md half while a second
+    # file the same request named (bets/GRAVEYARD.md, docs/bet-screen.md, …) sat modified-uncommitted,
+    # with the commit MESSAGE still claiming the whole request shipped. Stage every OTHER changed path
+    # too, so the whole request lands in ONE commit. Each path is NAMED — read from `git status
+    # --porcelain` and added one at a time — never a repo-wide `-A`/`.`/`:/` selector.
+    # DENY_PATHS / .herd/secrets stay EXCLUDED (HERD-381, _file_path_denied below): the scribe/local
+    # lane is structurally scoped away from them (herd-config.sh), and widening staging to the
+    # request's own edit surface must never widen it to a secret sitting beside that edit (see
+    # tests/test-scribe-deny-paths.sh, which asserts exactly this). An unrelated NESTED git repo
+    # (_file_path_is_nested_repo) is excluded too — staging it would silently swallow it as a gitlink
+    # (HERD-435 / GH #547 / tests/test-nested-repo-isolation.sh).
+    # herd-scope-ok: index-scoped — every path this loop stages is a NAMED `git add -- <path>` read
+    # from `git status --porcelain`; nothing here stages by a repo-wide `-A`/`.`/`:/` selector
+    # (HERD-435 / scripts/herd/git-scope-lint.sh).
+    while IFS= read -r _changed; do
+        [ -n "$_changed" ] || continue
+        _file_path_denied "$_changed" && continue
+        _file_path_is_nested_repo "$_changed" && continue
+        git add -- "$_changed" 2>/dev/null || true
+    done < <(git status --porcelain=v1 2>/dev/null | cut -c4-)
     if git diff --cached --quiet; then
         _BACKEND_RESULT="NOCHANGE"
     else
-        # herd-scope-ok: index-scoped — the two named `git add`s above stage only the backlog file
-        # and its archive; nothing here stages by scan (HERD-435 / scripts/herd/git-scope-lint.sh).
+        # herd-scope-ok: index-scoped — every path in the INDEX was staged above by a NAMED `git add`
+        # (the two literal names plus the per-path loop); this commit takes the index as-is, never `-a`.
         git commit -q -m "Backlog: $sum"
         _BACKEND_RESULT="DONE"
+        # HERD-475 (GH #566): verify the commit actually captured everything it was SUPPOSED to — a
+        # commit whose MESSAGE names an edit it does not CONTAIN is exactly what misled the #566
+        # post-mortem. DENY_PATHS/.herd/secrets are EXPECTED to stay dirty (they were deliberately
+        # never staged above) so they are filtered out here too; anything else still dirty right after
+        # this commit is a real defect: warn loudly (never silent) and journal it so the coordinator
+        # can find it without a human pasting a log.
+        _dirty_after="$(git status --porcelain 2>/dev/null)"
+        _dirty_real=""
+        while IFS= read -r _changed; do
+            [ -n "$_changed" ] || continue
+            _file_path_denied "${_changed:3}" && continue
+            _file_path_is_nested_repo "${_changed:3}" && continue
+            _dirty_real="${_dirty_real}${_changed}"$'\n'
+        done <<< "$_dirty_after"
+        if [ -n "$_dirty_real" ]; then
+            echo "scribe-step: WARNING — working tree not clean after commit for '$sum'; some edited paths may not have landed: $(printf '%s' "$_dirty_real" | tr '\n' ' ') [GH #566]" >&2
+            if command -v journal_append >/dev/null 2>&1; then
+                journal_append scribe_commit_incomplete \
+                    summary "$(printf '%s' "$sum" | tr '\t\n' '  ' | cut -c1-200)" \
+                    dirty "$(printf '%s' "$_dirty_real" | tr '\t\n' '  ' | cut -c1-300)"
+            fi
+        fi
     fi
     # Push any local commit(s) not yet on origin. This covers both a fresh commit and a
     # retry after an earlier push failure left the change committed-but-unpushed (in that

@@ -71,7 +71,11 @@ Capabilities this skill uses directly:
   builder's **agent** pane and **submit** it (type the text, then an explicit Enter keystroke —
   HERD-186: `pane run` alone can leave text sitting in the agent prompt buffer). Always target the
   agent pane — the `herdr agent list` entry whose name == slug — never the tab's root shell pane,
-  where text vanishes and the agent never wakes.
+  where text vanishes and the agent never wakes. **If you (the coordinator) run under Claude Code's
+  default auto permission mode and this is refused `Blocked by classifier`**: that mode's permission
+  classifier reads `herdr pane run` as "execute arbitrary text in a shell I don't control," which is
+  what it is. Pre-approve it — see "send-text under Claude Code's own permission classifier" in
+  `docs/driver-abstraction.md` for the exact `.claude/settings.json` allow rule (GH #564).
 - **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the Claude Code
   runtime's model mid-session (the escalate / step-up flow).
 
