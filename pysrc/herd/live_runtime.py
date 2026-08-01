@@ -825,6 +825,30 @@ def _inflight_verified_live(path, timeout):
     return age < timeout
 
 
+_MARKER_SHA_RE = re.compile(r'^[0-9a-f]{7,40}$')
+
+
+def _parse_marker_sha(path, prefix, pr, journal=None):
+    """Extract + validate the sha field off a ``<prefix>-<pr>-<sha>`` in-flight marker filename
+    (HERD-471). ``prefix`` and ``pr`` are known to the caller, so the sha is sliced off the KNOWN
+    ``<prefix>-<pr>-`` stem, never rsplit on the name's last hyphen — a blind rsplit truncates at the
+    WRONG boundary whenever the sha itself contains a hyphen (a hyphenated fixture sha; conceivably a
+    corrupted real one), silently handing back a plausible-looking but wrong fragment instead of the
+    real sha. The remainder is then shape-checked against a real git sha ([0-9a-f]{7,40}); anything
+    else is malformed — parsed off a marker this process didn't write in this shape, a partial write
+    caught mid-flight, or disk corruption — and is skipped LOUDLY: journaled as ``marker_sha_malformed``
+    (when a journal is given) rather than silently treated as a live/stale sha either way. Returns the
+    sha string, or ``None`` for anything that doesn't parse."""
+    name = os.path.basename(path)
+    stem = "%s-%s-" % (prefix, pr)
+    sha = name[len(stem):] if name.startswith(stem) else ""
+    if not _MARKER_SHA_RE.match(sha):
+        if journal is not None:
+            journal.append("marker_sha_malformed", "path", path, "prefix", prefix, "pr", pr)
+        return None
+    return sha
+
+
 class LiveState:
     """Resolver for the sha-keyed gate ledgers + in-flight markers under ``$TREES`` (== ``$WORKTREES_DIR``).
 
@@ -1311,16 +1335,19 @@ class LiveState:
     def merge_result_tree_path_sha(self, pr, sha):
         return self._sha_path(".merge-result-tree", pr, sha)
 
-    def stale_inflight(self, prefix, pr, cur_sha):
+    def stale_inflight(self, prefix, pr, cur_sha, journal=None):
         """DYNAMIC discovery of doomed workers: yield ``(marker_path, sha)`` for every
         ``$TREES/<prefix>-<pr>-<sha>`` in-flight marker whose ``sha`` differs from the PR's current head
         ``cur_sha`` (a prior head this PR has moved past). No hardcoded candidate list — the stale set is
         globbed off disk, exactly as ``_discard_stale_health`` walks ``.health-inflight-$pr-*``
-        (agent-watch.sh:10420). Empty with no state dir (a sim/dry-run tick has no on-disk workers)."""
+        (agent-watch.sh:10420). Empty with no state dir (a sim/dry-run tick has no on-disk workers). Each
+        marker's sha is extracted + validated by the shared :func:`_parse_marker_sha` (HERD-471) — a
+        marker whose sha doesn't parse is skipped (loud-journaled when ``journal`` is given), never
+        yielded with a corrupted sha."""
         if not self.dir:
             return
         for path in sorted(glob.glob(self._p("%s-%s-*" % (prefix, pr)))):
-            sha = os.path.basename(path).rsplit("-", 1)[-1]
+            sha = _parse_marker_sha(path, prefix, pr, journal=journal)
             if sha and sha != str(cur_sha):
                 yield path, sha
 
@@ -3627,7 +3654,7 @@ class LiveTick:
             try:
                 cur = str(cand.sha)
                 # health rail — session-kill the stale suite worker's subtree (HERD-283/348), reap scratch.
-                for path, sha in st.stale_inflight(".health-inflight", cand.pr, cur):
+                for path, sha in st.stale_inflight(".health-inflight", cand.pr, cur, journal=self.journal):
                     if _terminate_worker(path):
                         st.rm(path, st.health_dispatch_file_sha(cand.pr, sha),
                               st.health_result_file_sha(cand.pr, sha),
@@ -3635,7 +3662,7 @@ class LiveTick:
                         self.journal.append("gate_superseded", "pr", cand.pr, "rail", "health",
                                             "old_sha", sha, "new_sha", cur, "action", "session_kill")
                 # review rail — terminate the stale reviewer's subtree, retire its stamped pane, reap scratch.
-                for path, sha in st.stale_inflight(".review-inflight", cand.pr, cur):
+                for path, sha in st.stale_inflight(".review-inflight", cand.pr, cur, journal=self.journal):
                     if _terminate_worker(path):
                         pane = st.read_review_pane(cand.pr, sha)
                         st.rm(path, st.review_result_file_sha(cand.pr, sha),
@@ -3647,7 +3674,7 @@ class LiveTick:
                 # doomed sha's throwaway merged worktree so a superseded head never leaks temporary state.
                 # BYTE-INERT with the lever off: no ``.merge-result-inflight-*`` marker is ever written,
                 # so this glob is always empty and nothing is journaled.
-                for path, sha in st.stale_inflight(".merge-result-inflight", cand.pr, cur):
+                for path, sha in st.stale_inflight(".merge-result-inflight", cand.pr, cur, journal=self.journal):
                     if _terminate_worker(path):
                         st.rm(path, st.merge_result_dispatch_file_sha(cand.pr, sha),
                               st.merge_result_log_file_sha(cand.pr, sha))
@@ -4067,7 +4094,7 @@ class LiveTick:
         st = self.state
         if not st.dir:
             return
-        for path, old_sha in st.stale_inflight(".live-posted-hold_comment", cand.pr, cand.sha):
+        for path, old_sha in st.stale_inflight(".live-posted-hold_comment", cand.pr, cand.sha, journal=self.journal):
             if not st.once(cand.pr, old_sha, "hold_comment_superseded"):
                 continue
             reason = _hold_superseded_reason(cand, old_sha, action, self._hv_policy, cand.approved)
