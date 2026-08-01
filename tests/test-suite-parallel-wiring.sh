@@ -56,11 +56,31 @@ printf '#!/usr/bin/env bash\nexit 0\n' > "$PB/parallel"; chmod +x "$PB/parallel"
 # the "absent" cases below silently degrade to "present" on such boxes (reproduced: CI ubuntu
 # runners ship GNU parallel this way — confirmed the exact `--jobs 4` leak this guards against).
 # A box with no `parallel` at all strips nothing — the absent case is already satisfied.
+#
+# HERD-472: dropping the WHOLE directory is too blunt — Ubuntu CI ships `parallel` in /usr/bin,
+# the SAME directory as env/awk/grep/sed/mktemp/bash. Removing /usr/bin (and its /bin symlink
+# twin) from PATH entirely starved the "absent" case of every core utility, not just `parallel`
+# (reproduced: `env: command not found` at the very first external command in run_proj — ubuntu
+# shard 3/4). Instead, for each directory that resolves `parallel`, build a shadow directory
+# symlinking every OTHER entry and splice that in in its place — every tool but `parallel` stays
+# reachable, and `command -v parallel` still finds nothing anywhere on the resulting PATH.
+_SPD_SHADOW_ROOT="$T/no-parallel-bin"; mkdir -p "$_SPD_SHADOW_ROOT"
 strip_parallel_dirs() {
-  local _spd_out="" _spd_d
+  local _spd_out="" _spd_d _spd_shadow _spd_entry _spd_base _spd_idx=0
   while IFS= read -r _spd_d; do
     [ -n "$_spd_d" ] || continue
-    [ -x "$_spd_d/parallel" ] && continue
+    if [ -x "$_spd_d/parallel" ]; then
+      _spd_idx=$((_spd_idx + 1))
+      _spd_shadow="$_SPD_SHADOW_ROOT/$_spd_idx"
+      mkdir -p "$_spd_shadow"
+      for _spd_entry in "$_spd_d"/*; do
+        [ -e "$_spd_entry" ] || continue
+        _spd_base="$(basename "$_spd_entry")"
+        [ "$_spd_base" = "parallel" ] && continue
+        ln -sf "$_spd_entry" "$_spd_shadow/$_spd_base" 2>/dev/null
+      done
+      _spd_d="$_spd_shadow"
+    fi
     _spd_out="${_spd_out:+$_spd_out:}$_spd_d"
   done <<< "$(printf '%s' "$1" | tr ':' '\n')"
   printf '%s' "$_spd_out"
