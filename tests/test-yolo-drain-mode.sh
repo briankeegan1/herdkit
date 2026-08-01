@@ -354,9 +354,13 @@ grep -qE '^\s+solo-auto\|full-auto\|yolo\|' "$CONC" \
   || fail "E1: sandbox-concurrency-scenario.sh refuses the 'yolo' posture"
 ok "E1 the yolo posture is routed by the posture matrix and accepted by its scenario"
 
-grep -qE '^herd posture <list\|show\|apply>\t' "$CAPS" \
+# GNU grep's -E does NOT treat '\t' as a tab escape (it warns "stray \ before t" and matches a
+# literal 't') — only ugrep/BSD-flavoured greps do, which let this pass here while failing on every
+# CI leg (both ubuntu and macOS run real GNU grep). Splice in an actual tab byte instead.
+POSTURE_CMD_RE='^herd posture <list\|show\|apply>'$'\t'
+grep -qE "$POSTURE_CMD_RE" "$CAPS" \
   || fail "E2: no capabilities.tsv row for 'herd posture'"
-grep -qE '^herd posture <list\|show\|apply>\t' "$ROOT/templates/conformance.tsv" \
+grep -qE "$POSTURE_CMD_RE" "$ROOT/templates/conformance.tsv" \
   || fail "E2: no conformance.tsv proof row for 'herd posture'"
 ok "E2 the new command carries its capabilities + conformance rows"
 
