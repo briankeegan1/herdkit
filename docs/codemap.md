@@ -271,6 +271,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `JOURNAL_KEEP_DAYS` → `journal.sh`
 - `JOURNAL_MAX_MB` → `journal.sh`
 - `LIFECYCLE_CONTRACTS` → `lifecycle.sh`
+- `LINEAR_TEAM_ID` → `bin/herd`
 - `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `LOCAL_REVIEW_GLOB` → `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `MAIN_HEALTH_AUTOFIX` → `agent-watch.sh`

@@ -368,6 +368,13 @@ the file backend, restarts the backlog pane, and journals `backend_switched`. Ev
 drainer spawned under the OLD backend (the flip warns about this), and secrets NEVER go in
 `.herd/config` or the backlog file.
 
+On `linear`, when the API key's workspace hosts more than one team's issues, set `LINEAR_TEAM_ID`
+(`herd config set LINEAR_TEAM_ID <id>`, or alongside `LINEAR_API_KEY` in `.herd/secrets`) so
+`herd backlog` and new-issue creation are scoped to just this project's team instead of every team
+the key can see. It never scopes resolving an EXISTING reference (mark-shipped, claim, a
+cross-team `blocked-on:` dep) — that always resolves by the identifier's own team prefix. Unset is
+byte-identical to today.
+
 ## Workflow settings
 
 Every workflow preference lives in `.herd/config`, and the user can view or change **any** of them
