@@ -8,8 +8,10 @@
 #   herd-approve.sh list              — list gate-passed PRs awaiting approval (with review verdicts)
 #   herd-approve.sh approve <pr#>     — approve the currently-awaiting sha for <pr#>; the watcher
 #                                       merges on its next poll (~4 s)
-#   herd-approve.sh why <pr#>         — print the latest review verdict + block reason for a PR
-#                                       (from the review ledger and the PR's review comment)
+#   herd-approve.sh why <pr#>         — print the latest review verdict AND the reviewer's own stated
+#                                       reason for it, as recorded with the verdict (HERD-473). When
+#                                       no reason was recorded it says exactly that — it never
+#                                       substitutes other PR text for the gate's objection (#576).
 #   herd-approve.sh override <pr#>    — record a human override of a cached BLOCK for <pr#>'s
 #                                       current commit sha; the watcher treats it as PASS and
 #                                       proceeds to its normal approval/merge path. A new commit
@@ -86,6 +88,48 @@ print_human_verify_steps() {
   done <<EOF
 $_steps
 EOF
+}
+
+# review_block_reason <pr#> <sha> — echo the reviewer's STRUCTURED reason for this exact verdict, or
+# nothing (HERD-473). TWO sources, in this order, because the reason has two homes with different
+# lifetimes and neither alone answers every case:
+#
+#   1. the review LEDGER row's trailing field ($REVIEW_STATE, "<epoch> <pr> <sha> <verdict> <source>
+#      [reason…]") — the pre-merge fast path, written in the same append that records the verdict;
+#   2. the append-only JOURNAL's `verdict_recorded` for the same pr+sha — the DURABLE record, and the
+#      only one that still answers when the pool has migrated to the SQLite store (the flat ledger is
+#      then no longer the substrate) or when a reader comes back to a PR after the ledger was purged.
+#
+# The two carry the same string by construction (live_runtime.py reads the ledger back to build the
+# journal event), so consulting the second can never contradict the first. FAIL-SOFT throughout: a
+# LEGACY reason-less row, a missing ledger, a missing journal and an absent python3 all yield the same
+# empty answer — "no reason recorded" is a sayable answer, never an error and never a guess.
+review_block_reason() {
+  local _rb_pr="$1" _rb_sha="$2" _rb_out=""
+  [ -n "$_rb_pr" ] && [ -n "$_rb_sha" ] || return 0
+  if [ -s "$REVIEW_STATE" ]; then
+    _rb_out="$(awk -v p="$_rb_pr" -v s="$_rb_sha" '
+      $2==p && $3==s { r=""; for (i=6; i<=NF; i++) r = (r=="" ? $i : r" "$i) ; found=r }
+      END { if (found != "") print found }' "$REVIEW_STATE" 2>/dev/null || true)"
+  fi
+  local _rb_journal="${JOURNAL_FILE:-${WORKTREES_DIR:-}/.herd/journal.jsonl}"
+  if [ -z "$_rb_out" ] && [ -s "$_rb_journal" ] && command -v python3 >/dev/null 2>&1; then
+    _rb_out="$(HERD_RBR_PR="$_rb_pr" HERD_RBR_SHA="$_rb_sha" python3 -c '
+import json, os, sys
+pr, sha, out = os.environ["HERD_RBR_PR"], os.environ["HERD_RBR_SHA"], ""
+for raw in sys.stdin:
+    try:
+        o = json.loads(raw)
+    except Exception:
+        continue
+    if o.get("event") != "verdict_recorded":
+        continue
+    if str(o.get("pr", "")) == pr and str(o.get("sha", "")) == sha:
+        out = str(o.get("reason", "") or "")
+sys.stdout.write(" ".join(out.split()))
+' < "$_rb_journal" 2>/dev/null || true)"
+  fi
+  printf '%s' "$_rb_out"
 }
 
 case "$cmd" in
@@ -256,8 +300,19 @@ EOF
     fi
     printf 'PR #%s  sha:%.8s  verdict:%s%s  at %s\n\n' \
       "$prnum" "$sha" "$verdict" "$override_note" "$hhmm"
+    # THE REASON (HERD-473) — the whole point of this verb, and what it printed nothing of before: the
+    # reviewer's own stated objection. Always printed, and when there is none it SAYS so, because the
+    # failure this fixes (#576) was a BLOCK immediately followed by an unrelated approving comment,
+    # which reads as the gate's reasoning and is the exact opposite of it.
+    reason="$(review_block_reason "$prnum" "$sha")"
+    if [ -n "$reason" ]; then
+      printf 'Reason (recorded with the verdict):\n  %s\n\n' "$reason"
+    else
+      printf 'Reason: none recorded with this verdict.\n'
+      printf "  Nothing below is the gate's objection — read the reviewer's own comment on the PR.\n\n"
+    fi
     print_human_verify_steps "$prnum"
-    echo "Latest PR comment:"
+    echo "Latest PR comment (context only — NOT the review verdict):"
     gh pr view "$prnum" --json comments 2>/dev/null \
       | python3 -c '
 import sys, json

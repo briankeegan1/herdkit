@@ -908,17 +908,53 @@ class LiveState:
             return None
         return verdict
 
-    def record_review(self, pr, sha, verdict, source="reviewer"):
-        """Append one review ledger row ``<epoch> <pr> <sha> <verdict> <source>`` (agent-watch.sh:1820)."""
+    def recorded_review_reason(self, pr, sha):
+        """The reviewer's recorded BLOCK reason for this exact ``(pr, sha)``, or ``""`` (HERD-473).
+
+        The ledger row's TRAILING field (everything after ``source``), so the five positional fields
+        every other reader parses are untouched. FAIL-SOFT on a LEGACY reason-less row, a missing ledger
+        and an unreadable one alike: all three answer ``""``, and a caller never has to tell them apart
+        — "no reason recorded" is a first-class, sayable answer, not an error."""
         if self._store is not None:
-            self._store.record_review(pr, sha, verdict, source)
+            try:
+                return self._store.recorded_review_reason(pr, sha)
+            except Exception:
+                return ""
+        path = self.review_ledger()
+        if not path or not os.path.exists(path):
+            return ""
+        reason = ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and f[1] == str(pr) and f[2] == str(sha):
+                        reason = " ".join(f[5:])
+        except Exception:
+            return ""
+        return reason
+
+    def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
+        """Append one review ledger row ``<epoch> <pr> <sha> <verdict> <source> [reason…]``
+        (agent-watch.sh:1820).
+
+        ``reason`` (HERD-473) is the reviewer's structured BLOCK reason, whitespace-collapsed to a single
+        token run so it rides as the TRAILING field — appended, never interleaved, so `awk '$4'`/`$5` and
+        `f[3]`/`f[4]` readers are unaffected. Empty ⇒ the row is written BYTE-IDENTICALLY to before this
+        field existed, which is also exactly the shape every pre-HERD-473 row already has."""
+        reason = " ".join(str(reason).split())
+        if self._store is not None:
+            self._store.record_review(pr, sha, verdict, source, reason)
             return
         path = self.review_ledger()
         if not path:
             return
         try:
             with open(path, "a", encoding="utf-8") as fh:
-                fh.write("%s %s %s %s %s\n" % (_now_epoch(), pr, sha, verdict, source))
+                if reason:
+                    fh.write("%s %s %s %s %s %s\n" % (_now_epoch(), pr, sha, verdict, source, reason))
+                else:
+                    fh.write("%s %s %s %s %s\n" % (_now_epoch(), pr, sha, verdict, source))
         except Exception:
             pass
 
@@ -2145,7 +2181,14 @@ class LiveGates:
             except Exception:
                 text, verdict = "", "INFRA"
             if verdict in ("PASS", "BLOCK"):
-                st.record_review(cand.pr, cand.sha, verdict, "reviewer")
+                # HERD-473: a BLOCK carries the reviewer's STRUCTURED reason into the ledger row, in the
+                # same write that records the verdict — so the reason can never exist without its verdict
+                # or outlive it. A PASS, or a BLOCK whose line carried no parseable payload, yields ""
+                # and the row is written exactly as it was before this field existed. Parsing is a
+                # SECOND, independent pass over the same text (like parse_rubric_verdicts): it can never
+                # change the verdict decided above, and it never raises.
+                st.record_review(cand.pr, cand.sha, verdict, "reviewer",
+                                 parse_block_reason(text) if verdict == "BLOCK" else "")
                 # RUBRIC_FILE (HERD-400): a second, independent pass over the SAME text — a malformed
                 # or absent RUBRIC: line never affects the verdict just recorded above. Journaled only
                 # when >=1 criterion parsed cleanly (RUBRIC_FILE unset, or every line malformed, stays
@@ -2242,6 +2285,70 @@ def parse_review_verdict(text):
             # INFRA-FAIL, an empty body, or any unrecognized word — a transient, never a code verdict.
             verdict = "INFRA"
     return verdict
+
+
+# Per-field cap on a parsed BLOCK reason — the SAME 200-char cap agent-watch.sh's ``_parse_block_fields``
+# applies, so one pathological reviewer line can never bloat a ledger row, a journal event, or a comment.
+_BLOCK_FIELD_CAP = 200
+_BLOCK_FIELD_ORDER = ("rule", "why", "location")
+
+
+def parse_block_fields(text):
+    """The LAST ``REVIEW: BLOCK`` line's structured fields → ``{"rule", "why", "location"}`` (HERD-473).
+
+    herd-review.sh's BLOCK contract is ``REVIEW: BLOCK — rule: <rule> | why: <why> | location: <loc>``.
+    This is the PYTHON twin of agent-watch.sh's ``_parse_block_fields`` (:2564) and follows it rule for
+    rule: the payload is everything after the em-dash separator, split on ``' | '``; each segment is
+    classified by an explicit ``rule:``/``why:``/``location:`` key (case-insensitive); the FIRST unkeyed
+    segment falls back to ``why`` so a LEGACY freeform ``REVIEW: BLOCK — <reason>`` still yields one.
+    Values are whitespace-collapsed (the ledger row is space-delimited, so a reason may carry no newline
+    or tab) and capped at :data:`_BLOCK_FIELD_CAP`.
+
+    Pure and TOTAL: a PASS/INFRA text, an absent BLOCK line, or an empty payload returns ``{}`` — never
+    an exception, so a caller collecting a verdict can never be killed by an unparseable reason.
+    """
+    line = ""
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s.upper().startswith("REVIEW:"):
+            continue
+        if s.split(":", 1)[1].strip().upper().startswith("BLOCK"):
+            line = s                       # LAST BLOCK line wins, mirroring parse_review_verdict
+    if not line:
+        return {}
+    if "—" in line:
+        payload = line.split("—", 1)[1]        # text after the em-dash separator
+    else:
+        payload = line.split(":", 1)[1].strip()[len("BLOCK"):]   # no separator → tail after the tag
+    out = {}
+    for seg in payload.split(" | "):
+        key, sep, rest = seg.partition(":")
+        k = key.strip().lower()
+        if sep and k in _BLOCK_FIELD_ORDER:
+            val = " ".join(rest.split())[:_BLOCK_FIELD_CAP]
+            if val:
+                out[k] = val               # a repeated key is last-wins, exactly as bash's case arms are
+        elif "why" not in out:
+            val = " ".join(seg.split())[:_BLOCK_FIELD_CAP]
+            if val:
+                out["why"] = val           # legacy freeform → why, first-only (agent-watch.sh:2579)
+    return out
+
+
+def parse_block_reason(text):
+    """The reviewer's BLOCK reason as ONE canonical single-line string, or ``""`` (HERD-473).
+
+    ``rule: <rule> | why: <why> | location: <loc>``, in that fixed order, with absent fields simply
+    omitted. This is the value that travels into the review ledger, the ``verdict_recorded`` journal
+    event and the PR block comment, so all three carry byte-identical text and an operator reading any
+    one of them sees exactly what the reviewer said.
+
+    Returns ``""`` for a PASS/INFRA text or a BLOCK with no parseable payload — the caller then records
+    exactly what it recorded before this existed (no ``reason`` key, no trailing ledger field), which is
+    the same shape every LEGACY reason-less row already has.
+    """
+    fields = parse_block_fields(text)
+    return " | ".join("%s: %s" % (k, fields[k]) for k in _BLOCK_FIELD_ORDER if fields.get(k))
 
 
 def parse_rubric_verdicts(text):
@@ -2396,6 +2503,27 @@ def _hold_approve_comment(cand):
         "🐑 **herd watch** · all gates passed (healthcheck ✅ · review ✅) · awaiting approval before "
         "merge.\n\nRun `herd approve %s` (or `bash scripts/herd/herd-approve.sh approve %s`) to "
         "approve commit `%s` for merge." % (cand.pr, cand.pr, cand.sha[:8])
+    )
+
+
+def _review_block_comment(cand, reason):
+    """The review-BLOCK comment posted when the refix budget is exhausted and the block escalates to a
+    human (HERD-473, contract §5.6).
+
+    Carries the reviewer's STRUCTURED reason verbatim — the same string the ledger row and the
+    ``verdict_recorded`` journal event hold — so the PR, the journal and `herd approve why` cannot
+    disagree about what the objection was. FAIL-SOFT on a reason-less verdict: it says so EXPLICITLY
+    rather than going quiet or substituting some other text, because the failure this fixes (#576) was
+    an operator reading unrelated text as if it were the gate's objection."""
+    stated = ("> %s" % reason) if reason else (
+        "_The reviewer recorded no structured reason for this BLOCK._ Read the reviewer's own comment on "
+        "this PR, or the review log, before deciding — do NOT treat any other comment as the objection.")
+    return (
+        "🐑 **herd watch** · review gate **BLOCK** on commit `%s` — the auto-refix budget is spent, so "
+        "this now needs a human.\n\nReviewer's stated reason:\n\n%s\n\nInspect: `herd approve why %s` "
+        "(verdict + reason) or `herd why %s` (full gate history). If you have independently verified "
+        "this commit is correct, `herd approve override %s` records a sha-keyed override; a new commit "
+        "invalidates it and re-reviews." % (cand.sha[:8], stated, cand.pr, cand.pr, cand.pr)
     )
 
 
@@ -3812,8 +3940,16 @@ class LiveTick:
             _breaker_record_infra(self.state, self.config, self.journal)
             return ESCALATE
         if not getattr(self.gates, "reused_review", False):
-            self.journal.append("verdict_recorded", "pr", cand.pr, "sha", cand.sha, "value", verdict,
-                                "source", "reviewer")
+            # HERD-473: the verdict's REASON rides the same event (contract §3.2/§3.4). Read back from
+            # the LEDGER the rail just wrote rather than re-parsed here, so the journal and the ledger
+            # are the same string by construction and can never drift. Appended ONLY when non-empty:
+            # a PASS, a reason-less legacy reviewer line, and every sim/fixture tick journal a
+            # byte-identical `verdict_recorded` to the one they journaled before this field existed.
+            _vfields = ["pr", cand.pr, "sha", cand.sha, "value", verdict, "source", "reviewer"]
+            _vreason = self.state.recorded_review_reason(cand.pr, cand.sha)
+            if _vreason:
+                _vfields += ["reason", _vreason]
+            self.journal.append("verdict_recorded", *_vfields)
             # INFRA circuit breaker RECORD (HERD-110, restored HERD-447; agent-watch.sh:_review_gate_step
             # PASS/BLOCK branches): a REAL verdict proves the env is alive — reset + close the breaker.
             # Gated on `reused_review` exactly like the verdict_recorded journal above it: a cache-hit
@@ -3839,6 +3975,16 @@ class LiveTick:
                     self.journal.append("refix_escalated", "pr", cand.pr, "sha", cand.sha,
                                         "slug", cand.slug, "rounds", total,
                                         "reason", reason + " — review still blocked")
+                    # HERD-473: a standing BLOCK that has run out of refix budget is now a HUMAN's
+                    # problem, and the human's only surfaces are the PR and `herd approve why`. Post the
+                    # reviewer's stated reason to the PR through the SAME comment actuator (§5.6,
+                    # HERD-448) the hold branches use, under the SAME once-guard, so a re-walked blocked
+                    # PR never re-posts. The grounding incident (#576): the reviewer's reasoning reached
+                    # neither the PR nor any reader, leaving a coordinator to choose between a blind
+                    # `herd approve override` and nothing.
+                    self.actuator.post_comment(
+                        cand, "review-block",
+                        _review_block_comment(cand, self.state.recorded_review_reason(cand.pr, cand.sha)))
                 return ESCALATE
             # Contract §3.4 refix_bounce shape — mirror the shadow twin (shadow_runtime.py:429) and
             # bash (agent-watch.sh:7321); the live tick parses no finding location for either rail.

@@ -7314,7 +7314,11 @@ def describe(o):
     if ev == "review_dispatched":
         return "review dispatched", "sha %s · model %s · pid %s" % (g(o,"sha")[:12] or "?", g(o,"model") or "?", g(o,"pid") or "?")
     if ev == "verdict_recorded":
-        return "verdict recorded", "%s (%s) · sha %s" % (g(o,"value") or "?", g(o,"source") or "?", g(o,"sha")[:12] or "?")
+        # HERD-473: the structured reason of a BLOCK rides the event; render it so the ONE surface
+        # that aggregates the whole gate history of a PR states the objection instead of just naming it.
+        # A reason-less (legacy, or PASS) row renders byte-identically to before the field existed.
+        r = g(o,"reason")
+        return "verdict recorded", "%s (%s) · sha %s%s" % (g(o,"value") or "?", g(o,"source") or "?", g(o,"sha")[:12] or "?", (" · " + r) if r else "")
     if ev == "healthcheck_attempted":
         return "healthcheck attempt", "attempt %s → %s" % (g(o,"attempt") or "1", g(o,"result") or "?")
     if ev == "healthcheck_retried":

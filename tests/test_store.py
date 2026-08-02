@@ -54,7 +54,8 @@ class AccessorParity(_PoolCase):
         st.record_approval("hv-informed", "42", "abcdef123456")
         st.record_approval("approved", "42", "abcdef123456")
         st.record_review("42", "sha1", "PASS", "reviewer")
-        st.record_review("42", "sha1", "BLOCK", "reviewer")   # last matching row wins
+        st.record_review("42", "sha1", "BLOCK", "reviewer",
+                         "rule: R | why: W")                 # last matching row wins
         st.record_health_result("42", "sha1", "CLEAN", "ok")
         st.bump_refix("k", "sha1")
         st.bump_refix("k", "sha1")
@@ -66,6 +67,8 @@ class AccessorParity(_PoolCase):
             "approval": st.approval_state("42", "abcdef"),   # strongest = approved
             "approval_none": st.approval_state("99"),
             "review": st.recorded_review("42", "sha1"),      # BLOCK (last)
+            "review_reason": st.recorded_review_reason("42", "sha1"),      # HERD-473
+            "review_reason_none": st.recorded_review_reason("99", "sha1"),
             "health": st.health_cached_verdict("42", "sha1"),
             "refix": st.refix_count("k", "sha1"),            # 2
             "once_first": st.once("g1"),
@@ -83,6 +86,8 @@ class AccessorParity(_PoolCase):
         self.assertEqual(flat["approval"], "approved")
         self.assertEqual(flat["approval_none"], "none")
         self.assertEqual(flat["review"], "BLOCK")
+        self.assertEqual(flat["review_reason"], "rule: R | why: W")
+        self.assertEqual(flat["review_reason_none"], "")
         self.assertEqual(flat["health"], "CLEAN")
         self.assertEqual(flat["refix"], 2)
         self.assertTrue(flat["once_first"] and not flat["once_second"])
@@ -165,7 +170,8 @@ class RoundTrip(_PoolCase):
         with open(os.path.join(p, ".agent-watch-approvals"), "w") as f:
             f.write("1000 approved 42 abcdef123456\n1001 awaiting 43 beef\n")
         with open(os.path.join(p, ".agent-watch-reviewed"), "w") as f:
-            f.write("1000 42 sha1 PASS reviewer\n")
+            # row 2 carries a HERD-473 trailing reason (spaces and all); row 1 is the legacy shape
+            f.write("1000 42 sha1 PASS reviewer\n1001 42 sha2 BLOCK reviewer rule: R | why: W\n")
         with open(os.path.join(p, ".health-result-42-sha1"), "w") as f:
             f.write("CLEAN\tall good\n")
         with open(os.path.join(p, ".herd", "engine-seats.tsv"), "w") as f:
@@ -197,6 +203,10 @@ class RoundTrip(_PoolCase):
             self.assertTrue(st.is_sqlite)
             self.assertEqual(st.approval_state("42", "abcdef"), "approved")
             self.assertEqual(st.recorded_review("42", "sha1"), "PASS")
+            # HERD-473: a trailing reason survives the flat→db ingest, and a legacy row without one
+            # reads back "" rather than swallowing the next row's field.
+            self.assertEqual(st.recorded_review_reason("42", "sha2"), "rule: R | why: W")
+            self.assertEqual(st.recorded_review_reason("42", "sha1"), "")
             self.assertEqual(st.health_cached_verdict("42", "sha1"), "CLEAN")
             # rollback restores every byte and drops the marker
             self.assertEqual(S.rollback(self.pool), 0)
@@ -448,6 +458,40 @@ class BackendResolution(_PoolCase):
         with open(os.path.join(self.pool, ".herd", "store-backend"), "w") as f:
             f.write("sqlite\n")
         self.assertEqual(S.resolve_backend(self.pool), "flat")
+
+
+class ForwardColumnMigration(_PoolCase):
+    """HERD-473: a pool migrated BEFORE a column existed must gain it on the next open.
+
+    `CREATE TABLE IF NOT EXISTS` is a no-op on an existing table, so without the `_add_missing_columns`
+    step an already-migrated pool would keep the old shape and every INSERT naming the new column would
+    raise — the store's writes would start failing on exactly the long-lived pools that matter most."""
+
+    def _db(self):
+        return os.path.join(self.pool, ".herd", S._DB_NAME)
+
+    def test_pre_existing_db_gains_the_reason_column(self):
+        import sqlite3
+        conn = sqlite3.connect(self._db())
+        conn.execute("CREATE TABLE review_ledger(epoch INTEGER, pr TEXT, sha TEXT, verdict TEXT, "
+                     "source TEXT)")          # the PRE-HERD-473 shape, verbatim
+        conn.execute("INSERT INTO review_ledger VALUES (1000, '42', 'sha1', 'BLOCK', 'reviewer')")
+        conn.commit(); conn.close()
+
+        st = self.store("sqlite")
+        self.assertTrue(st.is_sqlite)
+        # the OLD row survives and reads back reason-less — never an error, never a guess
+        self.assertEqual(st.recorded_review("42", "sha1"), "BLOCK")
+        self.assertEqual(st.recorded_review_reason("42", "sha1"), "")
+        # and a NEW write with a reason succeeds against the widened table
+        st.record_review("42", "sha2", "BLOCK", "reviewer", "rule: R | why: W")
+        self.assertEqual(st.recorded_review_reason("42", "sha2"), "rule: R | why: W")
+
+    def test_adding_the_column_is_idempotent_across_opens(self):
+        for _ in range(3):
+            st = self.store("sqlite")
+            st.record_review("7", "s", "BLOCK", "reviewer", "why: W")
+        self.assertEqual(self.store("sqlite").recorded_review_reason("7", "s"), "why: W")
 
 
 if __name__ == "__main__":
