@@ -396,11 +396,17 @@ case "$ROW" in *"BLOCKED"*) fail "4b: blocked language survived a RUNNING pipeli
 ok
 
 # (4a) a live HEALTH worker outranks it → the SHARED health-running row (identical bytes to the row
-#      the health gate step itself emits, so the two renders in one tick never disagree).
-_marker_write "$(_health_inflight_file "565-abc123")" "$LIVE_PID"
+#      the health gate step itself emits, so the two renders in one tick never disagree). Both renders
+#      below independently compute the marker's age via _marker_age → _now_epoch (real `date +%s`) —
+#      pin HERD_FAKE_NOW across the write AND both renders so a wall-clock second ticking over between
+#      the several forked subprocesses each render costs (under load, e.g. an oversubscribed macOS CI
+#      runner) can never flip one render's "running Ns" out from under the other's — the exact
+#      under-load timing shape already fixed once in this file's sibling (a6aa919, #605's tmp-write
+#      race), here on the test's own clock read rather than production code.
+HERD_FAKE_NOW=5000 _marker_write "$(_health_inflight_file "565-abc123")" "$LIVE_PID"
 printf 'ok 1\nok 2\n' > "$(_health_log_file "565-abc123")"
-ROW="$(_gate_phase_row "feat-x" " #565 ·" 565 abc123 "$FALLBACK")"
-EXPECT_HEALTH="$(_health_running_row "feat-x" " #565 ·" "$(_health_inflight_file "565-abc123")" "$(_health_log_file "565-abc123")")"
+ROW="$(HERD_FAKE_NOW=5000 _gate_phase_row "feat-x" " #565 ·" 565 abc123 "$FALLBACK")"
+EXPECT_HEALTH="$(HERD_FAKE_NOW=5000 _health_running_row "feat-x" " #565 ·" "$(_health_inflight_file "565-abc123")" "$(_health_log_file "565-abc123")")"
 [ "$ROW" = "$EXPECT_HEALTH" ] || fail "4a: the phase row is not the shared health row: $ROW"
 ok
 _gate_health_inflight 565 abc123 || fail "4a: the shared inflight predicate missed a live worker"
