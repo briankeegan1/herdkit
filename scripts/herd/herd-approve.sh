@@ -112,23 +112,46 @@ review_block_reason() {
       $2==p && $3==s { r=""; for (i=6; i<=NF; i++) r = (r=="" ? $i : r" "$i) ; found=r }
       END { if (found != "") print found }' "$REVIEW_STATE" 2>/dev/null || true)"
   fi
-  local _rb_journal="${JOURNAL_FILE:-${WORKTREES_DIR:-}/.herd/journal.jsonl}"
-  if [ -z "$_rb_out" ] && [ -s "$_rb_journal" ] && command -v python3 >/dev/null 2>&1; then
-    _rb_out="$(HERD_RBR_PR="$_rb_pr" HERD_RBR_SHA="$_rb_sha" python3 -c '
-import json, os, sys
-pr, sha, out = os.environ["HERD_RBR_PR"], os.environ["HERD_RBR_SHA"], ""
-for raw in sys.stdin:
-    try:
-        o = json.loads(raw)
-    except Exception:
-        continue
-    if o.get("event") != "verdict_recorded":
-        continue
-    if str(o.get("pr", "")) == pr and str(o.get("sha", "")) == sha:
-        out = str(o.get("reason", "") or "")
-sys.stdout.write(" ".join(out.split()))
-' < "$_rb_journal" 2>/dev/null || true)"
+  [ -z "$_rb_out" ] || { printf '%s' "$_rb_out"; return 0; }
+  # Resolve the journal through journal.sh's OWN seam (_journal_file) rather than re-deriving the
+  # path here: JOURNAL_FILE overrides, and a test context redirects to a throwaway file, so a
+  # re-derivation would read a DIFFERENT file than journal_append wrote — a reader/writer split that
+  # reports "no reason recorded" for a reason that was in fact recorded. One seam, one answer.
+  local _rb_journal=""
+  if command -v _journal_file >/dev/null 2>&1; then
+    _rb_journal="$(_journal_file 2>/dev/null || true)"
+  elif [ -n "${JOURNAL_FILE:-}" ]; then
+    _rb_journal="$JOURNAL_FILE"
+  elif [ -n "${WORKTREES_DIR:-}" ]; then
+    _rb_journal="$WORKTREES_DIR/.herd/journal.jsonl"
   fi
+  [ -n "$_rb_journal" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  # Rotated archives too (journal-<stamp>.jsonl beside the live file, oldest first — the same set and
+  # order `herd why` aggregates over), so a verdict recorded before a rotation is not silently lost.
+  # Last matching row wins, mirroring the ledger's own rule.
+  _rb_out="$(HERD_RBR_PR="$_rb_pr" HERD_RBR_SHA="$_rb_sha" python3 -c '
+import glob, json, os, sys
+pr, sha, out = os.environ["HERD_RBR_PR"], os.environ["HERD_RBR_SHA"], ""
+live = sys.argv[1]
+paths = sorted(glob.glob(os.path.join(os.path.dirname(live) or ".", "journal-*.jsonl"))) + [live]
+for path in paths:
+    try:
+        fh = open(path, encoding="utf-8")
+    except OSError:
+        continue
+    with fh:
+        for raw in fh:
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            if o.get("event") != "verdict_recorded":
+                continue
+            if str(o.get("pr", "")) == pr and str(o.get("sha", "")) == sha:
+                out = str(o.get("reason", "") or "")
+sys.stdout.write(" ".join(out.split()))
+' "$_rb_journal" 2>/dev/null || true)"
   printf '%s' "$_rb_out"
 }
 

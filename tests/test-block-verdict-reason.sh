@@ -179,11 +179,17 @@ grep -q 'context only — NOT the review verdict' <<<"$out" \
 ok "(4b) no reason recorded ⇒ herd approve why says so and labels the PR comment as context"
 
 # ── (5) the JOURNAL is the durable fallback — a reason-less ledger row still answers ──────────────
+# JOURNAL_FILE is PINNED on every journal case below. `why` resolves the journal through journal.sh's
+# own _journal_file seam, which honors JOURNAL_FILE first and otherwise REDIRECTS inside a test
+# context (HERD-223) — so a case that only set WORKTREES_DIR would read whatever the ambient harness
+# had pinned, not the fixture it just wrote. That is exactly how this test passed standalone and
+# failed under the bats gate (PR #601). Pinning it makes the case independent of the ambient env.
 WT="$T/why-journal"; mkdir -p "$WT/.herd"
 printf '1720000000 30 a5243cc5 BLOCK reviewer\n' > "$WT/.agent-watch-reviewed"
 printf '{"ts":"2026-07-10T00:00:00Z","event":"verdict_recorded","pr":30,"sha":"a5243cc5","value":"BLOCK","source":"reviewer","reason":"%s"}\n' \
   "$BLOCK_REASON" > "$WT/.herd/journal.jsonl"
-out="$(HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$WT" bash "$APPROVE" why 30 2>&1)"
+out="$(HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$WT" JOURNAL_FILE="$WT/.herd/journal.jsonl" \
+       bash "$APPROVE" why 30 2>&1)"
 grep -qF "$BLOCK_REASON" <<<"$out" || fail "(5) why did not fall back to the journal: $out"
 ok "(5) herd approve why falls back to the durable journal when the ledger row carries no reason"
 
@@ -192,9 +198,37 @@ WT="$T/why-wrong-sha"; mkdir -p "$WT/.herd"
 printf '1720000000 30 a5243cc5 BLOCK reviewer\n' > "$WT/.agent-watch-reviewed"
 printf '{"ts":"2026-07-10T00:00:00Z","event":"verdict_recorded","pr":30,"sha":"0000ffff","value":"BLOCK","source":"reviewer","reason":"why: some OTHER commit"}\n' \
   > "$WT/.herd/journal.jsonl"
-out="$(HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$WT" bash "$APPROVE" why 30 2>&1)"
+out="$(HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$WT" JOURNAL_FILE="$WT/.herd/journal.jsonl" \
+       bash "$APPROVE" why 30 2>&1)"
 grep -q 'some OTHER commit' <<<"$out" && fail "(5b) why attributed another sha's reason to this verdict: $out"
 grep -q 'Reason: none recorded' <<<"$out" || fail "(5b) why did not report the reason as missing: $out"
 ok "(5b) a reason journaled for a different sha is never attributed to this verdict"
+
+# (5c) a verdict recorded before a ROTATION still answers — `why` aggregates the rotated archives
+# beside the live journal, the same set `herd why` reads, so a reason is never lost to rotation.
+WT="$T/why-rotated"; mkdir -p "$WT/.herd"
+printf '1720000000 30 a5243cc5 BLOCK reviewer\n' > "$WT/.agent-watch-reviewed"
+printf '{"ts":"2026-07-09T00:00:00Z","event":"verdict_recorded","pr":30,"sha":"a5243cc5","value":"BLOCK","source":"reviewer","reason":"%s"}\n' \
+  "$BLOCK_REASON" > "$WT/.herd/journal-20260709.jsonl"
+printf '{"ts":"2026-07-10T00:00:00Z","event":"merge","pr":99,"sha":"zz"}\n' > "$WT/.herd/journal.jsonl"
+out="$(HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$WT" JOURNAL_FILE="$WT/.herd/journal.jsonl" \
+       bash "$APPROVE" why 30 2>&1)"
+grep -qF "$BLOCK_REASON" <<<"$out" || fail "(5c) why did not read the rotated archive: $out"
+ok "(5c) a reason recorded before a journal rotation is still found in the archive"
+
+# (5d) THE GATE REGRESSION (PR #601): with JOURNAL_FILE pinned AWAY from the fixture — exactly what
+# the bats harness does — `why` must read the PINNED file, not a path it re-derived from
+# WORKTREES_DIR. Reading the fixture here would prove the resolver forked from journal.sh's seam.
+WT="$T/why-pinned-away"; mkdir -p "$WT/.herd"
+printf '1720000000 30 a5243cc5 BLOCK reviewer\n' > "$WT/.agent-watch-reviewed"
+printf '{"ts":"2026-07-10T00:00:00Z","event":"verdict_recorded","pr":30,"sha":"a5243cc5","value":"BLOCK","source":"reviewer","reason":"why: NOT the pinned journal"}\n' \
+  > "$WT/.herd/journal.jsonl"
+: > "$T/pinned-elsewhere.jsonl"
+out="$(HERD_CONFIG_FILE="$T/no-such-config" WORKTREES_DIR="$WT" JOURNAL_FILE="$T/pinned-elsewhere.jsonl" \
+       bash "$APPROVE" why 30 2>&1)"
+grep -q 'NOT the pinned journal' <<<"$out" \
+  && fail "(5d) why re-derived the journal path instead of honoring JOURNAL_FILE: $out"
+grep -q 'Reason: none recorded' <<<"$out" || fail "(5d) why did not report the reason as missing: $out"
+ok "(5d) why resolves the journal through journal.sh's seam — JOURNAL_FILE wins over any re-derivation"
 
 echo "ALL PASS ($PASS)"
