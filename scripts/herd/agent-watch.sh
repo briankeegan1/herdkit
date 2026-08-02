@@ -7025,19 +7025,26 @@ _main_health_sandbox_note() {
 # infra_event and reconcile_main_health picks up the NEW HEAD as a fresh observed-sha next tick.
 _main_health_worker() {
   local _mw_sha="$1" _mw_out="$2" _mw_log="$3" _mw_rc _mw_detail _mw_head0 _mw_head1
-  local _mw_tmp _mw_dir
+  local _mw_tmp _mw_dir _mw_wtmp
+  # _mw_wtmp is the staging path for the atomic write below — deliberately NOT of the form
+  # ".health-dispatch-main-*" (unlike the old "$_mw_out.tmp.$$" suffix scheme), because
+  # _collect_main_health's collector globs exactly that prefix. A suffixed tmp name still matched the
+  # glob, so a collector poll landing between this write and its rename (routine under load — GROUNDED
+  # in CI, macOS runner, HERD-421 belt-and-suspenders test) could parse "<sha>.tmp.<pid>" as the sha,
+  # writing the run-once marker under a garbled path and leaving the REAL sha's marker never set.
+  _mw_wtmp="${_mw_out%/*}/.health-write-$$"
   _mw_head0="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   _mw_tmp="$(mktemp -d 2>/dev/null || true)"
   if [ -z "$_mw_tmp" ]; then
     _main_health_sandbox_note "mktemp failed"
-    printf '5\tsandbox unavailable: mktemp failed\n' > "$_mw_out.tmp.$$" 2>/dev/null && mv "$_mw_out.tmp.$$" "$_mw_out" 2>/dev/null || true
+    printf '5\tsandbox unavailable: mktemp failed\n' > "$_mw_wtmp" 2>/dev/null && mv "$_mw_wtmp" "$_mw_out" 2>/dev/null || true
     return 0
   fi
   _mw_dir="$_mw_tmp/main-health"
   if ! git -C "$MAIN" worktree add --detach "$_mw_dir" "$_mw_sha" >/dev/null 2>&1; then
     rm -rf "$_mw_tmp" 2>/dev/null || true
     _main_health_sandbox_note "worktree add refused"
-    printf '5\tsandbox unavailable: worktree add refused\n' > "$_mw_out.tmp.$$" 2>/dev/null && mv "$_mw_out.tmp.$$" "$_mw_out" 2>/dev/null || true
+    printf '5\tsandbox unavailable: worktree add refused\n' > "$_mw_wtmp" 2>/dev/null && mv "$_mw_wtmp" "$_mw_out" 2>/dev/null || true
     return 0
   fi
   bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
@@ -7062,7 +7069,7 @@ _main_health_worker() {
     _mw_detail="$(sed -n '1p' "$_mw_log" 2>/dev/null)"
   fi
   _mw_detail="$(printf '%s' "$_mw_detail" | tr '\t\n' '  ')"; _mw_detail="${_mw_detail:0:200}"
-  printf '%s\t%s\n' "$_mw_rc" "$_mw_detail" > "$_mw_out.tmp.$$" 2>/dev/null && mv "$_mw_out.tmp.$$" "$_mw_out" 2>/dev/null || true
+  printf '%s\t%s\n' "$_mw_rc" "$_mw_detail" > "$_mw_wtmp" 2>/dev/null && mv "$_mw_wtmp" "$_mw_out" 2>/dev/null || true
 }
 
 # WHY the tick is ALWAYS heavy (never light) — a review-caught correctness trap. The 'light' profile
