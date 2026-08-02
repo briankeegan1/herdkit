@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# tests/test-sandbox-posture-matrix-docs-lab.sh — docs-lab slice of the posture matrix (HERD-477 split
+# of HERD-153's test-sandbox-posture-matrix.sh; see tests/lib/sandbox-posture-matrix-case.sh for what
+# this asserts and why the test family is split this way). docs-lab (MERGE_POLICY=auto) must fully
+# drain (queue_drained).
+#
+# Fully hermetic. Run:  bash tests/test-sandbox-posture-matrix-docs-lab.sh
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=tests/lib/sandbox-posture-matrix-case.sh
+. "$HERE/lib/sandbox-posture-matrix-case.sh"
+posture_matrix_case docs-lab 40

@@ -25,16 +25,13 @@ name	platforms	reason
 # only on the maintainer's blessed box. Pre-existing engine fragility, NOT introduced by HERD-167 —
 # documented here rather than hacked green or chased with an engine-render change this PR cannot validate.
 test-backlog-view-rich.sh	ubuntu,macos	pre-existing OSC8 rich-render double-wrap; fragile outside the maintainer's env (safety-net row — not this PR; typically passes on a clean no-herdr CI runner)
-# HERD-440 (2026-07-30): test-sandbox-posture-matrix.sh sequentially runs 7 postures + a fault-
-# injection re-run + a byte-identical re-run (9 real sandbox-scenario invocations total) through the
-# SHIPPED gate loop at SANDBOX_REVIEW_DELAY=1 — already the sim's floor delay, not test-side padding.
-# Measured ~116s on a clean local run, right at the shared 120s per-test cap; the macOS CI runner is
-# slower/more contended and tips it over. Passes reliably on ubuntu (not a code defect — the same
-# invariants it proves are also proven per-posture by the smaller sandbox-*-scenario tests). Fixing
-# this properly means parallelizing the posture loop in scripts/herd/sim/sandbox-posture-matrix.sh
-# (bash 3.2, no assoc arrays — real restructuring, not a quick patch); filed as a follow-up via herd
-# note rather than risking the shared sim script for this PR's narrow scope.
-test-sandbox-posture-matrix.sh	macos	TIMEOUT after 120s — 9 sequential sandbox-scenario runs at the sim's floor delay (~116s locally); prohibitively slow on the macOS CI runner, not a code defect (passes on ubuntu); follow-up filed to parallelize the posture loop
+# HERD-477 (2026-08-01): the HERD-440 row below is RESOLVED — test-sandbox-posture-matrix.sh (the
+# combined 9-sandbox-scenario-invocation file that rode the shared 120s per-test cap, and after #588
+# added the yolo posture row started flaking red/green on ubuntu too) is SPLIT into one thin wrapper
+# file per posture (tests/test-sandbox-posture-matrix-<posture>.sh, sharing
+# tests/lib/sandbox-posture-matrix-case.sh) plus tests/test-sandbox-posture-matrix-data.sh for the
+# data-shape checks. Each split file measures well under its own wall-clock headroom budget (see the
+# lib's WALL-CLOCK HEADROOM assertion) — no allowance needed on either platform.
 # HERD-440 (2026-07-30): test-cli-reload.sh surfaced as a 7th macOS-only TIMEOUT (main CI run
 # 30568890521), not in this PR's original six. Same class as the row above, not a hang: 46 checks,
 # ~24 real `bash bin/herd reload` subprocess spawns (each pays a fresh bash-startup+source cost);
