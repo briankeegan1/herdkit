@@ -7186,6 +7186,28 @@ _main_health_ci_log_identity() {
   printf '%s' "${_cl_names:0:200}"
 }
 
+# _main_health_ci_identity_persist <identity> — HERD-476 review fix (PR #600): once the CI honest-
+# identity leg derives a real test name from the failing run's log, persist it into
+# MAIN_HEALTH_STATE's ci field IN PLACE of the generic "CI <workflow>: <conclusion>" render
+# _main_health_set_red originally wrote there. Without this, _main_health_fix_mark claims the shared-
+# pool marker under the log-derived name but _main_health_clear's kind=ci branch releases it under
+# whatever the STATE FILE'S ci field says — the generic render, a DIFFERENT string — so the marker is
+# never released: it leaks permanently and a later regression of the exact same CI test silently stops
+# auto-filing/auto-spawning (mark-key must equal clear-key, exactly as it already does for kind=local,
+# where the state field IS the marked identity with no re-derivation in between). This also makes the
+# standing MAIN RED console row for a CI red name the real test instead of the content-free conclusion
+# string. A no-op when the field already holds this value (the common re-verify-same-red case) or when
+# no red is currently standing to update; best-effort/fail-soft — a write that cannot happen leaves the
+# PRE-existing generic-render row (cosmetic only), never blocks or crashes the autofix path.
+_main_health_ci_identity_persist() {
+  local _cip_id="${1:-}" _cip_sha="" _cip_since="" _cip_local="" _cip_ci=""
+  [ -n "$_cip_id" ] || return 0
+  [ -s "$MAIN_HEALTH_STATE" ] || return 0
+  IFS=$'\x1f' read -r _cip_sha _cip_since _cip_local _cip_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
+  [ "$_cip_ci" = "$_cip_id" ] && return 0
+  printf '%s\x1f%s\x1f%s\x1f%s\n' "$_cip_sha" "$_cip_since" "$_cip_local" "$_cip_id" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
+}
+
 # _main_health_autofix <pr#> <sha> <identity> <detail> [kind=local|ci] [ci-run-id] — MAIN_HEALTH_AUTOFIX
 # (default off, ship-dormant). On a REPRODUCED red whose identity is honest, enqueue ONE scribe item
 # citing the failing test and journal that we did. MAIN_HEALTH_AUTOFIX=spawn (HERD-476) additionally
@@ -7201,7 +7223,10 @@ _main_health_ci_log_identity() {
 # <identity> and <detail> before running the exact same honest-identity gate kind=local always used —
 # a genuine parse then shares the rest of this function (mark/scribe/spawn) unchanged. An unreadable or
 # unparseable log skips immediately with its OWN reason (ci-log-unreadable) and never falls through to
-# file off the generic conclusion string.
+# file off the generic conclusion string. The derived identity is ALSO persisted into
+# MAIN_HEALTH_STATE's ci field (_main_health_ci_identity_persist) before the mark below claims it —
+# review fix, PR #600: mark-key must equal clear-key, or _main_health_clear releases the marker under
+# the stale generic render still sitting in state and the marker leaks forever.
 #
 # DEDUP is a SHARED-POOL invariant, not seat memory (HERD-371 — HERD-362/HERD-365 duplicated the same
 # failing test because each seat's dedup only ever consulted its OWN local flat file). _main_health_fix_mark
@@ -7221,6 +7246,7 @@ _main_health_autofix() {
       return 0
     fi
     _af_id="$_af_ci_id"; _af_detail="$_af_ci_id"
+    _main_health_ci_identity_persist "$_af_ci_id"
   fi
   if ! _main_health_honest_identity "$_af_detail" "$_af_id"; then
     journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" result skipped reason dishonest-identity

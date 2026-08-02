@@ -585,7 +585,42 @@ _main_health_ci_leg
 [ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 1 ] || fail "(j) an honest CI-log identity did not file"
 [ "$(jcount '"event":"main_health_autofix".*"failed":"test-yolo-drain-mode.sh"')" -eq 1 ] || fail "(j) the autofix journal did not cite the CI-log-derived test"
 grep -q '^MAIN RED: fix test-yolo-drain-mode.sh$' "$SCRIBE_LOG" || fail "(j) the scribe title did not name the CI-log-derived test, not the generic conclusion: $(cat "$SCRIBE_LOG")"
+IFS=$'\x1f' read -r _j_sha _j_since _j_local _j_ci < "$MAIN_HEALTH_STATE"
+[ "$_j_ci" = "test-yolo-drain-mode.sh" ] || fail "(j) the log-derived identity was not persisted into the standing CI row (still the generic render?): '$_j_ci'"
 ok "(j) a kind=ci red whose run log names a real failing test is honest: MAIN_HEALTH_AUTOFIX files it"
+unset GH_RUNS GH_LOG_FAILED
+
+# (j2) MARK-KEY MUST EQUAL CLEAR-KEY (review finding, PR #600): a green→red re-arm cycle for a kind=ci
+# identity actually releases the shared-pool fix marker, so a LATER regression of the SAME CI test
+# files fresh instead of dedup'ing forever. Before the persist fix above, the marker was claimed under
+# the log-derived name but _main_health_clear released it under whatever the state file's ci field
+# said — the generic "CI <workflow>: <conclusion>" render — so the marker leaked permanently.
+reset_state
+MAIN_HEALTH_AUTOFIX=on
+new_sha "feat: a sha whose branch CI reds with a re-arm-able failing test"
+SHA_R1="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_R1"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9101}]'
+export GH_LOG_FAILED="$(printf 'ubuntu\trun\t   real-failed tests:\nubuntu\trun\t     ✗ test-rearm.sh\n')"
+_main_health_ci_leg
+[ "$(jcount '"event":"main_health_autofix".*"failed":"test-rearm.sh".*"result":"enqueued"')" -eq 1 ] || fail "(j2) setup: the first reproduction did not file"
+IFS=$'\x1f' read -r _j2_sha _j2_since _j2_local _j2_ci < "$MAIN_HEALTH_STATE"
+[ "$_j2_ci" = "test-rearm.sh" ] || fail "(j2) the standing CI identity was not persisted as the log-derived test name: '$_j2_ci'"
+
+# CI recovers on the SAME sha (a later run of the same commit going green) — the leg's PASS branch
+# clears the CI identity, which must release the marker under the SAME key it was claimed under.
+export GH_RUNS='[{"headSha":"'"$SHA_R1"'","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":9102}]'
+_main_health_ci_leg
+[ ! -s "$MAIN_HEALTH_STATE" ] || fail "(j2) the CI recovery did not clear the standing red: $(cat "$MAIN_HEALTH_STATE")"
+
+# The SAME failing test regresses again (a new commit) — if the marker had leaked, this would dedup
+# instead of filing fresh.
+new_sha "feat: the same CI test regresses again after recovery"
+SHA_R2="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_R2"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9103}]'
+_main_health_ci_leg
+[ "$(jcount '"event":"main_health_autofix".*"failed":"test-rearm.sh".*"result":"enqueued"')" -eq 2 ] || fail "(j2) a later regression of the same CI test did not file fresh — the fix marker leaked"
+[ "$(jcount '"event":"main_health_autofix".*"failed":"test-rearm.sh".*"result":"dedup"')" -eq 0 ] || fail "(j2) a later regression was wrongly deduped against a leaked marker"
+ok "(j2) a green→red re-arm cycle for a kind=ci identity releases the marker: a later regression of the same test files fresh (mark-key == clear-key)"
 unset GH_RUNS GH_LOG_FAILED
 
 # (k) TWO distinct failing tests in the same log are both captured, comma-joined and deduped — proof
