@@ -342,11 +342,15 @@ EOF
 }
 
 # ── BOX-LOAD timeout tolerance (HERD-462, extends the HERD-187 pattern) ───────────────────────────
-# test-sandbox-posture-matrix.sh's own sim (scripts/herd/sim/sandbox-posture-matrix.sh, a 7-posture
-# gate-loop matrix) is legitimately CPU-bound and borderline against BATS_TEST_TIMEOUT=120s even in
-# relative isolation (measured standalone on a quiet box: ~123s) — under real concurrent-builder box
-# contention it reliably tips over the bound (reproduced live, repeatedly). That is a BOX-LOAD
-# condition, not a code bug in this test or in HERD-462's own diff.
+# HERD-477 (2026-08-02): the file this tolerance was written for, test-sandbox-posture-matrix.sh (a
+# 7/8-posture gate-loop matrix legitimately CPU-bound and borderline against BATS_TEST_TIMEOUT=120s —
+# measured standalone ~123s on a quiet box, and reliably tipping over under real concurrent-builder box
+# contention), is now SPLIT into one thin file per posture (tests/test-sandbox-posture-matrix-<posture>.sh)
+# — none of which come anywhere near the 120s bound even under contention (the slowest, solo-auto,
+# measured 32-33s over 10 reps). No bats description will ever match _HK_TIMEOUT_TEST_DESC below again,
+# so this tolerance is now DORMANT (never matches → _hk_bats_timeout_only always returns 1) rather than
+# rewired to a new target: none of the split files are borderline enough to need it. Left in place,
+# harmless, as a historical record and in case a future test reintroduces this exact box-load shape.
 # SAFETY (same bar as HERD-187's tolerance): TOLERATED (exit 2) ONLY when (a) it is the SOLE failing
 # test AND (b) bats' own TAP line carries the "# timeout after Ns" directive it appends EXCLUSIVELY
 # for a genuine BATS_TEST_TIMEOUT kill — a real regression inside the test (any fail()/assertion) exits

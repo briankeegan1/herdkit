@@ -425,17 +425,21 @@ herd config models	unit	tests/test-model-matrix.sh
 #
 # ── POSTURE MATRIX (HERD-153) — posture-qualified sim proofs ─────────────────────────────────
 # scripts/herd/sim/sandbox-posture-matrix.sh runs the SHIPPED gate loop under each canonical
-# posture (templates/postures.tsv) and emits ONE scorecard per posture; the hermetic driver is
-# tests/test-sandbox-posture-matrix.sh. Each row maps the capability a posture EXERCISES to that
-# matrix proof (the posture is noted alongside): the matrix is the posture-qualified proof that
-# these levers hold their invariant under their posture. An explicit nightly-candidate run, not a
-# per-merge gate.
-templates/postures.tsv	sim	tests/test-sandbox-posture-matrix.sh
+# posture (templates/postures.tsv) and emits ONE scorecard per posture. HERD-477 split the one
+# hermetic driver (tests/test-sandbox-posture-matrix.sh) into a thin wrapper per posture
+# (tests/test-sandbox-posture-matrix-<posture>.sh, sharing tests/lib/sandbox-posture-matrix-case.sh)
+# plus tests/test-sandbox-posture-matrix-data.sh for the postures.tsv data-shape checks — each row
+# below now points at the specific split file whose posture actually exercises that capability's
+# invariant (team-approve is the one posture whose checkpoints depend on HUMAN_VERIFY_POLICY=hold
+# gating a merge; gated-push is the one that sets PUSH_GATE=human; custom-steps is the one that sets
+# STEPS_PROFILE, i.e. .herd/steps.tsv; solo-auto is the simplest MERGE_POLICY=auto representative).
+# An explicit nightly-candidate run, not a per-merge gate.
+templates/postures.tsv	sim	tests/test-sandbox-posture-matrix-data.sh
 templates/postures.tsv	sim	tests/test-yolo-drain-mode.sh
-MERGE_POLICY	sim	tests/test-sandbox-posture-matrix.sh
-HUMAN_VERIFY_POLICY	sim	tests/test-sandbox-posture-matrix.sh
-PUSH_GATE	sim	tests/test-sandbox-posture-matrix.sh
-.herd/steps.tsv	sim	tests/test-sandbox-posture-matrix.sh
+MERGE_POLICY	sim	tests/test-sandbox-posture-matrix-solo-auto.sh
+HUMAN_VERIFY_POLICY	sim	tests/test-sandbox-posture-matrix-team-approve.sh
+PUSH_GATE	sim	tests/test-sandbox-posture-matrix-gated-push.sh
+.herd/steps.tsv	sim	tests/test-sandbox-posture-matrix-custom-steps.sh
 herd agent-update [--dry-run]	unit	tests/test-agent-update.sh
 AGENT_UPDATE	unit	tests/test-agent-update.sh
 ENGINE_MIN	unit	tests/test-engine-handshake.sh

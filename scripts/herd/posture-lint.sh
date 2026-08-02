@@ -15,8 +15,9 @@
 #   (2) SIM-PROVEN HONESTY LINE — report whether the operator's EFFECTIVE posture combo (merge policy,
 #       human-verify policy, push gate, PR flow, custom steps) equals one of the CANONICAL postures
 #       (templates/postures.tsv) that the posture-matrix sim proves (scripts/herd/sim/
-#       sandbox-posture-matrix.sh, driven hermetically by tests/test-sandbox-posture-matrix.sh — the
-#       conformance proof_ref for templates/postures.tsv). A match ⇒ your combo is exercised; a miss ⇒
+#       sandbox-posture-matrix.sh, driven hermetically by the per-posture tests/test-sandbox-posture-
+#       matrix-<posture>.sh family — HERD-477 — the conformance proof_ref for templates/postures.tsv
+#       is tests/test-sandbox-posture-matrix-data.sh). A match ⇒ your combo is exercised; a miss ⇒
 #       it is a silent, never-exercised custom posture, and the closest canonical posture + the keys
 #       you deviate on are named.
 #
@@ -253,7 +254,7 @@ herd_doctor_posture() {
 
   if [ -n "$match" ]; then
     printf '  \xe2\x9c\x93 your effective posture (%s) matches the '\''%s'\'' posture\n' "$(_posture_tuple_pretty "$op_tuple")" "$match"
-    printf '      \xe2\x86\x92 exercised by the posture-matrix sim: tests/test-sandbox-posture-matrix.sh (scripts/herd/sim/sandbox-posture-matrix.sh)\n'
+    printf '      \xe2\x86\x92 exercised by the posture-matrix sim: tests/test-sandbox-posture-matrix-%s.sh (scripts/herd/sim/sandbox-posture-matrix.sh)\n' "$match"
     printf '        intent: %s\n' "$(posture_intent "$match")"
   else
     # Unexercised: find the closest canonical posture (most matching fields) and name the deviations.
