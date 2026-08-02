@@ -854,6 +854,34 @@ case "$_hc_eexp_rc" in
      exit 1 ;;
 esac
 
+# 5e. test-cap-ledger guard (HERD-478) — tests/test-caps.tsv (the per-test timeout ledger
+# scripts/ci/run-suite.sh's per-test `timeout` invocation reads) must carry no bare rows (reason +
+# measured-baseline are mandatory — the tests/gate-coverage-exempt.tsv / HERD-437 lesson) and no
+# STALE row (a listed test whose measured-baseline now sits comfortably under the default cap no
+# longer needs the elevated one). ONE implementation shared with the builder's light pre-PR gate
+# (scripts/herd/test-cap-ledger.sh), so the two gates can never disagree.
+tcl_note="test-cap-ledger: clean"
+HERD_TEST_CAP_LEDGER_SKIP_REASON=""
+if [ -f scripts/herd/test-cap-ledger.sh ]; then
+  . scripts/herd/test-cap-ledger.sh
+  _hc_tcl_errs="$(herd_test_cap_ledger_lint ".")"; _hc_tcl_rc=$?
+else
+  _hc_tcl_errs=""; _hc_tcl_rc=2
+  HERD_TEST_CAP_LEDGER_SKIP_REASON="scripts/herd/test-cap-ledger.sh not present"
+fi
+case "$_hc_tcl_rc" in
+  0) tcl_note="test-cap-ledger: clean" ;;
+  2) tcl_note="test-cap-ledger: skipped ($HERD_TEST_CAP_LEDGER_SKIP_REASON)" ;;
+  *) tcl_note="test-cap-ledger: MALFORMED/STALE ROW"
+     if [ -n "$ONELINE" ]; then
+       echo "test-cap-ledger: $(printf '%s' "$_hc_tcl_errs" | grep -E '^(MALFORMED|STALE)' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
+     else
+       echo "TEST-CAP-LEDGER: tests/test-caps.tsv carries a bare or stale row"
+       printf '%s\n' "$_hc_tcl_errs" | grep -E '^(MALFORMED|STALE)' || printf '%s\n' "$_hc_tcl_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
 # NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver
 # + scripts/herd/driver.sh). A ratchet against .herd/claude-hardcode-baseline.tsv (the grandfathered P1
@@ -874,5 +902,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $eexp_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $eexp_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $eexp_note; $tcl_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $chl_note"; }
 exit 0

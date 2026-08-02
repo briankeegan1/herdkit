@@ -1,0 +1,26 @@
+# tests/test-caps.tsv — HERD-478 PER-TEST TIMEOUT LEDGER: the committed, accountable list of
+# tests/test-*.sh files that need MORE than scripts/ci/run-suite.sh's uniform
+# HERD_CI_TEST_TIMEOUT default (120s) to run reliably. Read by scripts/herd/test-cap-ledger.sh
+# (herd_test_cap_for), sourced by scripts/ci/run-suite.sh — an unlisted test always gets the
+# default; a row here overrides ONLY that one test.
+#
+# Columns (TAB-separated):
+#   test               the bare test-*.sh basename (matches run-suite.sh's per-test `name`)
+#   cap-secs           this test's own timeout override, in seconds
+#   reason             one-line why it needs more than the default — MANDATORY, no bare rows
+#                       (the tests/gate-coverage-exempt.tsv / HERD-437 lesson: a reason-less row
+#                       is unauditable and rots silently)
+#   measured-baseline  the last REAL observed wall-clock runtime (seconds) this row was set from —
+#                       MANDATORY. herd_test_cap_ledger_check (the stale-row lint, wired into both
+#                       scripts/herd/healthcheck.sh and .herd/healthcheck.project.sh) reds a row
+#                       whose measured-baseline now sits comfortably under the default (<= half of
+#                       it): once a test is fast again, drop the row instead of leaving a stale cap.
+#
+# Two tests measured heavy immediately pre-HERD-478 turned out NOT to need a row here — worth
+# recording so a future pass doesn't re-add them without re-measuring first:
+#   • tests/test-sandbox-posture-matrix-*.sh (HERD-477 split) — each posture file now measures
+#     8-33s (per-file header comments), far under the stale threshold.
+#   • tests/test-suite-shard.sh (#603, HERD-463 fork-storm fix) — dropped from ~50s to ~22s local,
+#     no longer near the cap.
+test	cap-secs	reason	measured-baseline
+test-cli-reload.sh	180	~24 real bin/herd reload subprocess spawns (each pays a fresh bash-startup+source cost); already flagged macOS-XFAIL in tests/known-env-sensitive.tsv (HERD-440) for periodically TIMING OUT against the shared 120s cap — this row gives it real headroom instead of masking the timeout as env-sensitive	93

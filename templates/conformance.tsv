@@ -207,6 +207,7 @@ suite-shard.sh	unit	tests/test-suite-shard.sh
 bats-fd3-guard.sh	unit	tests/test-bats-fd3-guard.sh
 gate-coverage-lint.sh	unit	tests/test-gate-coverage.sh
 pipe-safety-lint.sh	unit	tests/test-pipe-safety.sh
+test-cap-ledger.sh	unit	tests/test-test-cap-ledger.sh
 git-scope-lint.sh	unit	tests/test-git-scope-lint.sh
 git-scope-lint.sh	unit	tests/test-nested-repo-isolation.sh
 journal-emission-lint.sh	unit	tests/test-journal-emission-lint.sh
