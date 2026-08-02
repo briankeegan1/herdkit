@@ -15,8 +15,10 @@
 #       (peak observed live reviewers <= REVIEW_CONCURRENCY), and the cap ACTIVELY gates (>=1 PR is
 #       QUEUED while the slots are full — a non-vacuous test).
 #   (b) HEALTH_CONCURRENCY=1 serializes healthchecks, NO interleaving — the stub healthcheck records
-#       the live .health-inflight-* marker count on every invocation and it is ALWAYS exactly 1; plus
-#       a planted-holder probe proves a second healthcheck QUEUEs (never runs) while a slot is busy.
+#       the live .health-inflight-* marker count on every invocation and the PEAK is exactly 1, never
+#       >=2 (a lone 0 is the benign fork-vs-marker-write window under load, not interleaving — see the
+#       health_serialized assertion); plus a planted-holder probe proves a second healthcheck QUEUEs
+#       (never runs) while a slot is busy.
 #   (c) no double-merge, no skipped PR — each PR's `gh pr merge` fires exactly once (do_merge's STATE
 #       record makes already_merged idempotent), and every opened PR ends merged.
 #   (d) the queue drains fully — after the tick loop every PR is merged and its worktree reaped.
@@ -209,7 +211,10 @@ chmod +x "$STUB_REVIEW"
 
 # Stub healthcheck (HERD_HEALTHCHECK_BIN seam): always clean; on every invocation records how many
 # .health-inflight-* markers are LIVE — the interleaving probe. Serialization (HEALTH_CONCURRENCY=1)
-# means this count must ALWAYS be exactly 1.
+# means this count must never EXCEED 1; interleaving is a count of 2+. A recorded 0 is benign and
+# expected under load (this worker's stub body reached the scan before the parent wrote its marker —
+# see the health_serialized assertion for why), so the invariant asserted below is peak==1, not "every
+# sample ==1".
 STUB_HC="$ART/stub-healthcheck.sh"
 cat > "$STUB_HC" <<'STUB'
 #!/usr/bin/env bash
@@ -679,11 +684,21 @@ else
   checkpoint review_cap_gated fail "no PR ever queued AND direct cap probe failed: $_cap_probe_detail — the cap never actually gated (vacuous test)"
 fi
 
-# (b) HEALTH_CONCURRENCY=1 — no interleaving: every recorded live-marker count is exactly 1.
-if [ "$HEALTH_RUNS" -ge 1 ] && [ "$MAX_HEALTH_INFLIGHT" = "1" ] && ! grep -qvx '1' "$STUB_HC_MARKERCOUNT_LOG"; then
-  checkpoint health_serialized pass "$HEALTH_RUNS healthchecks ran, max concurrent=1 (no interleaving)"
+# (b) HEALTH_CONCURRENCY=1 — no interleaving: the PEAK live-marker count is exactly 1, never >=2.
+# The real invariant is peak==1, NOT "every recorded sample ==1". The dispatch path (agent-watch.sh
+# _healthcheck_gate) spawns the background health worker FIRST and only THEN writes its
+# .health-inflight-<key> marker (the marker records the worker's pid, so it cannot precede the fork),
+# so the worker's own stub body can reach the marker-count scan in the window BEFORE the parent's
+# _marker_write lands and record a 0 (no live marker yet). Under load that 0 shows up intermittently
+# (repro: 12/48 full-auto runs at 24-way oversubscription, always max==1 never >=2) — it is a probe
+# ordering artifact, not interleaving. Interleaving is two suites live at once → a sample of 2+, which
+# makes MAX_HEALTH_INFLIGHT>=2 and still fails here; MAX==1 also stays non-vacuous (at least one live
+# observation, so a probe that never saw ANY marker — all-0, MAX==0 — still fails). The planted-holder
+# health_mutex_queues probe below proves the mutex directly.
+if [ "$HEALTH_RUNS" -ge 1 ] && [ "$MAX_HEALTH_INFLIGHT" = "1" ]; then
+  checkpoint health_serialized pass "$HEALTH_RUNS healthchecks ran, peak concurrent=1 (no interleaving; log: $(paste -sd' ' - < "$STUB_HC_MARKERCOUNT_LOG"))"
 else
-  checkpoint health_serialized fail "healthchecks interleaved: max concurrent=$MAX_HEALTH_INFLIGHT (log: $(paste -sd' ' - < "$STUB_HC_MARKERCOUNT_LOG"))"
+  checkpoint health_serialized fail "peak concurrent=$MAX_HEALTH_INFLIGHT (want 1: 0 ⇒ probe saw no live marker, >=2 ⇒ real interleaving) — log: $(paste -sd' ' - < "$STUB_HC_MARKERCOUNT_LOG")"
 fi
 
 # (b′) Active proof of the mutex: with a slot occupied by a live holder, a new healthcheck QUEUEs

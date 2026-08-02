@@ -31,17 +31,6 @@
 #         silently re-riding the cap (the exact defect class this split exists to prevent).
 #   Exits the caller's process (via `fail`, defined below) on any assertion failure — this function
 #   runs sourced into the caller's shell, not in a subshell.
-#
-# ONE TRANSIENT-HOST RETRY (main-red repro, 2026-08-02: full-auto came back fail(rc=1) on a real CI
-# run, but was unreproducible after ~100 local re-runs — the fingerprint of a one-off host hiccup, not
-# a deterministic defect). A first attempt is run in a SUBSHELL so a `fail()` there exits only the
-# subshell, not the caller — a single scheduling/IO stall on a contended box can blow the wall-clock
-# headroom budget, or even a tick budget inside the concurrency scenario, on an otherwise-correct run.
-# Only on that first-attempt failure do we re-run the WHOLE case for real (no subshell — a second
-# failure calls the top-level `fail` and exits the caller, exactly as before). This never masks a real
-# regression: a deterministic defect fails identically on the retry. Mirrors the same "retry the
-# transient, never the correctness check itself" doctrine already used by HERD-331's review_cap_gated
-# direct-probe fallback in scripts/herd/sim/sandbox-concurrency-scenario.sh.
 set -uo pipefail
 
 _pmc_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -64,13 +53,6 @@ for c in d["checkpoints"]:
 }
 
 posture_matrix_case() {
-  local POSTURE="$1" BUDGET_SECONDS="$2"
-  if ( _pmc_attempt "$POSTURE" "$BUDGET_SECONDS" ); then return 0; fi
-  echo "RETRY (posture $POSTURE): first attempt failed — re-running once to rule out a transient host hiccup before failing for real" >&2
-  _pmc_attempt "$POSTURE" "$BUDGET_SECONDS"
-}
-
-_pmc_attempt() {
   local POSTURE="$1" BUDGET_SECONDS="$2"
 
   command -v git     >/dev/null 2>&1 || fail "git required"
