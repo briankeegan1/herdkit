@@ -27,7 +27,9 @@
 #   HERD_CI_TESTS_DIR    directory holding the tests (default: <repo>/tests)
 #   HERD_CI_TEST_GLOB    test filename glob for ALL-mode (default: test-*.sh)
 #   HERD_CI_ALLOWLIST    env-sensitive allowlist tsv (default: <tests>/known-env-sensitive.tsv)
-#   HERD_CI_TEST_TIMEOUT per-test timeout seconds    (default: 180; needs coreutils timeout/gtimeout)
+#   HERD_CI_TEST_TIMEOUT per-test DEFAULT timeout seconds (default: 120; needs coreutils
+#                        timeout/gtimeout) — the uniform floor for any test with no
+#                        HERD_CI_TEST_CAP_LEDGER row; see that key below for per-test overrides.
 #   HERD_CI_FORCE_DIRECT 1 = run ALL test-*.sh (the glob), not just the curated herd.bats subset
 #   HERD_CI_ARTIFACTS_DIR dir for scorecard/per-rep artifacts from tests that support the shared
 #                        `--artifacts DIR --keep` convention (default: a fresh mktemp -d). Written
@@ -44,6 +46,12 @@
 #                        (mutation-proven by tests/test-suite-shard.sh). "all" mode
 #                        (HERD_CI_FORCE_DIRECT=1) ignores sharding — it is a debug/full-glob mode,
 #                        not the gate.
+#   HERD_CI_TEST_CAP_LEDGER (HERD-478): tsv path naming PER-TEST timeout overrides (default:
+#                        <tests-dir>/test-caps.tsv). A test named there runs under its own row's
+#                        cap-secs instead of HERD_CI_TEST_TIMEOUT; every other test is unaffected —
+#                        an absent/empty ledger is byte-identical to the pre-HERD-478 uniform cap.
+#                        See scripts/herd/test-cap-ledger.sh for the ledger format + the stale-row
+#                        lint that keeps it honest.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -54,6 +62,7 @@ TEST_GLOB="${HERD_CI_TEST_GLOB:-test-*.sh}"
 ALLOWLIST="${HERD_CI_ALLOWLIST:-$TESTS_DIR/known-env-sensitive.tsv}"
 CURATED_SRC="$TESTS_DIR/herd.bats"
 PER_TEST_TIMEOUT="${HERD_CI_TEST_TIMEOUT:-120}"
+CAP_LEDGER="${HERD_CI_TEST_CAP_LEDGER:-$TESTS_DIR/test-caps.tsv}"
 SHARD_INDEX="${HERD_CI_SHARD_INDEX:-1}"
 SHARD_COUNT="${HERD_CI_SHARD_COUNT:-1}"
 case "$SHARD_INDEX" in ''|*[!0-9]*) SHARD_INDEX=1 ;; esac
@@ -65,6 +74,14 @@ if [ -f "$ROOT/scripts/herd/suite-shard.sh" ]; then
 elif [ "$SHARD_COUNT" -gt 1 ]; then
   echo "❌ HERD_CI_SHARD_COUNT=$SHARD_COUNT but scripts/herd/suite-shard.sh is missing — refusing to guess a partial suite" >&2
   exit 2
+fi
+# HERD-478: per-test timeout ledger. Fail-soft on our own infra — a partially-upgraded tree missing
+# the library must fall back to the uniform PER_TEST_TIMEOUT for every test, never break the run.
+# shellcheck source=scripts/herd/test-cap-ledger.sh
+if [ -f "$ROOT/scripts/herd/test-cap-ledger.sh" ]; then
+  . "$ROOT/scripts/herd/test-cap-ledger.sh"
+else
+  herd_test_cap_for() { printf '%s' "$PER_TEST_TIMEOUT"; }
 fi
 
 # `herd reload` (exercised by test-cli-backend-switch and others) relaunches a HEADLESS background
@@ -124,9 +141,11 @@ detect_platform() {
 PLATFORM="$(detect_platform)"
 
 # ── a per-test timeout wrapper, if the coreutils binary is present (else run bare) ─
-TO=""
+# TO_BIN names the binary only; the actual cap-secs is resolved PER TEST below (HERD-478: a listed
+# test in $CAP_LEDGER runs under its own row's cap-secs instead of $PER_TEST_TIMEOUT).
+TO_BIN=""
 for _c in timeout gtimeout; do
-  if command -v "$_c" >/dev/null 2>&1; then TO="$_c $PER_TEST_TIMEOUT"; break; fi
+  if command -v "$_c" >/dev/null 2>&1; then TO_BIN="$_c"; break; fi
 done
 
 # ── allowlist lookup ─────────────────────────────────────────────────────────────
@@ -203,10 +222,17 @@ mkdir -p "$ARTROOT"
 if [ -n "${GITHUB_ENV:-}" ]; then
   { echo "HERD_CI_LOGDIR=$LOGDIR"; echo "HERD_CI_ARTIFACTS_DIR=$ARTROOT"; } >> "$GITHUB_ENV"
 fi
-[ -n "$TO" ] || echo "⚠️  no timeout binary found — running tests without a per-test cap"
+[ -n "$TO_BIN" ] || echo "⚠️  no timeout binary found — running tests without a per-test cap"
 shard_note=""
 [ "$SHARD_COUNT" -gt 1 ] && shard_note=", shard=$SHARD_INDEX/$SHARD_COUNT"
-echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, timeout=${TO:-none}${shard_note}) on ${PLATFORM}"
+cap_note=""
+if [ -f "$CAP_LEDGER" ]; then
+  cap_rows="$(grep -vE '^[[:space:]]*(#|test[[:space:]])' "$CAP_LEDGER" 2>/dev/null | grep -c .)" || cap_rows=0
+  [ "$cap_rows" -gt 0 ] && cap_note=", $cap_rows ledger override(s)"
+fi
+timeout_note="default-timeout=none"
+[ -n "$TO_BIN" ] && timeout_note="default-timeout=${PER_TEST_TIMEOUT}s"
+echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, ${timeout_note}${cap_note}${shard_note}) on ${PLATFORM}"
 for t in "${tests[@]}"; do
   name="$(basename "$t")"
   log="$LOGDIR/$name.log"
@@ -215,6 +241,10 @@ for t in "${tests[@]}"; do
   if grep -q -- '--artifacts) ART=' "$t" 2>/dev/null; then
     extra_args=(--artifacts "$test_artdir" --keep)
   fi
+  # HERD-478: this test's own cap-secs (its tests/test-caps.tsv row, else $PER_TEST_TIMEOUT).
+  cap="$(herd_test_cap_for "$name" "$CAP_LEDGER" "$PER_TEST_TIMEOUT")"
+  TO=""
+  [ -n "$TO_BIN" ] && TO="$TO_BIN $cap"
   # shellcheck disable=SC2086
   # HERMETIC_TEST names the fixture for journal.sh's fail-safe (and any other test-context guards).
   # extra_args[@] is expanded via the +"…" guard because macOS's system bash (3.2 — the default on
@@ -227,7 +257,7 @@ for t in "${tests[@]}"; do
     [ ${#extra_args[@]} -eq 0 ] || rm -rf "$test_artdir"  # green: nothing worth keeping
     continue
   fi
-  timedout=""; [ "$rc" -eq 124 ] && timedout=" (TIMEOUT after ${PER_TEST_TIMEOUT}s)"
+  timedout=""; [ "$rc" -eq 124 ] && timedout=" (TIMEOUT after ${cap}s)"
   if reason="$(allow_reason "$name")"; then
     xfail=$((xfail+1)); xfail_names+=("$name — $reason")
     echo "⚠️  XFAIL (env-sensitive) $name$timedout: $reason"

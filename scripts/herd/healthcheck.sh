@@ -163,6 +163,17 @@ else
   HERD_ENV_EXPORT_SKIP_REASON="env-export-lint.sh not present"
   herd_env_export_lint() { return 2; }
 fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# test-cap-ledger guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/test-cap-ledger.sh"
+[ -f "$DIR/scripts/herd/test-cap-ledger.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/test-cap-ledger.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_TEST_CAP_LEDGER_SKIP_REASON="test-cap-ledger.sh not present"
+  herd_test_cap_ledger_lint() { return 2; }
+fi
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
@@ -524,6 +535,20 @@ EOF
   if [ "$eexp_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ env-export — $(printf '%s' "$eexp_errs" | head -1) set but not exported";  # pipe-ok: head in a command substitution; status not gated
     else echo "❌ ENV-EXPORT: a config key the Python engine core reads from os.environ is set but not \`export\`ed by herd-config.sh (the child tick process never sees it)"; printf '%s\n' "$eexp_errs"; fi
+    exit 1
+  fi
+
+  # test-cap-ledger guard (HERD-478) — tests/test-caps.tsv (the per-test timeout ledger
+  # scripts/ci/run-suite.sh reads) must carry no bare rows (reason + measured-baseline mandatory)
+  # and no STALE row (a listed test whose measured-baseline now sits comfortably under the default
+  # cap). The SAME lint the heavy gate runs (scripts/herd/test-cap-ledger.sh). Same red semantics as
+  # caps-sync / env-export. Skipped (never red) when the shared lint is absent or the tree has no
+  # tests/ directory at all.
+  local tcl_errs tcl_rc
+  tcl_errs="$(herd_test_cap_ledger_lint ".")"; tcl_rc=$?
+  if [ "$tcl_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ test-cap-ledger — $(printf '%s' "$tcl_errs" | grep -E '^(MALFORMED|STALE)' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ TEST-CAP-LEDGER: tests/test-caps.tsv carries a bare or stale row"; printf '%s\n' "$tcl_errs" | grep -E '^(MALFORMED|STALE)' || printf '%s\n' "$tcl_errs"; fi
     exit 1
   fi
 
