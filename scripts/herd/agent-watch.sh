@@ -6826,12 +6826,21 @@ _main_health_recheck_mins() {
   esac
 }
 
-# _main_health_autofix_enabled — true iff MAIN_HEALTH_AUTOFIX opts in. Default OFF (ship-dormant).
+# _main_health_autofix_enabled — true iff MAIN_HEALTH_AUTOFIX opts in, file-only OR spawn. Default OFF
+# (ship-dormant).
 _main_health_autofix_enabled() {
   case "$(printf '%s' "${MAIN_HEALTH_AUTOFIX:-off}" | tr '[:upper:]' '[:lower:]')" in
-    1|true|on|yes|enable|enabled) return 0 ;;
+    1|true|on|yes|enable|enabled|spawn) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# _main_health_autofix_spawn_enabled — true iff MAIN_HEALTH_AUTOFIX is the literal token 'spawn'
+# (HERD-476): the opt-in ABOVE the default file-only behavior that additionally dispatches a
+# tracked+claimed quick-lane builder against the item this tick just filed. Default OFF, same as its
+# file-only sibling — a truthy-but-not-'spawn' value (on/true/yes/…) stays file-only, never spawns.
+_main_health_autofix_spawn_enabled() {
+  [ "$(printf '%s' "${MAIN_HEALTH_AUTOFIX:-off}" | tr '[:upper:]' '[:lower:]')" = "spawn" ]
 }
 
 # _main_health_ci_gate_enabled — true iff MAIN_HEALTH_CI_GATE opts in (HERD-434). Default OFF
@@ -7144,12 +7153,82 @@ _main_health_fix_clear() {
   return 0
 }
 
-# _main_health_autofix <pr#> <sha> <identity> <detail> — MAIN_HEALTH_AUTOFIX (default off, ship-dormant).
-# On a REPRODUCED red whose identity is honest, enqueue ONE scribe item citing the failing test and
-# journal that we did. Scoped DELIBERATELY narrow for this increment: it FILES work, it never spawns a
-# builder — an agent that fixes main unattended is a separate, riskier decision.
+# _main_health_ci_log_identity <run-id> — HERD-476: derive an HONEST failing-test identity for a
+# kind=ci red from the failing run's OWN logs, rather than trusting the bare workflow/conclusion pair
+# _main_health_ci_leg renders ("CI <workflow>: <conclusion>", which names no test and so
+# _main_health_honest_identity has always — correctly — rejected it as content-free). scripts/ci/
+# run-suite.sh, the runner behind this repo's own CI job, already prints exactly the honest identity a
+# LOCAL red gets: a "real-failed tests:" block listing one "✗ <test>[ (TIMEOUT …)]" line per real
+# failure. `gh run view <id> --log-failed` dumps ONLY the failed steps' logs (each line tab-prefixed
+# with its job/step name) — this greps that stream for the ✗ lines and comma-joins the distinct test
+# names, mirroring _health_fail_identity's own dedup-and-cap shape.
 #
-# DEDUP is now a SHARED-POOL invariant, not seat memory (HERD-371 — HERD-362/HERD-365 duplicated the same
+# Fail-soft, and DELIBERATELY narrow: empty (never a crash, never a guessed identity) on a missing run
+# id, an unavailable/timed-out/old `gh`, or a log with no ✗ line at all (a run that failed for a reason
+# run-suite.sh never got to print, e.g. an earlier setup step) — the caller then skips with
+# reason=ci-log-unreadable rather than ever filing off the generic conclusion string.
+_main_health_ci_log_identity() {
+  local _cl_run="${1:-}" _cl_tmp _cl_names
+  [ -n "$_cl_run" ] || return 0
+  _cl_tmp="$(mktemp 2>/dev/null)" || return 0
+  _gh_timeout main_health_ci_log run view "$_cl_run" --log-failed > "$_cl_tmp" 2>/dev/null
+  if [ ! -s "$_cl_tmp" ]; then
+    rm -f "$_cl_tmp" 2>/dev/null || true
+    return 0
+  fi
+  _cl_names="$(grep -F '✗' "$_cl_tmp" 2>/dev/null \
+    | sed -E 's/^.*✗[[:space:]]*//' \
+    | tr -d '\r' \
+    | awk 'NF' \
+    | awk '!seen[$0]++' \
+    | paste -sd, -)"
+  rm -f "$_cl_tmp" 2>/dev/null || true
+  printf '%s' "${_cl_names:0:200}"
+}
+
+# _main_health_ci_identity_persist <identity> — HERD-476 review fix (PR #600): once the CI honest-
+# identity leg derives a real test name from the failing run's log, persist it into
+# MAIN_HEALTH_STATE's ci field IN PLACE of the generic "CI <workflow>: <conclusion>" render
+# _main_health_set_red originally wrote there. Without this, _main_health_fix_mark claims the shared-
+# pool marker under the log-derived name but _main_health_clear's kind=ci branch releases it under
+# whatever the STATE FILE'S ci field says — the generic render, a DIFFERENT string — so the marker is
+# never released: it leaks permanently and a later regression of the exact same CI test silently stops
+# auto-filing/auto-spawning (mark-key must equal clear-key, exactly as it already does for kind=local,
+# where the state field IS the marked identity with no re-derivation in between). This also makes the
+# standing MAIN RED console row for a CI red name the real test instead of the content-free conclusion
+# string. A no-op when the field already holds this value (the common re-verify-same-red case) or when
+# no red is currently standing to update; best-effort/fail-soft — a write that cannot happen leaves the
+# PRE-existing generic-render row (cosmetic only), never blocks or crashes the autofix path.
+_main_health_ci_identity_persist() {
+  local _cip_id="${1:-}" _cip_sha="" _cip_since="" _cip_local="" _cip_ci=""
+  [ -n "$_cip_id" ] || return 0
+  [ -s "$MAIN_HEALTH_STATE" ] || return 0
+  IFS=$'\x1f' read -r _cip_sha _cip_since _cip_local _cip_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || return 0
+  [ "$_cip_ci" = "$_cip_id" ] && return 0
+  printf '%s\x1f%s\x1f%s\x1f%s\n' "$_cip_sha" "$_cip_since" "$_cip_local" "$_cip_id" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
+}
+
+# _main_health_autofix <pr#> <sha> <identity> <detail> [kind=local|ci] [ci-run-id] — MAIN_HEALTH_AUTOFIX
+# (default off, ship-dormant). On a REPRODUCED red whose identity is honest, enqueue ONE scribe item
+# citing the failing test and journal that we did. MAIN_HEALTH_AUTOFIX=spawn (HERD-476) additionally
+# dispatches a tracked+claimed quick-lane builder against that SAME identity (_main_health_autofix_spawn
+# below) — the file-only path stays the default; an agent that fixes main unattended is the deliberately
+# opt-in, riskier half.
+#
+# HONEST IDENTITY FOR kind=ci (HERD-476, dishonest-identity fix): the render string
+# _main_health_ci_leg passes in for a branch-CI red ("CI <workflow>: <conclusion>") names no test, so
+# EVERY kind=ci red used to autofix-skip as dishonest — even when scripts/ci/run-suite.sh had already
+# printed a real failing test into that same run's own log. For kind=ci this leg re-derives the
+# identity FIRST from the failing run's logs (_main_health_ci_log_identity) and swaps it in for both
+# <identity> and <detail> before running the exact same honest-identity gate kind=local always used —
+# a genuine parse then shares the rest of this function (mark/scribe/spawn) unchanged. An unreadable or
+# unparseable log skips immediately with its OWN reason (ci-log-unreadable) and never falls through to
+# file off the generic conclusion string. The derived identity is ALSO persisted into
+# MAIN_HEALTH_STATE's ci field (_main_health_ci_identity_persist) before the mark below claims it —
+# review fix, PR #600: mark-key must equal clear-key, or _main_health_clear releases the marker under
+# the stale generic render still sitting in state and the marker leaks forever.
+#
+# DEDUP is a SHARED-POOL invariant, not seat memory (HERD-371 — HERD-362/HERD-365 duplicated the same
 # failing test because each seat's dedup only ever consulted its OWN local flat file). _main_health_fix_mark
 # atomically claims the marker across the whole pool: the first seat to see this failing identity files it
 # and every OTHER seat (or a later tick on this seat) that reproduces the SAME identity sees the marker
@@ -7157,8 +7236,18 @@ _main_health_fix_clear() {
 # _main_health_clear once main goes green for that identity, so a LATER regression files fresh. Fully
 # fail-soft; always returns 0.
 _main_health_autofix() {
-  local _af_pr="$1" _af_sha="$2" _af_id="$3" _af_detail="$4" _af_mark_rc
+  local _af_pr="$1" _af_sha="$2" _af_id="$3" _af_detail="$4" _af_kind="${5:-local}" _af_ci_run="${6:-}"
+  local _af_mark_rc _af_ci_id
   _main_health_autofix_enabled || return 0
+  if [ "$_af_kind" = "ci" ]; then
+    _af_ci_id="$(_main_health_ci_log_identity "$_af_ci_run")"
+    if [ -z "$_af_ci_id" ]; then
+      journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" result skipped reason ci-log-unreadable
+      return 0
+    fi
+    _af_id="$_af_ci_id"; _af_detail="$_af_ci_id"
+    _main_health_ci_identity_persist "$_af_ci_id"
+  fi
   if ! _main_health_honest_identity "$_af_detail" "$_af_id"; then
     journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" result skipped reason dishonest-identity
     return 0
@@ -7177,19 +7266,68 @@ The default branch is RED at sha ${_af_sha} (landed as PR #${_af_pr}).
 Failing test: ${_af_detail}
 Add a 🔜 item to fix it. Do not close it until main-health goes green."
   journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result enqueued
+  _main_health_autofix_spawn "$_af_pr" "$_af_sha" "$_af_id" "$_af_detail"
   return 0
 }
 
-# _main_health_set_red <pr#> <sha> <healthcheck-oneline> [kind=local|ci] — a main sha REPRODUCED a red
-# in the given SCOPE (HERD-372: "local" for the healthcheck suite, "ci" for the branch-CI leg; local is
-# the default so the existing local-suite caller needs no change). MERGES into the state — it writes
-# ONLY the <kind> identity field, leaving whichever OTHER identity already stood untouched, so a
-# branch-CI red can never OVERWRITE (and thereby degrade) a standing local-suite failing-test identity,
-# and vice versa. The rendered/journaled/notified/autofixed identity is the MOST SPECIFIC one standing
-# (local wins over CI — mirrors build_main_health). The 'since #N' PR is STICKY: if main was already
-# red, keep the FIRST offending PR so a run of red merges all point back to where main broke.
+# _main_health_autofix_spawn <pr#> <sha> <identity> <detail> — the MAIN_HEALTH_AUTOFIX=spawn increment
+# (HERD-476). Called ONLY from the branch of _main_health_autofix that just WON the shared-pool claim
+# (never on a dedup/skip/store-unavailable), so it fires AT MOST ONCE per distinct honest identity while
+# main is red — the exact invariant the file-only scribe enqueue above already relies on. A no-op
+# (return 0, no journal) whenever MAIN_HEALTH_AUTOFIX is 'on' rather than the literal 'spawn' — 'on'
+# stays file-only, unchanged.
+#
+# Dispatches through the SAME durable spawn queue the coordinator's own spawn.sh enqueues to (drained by
+# _drain_spawn_queue → herd-quick.sh) — a TRACKED + CLAIMED quick-lane build, not a bespoke launch path:
+# HERD_ITEM_REF carries the failing identity as the spawn's tracker ref, so the builder's PR carries a
+# 'Refs:' line and, when CLAIM_REQUIRED is on, herd-claim.sh attempts an atomic claim on it before any
+# worktree/agent is created — exactly the two guarantees "tracked+claimed" names. (A ref that does not
+# yet resolve to a real tracker item — the scribe item filed above is itself created ASYNCHRONOUSLY by
+# the drainer — degrades no worse than any other untracked spawn: merge-time reconcile falls back to its
+# existing fuzzy slug/title match, per agent-watch.sh's own _reconcile_via_ref contract.) The slug embeds
+# the SHA, never just the identity, so a LATER regression of the same test — which _main_health_fix_clear
+# re-arms for filing once main goes green — gets its own fresh worktree instead of colliding with one
+# still sitting from a prior cycle.
+#
+# RISK, spelled out because this is the one path in the whole MAIN_HEALTH_AUTOFIX feature that writes
+# code unattended: the builder still goes through the ordinary pipeline (its own light healthcheck, then
+# the watcher's authoritative heavy gate + adversarial review) before anything merges — spawning is not
+# merging. Fully fail-soft: a missing spawn.sh, or a non-zero enqueue, is journaled and never blocks or
+# fails the tick — the scribe file above has already happened by the time this runs.
+_main_health_autofix_spawn() {
+  local _as_pr="$1" _as_sha="$2" _as_id="$3" _as_detail="$4" _as_slug _as_out _as_rc=0
+  _main_health_autofix_spawn_enabled || return 0
+  if [ ! -f "$HERE/spawn.sh" ]; then
+    journal_append main_health_autofix_spawn pr "$_as_pr" sha "$_as_sha" failed "$_as_id" result skipped reason no-spawn-sh
+    return 0
+  fi
+  _as_slug="main-red-${_as_sha:0:8}-$(printf '%s' "$_as_id" \
+    | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-40)"
+  _as_slug="${_as_slug%-}"
+  _as_out="$(HERD_ITEM_REF="$_as_id" bash "$HERE/spawn.sh" "$_as_slug" quick \
+    "Fix the reproduced MAIN RED regression. The default branch failed at sha ${_as_sha} (landed as PR #${_as_pr}). Failing test: ${_as_detail}. Diagnose and fix ${_as_id} so main-health goes green; do not touch unrelated code." \
+    2>&1)"; _as_rc=$?
+  if [ "$_as_rc" -eq 0 ]; then
+    journal_append main_health_autofix_spawn pr "$_as_pr" sha "$_as_sha" failed "$_as_id" slug "$_as_slug" result enqueued
+  else
+    journal_append main_health_autofix_spawn pr "$_as_pr" sha "$_as_sha" failed "$_as_id" slug "$_as_slug" result skipped reason "spawn.sh exited $_as_rc: $_as_out"
+  fi
+  return 0
+}
+
+# _main_health_set_red <pr#> <sha> <healthcheck-oneline> [kind=local|ci] [ci-run-id] — a main sha
+# REPRODUCED a red in the given SCOPE (HERD-372: "local" for the healthcheck suite, "ci" for the
+# branch-CI leg; local is the default so the existing local-suite caller needs no change). MERGES into
+# the state — it writes ONLY the <kind> identity field, leaving whichever OTHER identity already stood
+# untouched, so a branch-CI red can never OVERWRITE (and thereby degrade) a standing local-suite
+# failing-test identity, and vice versa. The rendered/journaled/notified/autofixed identity is the MOST
+# SPECIFIC one standing (local wins over CI — mirrors build_main_health). The 'since #N' PR is STICKY:
+# if main was already red, keep the FIRST offending PR so a run of red merges all point back to where
+# main broke. <ci-run-id> (HERD-476, kind=ci only) is the failing run's databaseId, threaded straight
+# through to _main_health_autofix so its honest-identity leg can read that run's own logs; empty for the
+# kind=local caller (and for any kind=ci call that could not resolve one), unchanged either way.
 _main_health_set_red() {
-  local _sr_pr="$1" _sr_sha="$2" _sr_out="$3" _sr_kind="${4:-local}"
+  local _sr_pr="$1" _sr_sha="$2" _sr_out="$3" _sr_kind="${4:-local}" _sr_ci_run="${5:-}"
   local _sr_fail _sr_since _sr_wasred=0 _sr_pv_sha="" _sr_pv_since="" _sr_pv_local="" _sr_pv_ci="" _sr_local _sr_ci _sr_render
   _sr_fail="$(_health_fail_identity "$_sr_out")"
   [ -n "$_sr_fail" ] || _sr_fail="$_sr_out"
@@ -7210,7 +7348,7 @@ _main_health_set_red() {
   if [ "$_sr_wasred" -eq 0 ]; then
     herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_render} (since #${_sr_since})" default
   fi
-  _main_health_autofix "$_sr_pr" "$_sr_sha" "$_sr_render" "$_sr_out"
+  _main_health_autofix "$_sr_pr" "$_sr_sha" "$_sr_render" "$_sr_out" "$_sr_kind" "$_sr_ci_run"
 }
 
 # Re-journal a STANDING deferral every N attempts (HERD-453). At the ~4 s tick this is ~7 min between
@@ -7414,11 +7552,14 @@ _main_health_file_age_mins() {
 # dedup memo), so a routinely-green branch never journals a green/clear on every ~40s scan (the memo IS
 # the guard: no prior fire ⇒ nothing to clear ⇒ byte-quiet, same as before this leg ever fired once).
 
-# _main_ci_classify <expected-sha> — read a `gh run list --json headSha,status,conclusion,workflowName`
-# array on stdin and emit "<bucket>\t<workflow>\t<conclusion>" for the most-recent COMPLETED run whose
-# headSha matches <expected-sha> (bucket ∈ pass|fail|pending), or NOTHING (a run still in progress, a run
-# for an older sha, bad JSON, no runs). Uses the SAME PASS/FAIL conclusion vocabulary as
-# _ci_checks_normalize — CANCELLED/STALE/unknown are deliberately never red. python3 stdlib only.
+# _main_ci_classify <expected-sha> — read a `gh run list --json headSha,status,conclusion,workflowName,
+# databaseId` array on stdin and emit "<bucket>\t<workflow>\t<conclusion>\t<run-id>" for the most-recent
+# COMPLETED run whose headSha matches <expected-sha> (bucket ∈ pass|fail|pending), or NOTHING (a run
+# still in progress, a run for an older sha, bad JSON, no runs). Uses the SAME PASS/FAIL conclusion
+# vocabulary as _ci_checks_normalize — CANCELLED/STALE/unknown are deliberately never red. <run-id> (HERD-
+# 476) is databaseId, the numeric id `gh run view --log-failed` wants — empty when the field is absent
+# (an older `gh` or a caller that omitted it from --json), which the honest-identity leg below then
+# treats as unreadable rather than guessing. python3 stdlib only.
 _main_ci_classify() {
   python3 -c '
 import sys, json
@@ -7444,7 +7585,8 @@ for r in runs:                       # gh returns newest-first
     if concl in FAIL:   bucket = "fail"
     elif concl in PASS: bucket = "pass"
     else:               bucket = "pending"   # CANCELLED / STALE / unknown → never red
-    sys.stdout.write("%s\t%s\t%s\n" % (bucket, clean(r.get("workflowName")), concl or "?"))
+    run_id = r.get("databaseId")
+    sys.stdout.write("%s\t%s\t%s\t%s\n" % (bucket, clean(r.get("workflowName")), concl or "?", run_id if run_id else ""))
     break
 ' "$1"
 }
@@ -7474,15 +7616,19 @@ _main_health_ci_leg() {
   # in depth: in practice a foreign sha rarely matches the default branch's own CI runs anyway, but this
   # closes the gap on principle and skips a wasted `gh run list` call).
   _main_checkout_sound >/dev/null || return 0
-  local _sha _json _res _bucket _wf _concl _line _prev
+  local _sha _json _res _bucket _wf _concl _run_id _line _prev
   _sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_sha" ] || return 0
+  # HERD-476: databaseId rides along so a FAIL bucket can hand its run id to _main_health_set_red,
+  # which threads it to the autofix leg's honest-identity log parse (_main_health_ci_log_identity).
+  # An older `gh` that ignores the extra --json field simply omits it from each object — _main_ci_
+  # classify already reads a missing databaseId as empty, so this is additive, never a new failure mode.
   _json="$(_gh_timeout main_health_ci run list --branch "$HERD_BRANCH_NAME" --limit 20 \
-             --json headSha,status,conclusion,workflowName 2>/dev/null)" || return 0
+             --json headSha,status,conclusion,workflowName,databaseId 2>/dev/null)" || return 0
   [ -n "$_json" ] || return 0                              # offline gh / no Actions → byte-identical
   _res="$(printf '%s' "$_json" | _main_ci_classify "$_sha")"
   [ -n "$_res" ] || return 0
-  IFS=$'\t' read -r _bucket _wf _concl <<EOF
+  IFS=$'\t' read -r _bucket _wf _concl _run_id <<EOF
 $_res
 EOF
   if [ "$_bucket" = "pass" ]; then
@@ -7497,7 +7643,7 @@ EOF
   _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
   [ "$_prev" = "$_line" ] && return 0                      # already fired for this sha+conclusion — no spam
   printf '%s\n' "$_line" > "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true
-  _main_health_set_red "?" "$_sha" "CI ${_wf:-run}: ${_concl}" ci
+  _main_health_set_red "?" "$_sha" "CI ${_wf:-run}: ${_concl}" ci "$_run_id"
   return 0
 }
 

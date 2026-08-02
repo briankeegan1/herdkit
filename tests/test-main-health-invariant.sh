@@ -83,11 +83,14 @@ export HC_MODE="$T/hc-mode"; printf 'green\n' > "$HC_MODE"
 # leg passed — the regression this closes (`--branch origin/main` silently matching zero runs) was
 # invisible to a stub that only ever checked "$1 $2", never the rest of argv.
 BIN="$T/bin"; mkdir -p "$BIN"
+# GH_LOG_FAILED (HERD-476): the `gh run view <id> --log-failed` stub output, for the CI honest-identity
+# leg (_main_health_ci_log_identity). Kept as simple/global as GH_RUNS — one scenario at a time.
 cat > "$BIN/gh" <<'GHSTUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${GH_CALLS:-/dev/null}"
 case "$1 $2" in
   "run list") printf '%s\n' "${GH_RUNS:-}"; exit 0 ;;
+  "run view") printf '%s\n' "${GH_LOG_FAILED:-}"; exit 0 ;;
 esac
 exit 0
 GHSTUB
@@ -111,7 +114,8 @@ export DEFAULT_BRANCH=origin/main
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in reconcile_main_health _main_health_dispatch _main_health_died _main_health_autofix \
-          _main_health_honest_identity _main_health_observed_pr main_health_tick; do
+          _main_health_honest_identity _main_health_observed_pr main_health_tick \
+          _main_health_ci_log_identity _main_health_autofix_spawn; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
 case "$(_journal_file)" in "$T"/*) : ;; *) fail "journal path escapes the sandbox" ;; esac
@@ -561,5 +565,164 @@ new_sha "Fix #123 widget handling (#456)"
 new_sha "chore: a commit that names no PR at all"
 [ -z "$(_main_health_observed_pr "$(head_sha)")" ] || fail "(a) a PR number was invented for a subject that names none"
 ok "(a) attribution: trailing (#N) wins over an earlier issue ref; no PR named → no PR invented"
+
+# ── HERD-476 (i): an HONEST identity for kind=ci reds, parsed from the failing run's OWN logs ──────
+# Before this fix, _main_health_ci_leg's render string ("CI <workflow>: <conclusion>") was the ONLY
+# identity autofix ever saw for a branch-CI red — content-free, so EVERY kind=ci red skipped as
+# dishonest, even when the failing run's own log (scripts/ci/run-suite.sh's "real-failed tests:"
+# block) already named a real test. _main_health_ci_log_identity re-derives it from that log.
+
+# (j) a kind=ci red whose run log names one real failing test is honest: MAIN_HEALTH_AUTOFIX files it,
+# citing that test — not the generic conclusion string.
+reset_state
+MAIN_HEALTH_AUTOFIX=on
+new_sha "feat: a sha whose branch CI reds with a real failing test in its log"
+SHA476="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA476"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9001}]'
+export GH_LOG_FAILED="$(printf 'ubuntu-shard\trun tests\t   real-failed tests:\nubuntu-shard\trun tests\t     ✗ test-yolo-drain-mode.sh\n')"
+_main_health_ci_leg
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(j) setup: the CI conclusion did not paint MAIN RED"
+[ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 1 ] || fail "(j) an honest CI-log identity did not file"
+[ "$(jcount '"event":"main_health_autofix".*"failed":"test-yolo-drain-mode.sh"')" -eq 1 ] || fail "(j) the autofix journal did not cite the CI-log-derived test"
+grep -q '^MAIN RED: fix test-yolo-drain-mode.sh$' "$SCRIBE_LOG" || fail "(j) the scribe title did not name the CI-log-derived test, not the generic conclusion: $(cat "$SCRIBE_LOG")"
+IFS=$'\x1f' read -r _j_sha _j_since _j_local _j_ci < "$MAIN_HEALTH_STATE"
+[ "$_j_ci" = "test-yolo-drain-mode.sh" ] || fail "(j) the log-derived identity was not persisted into the standing CI row (still the generic render?): '$_j_ci'"
+ok "(j) a kind=ci red whose run log names a real failing test is honest: MAIN_HEALTH_AUTOFIX files it"
+unset GH_RUNS GH_LOG_FAILED
+
+# (j2) MARK-KEY MUST EQUAL CLEAR-KEY (review finding, PR #600): a green→red re-arm cycle for a kind=ci
+# identity actually releases the shared-pool fix marker, so a LATER regression of the SAME CI test
+# files fresh instead of dedup'ing forever. Before the persist fix above, the marker was claimed under
+# the log-derived name but _main_health_clear released it under whatever the state file's ci field
+# said — the generic "CI <workflow>: <conclusion>" render — so the marker leaked permanently.
+reset_state
+MAIN_HEALTH_AUTOFIX=on
+new_sha "feat: a sha whose branch CI reds with a re-arm-able failing test"
+SHA_R1="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_R1"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9101}]'
+export GH_LOG_FAILED="$(printf 'ubuntu\trun\t   real-failed tests:\nubuntu\trun\t     ✗ test-rearm.sh\n')"
+_main_health_ci_leg
+[ "$(jcount '"event":"main_health_autofix".*"failed":"test-rearm.sh".*"result":"enqueued"')" -eq 1 ] || fail "(j2) setup: the first reproduction did not file"
+IFS=$'\x1f' read -r _j2_sha _j2_since _j2_local _j2_ci < "$MAIN_HEALTH_STATE"
+[ "$_j2_ci" = "test-rearm.sh" ] || fail "(j2) the standing CI identity was not persisted as the log-derived test name: '$_j2_ci'"
+
+# CI recovers on the SAME sha (a later run of the same commit going green) — the leg's PASS branch
+# clears the CI identity, which must release the marker under the SAME key it was claimed under.
+export GH_RUNS='[{"headSha":"'"$SHA_R1"'","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":9102}]'
+_main_health_ci_leg
+[ ! -s "$MAIN_HEALTH_STATE" ] || fail "(j2) the CI recovery did not clear the standing red: $(cat "$MAIN_HEALTH_STATE")"
+
+# The SAME failing test regresses again (a new commit) — if the marker had leaked, this would dedup
+# instead of filing fresh.
+new_sha "feat: the same CI test regresses again after recovery"
+SHA_R2="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_R2"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9103}]'
+_main_health_ci_leg
+[ "$(jcount '"event":"main_health_autofix".*"failed":"test-rearm.sh".*"result":"enqueued"')" -eq 2 ] || fail "(j2) a later regression of the same CI test did not file fresh — the fix marker leaked"
+[ "$(jcount '"event":"main_health_autofix".*"failed":"test-rearm.sh".*"result":"dedup"')" -eq 0 ] || fail "(j2) a later regression was wrongly deduped against a leaked marker"
+ok "(j2) a green→red re-arm cycle for a kind=ci identity releases the marker: a later regression of the same test files fresh (mark-key == clear-key)"
+unset GH_RUNS GH_LOG_FAILED
+
+# (k) TWO distinct failing tests in the same log are both captured, comma-joined and deduped — proof
+# this is a real parse of every ✗ line, not a first-match shortcut (a regression that stopped at the
+# first ✗ line, or hardcoded a single name, would fail this).
+export GH_LOG_FAILED="$(printf 'ubuntu\trun\t   real-failed tests:\nubuntu\trun\t     ✗ test-a.sh\nubuntu\trun\t     ✗ test-b.sh (TIMEOUT after 120s)\n')"
+_K_ID="$(_main_health_ci_log_identity 9002)"
+grep -q 'test-a.sh' <<< "$_K_ID" || fail "(k) the first failing test was dropped: '$_K_ID'"
+grep -q 'test-b.sh' <<< "$_K_ID" || fail "(k) the second failing test was dropped: '$_K_ID'"
+ok "(k) multiple real-failed test names in one log are all captured, comma-joined"
+unset GH_LOG_FAILED
+
+# (l) an UNREADABLE ci log (gh run view returns nothing: offline, old gh, no matching run) skips with
+# its OWN reason, ci-log-unreadable — and NEVER falls through to file off the generic conclusion
+# string (the pre-fix dishonest-identity path). The red row itself still paints; only autofix declines.
+reset_state
+MAIN_HEALTH_AUTOFIX=on
+new_sha "feat: a sha whose branch CI reds but the log is unreadable"
+SHA476C="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA476C"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9003}]'
+export GH_LOG_FAILED=""
+_main_health_ci_leg
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(l) the red row itself must still paint even though autofix could not file"
+[ "$(jcount '"event":"main_health_autofix".*"reason":"ci-log-unreadable"')" -eq 1 ] || fail "(l) an unreadable CI log was not skipped with reason=ci-log-unreadable"
+[ "$(jcount '"event":"main_health_autofix".*"reason":"dishonest-identity"')" -eq 0 ] || fail "(l) an unreadable CI log fell through to the generic dishonest-identity skip"
+[ "$(grep -c . "$SCRIBE_LOG")" -eq 0 ] || fail "(l) an unreadable CI log filed an item anyway"
+ok "(l) an unreadable/unparseable CI log skips with reason=ci-log-unreadable, never files off the generic conclusion string"
+unset GH_RUNS GH_LOG_FAILED
+
+# (m) no run id at all (an older `gh` whose --json omitted databaseId) degrades the same fail-soft way:
+# empty, never a crash, never a guess.
+[ -z "$(_main_health_ci_log_identity "")" ] || fail "(m) an empty run id produced a non-empty identity"
+ok "(m) _main_health_ci_log_identity with no run id returns empty (fail-soft)"
+
+# (n) an XFAIL-only log (run-suite.sh's ⚠️ env-sensitive line, no ✗ real-failure line) yields no
+# identity — the parser is anchored on the REAL-failure glyph, never an env-sensitive skip note.
+export GH_LOG_FAILED="$(printf 'ubuntu\trun\t⚠️  XFAIL (env-sensitive) test-flaky.sh: known issue\n')"
+[ -z "$(_main_health_ci_log_identity 9004)" ] || fail "(n) an XFAIL-only log was treated as a real failing identity"
+ok "(n) an XFAIL-only log (no ✗ real-failure line) yields no identity"
+unset GH_LOG_FAILED
+MAIN_HEALTH_AUTOFIX=off
+
+# ── HERD-476 (ii): MAIN_HEALTH_AUTOFIX=spawn dispatches a tracked+claimed quick-lane build ─────────
+# No stub: _main_health_autofix_spawn calls the REAL scripts/herd/spawn.sh, which only ENQUEUES into
+# the durable spawn queue ($WORKTREES_DIR/spawn-queue/) — draining it into an actual herdr tab/agent is
+# _drain_spawn_queue's job, never invoked here, so this stays fully hermetic: no worktree, no claim
+# lookup, no network. TRACKED_SPAWNS / CLAIM_REQUIRED both default off, so spawn.sh's own gates pass
+# through untouched, exactly the "tracked+claimed WHEN a project opts into those levers" contract.
+SPAWN_Q="$TREES_DIR/spawn-queue"
+spawn_reqs() { ls "$SPAWN_Q"/*.req 2>/dev/null | wc -l | tr -d ' '; }
+latest_req() { ls -t "$SPAWN_Q"/*.req 2>/dev/null | sed -n '1p'; }
+
+# (o) a FRESH honest local red under MAIN_HEALTH_AUTOFIX=spawn both files the scribe item AND
+# dispatches a tracked+claimed quick-lane spawn, carrying the failing identity as HERD_ITEM_REF.
+reset_state
+MAIN_HEALTH_AUTOFIX=spawn
+printf 'red-file\n' > "$HC_MODE"
+new_sha "feat: reds main with autofix=spawn"
+SHASPAWN="$(head_sha)"
+reconcile_main_health; settle
+[ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 1 ] || fail "(o) autofix=spawn did not file the scribe item"
+[ "$(jcount '"event":"main_health_autofix_spawn".*"result":"enqueued"')" -eq 1 ] || fail "(o) autofix=spawn did not journal a spawn enqueue"
+[ "$(spawn_reqs)" -eq 1 ] || fail "(o) spawn.sh did not enqueue exactly one intent: $(ls "$SPAWN_Q" 2>/dev/null)"
+REQ_O="$(latest_req)"
+grep -q "^main-red-${SHASPAWN:0:8}-" "$REQ_O" || fail "(o) the spawn slug does not embed the red sha: $(cat "$REQ_O")"
+[ "$(sed -n '2p' "$REQ_O")" = "quick" ] || fail "(o) the spawn did not use the quick lane: $(cat "$REQ_O")"
+grep -q 'app/greet.test.sh' "$REQ_O" || fail "(o) the spawn task does not name the failing test: $(cat "$REQ_O")"
+[ "$(cat "${REQ_O%.req}.ref" 2>/dev/null)" = "app/greet.test.sh" ] || fail "(o) the spawn's tracker ref is not the failing identity: $(cat "${REQ_O%.req}.ref" 2>/dev/null)"
+ok "(o) MAIN_HEALTH_AUTOFIX=spawn files the scribe item AND dispatches a tracked+claimed quick-lane spawn"
+
+# (p) the SAME identity's dedup'd reproduction never spawns a SECOND builder — spawn rides the exact
+# shared-pool once-per-identity claim the file-only path already relies on.
+MAIN_HEALTH_RECHECK_MINS=30
+touch -t 200001010000 "$(_main_health_marker "$SHASPAWN")"
+reconcile_main_health; settle
+[ "$(jcount '"event":"main_health_autofix".*"result":"dedup"')" -ge 1 ] || fail "(p) the re-verify was not journaled as a dedup"
+[ "$(spawn_reqs)" -eq 1 ] || fail "(p) a dedup'd reproduction spawned a SECOND builder for the same identity: $(ls "$SPAWN_Q" 2>/dev/null)"
+MAIN_HEALTH_RECHECK_MINS=0
+ok "(p) a dedup'd reproduction of the same identity never spawns a second builder"
+
+# (q) MAIN_HEALTH_AUTOFIX=on (not the literal 'spawn') never touches spawn.sh — the file-only default
+# is byte-unchanged by this feature.
+reset_state
+MAIN_HEALTH_AUTOFIX=on
+printf 'red-file\n' > "$HC_MODE"
+new_sha "feat: reds main with autofix=on (file-only, not spawn)"
+reconcile_main_health; settle
+[ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 1 ] || fail "(q) setup: autofix=on did not file"
+[ "$(spawn_reqs)" -eq 0 ] || fail "(q) MAIN_HEALTH_AUTOFIX=on (file-only) spawned a builder anyway: $(ls "$SPAWN_Q" 2>/dev/null)"
+ok "(q) MAIN_HEALTH_AUTOFIX=on stays file-only: no spawn.sh call"
+
+# (r) a MISSING spawn.sh journals no-spawn-sh and never blocks the file-only path (fail-soft).
+reset_state
+MAIN_HEALTH_AUTOFIX=spawn
+printf 'red-tap\n' > "$HC_MODE"
+new_sha "feat: reds main with autofix=spawn but spawn.sh is missing"
+mv "$HERE/spawn.sh" "$HERE/spawn.sh.disabled"
+reconcile_main_health; settle
+mv "$HERE/spawn.sh.disabled" "$HERE/spawn.sh"
+[ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 1 ] || fail "(r) the scribe file did not still happen when spawn.sh is missing"
+[ "$(jcount '"event":"main_health_autofix_spawn".*"reason":"no-spawn-sh"')" -eq 1 ] || fail "(r) a missing spawn.sh was not journaled as no-spawn-sh"
+ok "(r) a missing spawn.sh journals no-spawn-sh and never blocks the file-only path"
+MAIN_HEALTH_AUTOFIX=off
 
 echo "ALL PASS ($pass checks)"
