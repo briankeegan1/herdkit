@@ -75,7 +75,8 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in _classify_finish_stall _draft_auto_promote_enabled _draft_promote_once _draft_promote_pr \
           _reconcile_draft_stall _row_draft_stall _finish_stall_scan_summary _prs_fetch_tick \
-          _discover_feature_worktrees _finish_stall_note_pr_opened _watcher_tick_fields; do
+          _discover_feature_worktrees _finish_stall_note_pr_opened _watcher_tick_fields \
+          herd_agent_name_sanitize; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
 
@@ -334,6 +335,95 @@ grep -q '"event":"finish_stall_detected".*"reason":"draft_pr"' "$JOURNAL_FILE" \
 # NEGATIVE SEAM: the promoted-slug builder (a REAL, non-draft — BLOCKED, not DRAFT — PR) must NEVER
 # surface a draft-PR stall, however long it sits idle.
 ! grep -q 'promoted-slug' "$JOURNAL_FILE" || fail "live loop: promoted-slug (a non-draft PR) must never appear in a draft-stall journal event: $(grep promoted-slug "$JOURNAL_FILE")"
+ok
+
+# ── HERD-483: AUTOFIX-SPAWNED builders are invisible to finish_stall_scan ──────────────────────────
+# herd_agent_name_sanitize (driver.sh) is the ONE seam every herdr registration routes a name through
+# before `herdr agent start` — lowercase, [^a-z0-9_-] -> '-', truncated to herdr's 32-char cap. A
+# human-picked slug is short kebab-case, so the sanitizer is a no-op and the registered herdr agent
+# NAME equals the worktree-basename slug the tick loop matches astatus by. MAIN_HEALTH_AUTOFIX=spawn's
+# algorithmic 'main-red-<sha8>-<detail>' slugs routinely exceed 32 chars, so the REGISTERED name and
+# the raw slug diverge — before the fix, astatus read permanently empty and PRs #605/#606 sat
+# draft+idle 55min with zero finish_stall/draft_pr_promoted events despite a live, idle agent.
+#
+# This fixture reproduces that exact shape: a real git worktree on a long autofix-style slug, with
+# AGENTS_JSON registering ONLY the SANITIZED (herdr-truncated) name — precisely what a real herdr
+# daemon would report for such a slug — then drives the SAME real tick sequence through DETECTION and
+# (DRAFT_AUTO_PROMOTE=on) PROMOTION, mirroring the task-writer's own frame: "an AUTOFIX-SPAWNED idle
+# builder over a draft PR is detected + promoted".
+RAW_SLUG="main-red-489495a4-a-very-long-generated-test-identity-slug"
+SAN_SLUG="$(herd_agent_name_sanitize "$RAW_SLUG")"
+# MUTATION-PROVE precondition: if a future herdr relaxes its 32-char cap (or this literal slug shrinks
+# under refactoring) so RAW_SLUG no longer differs from its sanitized form, this fixture stops
+# exercising the mismatch at all and every assertion below would pass VACUOUSLY. Fail loudly instead.
+[ "$RAW_SLUG" != "$SAN_SLUG" ] || fail "fixture no longer exercises the sanitize mismatch (RAW_SLUG already equals its sanitized form) — widen RAW_SLUG"
+[ "${#SAN_SLUG}" -le 32 ] || fail "herd_agent_name_sanitize returned a name over its own 32-char cap: $SAN_SLUG"
+
+git -C "$MAIN" worktree add -q -b "feat/$RAW_SLUG" "$TREES/$RAW_SLUG" main
+SHA_AUTOFIX="$(git -C "$TREES/$RAW_SLUG" rev-parse HEAD)"
+
+_autofix_tick() {
+  _prs_fetch_tick
+  WT="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null || echo '')"
+  # Only the SANITIZED name is registered — exactly what a real herdr daemon reports for a slug this
+  # long. A raw-slug-only lookup (the pre-HERD-483 behavior) finds nothing here by construction.
+  AGENTS_JSON="{\"result\":{\"agents\":[{\"name\":\"$SAN_SLUG\",\"agent_status\":\"idle\"}]}}"
+  FEATS=()
+  while IFS= read -r rec; do
+    [ -n "$rec" ] && FEATS+=("$rec")
+  done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" TREES="$TREES" _discover_feature_worktrees)
+  _FSS_ELIGIBLE=0; _FSS_RETASKED=0; _FSS_ESCALATED=0
+  for rec in ${FEATS[@]+"${FEATS[@]}"}; do
+    IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail isdraft <<EOF
+$rec
+EOF
+    [ -n "$prnum" ] && _finish_stall_note_pr_opened "$slug"
+    _dstall=""
+    if [ -n "$prnum" ] && [ "$isdraft" = "1" ]; then
+      case "$astatus" in
+        done|idle) _dstall="$(_reconcile_draft_stall "$slug" "$astatus" "$prnum")" ;;
+      esac
+      case "$_dstall" in
+        PENDING)     _FSS_ELIGIBLE=$((_FSS_ELIGIBLE + 1)) ;;
+        PROMOTED)    _FSS_RETASKED=$((_FSS_RETASKED + 1)) ;;
+        FIRST_STALL|SECOND_STALL|ESCALATED) _FSS_ESCALATED=$((_FSS_ESCALATED + 1)) ;;
+      esac
+    elif [ -n "$prnum" ] && _finish_stall_enabled; then
+      _finish_stall_clear "draftpr:${slug}"
+    fi
+  done
+  _FINISH_STALL_SCAN_TICK=$((_FINISH_STALL_SCAN_TICK + 1))
+  if [ "$_FINISH_STALL_SCAN_TICK" -ge "$_FINISH_STALL_SCAN_INTERVAL" ]; then
+    _FINISH_STALL_SCAN_TICK=0
+    _finish_stall_scan_summary "$_FSS_ELIGIBLE" "$_FSS_RETASKED" "$_FSS_ESCALATED"
+  fi
+}
+
+: > "$JOURNAL_FILE"; : > "$GH_PR_READY_LOG"; : > "$HERDR_NOTIFY_LOG"
+export DRAFT_AUTO_PROMOTE=on
+export LIVE_TICK_PRS_JSON="$(python3 -c '
+import json, os
+print(json.dumps([
+  {"number":905,"title":"autofix builder","headRefName":"feat/'"$RAW_SLUG"'","headRefOid":"'"$SHA_AUTOFIX"'","mergeable":"MERGEABLE","mergeStateStatus":"UNKNOWN","isDraft":True},
+]))
+')"
+# Two ticks — WITHIN grace, then PAST it — exactly mirrors the direct-call E2E case above
+# (PENDING then FIRST_STALL/PROMOTED), just driven through the REAL discovery/tick sequence instead
+# of calling _reconcile_draft_stall directly. _FINISH_STALL_SCAN_TICK is primed so each tick's summary
+# journals immediately (no need to iterate to the throttle interval to observe the verdict).
+_FINISH_STALL_SCAN_TICK=$_FINISH_STALL_SCAN_INTERVAL
+HERD_NOW_EPOCH="$NOW" _autofix_tick
+grep -q '"event":"finish_stall_scan".*"result":"eligible"' "$JOURNAL_FILE" \
+  || fail "autofix live loop tick1: finish_stall_scan did not report eligible for an idle autofix-spawned builder over a draft PR — the exact HERD-483 miss: $(cat "$JOURNAL_FILE")"
+
+_FINISH_STALL_SCAN_TICK=$_FINISH_STALL_SCAN_INTERVAL
+HERD_NOW_EPOCH="$((NOW + GRACE + 1))" _autofix_tick
+grep -q '"event":"finish_stall_detected".*"reason":"draft_pr"' "$JOURNAL_FILE" \
+  || fail "autofix live loop tick2: expected finish_stall_detected(reason=draft_pr) for the long-slug autofix builder: $(cat "$JOURNAL_FILE")"
+grep -q '"event":"draft_pr_promoted","pr":905' "$JOURNAL_FILE" \
+  || fail "autofix live loop tick2: DRAFT_AUTO_PROMOTE=on should have promoted PR #905 (detected + promoted), got: $(cat "$JOURNAL_FILE")"
+[ "$(cat "$GH_PR_READY_LOG" 2>/dev/null)" = "905" ] || fail "autofix live loop: expected exactly one 'gh pr ready 905', got: $(cat "$GH_PR_READY_LOG" 2>/dev/null)"
+unset DRAFT_AUTO_PROMOTE
 ok
 
 echo "ok — $pass draft-PR-stall assertions passed"
