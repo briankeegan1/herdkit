@@ -76,6 +76,10 @@ The watcher **always**:
 - `MERGE_POLICY` should be set explicitly for unattended intent (default is `auto` — the watcher merges on pass; use `approve` for coordinator sign-off via `herd-approve.sh`, or `observe` to never merge).
 - `CLAIM_REQUIRED` should be `on` if a shared project (prevents concurrent operator claims).
 - `COORDINATOR_WATCHDOG` should be enabled (so the coordinator auto-resumes on limit-hit or crash).
+- `WATCHER_RESURRECT` should be enabled, with a cron/launchd job calling `herd watcher-resurrect` on
+  a schedule (e.g. every 5-15 min) — see "Watcher is dead" below. COORDINATOR_WATCHDOG only revives
+  the coordinator; it runs as code the watcher's own tick loop executes, so it cannot help if the
+  watcher process itself has died (HERD-489).
 - Backlog must be well-prioritized (the coordinator respects top-to-bottom order).
 
 **Launch**:
@@ -98,7 +102,7 @@ herd status --json | jq '.watcher.alive | select(. == false)' && notify_ops "Wat
 ```
 
 **Troubleshooting**:
-- **Watcher is dead**: Run `herd reload` to restart it. If it dies again immediately, check the watcher log: `herd log --component watcher --tail 20`.
+- **Watcher is dead**: Run `herd reload` to restart it. If it dies again immediately, check the watcher log: `herd log --component watcher --tail 20`. To stop finding out about this only when a human happens to look, wire a cron/launchd job to run `herd watcher-resurrect` on a schedule and set `WATCHER_RESURRECT=on` (default off, HERD-489) — it relaunches ONLY on a confirmed zero-watcher verdict (never doubles a live one) via the same verified `herd reload` seam, and journals the resurrection loudly (`herd log` shows `watcher_resurrect_detected` / `watcher_resurrected`).
 - **Coordinator is paused on limit**: The `COORDINATOR_WATCHDOG` should have auto-resumed it. Check the journal: `herd log --component coordinator --tail 20`. If no auto-resume event, the watchdog may not be enabled; enable it with `herd config set COORDINATOR_WATCHDOG on`.
 - **A builder is stuck**: Check `herd status` for in-flight worktrees. Run `herd why <pr#>` to see the full gate history. If it's wedged (no state change for >30 min), surface it to the human (a HUMAN-VERIFY / ESCALATE note via the coordinator) — there is no dedicated escalate subcommand; the journal + status console carry the trail.
 - **A review keeps BLOCKING**: Run `herd log --pr <pr#>` to see the review comments. Either the code needs fixing, or the review gate is too strict. If misconfigured, adjust `REVIEW_CHECKLIST` or set `REVIEW_MODEL_CHEAP` for non-blocking passes.

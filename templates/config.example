@@ -417,6 +417,21 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # recommendation row and every gate dispatch are byte-identical to before. Watcher-affecting.
 # WATCHER_SELF_RESTART="off"   # off (default) | on
 
+# External-cadence WATCHER RESURRECTION (HERD-489) — on | off (default off, ship-dormant). Every
+# lever above (WATCHER_SELF_RESTART, WATCHER_SINGLETON_RECONCILE, COORDINATOR_WATCHDOG) is code the
+# watcher's OWN tick loop runs, so none of them can save you the day the watcher process itself is
+# not running at all (grounded: a 5-hour outage, 2026-08-02). This key gates a SEPARATE short-lived
+# probe (`herd watcher-resurrect`, scripts/herd/watcher-resurrect.sh) meant to be driven by an
+# operator cron/launchd job on an external cadence — the one place code CAN run when the watcher
+# cannot. ON → each invocation classifies this project's watcher via the shared HERD-450 seam
+# (watcher_singleton_verdict — the same argv0 + lockfile/flock check `herd status` uses) and acts
+# ONLY on a CONFIRMED zero-mains verdict; any live main, drifted lock, duplicate, or self-restart
+# handoff is left STRICTLY alone, so a live watcher is NEVER doubled. On a confirmed-dead watcher it
+# journals watcher_resurrect_detected, relaunches through the VERIFIED stop/start seam (`herd
+# reload`, issue #579), and journals watcher_resurrected (or watcher_resurrect_failed). OFF (default)
+# → byte-inert even when the probe is invoked: no verdict call, no journal write, no relaunch.
+# WATCHER_RESURRECT="off"      # off (default) | on
+
 # Cross-seat OPERATOR INBOX (HERD-184) — so coordination messages left as comments reach an autonomous
 # coordinator automatically. ON → each watcher tick surfaces NEW comments by OTHER authors as a
 # 'operator inbox' console section (needs-you-adjacent) plus one notify-once per comment: (a) a
