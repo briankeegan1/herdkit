@@ -96,6 +96,7 @@ Role summarized from each file's top-of-file comment.
 - `sweep.sh` — the engine behind `herd sweep`: ONE-COMMAND CONTROL-ROOM CLEANUP (HERD-191).
 - `symbol-index.sh` — bespoke, bash-native def→caller index behind `herd symbol-index`. The companion
 - `task-spec-view.sh` — task-spec-view.sh <spec-file> — live, styled viewer for a BUILDER tab's otherwise-idle root pane.
+- `test-cap-ledger.sh` — THE shared PER-TEST TIMEOUT LEDGER library (HERD-478): scripts/ci/run-suite.sh
 - `theme.sh` — pluggable theming (HERD_THEME) for every herd color surface.
 - `tracker-state-sweep.sh` — periodic, ADVISORY tracker-state SELF-HEAL sweep (HERD-86).
 - `triggers.sh` — SCHEDULED / TRIGGERED RUNS (HERD-169): a cron-style trigger spawns a defined workflow
