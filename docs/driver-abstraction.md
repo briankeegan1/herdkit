@@ -77,6 +77,54 @@ the raw command, is the unit of abstraction.
 
 ---
 
+## `send-text` under Claude Code's own permission classifier (GH #564)
+
+The coordinator itself is usually a Claude Code session, and it usually runs in Claude Code's
+**default auto permission mode**. In that mode every `Bash` call is approved or refused by a
+permission **classifier** before it runs — and `herdr pane run <pane> "<text>"` reads, to that
+classifier, as "execute this arbitrary string in a shell I don't control." That is a fair read: the
+`<text>` argument genuinely is free text the coordinator composed and is injecting into a live agent
+session. Under the default posture the call is refused with `Blocked by classifier` **before it ever
+reaches the pane** — this is not herdkit config drift, it reproduces from a fresh consuming project
+with `HERD_DRIVER` unset (the shipped default, `herdr-claude`) the first time `send-text` fires.
+
+This is load-bearing, not cosmetic: `switch-model` is built entirely on `send-text` (the *only*
+documented mid-flight model step-up mechanism — `MODEL_ESCALATE_GLOB` cannot cover scope discovered
+after a builder has already spawned), and the skill's hand re-task path for a blocked review
+(`REVIEW_AUTOFIX=false`, the default) also routes through it. So under default config *and* default
+permission mode, both of the coordinator's documented remedies for "a builder needs my help right
+now" are commands it is not permitted to run — and the failure is silent until the moment one is
+needed.
+
+**Fix it at the seam by pre-approving the exact command the active driver issues.** Read the live
+binding for your `HERD_DRIVER` with `herd_driver_agent_value` (`scripts/herd/driver.sh`), or just use
+the default `herdr-claude` shape below, and add an `allow` rule to the coordinator's own
+`.claude/settings.json` — or `.claude/settings.local.json` for a per-machine-only grant:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(herdr pane run:*)",
+      "Bash(herdr pane send-keys:*)",
+      "Bash(herdr pane read:*)"
+    ]
+  }
+}
+```
+
+`read-pane` and `send-keys` bind to the same `herdr pane …` shape `send-text` does (see the
+capability table above) and the watcher / hand re-tasking exercise them too, so grant all three
+together — otherwise the second and third block one at a time, the same silent-until-needed way
+`send-text` did. This is **operational guidance for the consuming project, not an engine change**:
+herdkit renders no `.claude/settings.json` of its own (a project's permission posture is that
+project's call — the same stance `docs/macos-unattended-permissions.md` takes for the OS-level TCC
+posture), so there is nothing in the coordinator skill to change here, only a constraint to document
+at the exact seam it applies to. If you would rather narrow the grant than allow the whole `herdr
+pane run:*` prefix, scope it to your project's actual pane-label pattern instead.
+
+---
+
 ## Inventory: driver incantations in `templates/coordinator.md.tmpl`
 
 Every place the coordinator skill is currently bound to herdr + Claude Code. After the phase-1

@@ -188,4 +188,26 @@ got="$(env -u HERD_DRIVER HERD_CLAUDE_FLAGS='--custom-yolo' bash -c '. "$1"; '"$
   || fail "explicit HERD_CLAUDE_FLAGS override did not win for a grok ref: got [$got]"
 ok; echo "PASS (7) HERD-201: lanes derive the permission flag from the resolved runtime (grok/codex own flag; claude byte-identical; explicit override wins)"
 
+# ── 8. HERD-475 / GH #564: the send-text permission-classifier constraint is documented at the seam.
+# `herdr pane run` is refused (`Blocked by classifier`) by Claude Code's default auto permission mode
+# because it reads as "execute arbitrary text in a shell I don't control" — a real, reproducible
+# constraint, not something this repo's code can silently fix (Claude Code's own classifier is not
+# herdkit's to change). The remedy is a documented `.claude/settings.json` allow rule at the exact
+# seam a coordinator hits it. Assert the documentation survives, not the prose.
+TMPL="$ROOT/templates/coordinator.md.tmpl"
+DOC="$ROOT/docs/driver-abstraction.md"
+grep -q 'Blocked by classifier' "$TMPL" \
+  || fail "8: coordinator.md.tmpl's DRIVER:send-text bullet no longer documents the classifier block (GH #564)"
+grep -q 'driver-abstraction.md' <<< "$(grep -A8 'DRIVER:send-text' "$TMPL")" \
+  || fail "8: coordinator.md.tmpl's DRIVER:send-text bullet no longer points at docs/driver-abstraction.md"
+grep -q 'GH #564' "$DOC" \
+  || fail "8: docs/driver-abstraction.md no longer references GH #564"
+grep -q 'Bash(herdr pane run:\*)' "$DOC" \
+  || fail "8: docs/driver-abstraction.md dropped the herdr pane run permission allow-rule example"
+grep -q 'Bash(herdr pane send-keys:\*)' "$DOC" \
+  || fail "8: docs/driver-abstraction.md dropped the herdr pane send-keys permission allow-rule example"
+grep -q 'Bash(herdr pane read:\*)' "$DOC" \
+  || fail "8: docs/driver-abstraction.md dropped the herdr pane read permission allow-rule example"
+ok; echo "PASS (8) HERD-475/GH#564: send-text permission-classifier constraint documented at the seam (coordinator.md.tmpl + driver-abstraction.md)"
+
 echo "ALL PASS ($pass checks)"
