@@ -19,12 +19,15 @@
 # in every Linear client view).
 #
 # Credentials: LINEAR_API_KEY is read from .herd/secrets (gitignored) — NEVER from .herd/config.
-# Loud error + exit 1 if it is absent. An optional LINEAR_TEAM_ID (also from .herd/secrets) names
-# the team new issues are filed under and, critically, scopes the open-issue list — so a second
-# private team's issues never leak into 'herd backlog'. It deliberately does NOT scope issue
-# resolution (mark_shipped / item_state); that is keyed off the identifier's own team (see below).
-# When unset, the first team the key can see files new issues and the open list spans every team the
-# key can see (legacy all-teams behavior).
+# Loud error + exit 1 if it is absent. An optional LINEAR_TEAM_ID names the team new issues are
+# filed under and, critically, scopes the open-issue list — so a second private team's issues never
+# leak into 'herd backlog' (HERD-474, GH #582). It deliberately does NOT scope issue resolution
+# (mark_shipped / item_state); that is keyed off the identifier's own team (see below). When unset,
+# the first team the key can see files new issues and the open list spans every team the key can see
+# (legacy all-teams behavior). Unlike LINEAR_API_KEY, a team id is not a credential, so it is a
+# documented templates/capabilities.tsv config key: set it with `herd config set LINEAR_TEAM_ID <id>`
+# (committed .herd/config) or alongside LINEAR_API_KEY in .herd/secrets, which is sourced AFTER
+# .herd/config and so wins if both are set.
 #
 # Issue resolution uses issues(filter: { number, team }) — Linear DEPRECATED and removed the
 # issueSearch endpoint (2026-07: every call returns errors[0].message='deprecated', HTTP 400), so

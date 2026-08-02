@@ -207,7 +207,9 @@ check("a': the DEAD scan still catches real dead keys", not probe_dead,
 # read of an undeclared, non-exempt var trips this — forcing a deliberate declare-or-exempt choice.
 EXEMPT_PREFIX = (
     "HERD_",            # engine runtime/CLI/test-seam namespace (real HERD_ config keys are declared)
-    "JIRA_", "LINEAR_", # tracker-backend secrets — sourced from .herd/secrets, never .herd/config
+    "JIRA_", "LINEAR_", # tracker-backend secrets — sourced from .herd/secrets, never .herd/config.
+                        # LINEAR_TEAM_ID is the one exception: not a credential, so it is DECLARED
+                        # (HERD-474) and short-circuits this prefix rule via `k in declared` above.
     "C_",               # theme palette color vars (theme.sh)
     "HANDOFF_",         # handoff.sh capture fields
     "SWEEP_",           # backlog-reconcile-sweep.sh scoring seams + sweep.sh internals (SWEEP_AUTO is declared)
