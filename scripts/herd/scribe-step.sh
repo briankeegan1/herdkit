@@ -313,6 +313,71 @@ _scribe_auto_marker() {
   fi
 }
 
+# ── HERD-490: an Add for an ALREADY-MERGED PR must be filed DONE, never left in Backlog ──────────
+# The sweep's retroactive-linkage leg (sweep.sh's sweep_leg_links / _sweep_relink_request) files a
+# ship-record for a merged PR whose tracker ref resolves to nothing. That work is not queued — it is
+# already shipped — so a plain Add leaves it sitting in the backend's default new-issue state
+# (Backlog/Triage/unstarted) forever: a phantom row that never reflects reality unless a human
+# happens to notice and fix it by hand. The anchored "UNMATCHED-MERGE: <pr-url>" marker (see
+# _scribe_unmatched_merge_pr) is this leg's own signal, parsed the same CONSERVATIVE way HERD-183's
+# sequencing clause is, so the auto-ship never fires on a request that merely mentions "merged" in
+# passing prose.
+
+# _scribe_unmatched_merge_pr <body> — echo the PR URL when <body> carries the sweep's ANCHORED
+# "UNMATCHED-MERGE: <pr-url>" marker; else echo nothing. Same anchoring discipline as
+# _scribe_seq_blocker: a leading word boundary, one fixed literal form, never fuzzy prose.
+_scribe_unmatched_merge_pr() {
+  printf '%s' "$1" | python3 -c '
+import sys, re
+body = sys.stdin.read()
+m = re.search(r"(?<![A-Za-z0-9])UNMATCHED-MERGE:\s*(\S+)", body)
+if m:
+    sys.stdout.write(m.group(1))
+' 2>/dev/null || true
+}
+
+# _scribe_auto_ship <backend> <add-result> <add-stdout-file> <pr-url> — after an Add whose body
+# carried the UNMATCHED-MERGE marker, immediately move the NEW item into the Done state via
+# _backend_mark_shipped (which also comments the PR link — the same op every backend already defines
+# for shipping an item, previously never wired up to a create path). FAIL-SOFT throughout — the item
+# is already filed; shipping it is best-effort:
+#   - only runs when the Add actually created an item (add-result = DONE);
+#   - needs a machine id for the new item (from the backend's add stdout); none surfaced → soft note;
+#   - a backend with no mark-shipped op → soft note, item stays as filed (never a hard failure).
+# Journals ONE tracker_create_unmatched_merge event, ALWAYS, attributed component=sweep
+# reason=unmatched-merge — a create along this path is never a silent, unattributed write.
+_scribe_auto_ship() {
+  local backend="$1" result="$2" out_file="$3" pr="$4" new_id _as_saved_result _as_ship_result
+  [ "$result" = "DONE" ] || return 0
+  new_id="$(_scribe_new_item_ref "$out_file")"
+  if [ -z "$new_id" ]; then
+    echo "scribe-step: HERD-490 UNMATCHED-MERGE marker present but backend '$backend' surfaced no id for the new item — could not auto-mark it done (it needs a manual state fix)." >&2
+    journal_append tracker_create_unmatched_merge ref "" pr "$pr" component sweep reason unmatched-merge result NOCHANGE
+    return 0
+  fi
+  if ! command -v _backend_mark_shipped >/dev/null 2>&1; then
+    echo "scribe-step: backend '$backend' defines no _backend_mark_shipped op — $new_id stays as filed, not auto-shipped. [HERD-490]" >&2
+    journal_append tracker_create_unmatched_merge ref "$new_id" pr "$pr" component sweep reason unmatched-merge result NOCHANGE
+    return 0
+  fi
+  # _BACKEND_RESULT is a SHARED global the caller (_scribe_post_add, right after we return) reads to
+  # judge whether the CREATE succeeded — never let the SHIP outcome clobber it. Save/restore around
+  # the mark-shipped call so the caller always sees "DONE" (the create it actually cares about),
+  # regardless of whether the best-effort auto-ship itself lands.
+  _as_saved_result="$_BACKEND_RESULT"
+  HERD_COMPONENT="sweep" _BACKEND_RESULT=""
+  export HERD_COMPONENT
+  _backend_mark_shipped "$new_id" "$pr" >/dev/null 2>&1 || true
+  _as_ship_result="${_BACKEND_RESULT:-NOCHANGE}"
+  _BACKEND_RESULT="$_as_saved_result"
+  journal_append tracker_create_unmatched_merge ref "$new_id" pr "$pr" component sweep reason unmatched-merge result "$_as_ship_result"
+  if [ "$_as_ship_result" = "DONE" ]; then
+    echo "🩹 $new_id filed for an already-merged PR and marked done immediately — never rendered as Backlog. [HERD-490]"
+  else
+    echo "scribe-step: filed $new_id for an already-merged PR but could not auto-mark it done — it needs a manual state fix. [HERD-490]" >&2
+  fi
+}
+
 case "$cmd" in
   next)
     # LINGER window (HERD-88): after the base $POLL wait empties the queue, keep polling for
@@ -398,15 +463,21 @@ case "$cmd" in
     # HERD-183: parse the body FIRST (pure text). With no explicit sequencing clause we take the
     # unchanged path below — byte-identical to before, nothing extra published.
     _seq_blocker="$(_scribe_seq_blocker "$text")"
-    if [ -n "$_seq_blocker" ]; then
-      # A clause is present: capture the backend's add stdout so we can read the NEW item's id and
-      # queue it after the blocker. Redirecting a plain function call keeps _BACKEND_RESULT in THIS
-      # shell (a $()/pipe would run _backend_add_item in a subshell and lose it); we replay the
-      # captured stdout verbatim so the drainer's output is unchanged.
+    # HERD-490: does this Add describe work that is ALREADY MERGED (the sweep's retroactive-linkage
+    # leg filing a ship-record for an unmatched merge)? If so the new item must be marked done in the
+    # SAME breath it is created — never left rendering as Backlog.
+    _ship_pr="$(_scribe_unmatched_merge_pr "$text")"
+    if [ -n "$_seq_blocker" ] || [ -n "$_ship_pr" ]; then
+      # Either clause needs the backend's add stdout: the sequencing clause to read the new item's id
+      # for the queue marker, the ship clause to read it for the auto-ship. Redirecting a plain
+      # function call keeps _BACKEND_RESULT in THIS shell (a $()/pipe would run _backend_add_item in a
+      # subshell and lose it); we replay the captured stdout verbatim so the drainer's output is
+      # unchanged.
       _add_out="$TREES/.scribe-add-out.$$"
       _backend_add_item "$mine" "$text" > "$_add_out"
       cat "$_add_out"
-      _scribe_auto_marker "$SCRIBE_BACKEND" "$_BACKEND_RESULT" "$_add_out" "$_seq_blocker"
+      [ -n "$_seq_blocker" ] && _scribe_auto_marker "$SCRIBE_BACKEND" "$_BACKEND_RESULT" "$_add_out" "$_seq_blocker"
+      [ -n "$_ship_pr" ] && _scribe_auto_ship "$SCRIBE_BACKEND" "$_BACKEND_RESULT" "$_add_out" "$_ship_pr"
       rm -f "$_add_out"
     else
       _backend_add_item "$mine" "$text"

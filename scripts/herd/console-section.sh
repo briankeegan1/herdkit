@@ -141,7 +141,14 @@ $_cs_line
 EOF
     case "${_cs_status:-}" in
       healed)
-        [ -n "${_cs_ref:-}" ] && _cs_healed="${_cs_healed}${_cs_ref} "
+        if [ -n "${_cs_ref:-}" ]; then
+          # HERD-490: a SECOND healed row for a ref already recorded healed (newest-first, so this
+          # is an OLDER duplicate — e.g. the same merged PR healed twice across sweep runs) is
+          # itself superseded, exactly like a failed row is — the console must never render the
+          # identical heal twice for one ref.
+          case "${_cs_healed}" in *" ${_cs_ref} "*) continue ;; esac
+          _cs_healed="${_cs_healed}${_cs_ref} "
+        fi
         ;;
       *)
         if [ -n "${_cs_ref:-}" ]; then
