@@ -122,4 +122,42 @@ NOW=1000000000
 grep -qxvE 'feat-alpha' <<< "$(printf '%s\n' "$OUT" | _slugs)" && fail "no non-builder slug may reach dead-builder classification"
 ok
 
+
+# ── HERD-483: astatus lookup PARITY with herd_agent_name_sanitize across the transform's own edge
+# cases ──────────────────────────────────────────────────────────────────────────────────────────
+# _discover_feature_worktrees mirrors herd_agent_name_sanitize (driver.sh) — the ONE sanitizer every
+# herdr registration routes a name through — with its OWN inline python copy (a single python process
+# still builds the whole FEATS table, rather than shelling out per worktree). A literal copy can drift
+# from its original; this drives BOTH the real bash sanitizer and the real discovery helper over the
+# same battery of inputs (long, uppercase, punctuation, digit-leading) and asserts the astatus each
+# worktree's SANITIZED-only registration resolves to matches exactly — proof the two never disagree,
+# not just that one hand-picked case happens to work.
+type herd_agent_name_sanitize >/dev/null 2>&1 || fail "herd_agent_name_sanitize not defined"
+
+PARITY_RAW=(
+  "main-red-489495a4-a-very-long-generated-test-identity-slug"
+  "Feature-Slug-With-Caps"
+  "weird.slug!name"
+  "123-numeric-start"
+)
+PWT="$T/parity-trees"; mkdir -p "$PWT"
+declare -a PARITY_AGENTS=()
+for raw in "${PARITY_RAW[@]}"; do
+  san="$(herd_agent_name_sanitize "$raw")"
+  git -C "$MAIN" worktree add -q -b "feat/$raw" "$PWT/$raw" >/dev/null 2>&1 \
+    || fail "could not create parity worktree for '$raw'"
+  PARITY_AGENTS+=("{\"name\":\"$san\",\"agent_status\":\"idle-$san\"}")
+done
+PWT_LIST="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null)"
+PARITY_AGENTS_JSON="{\"result\":{\"agents\":[$(IFS=,; echo "${PARITY_AGENTS[*]}")]}}"
+POUT="$(WT="$PWT_LIST" MAIN="$MAIN" TREES="$PWT" PRS_JSON='[]' AGENTS_JSON="$PARITY_AGENTS_JSON" _discover_feature_worktrees)"
+for raw in "${PARITY_RAW[@]}"; do
+  san="$(herd_agent_name_sanitize "$raw")"
+  rec="$(printf '%s\n' "$POUT" | grep -F "$(printf '\037%s\037' "$raw")")"
+  [ -n "$rec" ] || fail "parity: no discovery record for slug '$raw'"
+  astatus="$(printf '%s' "$rec" | awk -F'\037' '{print $7}')"
+  [ "$astatus" = "idle-$san" ] || fail "parity: slug '$raw' (sanitizes to '$san') resolved astatus='$astatus', expected 'idle-$san' — the inline python mirror has drifted from herd_agent_name_sanitize"
+done
+ok
+
 echo "ALL PASS ($PASS groups)"

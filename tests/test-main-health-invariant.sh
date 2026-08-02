@@ -723,6 +723,51 @@ mv "$HERE/spawn.sh.disabled" "$HERE/spawn.sh"
 [ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 1 ] || fail "(r) the scribe file did not still happen when spawn.sh is missing"
 [ "$(jcount '"event":"main_health_autofix_spawn".*"reason":"no-spawn-sh"')" -eq 1 ] || fail "(r) a missing spawn.sh was not journaled as no-spawn-sh"
 ok "(r) a missing spawn.sh journals no-spawn-sh and never blocks the file-only path"
+
+# ── HERD-482: sanitize identity BEFORE slug/branch derivation (ANSI strip + prefer a test-file token)
+# GROUNDED SHAPE: a colorized `gh run view --log-failed` line (CI logs are colorized by default) once
+# rendered as branch main-red-<sha8>-0m-full-auto-fail-rc-1-see-var-folders-d — the ANSI reset code's
+# digits+letter ("0m") survived tr/sed sanitization as literal text and ate the slug's 40-char budget
+# ahead of anything a human would recognize. _main_health_ci_log_identity does not strip ANSI (it never
+# needs to for the SCRIBE item text a human reads), so the fix lives at the ONE chokepoint every
+# MAIN_HEALTH_AUTOFIX=spawn slug/branch derivation shares: _main_health_autofix_spawn.
+
+# (s) an ANSI-colorized ✗ line that STILL names a real test file: the spawned slug names that file
+# cleanly — no stray ANSI-derived digits/letters, no rc/path noise eating the character budget.
+reset_state
+MAIN_HEALTH_AUTOFIX=spawn
+new_sha "feat: reds main via a colorized CI log line"
+SHA482S="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA482S"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9482}]'
+export GH_LOG_FAILED="$(printf 'ubuntu\trun\t   real-failed tests:\nubuntu\trun\t     \xe2\x9c\x97 \x1b[31mtests/test-yolo-drain-mode.sh\x1b[0m rc 1 see /var/folders/xy/T/tmp.XXXXXX\n')"
+_main_health_ci_leg
+settle
+[ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 1 ] || fail "(s) setup: an ANSI-laden but honest CI identity did not file"
+[ "$(spawn_reqs)" -eq 1 ] || fail "(s) spawn.sh did not enqueue exactly one intent: $(ls "$SPAWN_Q" 2>/dev/null)"
+REQ_S="$(latest_req)"
+SLUG_S="$(sed -n '1p' "$REQ_S")"
+case "$SLUG_S" in *test-yolo-drain-mode-sh*) : ;; *) fail "(s) the spawned slug does not name the real test file: $SLUG_S" ;; esac
+case "$SLUG_S" in *0m*) fail "(s) an ANSI escape's tail survived sanitization into the slug: $SLUG_S" ;; esac
+case "$SLUG_S" in *$'\x1b'*) fail "(s) a raw ESC byte survived into the spawn queue file: $SLUG_S" ;; esac
+ok "(s) an ANSI-colorized identity that names a real test file spawns a CLEAN slug (no ANSI residue, no rc/path noise)"
+unset GH_RUNS GH_LOG_FAILED
+
+# (t) an ANSI-colorized rc/path blob that names NO file at all reads DISHONEST — never filed, never
+# spawned. Tightening _main_health_honest_identity to share _main_health_slug_identity's own ANSI-strip
+# + token search means "sluggable" and "honest" can never diverge: no token survives for either purpose.
+reset_state
+MAIN_HEALTH_AUTOFIX=spawn
+new_sha "feat: reds main via a colorized CI log line naming no file"
+SHA482T="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA482T"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9483}]'
+export GH_LOG_FAILED="$(printf 'ubuntu\trun\t   real-failed tests:\nubuntu\trun\t     \xe2\x9c\x97 \x1b[31mfull-auto fail\x1b[0m rc 1 see /var/folders/xy/T/tmp.XXXXXX\n')"
+_main_health_ci_leg
+settle
+[ "$(jcount '"event":"main_health_autofix".*"reason":"dishonest-identity"')" -eq 1 ] || fail "(t) an ANSI-laden rc/path blob with no file token was not skipped as dishonest"
+[ "$(jcount '"event":"main_health_autofix".*"result":"enqueued"')" -eq 0 ] || fail "(t) a token-less rc/path blob filed a scribe item anyway"
+[ "$(spawn_reqs)" -eq 0 ] || fail "(t) a dishonest identity spawned a builder anyway: $(ls "$SPAWN_Q" 2>/dev/null)"
+ok "(t) an ANSI-laden rc/path blob with no file token reads dishonest — never filed, never spawned"
+unset GH_RUNS GH_LOG_FAILED
 MAIN_HEALTH_AUTOFIX=off
 
 echo "ALL PASS ($pass checks)"

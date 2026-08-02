@@ -7128,6 +7128,45 @@ _main_health_clear() {
   fi
 }
 
+# _strip_ansi <text> — HERD-482: drop ANSI SGR/CSI escape sequences (ESC '[' … final-byte). Colorized
+# tool output — a `gh run view --log-failed` CI log line, a healthcheck oneline captured from a TTY —
+# carries these straight into any identity derived from it. Left in place they are not merely cosmetic:
+# tr/sed slug sanitization (which maps everything outside [a-z0-9] to '-') treats an escape's digits and
+# final letter as ordinary text, so an 'ESC[0m' reset survives as the literal characters "0m" and eats
+# the front of the slug's character budget ahead of anything a human would recognize (observed: a
+# colorized 'fail rc 1' detail rendered as branch main-red-<sha>-0m-full-auto-fail-rc-1-…). LC_ALL=C so
+# the byte-oriented pattern never trips over a multibyte locale; fail-soft to the raw text on any sed
+# error rather than dropping the identity entirely.
+_strip_ansi() {
+  LC_ALL=C sed -E $'s/\x1b\\[[0-9;]*[A-Za-z]//g' <<< "${1:-}" 2>/dev/null || printf '%s\n' "${1:-}"
+}
+
+# _MAIN_HEALTH_TESTFILE_RE — the ONE pattern that decides "does this identity name a concrete test/
+# source file", shared by _main_health_honest_identity (the floor: no token → dishonest, never filed)
+# and _main_health_slug_identity (the preference: a token, not the surrounding rc/path noise, becomes
+# the slug/branch material) — doctrine Rule 2. A single defined-but-divergent regex between the two
+# would let a detail read "honest" under one and "no token" under the other; sharing the constant makes
+# that impossible by construction.
+_MAIN_HEALTH_TESTFILE_RE='[A-Za-z0-9_./-]+\.(sh|bats|py|go|ts|js|jsx|tsx|rs|java|rb)'
+
+# _main_health_slug_identity <raw-identity> — HERD-482: the ONE normalization every MAIN_HEALTH_AUTOFIX
+# slug/branch derivation off a failing-test identity routes through. ANSI-strips first (see _strip_ansi),
+# then PREFERS the first concrete test/source file token (basename only — a full path is not shorter or
+# more legible in a branch name) over the raw text, so an rc/path blob's essentially-random tail never
+# out-competes the one token a human would actually recognize for the slug's capped character budget.
+# Falls back to the ansi-stripped raw text verbatim when no token matches (the caller's own honest-
+# identity gate is what decides whether that fallback ever reaches a slug at all).
+_main_health_slug_identity() {
+  local _si_clean _si_tok
+  _si_clean="$(_strip_ansi "${1:-}")"
+  _si_tok="$(printf '%s\n' "$_si_clean" | grep -oE "$_MAIN_HEALTH_TESTFILE_RE" 2>/dev/null | head -1)"  # pipe-ok: single short scalar (one line), far under a pipe buffer
+  if [ -n "$_si_tok" ]; then
+    printf '%s' "${_si_tok##*/}"
+  else
+    printf '%s' "$_si_clean"
+  fi
+}
+
 # _main_health_honest_identity <detail> <identity> — true iff this red names something a human (or a
 # scribe item) can act on. The floor the AUTOFIX path must clear before it files work:
 #   • a TAP 'not ok' line, or an identity that resolved to concrete test/source FILE tokens → honest;
@@ -7141,13 +7180,18 @@ _main_health_clear() {
 # caller may reach from a path that has not classified the detail. The check is a string match on one
 # line — the cost of keeping the guarantee local is nil, and the cost of it being someone else's job is a
 # spurious item filed against a control-room hiccup.
+#
+# HERD-482: the file-token check now runs ANSI-stripped and through the SAME regex
+# _main_health_slug_identity prefers a match from — an rc/path blob with no real file token anywhere in
+# it (colorized or not) reads dishonest here exactly as it reads token-less there, so "honest" and
+# "sluggable" can never diverge.
 _main_health_honest_identity() {
   local _hi_detail="${1:-}" _hi_id="${2:-}"
   [ -n "$_hi_id" ] || return 1
   printf '%s\n' "$_hi_id" | grep -qiE "$_HFD_PASS_RE" 2>/dev/null && return 1  # pipe-ok: single short scalar (one line), far under a pipe buffer
   _health_is_leak_guard_detail "$_hi_detail" && return 1
   printf '%s\n' "$_hi_detail" | grep -qE '^[[:space:]]*not ok( |$)' 2>/dev/null && return 0  # pipe-ok: single short scalar (one line), far under a pipe buffer
-  printf '%s\n' "$_hi_id" | grep -qE '[A-Za-z0-9_./-]+\.(sh|bats|py|go|ts|js|jsx|tsx|rs|java|rb)' 2>/dev/null  # pipe-ok: single short scalar (one line), far under a pipe buffer
+  _strip_ansi "$_hi_id" | grep -qE "$_MAIN_HEALTH_TESTFILE_RE" 2>/dev/null  # pipe-ok: single short scalar (one line), far under a pipe buffer
 }
 
 # _main_health_scribe <text> — the ENQUEUE edge of the autofix path, isolated in one function so a test
@@ -7343,7 +7387,12 @@ _main_health_autofix_spawn() {
     journal_append main_health_autofix_spawn pr "$_as_pr" sha "$_as_sha" failed "$_as_id" result skipped reason no-spawn-sh
     return 0
   fi
-  _as_slug="main-red-${_as_sha:0:8}-$(printf '%s' "$_as_id" \
+  # HERD-482: route through _main_health_slug_identity BEFORE the tr/sed sanitize pass — ANSI-strips
+  # (a colorized identity's escape codes otherwise survive tr/sed as literal digits+letters, e.g. an
+  # 'ESC[0m' reset rendering as "0m") and prefers the concrete test/source file token over the
+  # surrounding rc/path noise, so the 40-char slug budget below is spent on the one thing a human would
+  # recognize rather than on whatever happened to come first in the raw identity.
+  _as_slug="main-red-${_as_sha:0:8}-$(_main_health_slug_identity "$_as_id" \
     | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-40)"
   _as_slug="${_as_slug%-}"
   _as_out="$(HERD_ITEM_REF="$_as_id" bash "$HERE/spawn.sh" "$_as_slug" quick \
@@ -13589,6 +13638,34 @@ try: agents = (json.loads(os.environ.get("AGENTS_JSON") or "{}").get("result") o
 except Exception: agents = []
 pr_by_branch = {p.get("headRefName"): p for p in prs}
 ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
+# HERD-483: herdr agent names are NOT the raw worktree-basename slug — herd_agent_name_sanitize
+# (driver.sh) is the ONE sanitizer every registration AND lookup site routes through before a name
+# ever reaches herdr agent start: lowercase, every non [a-z0-9_-] char mapped to a dash, an a- prefix
+# if it would not start with a letter, truncated to herdr 32-char cap. Every OTHER lookup site calls
+# that same sanitizer before comparing; this one compared the RAW slug instead, so any slug the
+# sanitizer actually changes (over 32 chars, or carrying upper/invalid chars) NEVER matched its own
+# agent status here — astatus read permanently empty and the FEATS row fell through every
+# astatus-gated branch below (finish-stall, draft-stall, dead-builder) as if no agent existed.
+# Human-picked slugs are short kebab-case and this sanitizer is a no-op on them, which is why the gap
+# stayed hidden until MAIN_HEALTH_AUTOFIX=spawn algorithmic main-red-sha8-detail slugs (routinely over
+# 32 chars) made it systematic (PRs #605/#606 sat draft+idle 55min with zero finish_stall events).
+# Mirrors herd_agent_name_sanitize EXACTLY (same transform, same 32-char cap) rather than shelling out
+# to it per-worktree, so one process still builds the whole FEATS table; a parity test keeps the two
+# from drifting apart.
+import re
+def _sanitized_agent_name(name):
+    s = re.sub(r"[^a-z0-9_-]", "-", (name or "").lower())
+    if not re.match(r"^[a-z]", s):
+        s = "a" + s
+    return s[:32]
+def _ag_status_for(slug):
+    # Raw lookup FIRST — byte-identical for every slug the sanitizer would leave unchanged (the
+    # overwhelming common case), so this only ever adds a hit, never changes one.
+    st = ag_status.get(slug, "")
+    if st:
+        return st
+    san = _sanitized_agent_name(slug)
+    return ag_status.get(san, "") if san != slug else ""
 feats = []; wt = None; branch = None; head = None; detached = False
 def _emit(wt, branch, head, detached):
     # A builder candidate is UNDER $WORKTREES_DIR, on a BRANCH (not detached), and not $MAIN.
@@ -13645,7 +13722,7 @@ for wt, branch, head in feats:
     print("\x1f".join(str(x) for x in [
         wt, slug, branch or "", pr.get("number", ""),
         pr.get("mergeable", ""), pr.get("mergeStateStatus", ""),
-        ag_status.get(slug, ""), pr.get("headRefOid", ""),
+        _ag_status_for(slug), pr.get("headRefOid", ""),
         (pr.get("author") or {}).get("login", ""),
         kind, detail,
         ("1" if pr.get("isDraft") else "0") if "isDraft" in pr else ""]))
