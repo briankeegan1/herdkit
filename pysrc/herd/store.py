@@ -160,12 +160,19 @@ class Store:
     def purge_pr_approvals(self, pr):
         return self._b.purge_pr_approvals(pr)
 
-    # review ledger ── "<epoch> <pr> <sha> <verdict> <source>", last matching row wins ───────────────
+    # review ledger ── "<epoch> <pr> <sha> <verdict> <source> [reason…]", last matching row wins ─────
+    # `reason` (HERD-473) is the reviewer's structured BLOCK reason, single-line and whitespace-collapsed
+    # so it can ride as the row's TRAILING field without disturbing the five positional fields every
+    # existing reader (`awk '$2==pr && $3==sha {v=$4}'`, `f[3]`, `f[4]`) already parses. Omitted ⇒ the
+    # row is written exactly as it was before this field existed.
     def recorded_review(self, pr, sha):
         return self._b.recorded_review(pr, sha)
 
-    def record_review(self, pr, sha, verdict, source="reviewer"):
-        return self._b.record_review(pr, sha, verdict, source)
+    def recorded_review_reason(self, pr, sha):
+        return self._b.recorded_review_reason(pr, sha)
+
+    def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
+        return self._b.record_review(pr, sha, verdict, source, reason)
 
     # health results ── sha-keyed terminal verdict cache ("<verdict>\t<detail>") ─────────────────────
     def health_cached_verdict(self, pr, sha):
@@ -354,14 +361,35 @@ class _FlatBackend:
             return None
         return verdict
 
-    def record_review(self, pr, sha, verdict, source="reviewer"):
+    def recorded_review_reason(self, pr, sha):
+        """The trailing ``reason`` of the LAST matching row, or ``""`` (HERD-473). A LEGACY row with only
+        the five positional fields has none, so it reads back as "" — never an error, never a guess."""
+        path = self._p(".agent-watch-reviewed")
+        if not path or not os.path.isfile(path):
+            return ""
+        reason = ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and f[1] == str(pr) and f[2] == str(sha):
+                        reason = " ".join(f[5:])
+        except Exception:
+            return ""
+        return reason
+
+    def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         path = self._p(".agent-watch-reviewed")
         if not path:
             return
         _ensure_parent(path)
+        reason = " ".join(str(reason).split())
         try:
             with open(path, "a", encoding="utf-8") as fh:
-                fh.write("%s %s %s %s %s\n" % (_now(), pr, sha, verdict, source))
+                if reason:
+                    fh.write("%s %s %s %s %s %s\n" % (_now(), pr, sha, verdict, source, reason))
+                else:
+                    fh.write("%s %s %s %s %s\n" % (_now(), pr, sha, verdict, source))
         except Exception:
             pass
 
@@ -707,7 +735,8 @@ class _FlatBackend:
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS approvals   (epoch INTEGER, state TEXT, pr TEXT, sha TEXT);
 CREATE INDEX IF NOT EXISTS approvals_pr ON approvals(pr);
-CREATE TABLE IF NOT EXISTS review_ledger(epoch INTEGER, pr TEXT, sha TEXT, verdict TEXT, source TEXT);
+CREATE TABLE IF NOT EXISTS review_ledger(epoch INTEGER, pr TEXT, sha TEXT, verdict TEXT, source TEXT,
+                                         reason TEXT);
 CREATE INDEX IF NOT EXISTS review_prsha ON review_ledger(pr, sha);
 CREATE TABLE IF NOT EXISTS health_results(pr TEXT, sha TEXT, verdict TEXT, detail TEXT, epoch INTEGER,
                                           PRIMARY KEY (pr, sha));
@@ -754,11 +783,26 @@ class _SqliteBackend:
             try:
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.executescript(_SCHEMA)
+                self._add_missing_columns()
                 break
             except sqlite3.OperationalError:
                 if _attempt == _INIT_RETRIES - 1:
                     raise
                 time.sleep(0.01)
+
+    # Columns added to a table AFTER a pool was first migrated. `CREATE TABLE IF NOT EXISTS` is a no-op
+    # on an existing table, so a db migrated before the column existed keeps the OLD shape and every
+    # INSERT naming the new column would raise — this is the one-line forward migration that closes
+    # that gap, run on every open and idempotent (the column is added only when `table_info` says it is
+    # missing). Raising here is deliberate and safe: it happens inside the retried init above, and
+    # ``open_store`` catches a definitive failure and degrades this caller to the FLAT backend.
+    _ADDED_COLUMNS = (("review_ledger", "reason", "TEXT"),)     # HERD-473
+
+    def _add_missing_columns(self):
+        for table, column, decl in self._ADDED_COLUMNS:
+            have = [r[1] for r in self._conn.execute("PRAGMA table_info(%s)" % table).fetchall()]
+            if column not in have:
+                self._conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, column, decl))
 
     # _rmw — run a read-modify-write body inside a BEGIN IMMEDIATE … COMMIT transaction, RETRYING on a
     # transient lock error. BEGIN IMMEDIATE takes the write lock up front so a contended writer WAITS
@@ -820,10 +864,18 @@ class _SqliteBackend:
             (str(pr), str(sha))).fetchone()
         return row[0] if row else None
 
-    def record_review(self, pr, sha, verdict, source="reviewer"):
+    def recorded_review_reason(self, pr, sha):
+        """The reviewer's recorded BLOCK reason for this (pr, sha), or ``""`` (HERD-473). A row written
+        before the column existed reads back NULL → "", identical to a legacy flat row's missing field."""
+        row = self._conn.execute(
+            "SELECT reason FROM review_ledger WHERE pr=? AND sha=? ORDER BY rowid DESC LIMIT 1",
+            (str(pr), str(sha))).fetchone()
+        return (row[0] or "") if row else ""
+
+    def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         self._conn.execute(
-            "INSERT INTO review_ledger(epoch, pr, sha, verdict, source) VALUES (?,?,?,?,?)",
-            (_now(), str(pr), str(sha), verdict, source))
+            "INSERT INTO review_ledger(epoch, pr, sha, verdict, source, reason) VALUES (?,?,?,?,?,?)",
+            (_now(), str(pr), str(sha), verdict, source, " ".join(str(reason).split())))
 
     # health results ─────────────────────────────────────────────────────────────────────────────
     def health_cached_verdict(self, pr, sha):
@@ -1156,8 +1208,10 @@ def _ingest_typed(be, pool, rel, raw):
                 f = ln.split()
                 if len(f) >= 4:
                     be._conn.execute(
-                        "INSERT INTO review_ledger(epoch, pr, sha, verdict, source) VALUES (?,?,?,?,?)",
-                        (_int(f[0]), f[1], f[2], f[3], f[4] if len(f) > 4 else "reviewer"))
+                        "INSERT INTO review_ledger(epoch, pr, sha, verdict, source, reason) "
+                        "VALUES (?,?,?,?,?,?)",
+                        (_int(f[0]), f[1], f[2], f[3], f[4] if len(f) > 4 else "reviewer",
+                         " ".join(f[5:])))
         elif name.startswith(".health-result-"):
             key = name[len(".health-result-"):]
             pr, _, sha = key.partition("-")

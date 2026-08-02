@@ -2533,13 +2533,25 @@ _maybe_carry_forward_review() {
   return 0
 }
 
-# record_review <pr#> <headSha> <verdict> [source] — append one review record (the instant a verdict
-# is known). <source> is the verdict PROVENANCE (reviewer | gate_default | infra); defaults to
+# record_review <pr#> <headSha> <verdict> [source] [reason] — append one review record (the instant a
+# verdict is known). <source> is the verdict PROVENANCE (reviewer | gate_default | infra); defaults to
 # "reviewer" when omitted. Only "reviewer" verdicts are ever cached as a sticky BLOCK AND are the
 # only ones eligible to auto-refix a builder — a purely infrastructural death must never stick.
+#
+# [reason] (HERD-473) is the reviewer's STRUCTURED BLOCK reason, single-line. It rides as the row's
+# TRAILING field and as a `reason` key on the journal event, so `herd approve why` / `herd why` can
+# state the objection instead of leaving an operator to override a gate blind (#576). Both writes are
+# ADDITIVE and skipped when it is empty: a PASS, a reason-less reviewer line, and every legacy caller
+# produce a row and an event byte-identical to the ones they produced before this field existed.
 record_review() {
-  printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "${4:-reviewer}" >> "$REVIEW_STATE"
-  journal_append verdict_recorded pr "$1" sha "$2" value "$3" source "${4:-reviewer}"
+  local _rr_reason; _rr_reason="$(printf '%s' "${5:-}" | tr '\n\t' '  ' | sed -E 's/  +/ /g; s/^ //; s/ $//')"
+  if [ -n "$_rr_reason" ]; then
+    printf '%s %s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "${4:-reviewer}" "$_rr_reason" >> "$REVIEW_STATE"
+    journal_append verdict_recorded pr "$1" sha "$2" value "$3" source "${4:-reviewer}" reason "$_rr_reason"
+  else
+    printf '%s %s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" "${4:-reviewer}" >> "$REVIEW_STATE"
+    journal_append verdict_recorded pr "$1" sha "$2" value "$3" source "${4:-reviewer}"
+  fi
   # RESET-ON-PROGRESS (HERD-229): a PASS is the review rail's red resolving — whatever its provenance
   # (reviewer, carried-forward, skipped-low-risk), the review loop converged. Refund that rail's refix
   # budget here, at the one seam every PASS passes through. No-op unless the rail has rounds to zero.
@@ -2591,6 +2603,27 @@ _persist_block_fields() {
   _parse_block_fields "$3"
   { printf '%s\n%s\n%s\n' "$_BLK_RULE" "$_BLK_WHY" "$_BLK_LOCATION"; } \
     > "$(_review_block_file "$pr" "$sha")" 2>/dev/null || true
+}
+
+# _compose_block_reason <verdict-line> — echo the parsed BLOCK line as ONE canonical single-line reason
+# 'rule: <rule> | why: <why> | location: <loc>', absent fields simply omitted, empty when nothing parsed
+# (HERD-473). This is the string that travels into the ledger row + the journal event, and the twin of
+# live_runtime.py's parse_block_reason — keep the two in lockstep (tests/test-block-verdict-reason.sh
+# A/Bs the two over every shape) so whichever core recorded a verdict, an operator reads the SAME text
+# back. Only a BLOCK line has a reason: a PASS (whose ' — advisory: …' tail is NOT an objection) or an
+# INFRA-FAIL yields empty, never a manufactured one. Same fail-soft contract as _parse_block_fields.
+_compose_block_reason() {
+  local _cb_out="" _cb_body
+  # The BLOCK guard, byte-for-byte the rule parse_block_reason applies: everything after the FIRST
+  # colon, trimmed and upper-cased, must start with BLOCK.
+  case "$1" in *:*) _cb_body="${1#*:}" ;; *) return 0 ;; esac
+  _cb_body="$(printf '%s' "$_cb_body" | tr '[:lower:]' '[:upper:]' | sed -E 's/^[[:space:]]+//')"
+  case "$_cb_body" in BLOCK*) : ;; *) return 0 ;; esac
+  _parse_block_fields "$1"
+  [ -n "$_BLK_RULE" ]     && _cb_out="rule: $_BLK_RULE"
+  [ -n "$_BLK_WHY" ]      && _cb_out="${_cb_out:+$_cb_out | }why: $_BLK_WHY"
+  [ -n "$_BLK_LOCATION" ] && _cb_out="${_cb_out:+$_cb_out | }location: $_BLK_LOCATION"
+  printf '%s' "$_cb_out"
 }
 
 # ── Advisory (non-blocking) notes on a PASS (HERD-105) ────────────────────────────────────────────
@@ -3588,7 +3621,9 @@ _review_gate_step() {
         _rgs_echo=PASS ;;
       "REVIEW: BLOCK"*)
         _breaker_record_ok
-        record_review "$pr" "$sha" "BLOCK" "reviewer"
+        # HERD-473: the SAME parse that feeds the refix bounce also feeds the ledger + journal, so the
+        # operator surfaces (`herd approve why` / `herd why`) state the objection the builder was given.
+        record_review "$pr" "$sha" "BLOCK" "reviewer" "$(_compose_block_reason "$verdict_line")"
         # Cache the structured rule/why/location so the auto-refix bounce is actionable (HERD-104).
         _persist_block_fields "$pr" "$sha" "$verdict_line"
         _rgs_echo=BLOCK ;;

@@ -213,6 +213,25 @@ gate_default | infra`** (`agent-watch.sh:1756`). In the live tree:
   (never cached, `agent-watch.sh:2834`) + the circuit breaker (`agent-watch.sh:2835`); the
   forensic record is an `infra_event` line (e.g. `agent-watch.sh:10464`), not a verdict.
 
+#### 3.2a Reason (`reason`, HERD-473)
+
+A **BLOCK** verdict additionally carries the reviewer's stated objection as `reason` — one line,
+whitespace-collapsed, composed from herd-review.sh's structured BLOCK contract
+(`REVIEW: BLOCK — rule: … | why: … | location: …`) into `rule: … | why: … | location: …` with absent
+fields omitted. A legacy freeform `REVIEW: BLOCK — <text>` yields `why: <text>`.
+
+The reason has **two homes and one value**: the review ledger row's TRAILING field
+(`<epoch> <pr> <sha> <verdict> <source> [reason…]` — appended after the five positional fields, so
+every `$4`/`$5`/`f[3]`/`f[4]` reader is unaffected) and the `reason` key on `verdict_recorded`. The
+journal value is READ BACK from the ledger the rail just wrote (`live_runtime.py:LiveTick._walk`), so
+the two cannot drift. Readers: `herd approve why` (ledger first, journal as the durable/post-migration
+fallback), `herd why` / `pysrc/herd/why.py`, and the review-BLOCK PR comment posted when a block
+escalates past its refix budget (§5.6).
+
+Both writes are **omitted when the reason is empty** — a PASS, an unparseable BLOCK payload, and every
+pre-HERD-473 row alike. A reason-less row is therefore never an error and never a guess: every reader
+answers "none recorded" explicitly rather than substituting other text (the #576 failure).
+
 ### 3.3 The INFRA circuit breaker
 
 The breaker is the "env looks dead, stop dispatching" seam. One-line state `<state> <fails>
@@ -276,7 +295,7 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 
 | Event | Keys | Anchor |
 |---|---|---|
-| `verdict_recorded` | pr, sha, value(PASS\|BLOCK), source | `agent-watch.sh:1761` |
+| `verdict_recorded` | pr, sha, value(PASS\|BLOCK), source [, reason] | `agent-watch.sh:1761` |
 | `review_dispatched` | pr, sha, pid, model, log_path, pin | `agent-watch.sh:2545` |
 | `healthcheck_started` | pr, slug, sha, pid, log_path | `agent-watch.sh:10390` |
 | `healthcheck_outcome` | pr, slug, outcome(CLEAN\|FLAKY\|CODEERROR) | `agent-watch.sh:10273` |
@@ -288,7 +307,7 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `hold_released` | pr, sha, slug, kind(approve\|human-verify), reason(approved) | port `live_runtime.py:LiveTick._walk` (HERD-442 — restored; consumed by `herd why` and the fleet inbox/digest) |
 | `hv_body_unreadable` | pr, sha, slug, rc, detail | port `live_runtime.py:LiveTick._resolve_hold_inputs` (HERD-442 — the fail-CLOSED record for an unreadable PR body) |
 | `human_verify_policy` | pr, sha, slug, policy(auto), action | port `live_runtime.py:LiveTick._walk` (HERD-439 — the bash anchor `agent-watch.sh:12314` died at `ede7d45`) |
-| `hold_comment_failed` | pr, sha, slug, kind(coordinator\|human-verify\|approve\|hv-auto) | port `live_runtime.py:LiveActuator.post_comment` (HERD-448 — the once-guard already fired before this runs, so a failed comment post is never retried; this is the only durable record one was attempted) |
+| `hold_comment_failed` | pr, sha, slug, kind(coordinator\|human-verify\|approve\|hv-auto\|review-block) | port `live_runtime.py:LiveActuator.post_comment` (HERD-448 — the once-guard already fired before this runs, so a failed comment post is never retried; this is the only durable record one was attempted) |
 | `hold_comment_superseded` | pr, sha, old_sha, slug, reason | port `live_runtime.py:LiveTick._supersede_hold_comment` (HERD-464 — a hold comment posted for `old_sha` no longer reflects reality: a new sha landed, an approval landed, or a policy change made re-holding it impossible; edited in place via `gh pr comment --edit-last`, never re-posted) |
 | `hold_comment_edit_failed` | pr, sha, slug, kind(superseded) | port `live_runtime.py:LiveActuator.edit_comment` (HERD-464 — same once-guard/never-retried contract as `hold_comment_failed`) |
 | `approval_recorded` | pr, sha, state(approved), source | `herd-approve.sh:232` |
@@ -525,6 +544,17 @@ commit at all. Guarded by the SAME `LiveState.once` doctrine as every other hold
 (§5.3): each (pr, sha) pair is superseded at most once. `DryRunActuator.edit_comment` is a pure
 no-op returning success (mirrors `post_comment`); a failed live edit journals
 `hold_comment_edit_failed` (§3.4) and is never retried, exactly like `hold_comment_failed`.
+
+**REVIEW-BLOCK COMMENT (HERD-473).** A standing BLOCK whose auto-refix budget is spent is a hold on
+a human, and until now it told that human nothing: the reviewer's reasoning reached the builder's
+pane and no durable operator surface, leaving a coordinator with a blocked PR, no stated objection,
+and only a blind `herd approve override` (#576). The `refix_escalated` (review rail) branch now posts
+a `review-block` comment through the SAME `LiveActuator.post_comment` actuator and inside the SAME
+`refix_escalated_review` once-guard that already dedups the journal line — so a re-walked blocked PR
+never re-posts, and `DryRunActuator` still posts nothing. The body carries the `reason` recorded with
+the verdict (§3.2a) verbatim; with no reason recorded it says so explicitly and warns that no other
+comment is the gate's objection. Same fail-soft contract as every other comment: a failed post
+journals `hold_comment_failed` (kind `review-block`) and never alters the escalation already taken.
 
 ---
 

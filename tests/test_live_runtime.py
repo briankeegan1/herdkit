@@ -34,7 +34,7 @@ from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
                                LiveActuator, LiveHoldSource,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
-                               parse_rubric_verdicts,
+                               parse_rubric_verdicts, parse_block_fields, parse_block_reason,
                                _select_candidates, _marker_write, _marker_live, _terminate_worker,
                                _marker_nonce, _dispatch_nonce,
                                _main_health_pending,
@@ -5805,6 +5805,230 @@ class TestHumanVerifyParser(unittest.TestCase):
     def test_block_ends_at_the_first_blank_line(self):
         self.assertEqual(_hv.steps("HUMAN-VERIFY:\n- a\n\n- b\n"), ["a"])
 
+
+# ── HERD-473: a BLOCK verdict records a machine-readable reason ───────────────────────────────────
+_BLOCK_LINE = ("REVIEW: BLOCK — rule: unchecked nil deref | why: cand.sha may be empty on an "
+               "adopted PR | location: live_runtime.py:3120")
+_BLOCK_REASON = ("rule: unchecked nil deref | why: cand.sha may be empty on an adopted PR | "
+                 "location: live_runtime.py:3120")
+
+
+class TestBlockReasonParser(unittest.TestCase):
+    """The pure parser half (HERD-473). The bash twin `_compose_block_reason` (agent-watch.sh) is
+    pinned against these same cases by tests/test-block-verdict-reason.sh."""
+
+    def test_structured_block_line(self):
+        self.assertEqual(parse_block_fields(_BLOCK_LINE), {
+            "rule": "unchecked nil deref",
+            "why": "cand.sha may be empty on an adopted PR",
+            "location": "live_runtime.py:3120"})
+        self.assertEqual(parse_block_reason(_BLOCK_LINE), _BLOCK_REASON)
+
+    def test_legacy_freeform_block_becomes_why(self):
+        self.assertEqual(parse_block_reason("REVIEW: BLOCK — the merge loses the last commit"),
+                         "why: the merge loses the last commit")
+
+    def test_partial_fields_omit_the_absent_ones(self):
+        self.assertEqual(parse_block_reason("REVIEW: BLOCK — why: wrong sign | location: a.sh:3"),
+                         "why: wrong sign | location: a.sh:3")
+
+    def test_field_order_is_canonical_not_source_order(self):
+        # An operator reads the SAME shape whichever order the reviewer emitted the segments in.
+        self.assertEqual(parse_block_reason("REVIEW: BLOCK — location: a.sh:3 | rule: R | why: W"),
+                         "rule: R | why: W | location: a.sh:3")
+
+    def test_pass_and_infra_carry_no_reason(self):
+        self.assertEqual(parse_block_reason("REVIEW: PASS — advisory: rename this"), "")
+        self.assertEqual(parse_block_reason("REVIEW: INFRA-FAIL — reviewer died"), "")
+        self.assertEqual(parse_block_reason(""), "")
+
+    def test_bare_block_has_no_parseable_payload(self):
+        self.assertEqual(parse_block_reason("REVIEW: BLOCK"), "")
+
+    def test_last_block_line_wins_like_the_verdict_parser(self):
+        text = "REVIEW: BLOCK — why: first\nnoise\nREVIEW: BLOCK — why: second"
+        self.assertEqual(parse_block_reason(text), "why: second")
+
+    def test_whitespace_is_collapsed_so_the_reason_is_one_ledger_field(self):
+        # The ledger row is space-delimited and the journal is one JSON line — a reason may carry
+        # neither a newline nor a tab, or it would split the row / break the reader.
+        r = parse_block_reason("REVIEW: BLOCK — why: a\tb   c")
+        self.assertEqual(r, "why: a b c")
+        self.assertNotIn("\n", r)
+        self.assertNotIn("\t", r)
+
+    def test_a_pathological_line_is_capped_not_propagated(self):
+        r = parse_block_reason("REVIEW: BLOCK — why: " + "x" * 5000)
+        self.assertEqual(len(r), len("why: ") + 200)
+
+    def test_parser_never_raises_on_garbage(self):
+        for junk in ("REVIEW:", "REVIEW: BLOCK —", "REVIEW: block — | | |", "—", "REVIEW: BLOCK—x"):
+            parse_block_reason(junk)          # the assertion IS that nothing raises
+
+
+class TestBlockReasonLedger(LiveCase):
+    """The ledger half (HERD-473): the reason rides the row's TRAILING field, so the five positional
+    fields every other reader parses are untouched, and a legacy reason-less row reads back cleanly."""
+
+    def test_reason_rides_as_the_trailing_field(self):
+        st = LiveState(self.tmp)
+        st.record_review(7, "shaA", "BLOCK", "reviewer", _BLOCK_REASON)
+        row = open(st.review_ledger(), encoding="utf-8").read().strip()
+        f = row.split()
+        self.assertEqual((f[1], f[2], f[3], f[4]), ("7", "shaA", "BLOCK", "reviewer"))
+        self.assertEqual(" ".join(f[5:]), _BLOCK_REASON)
+        self.assertEqual(st.recorded_review(7, "shaA"), "BLOCK")
+        self.assertEqual(st.recorded_review_reason(7, "shaA"), _BLOCK_REASON)
+
+    def test_no_reason_writes_the_pre_herd473_row_byte_identically(self):
+        st = LiveState(self.tmp)
+        st.record_review(7, "shaB", "PASS", "reviewer")
+        row = open(st.review_ledger(), encoding="utf-8").read().strip()
+        self.assertEqual(len(row.split()), 5)
+        self.assertEqual(st.recorded_review_reason(7, "shaB"), "")
+
+    def test_legacy_reason_less_row_reads_back_empty_not_an_error(self):
+        with open(os.path.join(self.tmp, ".agent-watch-reviewed"), "w", encoding="utf-8") as fh:
+            fh.write("1720000000 9 shaC BLOCK reviewer\n")
+        st = LiveState(self.tmp)
+        self.assertEqual(st.recorded_review(9, "shaC"), "BLOCK")
+        self.assertEqual(st.recorded_review_reason(9, "shaC"), "")
+
+    def test_missing_ledger_reads_back_empty(self):
+        self.assertEqual(LiveState(os.path.join(self.tmp, "nope")).recorded_review_reason(1, "s"), "")
+
+    def test_last_matching_row_wins_like_the_verdict(self):
+        st = LiveState(self.tmp)
+        st.record_review(7, "shaD", "BLOCK", "reviewer", "why: first")
+        st.record_review(7, "shaD", "BLOCK", "reviewer", "why: second")
+        self.assertEqual(st.recorded_review_reason(7, "shaD"), "why: second")
+
+    def test_another_prs_reason_is_never_returned(self):
+        st = LiveState(self.tmp)
+        st.record_review(7, "shaE", "BLOCK", "reviewer", "why: mine")
+        self.assertEqual(st.recorded_review_reason(8, "shaE"), "")
+        self.assertEqual(st.recorded_review_reason(7, "shaF"), "")
+
+    def test_collecting_a_block_verdict_records_its_reason(self):
+        # The real rail: LiveGates.review consumes the reviewer's result file, so the reason is
+        # parsed and durably recorded in the SAME write that records the verdict.
+        st = LiveState(self.tmp)
+        cand = LiveCandidate(pr="7", slug="feat-x", sha="shaG")
+        with open(st.review_result_file(cand), "w", encoding="utf-8") as fh:
+            fh.write(_BLOCK_LINE + "\n")
+        journal = LiveJournal(self.jpath)
+        gates = LiveGates(self.tmp, st, journal, config={})
+        self.assertEqual(gates.review(cand), "BLOCK")
+        self.assertEqual(st.recorded_review_reason("7", "shaG"), _BLOCK_REASON)
+
+    def test_collecting_a_pass_records_no_reason(self):
+        st = LiveState(self.tmp)
+        cand = LiveCandidate(pr="7", slug="feat-x", sha="shaH")
+        with open(st.review_result_file(cand), "w", encoding="utf-8") as fh:
+            fh.write("REVIEW: PASS\n")
+        gates = LiveGates(self.tmp, st, LiveJournal(self.jpath), config={})
+        self.assertEqual(gates.review(cand), "PASS")
+        self.assertEqual(st.recorded_review_reason("7", "shaH"), "")
+
+
+class TestBlockReasonJournal(LiveCase):
+    """The journal half (HERD-473): `verdict_recorded` gains `reason` — read back from the ledger, so
+    the two can never disagree — and stays byte-identical when there is none."""
+
+    def test_verdict_recorded_carries_the_reason(self):
+        LiveState(self.tmp).record_review(1, "sha1", "BLOCK", "reviewer", _BLOCK_REASON)
+        res, ev = self.tick([self.one(1, review="BLOCK", health="CLEAN", agent_status="idle")])
+        vr = [o for o in ev if o["event"] == "verdict_recorded"]
+        self.assertEqual(len(vr), 1)
+        self.assertEqual(vr[0]["value"], "BLOCK")
+        self.assertEqual(vr[0]["reason"], _BLOCK_REASON)
+
+    def test_reason_less_verdict_recorded_is_byte_identical(self):
+        res, ev = self.tick([self.one(1, review="BLOCK", health="CLEAN", agent_status="idle")])
+        vr = [o for o in ev if o["event"] == "verdict_recorded"]
+        self.assertEqual(len(vr), 1)
+        self.assertNotIn("reason", vr[0])
+
+    def test_a_pass_never_carries_a_reason(self):
+        res, ev = self.tick([self.one(1, review="PASS", health="CLEAN")])
+        vr = [o for o in ev if o["event"] == "verdict_recorded"]
+        self.assertNotIn("reason", vr[0])
+
+
+class TestBlockReasonComment(LiveCase):
+    """The PR surface (HERD-473, contract §5.6): a BLOCK that has spent its refix budget escalates to
+    a human, and now TELLS that human what the objection was — through the same #577 comment actuator
+    and the same once-guard. Mutation-proven: dropping the post_comment call reds the first three."""
+
+    def _escalating_tick(self, reason=None, config=None):
+        # Seed the refix ledger so the review rail's budget is already spent for this PR — the exact
+        # state that escalates a standing BLOCK to a human instead of bouncing the builder again.
+        LR._append_refix_ledger(self.tmp, "1720000000 1 sha-old feat-x review\n")
+        if reason is not None:
+            LiveState(self.tmp).record_review(1, "sha1", "BLOCK", "reviewer", reason)
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        cand = self.one(1, review="BLOCK", health="CLEAN", slug="feat-x", agent_status="idle")
+        scenario = {"candidates": [cand],
+                    "config": config or {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "1"}}
+        journal = LiveJournal(self.jpath)
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     act, journal, state=LiveState(self.tmp))
+        res = t.run()
+        return res["outcomes"]["1"], act, events(self.jpath)
+
+    def test_escalated_block_posts_the_reason_to_the_pr(self):
+        out, act, ev = self._escalating_tick(reason=_BLOCK_REASON)
+        self.assertEqual(out, "ESCALATE")
+        self.assertEqual(len(act.comments), 1)
+        pr, kind, body = act.comments[0]
+        self.assertEqual(kind, "review-block")
+        self.assertIn(_BLOCK_REASON, body)                  # the reviewer's words, verbatim
+        self.assertIn("herd approve why 1", body)
+
+    def test_a_reason_less_block_says_so_instead_of_going_quiet(self):
+        # #576's actual harm was TEXT THAT WAS NOT THE OBJECTION reading as if it were. With no
+        # reason recorded the comment must state that, and warn off exactly that misreading.
+        out, act, ev = self._escalating_tick(reason=None)
+        self.assertEqual(out, "ESCALATE")
+        self.assertEqual(len(act.comments), 1)
+        body = act.comments[0][2]
+        self.assertIn("no structured reason", body)
+        self.assertNotIn("Reviewer's stated reason:\n\n> ", body)
+
+    def test_the_comment_is_posted_once_per_sha_not_once_per_tick(self):
+        out, act, ev = self._escalating_tick(reason=_BLOCK_REASON)
+        self.assertEqual(out, "ESCALATE")
+        cand = self.one(1, review="BLOCK", health="CLEAN", slug="feat-x", agent_status="idle")
+        scenario = {"candidates": [cand], "config": {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "1"}}
+        journal = LiveJournal(self.jpath)
+        t2 = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                      act, journal, state=LiveState(self.tmp))
+        self.assertEqual(t2.run()["outcomes"]["1"], "ESCALATE")
+        self.assertEqual(len(act.comments), 1, "a re-walked blocked PR must never re-post")
+
+    def test_a_bounced_block_posts_nothing(self):
+        # Budget REMAINING → the builder is re-tasked, not the human. No comment on that path.
+        act = _RecordingHoldActuator(LiveJournal(self.jpath))
+        cand = self.one(1, review="BLOCK", health="CLEAN", slug="feat-x", agent_status="idle")
+        scenario = {"candidates": [cand], "config": {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}}
+        journal = LiveJournal(self.jpath)
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), FixtureGates(scenario),
+                     act, journal, state=LiveState(self.tmp))
+        self.assertEqual(t.run()["outcomes"]["1"], "BLOCK")
+        self.assertEqual(act.comments, [])
+
+    def test_dry_run_actuator_posts_nothing(self):
+        LR._append_refix_ledger(self.tmp, "1720000000 1 sha-old feat-x review\n")
+        LiveState(self.tmp).record_review(1, "sha1", "BLOCK", "reviewer", _BLOCK_REASON)
+        orig = LR.subprocess
+        LR.subprocess = _Poison()
+        try:
+            res, ev = self.tick([self.one(1, review="BLOCK", health="CLEAN", slug="feat-x",
+                                          agent_status="idle")],
+                                config={"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "1"})
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(res["outcomes"]["1"], "ESCALATE")
 
 
 if __name__ == "__main__":

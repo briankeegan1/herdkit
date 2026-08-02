@@ -62,6 +62,8 @@ cat > "$TREES/.herd/journal.jsonl" <<'JNL'
 {"ts":"2026-07-10T00:00:06Z","event":"cost","pr":"43","component":"builder","model":"foreign-model?","usd":"0","in":"1","out":"2","cache_read":"0","cache_write":"0","msgs":"1","unpriced":"1"}
 {"ts":"2026-07-10T00:00:07Z","event":"some_novel_event","pr":"42","alpha":"one","beta":"two"}
 {"ts":"2026-07-10T00:00:08Z","event":"infra_event","pr":"","component":"watcher","exit_code":"0","stderr_tail":""}
+{"ts":"2026-07-10T00:00:09Z","event":"verdict_recorded","pr":"43","value":"BLOCK","source":"reviewer","sha":"aabbccdd","reason":"rule: R | why: W | location: a.py:3"}
+{"ts":"2026-07-10T00:00:10Z","event":"verdict_recorded","pr":"44","value":"BLOCK","source":"reviewer","sha":"aabbccdd"}
 JNL
 
 # run_herd <engine-py 0|1> -- args...  → runs the real CLI in the fixture project, stdout+exit only.
@@ -91,6 +93,17 @@ assert_parity "why 42" why 42
 [[ "$(run_herd 1 why 42)" == *"gate history (7 events)"* ]] || fail "why 42: unexpected event count"
 assert_parity "why 43" why 43
 assert_parity "why 999 (no events)" why 999
+
+# HERD-473: a BLOCK's recorded reason is RENDERED by `herd why` — by BOTH readers identically (the
+# parity assertions above already prove that), and a reason-less row renders exactly as it did before
+# the field existed, so a legacy journal reads the same as it always has.
+[[ "$(run_herd 1 why 43)" == *"BLOCK (reviewer) · sha aabbccdd · rule: R | why: W | location: a.py:3"* ]] \
+  || fail "why 43: the recorded BLOCK reason was not rendered"
+assert_parity "why 44 (reason-less BLOCK)" why 44
+[[ "$(run_herd 1 why 44)" == *"BLOCK (reviewer) · sha aabbccdd"* ]] \
+  || fail "why 44: a reason-less verdict did not render"
+[[ "$(run_herd 1 why 44)" == *"sha aabbccdd ·"* ]] \
+  && fail "why 44: a reason-less verdict grew a trailing separator"
 
 # ── (2) herd log — full stream, and --pr filter ──
 assert_parity "log (all)"     log
