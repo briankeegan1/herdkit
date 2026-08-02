@@ -201,9 +201,13 @@ SANDBOX_FORCE_STEPS_FAULT=1 bash scripts/herd/sim/sandbox-scenario.sh --posture 
 
 The default (no `--posture`) invocation of either scenario is **byte-identical** to today — the posture
 logic is inert when unset, so the per-merge sims stay cheap. The matrix is an **explicit** invocation
-(a nightly candidate, not a per-merge gate). Hermetic proof:
-[`../../../tests/test-sandbox-posture-matrix.sh`](../../../tests/test-sandbox-posture-matrix.sh) — the
-seven posture invariants, the caught fault, and the byte-identical solo-auto check.
+(a nightly candidate, not a per-merge gate). Hermetic proof (HERD-477: split per-posture so the CI
+shard machinery distributes them instead of one file paying for all eight):
+[`../../../tests/test-sandbox-posture-matrix-data.sh`](../../../tests/test-sandbox-posture-matrix-data.sh)
+for the postures.tsv data-shape checks, and one
+`tests/test-sandbox-posture-matrix-<posture>.sh` per posture (sharing
+[`../../../tests/lib/sandbox-posture-matrix-case.sh`](../../../tests/lib/sandbox-posture-matrix-case.sh))
+for the eight posture invariants, the caught fault, and the byte-identical solo-auto check.
 
 ## P2a — end-to-end LIMIT-PARK / AUTO-RESUME scenario — `sandbox-limit-resume-scenario.sh`
 
