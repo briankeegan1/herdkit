@@ -37,21 +37,29 @@ herd_suite_curated_tests() {
   local _hsc_dir="${1:-}" _hsc_exempt="${2:-}"
   [ -n "$_hsc_dir" ] && [ -d "$_hsc_dir" ] || return 0
   [ -n "$_hsc_exempt" ] || _hsc_exempt="$_hsc_dir/gate-coverage-exempt.tsv"
-  (
+  # tests/test-suite-shard.sh calls this (via herd_suite_tests_for_shard) 15x for one run, once per
+  # (shard_index, shard_count) pair — a per-file basename+grep fork here used to mean 700+ forks per
+  # call and a >120s test timeout. One bulk grep against the exempt file keeps this O(1) forks.
+  local _hsc_raw
+  _hsc_raw="$(
     shopt -s nullglob
-    local _hsc_f _hsc_base
+    local _hsc_f
     for _hsc_f in "$_hsc_dir"/test-*.sh; do
-      _hsc_base="$(basename "$_hsc_f")"
-      if [ -f "$_hsc_exempt" ] && grep -qxF -- "$_hsc_base" "$_hsc_exempt" 2>/dev/null; then
-        continue
-      fi
-      printf '%s\n' "$_hsc_base"
+      printf '%s\n' "${_hsc_f##*/}"
     done
-  ) | LC_ALL=C sort
+  )"
+  [ -n "$_hsc_raw" ] || return 0
+  if [ -f "$_hsc_exempt" ]; then
+    printf '%s\n' "$_hsc_raw" | grep -vFxf "$_hsc_exempt" | LC_ALL=C sort
+  else
+    printf '%s\n' "$_hsc_raw" | LC_ALL=C sort
+  fi
 }
 
 herd_suite_shard_hash() {
-  printf '%s' "$1" | cksum | awk '{print $1}'
+  local _hsh_out
+  _hsh_out="$(cksum <<< "$1")"
+  printf '%s' "${_hsh_out%% *}"
 }
 
 herd_suite_shard_of() {
