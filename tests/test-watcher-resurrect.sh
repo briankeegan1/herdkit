@@ -25,18 +25,31 @@
 #   (7) a relaunch that leaves no live pid journals watcher_resurrect_failed and exits 1 (the cron
 #       job's own failure signal)
 #
-# NETWORK-FREE, no herdr, no gh. Spawns only `sleep` as stand-ins for "a watcher process"; every
-# spawned pid is killed in the EXIT trap.
+# NETWORK-FREE, no herdr, no gh. Spawns only `sleep` as stand-ins for "a watcher process", each one
+# fd-closed + exec'd (HERD-462) and tracked for a forced reap in the EXIT trap.
 # Run:  bash tests/test-watcher-resurrect.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/../scripts/herd/watcher-resurrect.sh"
 
 T="$(mktemp -d)"
-SPAWNED_PIDS=""
+
+# HERD-462: bats-core dup's a live pipe onto a high fd (its own "ok N …" aggregator) before running
+# each test; a backgrounded stand-in process inherits that fd unless it explicitly closes it, and
+# keeps the WRITE end open long after this test finishes — bats then blocks forever on a read() that
+# never sees EOF, wedging the whole run behind one leaked child even though every test itself
+# reported "ok" (see tests/test-cli-reload.sh's `_bg_close_fds` for the original writeup). Close the
+# whole high-fd range and always `exec` into the final command (never leave a plain forked child), so
+# a lone `kill` fully reaps it.
+_bg_close_fds() {
+  local fd
+  for fd in $(seq 3 255); do eval "exec $fd>&-" 2>/dev/null; done
+}
+_BG_PIDS=""
+_bg_track() { _BG_PIDS="$_BG_PIDS $1"; }
 cleanup() {
   local p
-  for p in $SPAWNED_PIDS; do kill -9 "$p" 2>/dev/null || true; done
+  for p in $_BG_PIDS; do kill -9 "$p" 2>/dev/null || true; done
   rm -rf "$T"
 }
 trap cleanup EXIT
@@ -52,15 +65,17 @@ ok()   { pass=$((pass+1)); }
 # subshell orphans the job to a subshell that exits (and reaps it) before the caller can observe it
 # alive, which is a real bash gotcha, not a herdkit one. Called directly at top level instead.
 spawn_stub_process() {
-  sleep 100 &
+  ( _bg_close_fds; exec sleep 100 ) &
   SPAWN_PID=$!
-  SPAWNED_PIDS="$SPAWNED_PIDS $SPAWN_PID"
+  _bg_track "$SPAWN_PID"
 }
 
 # ── Stub `herd` on PATH ───────────────────────────────────────────────────────────────────────────
 # reload → logs the call, then simulates the VERIFIED relaunch by spawning a real detached process
 # and recording its pid in the lockfile — exactly the observable outcome `herd reload`'s own
 # background fallback produces, without exercising the real (herdr/pane-dependent) machinery here.
+# It closes its own high fds before backgrounding (same HERD-462 reason as _bg_close_fds above) —
+# this stub is a SEPARATE process invoked by watcher-resurrect.sh, so it inherits the same bats fds.
 BIN="$T/bin"; mkdir -p "$BIN"
 cat > "$BIN/herd" <<'STUB'
 #!/usr/bin/env bash
@@ -68,7 +83,8 @@ case "${1:-}" in
   reload)
     [ -n "${STUB_HERD_CALL_LOG:-}" ] && printf 'reload\n' >> "$STUB_HERD_CALL_LOG"
     if [ "${STUB_RELOAD_SUCCEEDS:-1}" = "1" ]; then
-      ( sleep 100 & echo $! > "${STUB_WATCHER_LOCK:-/dev/null}" )
+      ( for fd in $(seq 3 255); do eval "exec $fd>&-" 2>/dev/null; done
+        exec sleep 100 ) & echo $! > "${STUB_WATCHER_LOCK:-/dev/null}"
     fi
     ;;
   *) exit 0 ;;
@@ -164,7 +180,7 @@ ok
 [ -f "$HERD_WATCHER_LOCK" ] || fail "5: the lockfile must now exist"
 ok
 NEW_PID="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
-SPAWNED_PIDS="$SPAWNED_PIDS $NEW_PID"
+_bg_track "$NEW_PID"
 kill -0 "$NEW_PID" 2>/dev/null || fail "5: the resurrected pid must be a REAL live process"
 ok
 # journal.sh emits an integer-looking value as a bare JSON number (pid), never a quoted string.
