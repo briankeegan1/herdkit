@@ -9639,6 +9639,213 @@ Why: ${_CI_REPAIR_REASON:-CI red + gates green + behind base}"
   return 0
 }
 
+# ── CI fast-bounce: act on the PR's OWN CI failure conclusion, ahead of the local suite (HERD-495) ──
+# CI_FAST_BOUNCE=on|off (default off, yolo posture adopts on). GROUNDED (PR #610, 2026-08-01): #610 sat
+# red for ~50 minutes — the full local healthcheck suite ran, failed, and was retried in full — while
+# GitHub Actions had already named the exact failing test in ~4 minutes. `_handle_ci_repair` (HERD-250)
+# only ever acts on the INHERITED-red case (gates green + behind base); a REAL new-code CI failure falls
+# straight through to a passive needs-you row and waits for the local suite to independently reach the
+# same verdict. This leg closes that gap: when the PR's OWN CI run concludes a FAILURE and its own log
+# (scripts/ci/run-suite.sh's "✗ <test>" lines, read via `gh run view --log-failed`) names a real test —
+# the SAME honest-identity extraction HERD-476/PR #600 built for the main-health CI leg
+# (_main_health_ci_log_identity, reused verbatim here, not re-implemented) — the builder is bounced
+# IMMEDIATELY with that evidence, instead of waiting for the local suite to catch up.
+#
+# The bounce prompt says PROVISIONAL, on purpose: CI's read can be wrong (flaky infra, an inherited base
+# bug the local suite's BASELINE_AWARE_GATE would forgive) in a way the local suite is not — so the
+# local run stays the AUTHORITATIVE verdict and this is framed as a head start, never a final word.
+#
+# SHARES THE HEALTH RAIL'S BUDGET, ON PURPOSE (kind=health, not a new rail): a fast-bounce and a local
+# CODE ERROR bounce (_handle_health_codeerror) are the same claim — "this sha has a failing test" — just
+# sourced at different speeds. Reusing kind=health means: (a) the sha-keyed once-guard is the SAME
+# once-guard, so if CI fires first the later local CODE ERROR sees refix_attempted(...,health)=true and
+# never double-bounces; (b) the round budget is the SAME REFIX_MAX_ROUNDS budget, never a second pool to
+# exhaust; (c) a local CLEAN/FLAKY verdict resets kind=health exactly as it already does today — this red
+# "retracts via normal rails" with zero new code, because the rail it retracts is the one that already
+# existed.
+#
+# Only reached when `_handle_ci_repair` did NOT handle the tick (off, or genuinely not the inherited-red
+# case) — see the call site. off (default) → byte-identical to the pre-HERD-495 needs-you path: no gh
+# calls beyond what `_ci_gate_eval` already made, no bounce, no ledger write.
+
+# _ci_fastbounce_enabled — true iff CI_FAST_BOUNCE opts in. Any unrecognized value → off.
+_ci_fastbounce_enabled() {
+  case "$(printf '%s' "${CI_FAST_BOUNCE:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _ci_fastbounce_identity <branch> <sha> — the HONEST failing-test identity for the PR's OWN CI run at
+# <sha>, or empty (fail-soft: an offline/old gh, no completed run yet for this sha, a run whose bucket
+# isn't fail, or a log with no parseable ✗ line all yield nothing — never a guessed identity). Finds the
+# most recent COMPLETED run on <branch> matching <sha> via the SAME classifier the main-health CI leg
+# uses (_main_ci_classify, already generic — not main-specific despite its name), then hands its
+# databaseId to _main_health_ci_log_identity (HERD-476/#600) for the log-derived test name(s).
+#
+# Test seam: HERD_CI_FASTBOUNCE_IDENTITY, when SET (even to ""), is returned verbatim and no gh call is
+# made — lets a hermetic test drive both the honest-identity and the log-unreadable paths without a
+# real run id.
+_ci_fastbounce_identity() {
+  local _cfi_branch="$1" _cfi_sha="$2"
+  if [ -n "${HERD_CI_FASTBOUNCE_IDENTITY+set}" ]; then
+    printf '%s' "$HERD_CI_FASTBOUNCE_IDENTITY"
+    return 0
+  fi
+  [ -n "$_cfi_branch" ] && [ -n "$_cfi_sha" ] || return 0
+  local _cfi_json _cfi_res _cfi_bucket _cfi_wf _cfi_concl _cfi_run
+  _cfi_json="$(_gh_timeout ci_fastbounce run list --branch "$_cfi_branch" --limit 20 \
+                 --json headSha,status,conclusion,workflowName,databaseId 2>/dev/null)" || return 0
+  [ -n "$_cfi_json" ] || return 0
+  _cfi_res="$(printf '%s' "$_cfi_json" | _main_ci_classify "$_cfi_sha")"
+  [ -n "$_cfi_res" ] || return 0
+  IFS=$'\t' read -r _cfi_bucket _cfi_wf _cfi_concl _cfi_run <<EOF
+$_cfi_res
+EOF
+  [ "$_cfi_bucket" = "fail" ] || return 0
+  [ -n "$_cfi_run" ] || return 0
+  _main_health_ci_log_identity "$_cfi_run"
+}
+
+# _handle_ci_fastbounce <pr#> <slug> <headSha> <display-idx> <worktree-dir> <branch> <ci-summary>
+# Called from the same UNSTABLE+fail spot as _handle_ci_repair, only when that handler returned 1 (off,
+# or a genuinely real — not inherited — CI failure). Returns 0 if THIS handler set DISPLAY (bounced,
+# deferred, or needs-you after a spent budget); returns 1 if the caller should paint the classic
+# needs-you · CI-failed row (off / dry-run / log unreadable) — the unchanged pre-HERD-495 fallback.
+_handle_ci_fastbounce() {
+  local _cfb_pr="$1" _cfb_slug="$2" _cfb_sha="$3" _cfb_idx="$4" _cfb_wt="${5:-}" \
+        _cfb_branch="${6:-}" _cfb_ci="${7:-}"
+  local _cfb_sl _cfb_pn _cfb_rounds _cfb_round_num _cfb_capmsg _cfb_id _cfb_note
+
+  if ! _ci_fastbounce_enabled || [ -n "${DRYRUN:-}" ]; then
+    return 1
+  fi
+
+  _cfb_id="$(_ci_fastbounce_identity "$_cfb_branch" "$_cfb_sha")"
+  if [ -z "$_cfb_id" ]; then
+    if ! _refix_dead_seen "$_cfb_pr" "ci-fastbounce-unreadable-$_cfb_sha"; then
+      _record_refix_dead "$_cfb_pr" "ci-fastbounce-unreadable-$_cfb_sha"
+      journal_append ci_fastbounce pr "$_cfb_pr" sha "$_cfb_sha" slug "$_cfb_slug" \
+        result skipped reason ci-log-unreadable
+    fi
+    return 1
+  fi
+
+  _cfb_sl="$(_slug_cell "$_cfb_slug")"
+  _cfb_pn=" ${C_DIM}#${_cfb_pr}${C_RESET} ·"
+
+  # LIMIT PREFLIGHT: never type into a usage-limit arrow-menu. Once-guard not burned.
+  if [ -n "$_cfb_wt" ]; then
+    local _cfb_lreset
+    if _cfb_lreset="$(_detect_limit_hit "$_cfb_slug" "$_cfb_wt")"; then
+      journal_append ci_fastbounce_deferred_limit pr "$_cfb_pr" sha "$_cfb_sha" slug "$_cfb_slug" \
+        reset_at "${_cfb_lreset:-0}"
+      _handle_limit_blocked "$_cfb_slug" "$_cfb_wt" "$_cfb_idx" "${_cfb_lreset:-0}"
+      return 0
+    fi
+  fi
+
+  # SHARED RAIL: kind=health, the SAME rail _handle_health_codeerror bounces on. Already-bounced (by
+  # either trigger) or already-working reads as honest in-progress; the once-guard blocks a re-bounce.
+  if _cfb_note="$(_active_fix_note "$_cfb_pr" "$_cfb_sha" "$_cfb_slug" health)"; then
+    DISPLAY[_cfb_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_YELLOW}CI red (provisional) · ${_cfb_note}${C_RESET}"
+    return 0
+  fi
+  if refix_attempted "$_cfb_pr" "$_cfb_sha" health; then
+    DISPLAY[_cfb_idx]="$(_refix_stalled_row "$_cfb_pr" "$_cfb_sha" "$_cfb_slug" health "$_cfb_sl" "$_cfb_pn")"
+    return 0
+  fi
+
+  _cfb_rounds="$(refix_rail_count "$_cfb_pr" health)"
+  if _cfb_capmsg="$(_refix_budget_reason "$_cfb_pr" health)"; then
+    DISPLAY[_cfb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_RED}needs you · ${_cfb_capmsg} · CI red (provisional): ${_cfb_id}${C_RESET}"
+    if ! _refix_dead_seen "$_cfb_pr" "ci-fastbounce-cap-$_cfb_sha"; then
+      _record_refix_dead "$_cfb_pr" "ci-fastbounce-cap-$_cfb_sha"
+      local _cfb_report_rounds="$_cfb_rounds"
+      case "$_cfb_capmsg" in
+        *'total rounds across rails'*) _cfb_report_rounds="$(refix_total_count "$_cfb_pr")" ;;
+      esac
+      journal_append ci_fastbounce_escalated pr "$_cfb_pr" sha "$_cfb_sha" slug "$_cfb_slug" \
+        rounds "$_cfb_report_rounds" reason "${_cfb_capmsg} — CI still red (provisional)"
+      herd_driver_notify "⚠️ refix budget spent: ${_cfb_slug}" \
+        "PR #${_cfb_pr} CI red (provisional) after ${_cfb_report_rounds} refix rounds — needs you" default
+    fi
+    return 0
+  fi
+
+  # DEAD/MISSING PREFLIGHT: a wake typed at a dead session or a vanished pane can only hit nobody.
+  local _cfb_live
+  if _cfb_live="$(_agent_liveness "$_cfb_slug")"; [ "$_cfb_live" = "dead" ] || [ "$_cfb_live" = "missing" ]; then
+    if [ "$_cfb_live" = "missing" ]; then
+      DISPLAY[_cfb_idx]="    ${C_RED}🫥${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_RED}needs you · CI red (provisional) + agent missing (no agent pane) — fix + push by hand${C_RESET}"
+    else
+      DISPLAY[_cfb_idx]="    ${C_RED}💀${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_RED}needs you · CI red (provisional) + agent dead (unwakeable) — fix + push by hand${C_RESET}"
+    fi
+    if ! _refix_dead_seen "$_cfb_pr" "ci-fastbounce-$_cfb_sha"; then
+      _record_refix_dead "$_cfb_pr" "ci-fastbounce-$_cfb_sha"
+      journal_append ci_fastbounce_escalated pr "$_cfb_pr" sha "$_cfb_sha" slug "$_cfb_slug" \
+        reason "agent ${_cfb_live} — wake would fail; escalated for human"
+      herd_driver_notify "💀 agent ${_cfb_live}: ${_cfb_slug}" \
+        "PR #${_cfb_pr} CI red (provisional) but the builder is ${_cfb_live} — fix by hand" default
+    fi
+    return 0
+  fi
+
+  # SELF-RESTART QUIESCE: drain toward re-exec — do not burn the once-guard.
+  if _self_restart_hold_dispatch; then
+    DISPLAY[_cfb_idx]="    ${C_YELLOW}🔁${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_YELLOW}CI red (provisional) · held (watcher restarting on new engine code)${C_RESET}"
+    return 0
+  fi
+
+  # SUITE WRITE INTERLOCK: a live health suite owns this worktree — defer without burning the guard.
+  _defer_for_suite "$_cfb_pr" "$_cfb_slug" "$_cfb_sha" "$_cfb_idx" health "CI red (provisional)" && return 0
+
+  # BOUNCE. Record BEFORE sending so the once-guard holds even if pane lookup or delivery fails.
+  _cfb_round_num="$((_cfb_rounds + 1))"
+  DISPLAY[_cfb_idx]="    ${C_CYAN}🔁${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_CYAN}fast-bounce · CI red, provisional (round ${_cfb_round_num}/${REFIX_MAX_ROUNDS:-3})${C_RESET}"
+  render
+  record_refix "$_cfb_pr" "$_cfb_sha" "$_cfb_slug" health
+  local _cfb_before; _cfb_before="$(_agent_status "$_cfb_slug")"
+  journal_append ci_fastbounce_bounce pr "$_cfb_pr" sha "$_cfb_sha" slug "$_cfb_slug" \
+    round "$_cfb_round_num" agent_status_before "${_cfb_before:-unknown}" detail "$_cfb_id"
+
+  local _cfb_pane_id _cfb_woke=0 _cfb_escalated=false _cfb_prompt
+  _cfb_prompt="PR #${_cfb_pr}'s CI just concluded FAILURE, naming: ${_cfb_id}
+This is PROVISIONAL — GitHub Actions' own log named it, but your local pre-merge healthcheck suite (the
+gate that actually merges this PR) is still the AUTHORITATIVE verdict and has not weighed in yet. This
+bounce exists so you get a head start instead of waiting out the full local suite (which can take far
+longer) to learn what CI already knows.
+Reproduce and fix ${_cfb_id} now, from your worktree. If the local suite later disagrees and comes back
+CLEAN, this red retracts on its own via the normal rails — no action needed in that case.
+Fix the failure, re-run until clean, then push."
+  _cfb_pane_id="$(_find_builder_pane_id_any "$_cfb_slug")"
+  if [ -n "$_cfb_pane_id" ]; then
+    local _cfb_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
+    herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
+    if _wait_agent_working "$_cfb_slug" "$_cfb_wait"; then
+      _cfb_woke=1
+    else
+      herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
+      if _wait_agent_working "$_cfb_slug" "$_cfb_wait"; then
+        _cfb_woke=1
+      else
+        DISPLAY[_cfb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_RED}needs you · CI fast-bounce failed · check pane${C_RESET}"
+        _cfb_escalated=true
+        _escalate_refix_stuck "$_cfb_pr" "$_cfb_sha" "$_cfb_slug" health "the builder never woke (prompt delivered twice)"
+      fi
+    fi
+  else
+    DISPLAY[_cfb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_RED}needs you · CI fast-bounce failed · agent pane not found${C_RESET}"
+    _cfb_escalated=true
+    _escalate_refix_stuck "$_cfb_pr" "$_cfb_sha" "$_cfb_slug" health "no agent pane to deliver the bounce to"
+  fi
+  local _cfb_after; _cfb_after="$(_agent_status "$_cfb_slug")"
+  journal_append ci_fastbounce_wake_result pr "$_cfb_pr" sha "$_cfb_sha" slug "$_cfb_slug" \
+    round "$_cfb_round_num" agent_status_before "${_cfb_before:-unknown}" \
+    agent_status_after "${_cfb_after:-unknown}" woke "$_cfb_woke" escalated "$_cfb_escalated"
+  return 0
+}
+
 # ── Auto-refix (healthcheck): bounce a reproduced CODE ERROR straight to the builder ───────────────
 # HEALTHCHECK_AUTOFIX=true|false (default false). The review gate already bounces a BLOCK verdict to the
 # builder (_handle_block_verdict); a reproduced healthcheck CODE ERROR is the same shape of finding —
@@ -14644,6 +14851,8 @@ EOF
         _ci_bucket="${_ci_sum%%$'\t'*}"; _ci_text="${_ci_sum#*$'\t'}"
         if [ "$_ci_bucket" = "fail" ]; then
           if _handle_ci_repair "$prnum" "$slug" "$headsha" "$i" "$dir" "$branch" "$_ci_text"; then
+            FLAIR_STATE[i]="busy"
+          elif _handle_ci_fastbounce "$prnum" "$slug" "$headsha" "$i" "$dir" "$branch" "$_ci_text"; then
             FLAIR_STATE[i]="busy"
           else
             DISPLAY[i]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_RED}needs you · ${_ci_text}${C_RESET}"
