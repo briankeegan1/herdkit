@@ -84,8 +84,8 @@ with_seam="$(_run seam)"
 no_seam="$(_run none)"
 
 # Both must show the builder row for myslug at all.
-printf '%s' "$with_seam" | "$GREP" -q 'myslug' || fail "status row for the builder is missing (with seam)"
-printf '%s' "$no_seam"   | "$GREP" -q 'myslug' || fail "status row for the builder is missing (no seam)"
+"$GREP" -q 'myslug' <<< "$with_seam" || fail "status row for the builder is missing (with seam)"
+"$GREP" -q 'myslug' <<< "$no_seam"   || fail "status row for the builder is missing (no seam)"
 pass
 
 # The classification MUST differ: the seam-fed roster (agent working) is NOT the empty-roster DEAD
@@ -99,9 +99,9 @@ line_none="$(printf '%s\n' "$no_seam"   | "$GREP" 'myslug' | sed -n 1p)"
 pass
 
 # And concretely: the seam-fed row must NOT read DEAD, while the empty-roster row DOES.
-printf '%s' "$line_none" | "$GREP" -qi 'dead' \
+"$GREP" -qi 'dead' <<< "$line_none" \
   || fail "empty roster did not yield the DEAD signature (test premise broken): $line_none"
-printf '%s' "$line_seam" | "$GREP" -qi 'dead' \
+"$GREP" -qi 'dead' <<< "$line_seam" \
   && fail "seam reported the agent working yet status still marked it DEAD: $line_seam"
 pass
 

@@ -102,10 +102,11 @@ out="$(PATH="$FAKEBIN:$PATH" CLAUDE_ARGV_LOG="$LOG" ADVISE_MODEL="advisor-x" \
 "$GREP" -q '^ARG:advisor-x$' "$LOG"                   || fail "(B) advisor query did not carry the resolved ADVISE_MODEL"
 "$GREP" -q '^ARG:--dangerously-skip-permissions$' "$LOG" || fail "(B) advisor query dropped the permission flag"
 # --model is immediately followed by the model value (order preserved).
-"$GREP" -A1 '^ARG:--model$' "$LOG" | "$GREP" -q '^ARG:advisor-x$' \
+_model_argline="$("$GREP" -A1 '^ARG:--model$' "$LOG")"
+"$GREP" -q '^ARG:advisor-x$' <<< "$_model_argline" \
   || fail "(B) --model is not immediately followed by the model value"
 # The advice (fake stdout) surfaced back to the builder — the seam did not swallow output.
-echo "$out" | "$GREP" -q 'ARG:advisor-x' || fail "(B) advisor stdout did not reach the builder"
+"$GREP" -q 'ARG:advisor-x' <<< "$out" || fail "(B) advisor stdout did not reach the builder"
 pass
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════

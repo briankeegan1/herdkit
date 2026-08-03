@@ -32,6 +32,16 @@
 #  (15) A QUOTED '# pipe-ok' grants NO exemption — the annotation must be a real trailing comment.
 #  (16) …while a genuine trailing '# pipe-ok' still opts out.
 #
+# HERD-507 widened the detector past the literal token `grep`; (17)-(20) pin that down:
+#  (17) a producer piped into a QUOTED-VARIABLE consumer (holding the consumer's name at runtime,
+#       e.g. a portability shim like GREP=/usr/bin/grep) REDS — the EPIPE bug does not care whether
+#       the consumer's name is a literal or resolved from a variable.
+#  (18) …a BRACED-variable consumer REDS too.
+#  (19) ANY short-circuit-shaped consumer REDS regardless of token — not just grep or a variable, a
+#       wholly different literal command name ending its first flag in the early-exit shape also reds.
+#  (20) The safe forms still hold for a variable-held consumer: reading a FILE directly or a
+#       here-string (no producer pipe) stays clean, and '# pipe-ok' still opts out.
+#
 # Network-free: temp dirs + fixtures only. Run:  bash tests/test-pipe-safety.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -267,6 +277,42 @@ out="$(herd_pipe_safety_lint "$TPH2")"; rc=$?
 [ "$rc" -eq 0 ] || fail "(16) a genuine trailing '# pipe-ok' must still opt out (exit 0, got $rc): $out"
 pass
 echo "PASS (16) a genuine trailing '# pipe-ok' annotation still opts out"
+
+# ── 17. HERD-507: a quoted-variable consumer (producer piped into "$VAR" -q) reds ─────────────────
+TVQ="$T/varquoted"; make_script "$TVQ" 'echo "$out" | "$GREP" -q needle || fail "missing"'  # pipe-ok: fixture/assertion TEXT, not a live pipeline — this is the anti-pattern the lint under test must detect
+out="$(herd_pipe_safety_lint "$TVQ")"; rc=$?
+[ "$rc" -eq 1 ] || fail "(17) a producer piped into a quoted-variable consumer must red (exit 1, got $rc): $out"
+grep -q 'PIPE-UNSAFE .*probe.sh:2' <<< "$out" \
+  || fail "(17) should print a PIPE-UNSAFE line for probe.sh:2 (got: $out)"
+pass
+echo "PASS (17) a producer piped into a quoted-variable consumer (e.g. a GREP= portability shim) reds"
+
+# ── 18. HERD-507: a braced-variable consumer (producer piped into \${VAR} -q) reds ────────────────
+TVB="$T/varbraced"; make_script "$TVB" 'echo "$out" | ${GREP} -q needle || fail "missing"'  # pipe-ok: fixture/assertion TEXT, not a live pipeline — this is the anti-pattern the lint under test must detect
+out="$(herd_pipe_safety_lint "$TVB")"; rc=$?
+[ "$rc" -eq 1 ] || fail "(18) a producer piped into a braced-variable consumer must red (exit 1, got $rc): $out"
+pass
+echo "PASS (18) a producer piped into a braced-variable consumer reds too"
+
+# ── 19. HERD-507: ANY short-circuit-shaped consumer reds, regardless of token ────────────────────
+TTOK="$T/anytoken"; make_script "$TTOK" 'echo "$out" | some-other-tool -q needle || fail "missing"'  # pipe-ok: fixture/assertion TEXT, not a live pipeline — this is the anti-pattern the lint under test must detect
+out="$(herd_pipe_safety_lint "$TTOK")"; rc=$?
+[ "$rc" -eq 1 ] || fail "(19) a short-circuit-shaped consumer must red for ANY token, not just grep/head (exit 1, got $rc): $out"
+pass
+echo "PASS (19) an arbitrary command token in the short-circuit shape reds, not only grep/head"
+
+# ── 20. HERD-507: safe forms + opt-out still hold for a variable-held consumer ────────────────────
+TVSAFE="$T/varsafe"; make_script "$TVSAFE" \
+  '"$GREP" -q needle "$f" && echo a' \
+  '"$GREP" -q needle <<< "$var" && echo b'
+out="$(herd_pipe_safety_lint "$TVSAFE")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(20) a variable-held consumer reading a file or here-string must be clean (exit 0, got $rc): $out"
+grep -q 'PIPE-UNSAFE' <<< "$out" && fail "(20) safe variable-held forms must not be flagged (got: $out)"
+TVOK="$T/varoptout"; make_script "$TVOK" 'echo "$out" | "$GREP" -q needle  # pipe-ok: tiny fixed producer'
+out="$(herd_pipe_safety_lint "$TVOK")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(20) '# pipe-ok' must still opt out a variable-held consumer (exit 0, got $rc): $out"
+pass
+echo "PASS (20) safe forms and '# pipe-ok' opt-out still hold for a variable-held consumer"
 
 echo
 echo "ALL PASS ($PASS checks) — pipe-safety guard is live, fail-soft, block-aware, and itself pipefail-safe."

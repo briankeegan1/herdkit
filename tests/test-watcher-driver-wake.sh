@@ -51,16 +51,16 @@ want="claude --dangerously-skip-permissions --continue continue"
 pass
 
 got="$(herd_driver_agent_resume_cmd "please fix the review")"
-printf '%s' "$got" | "$GREP" -qF "claude --dangerously-skip-permissions --continue" \
+"$GREP" -qF "claude --dangerously-skip-permissions --continue" <<< "$got" \
   || fail "(A2) multi-word resume missing claude shape: $got"
-printf '%s' "$got" | "$GREP" -qE "please fix the review|'please fix the review'" \
+"$GREP" -qE "please fix the review|'please fix the review'" <<< "$got" \
   || fail "(A2) multi-word prompt not carried: $got"
 pass
 
 # Explicit flags override the permission token.
 got="$(herd_driver_agent_resume_cmd "continue" "--dangerously-skip-permissions --verbose")"
-printf '%s' "$got" | "$GREP" -qF -- "--verbose" || fail "(A3) flags override not applied: $got"
-printf '%s' "$got" | "$GREP" -qF -- "--continue" || fail "(A3) --continue dropped: $got"
+"$GREP" -qF -- "--verbose" <<< "$got" || fail "(A3) flags override not applied: $got"
+"$GREP" -qF -- "--continue" <<< "$got" || fail "(A3) --continue dropped: $got"
 pass
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -69,9 +69,9 @@ pass
 for pair in "stub:stub-agent" "codex:codex" "grok:grok"; do
   drv="${pair%%:*}"; bin="${pair#*:}"
   got="$(herd_driver_agent_resume_cmd "continue" "" "$drv")"
-  printf '%s' "$got" | "$GREP" -qE "^${bin}( |$)" \
+  "$GREP" -qE "^${bin}( |$)" <<< "$got" \
     || fail "(B) $drv resume must start with $bin (got: $got)"
-  printf '%s' "$got" | "$GREP" -qF "claude" \
+  "$GREP" -qF "claude" <<< "$got" \
     && fail "(B) $drv resume must NOT invoke claude (got: $got)"
 done
 pass
@@ -176,10 +176,10 @@ export STUB_AGENT_NAME="wake-f" STUB_AGENT_STATUS="done" STUB_AGENT_PANE_ID="pan
 WT="$T/trees/wake-f"; mkdir -p "$WT"
 _resume_builder "wake-f" "$WT" "pane-F" || fail "(F) _resume_builder should return 0 when agent wakes"
 cmd="$(head -1 "$PANE_LOG")"
-printf '%s\n' "$cmd" | "$GREP" -q -- "--continue" || fail "(F) resume must use --continue (got: $cmd)"
-printf '%s\n' "$cmd" | "$GREP" -q "claude" || fail "(F) default resume must invoke claude (got: $cmd)"
-printf '%s\n' "$cmd" | "$GREP" -q "$WT" || fail "(F) resume must cd into the worktree (got: $cmd)"
-printf '%s\n' "$cmd" | "$GREP" -q -- "--dangerously-skip-permissions" \
+"$GREP" -q -- "--continue" <<< "$cmd" || fail "(F) resume must use --continue (got: $cmd)"
+"$GREP" -q "claude" <<< "$cmd" || fail "(F) default resume must invoke claude (got: $cmd)"
+"$GREP" -q "$WT" <<< "$cmd" || fail "(F) resume must cd into the worktree (got: $cmd)"
+"$GREP" -q -- "--dangerously-skip-permissions" <<< "$cmd" \
   || fail "(F) default permission flag missing (got: $cmd)"
 pass
 
@@ -188,9 +188,9 @@ export HERD_DRIVER=stub
 : > "$PANE_LOG"; printf '0\n' > "$STUB_WAIT_FILE"
 _resume_builder "wake-f" "$WT" "pane-F" "go on" || fail "(F2) stub resume should wake"
 cmd="$(head -1 "$PANE_LOG")"
-printf '%s\n' "$cmd" | "$GREP" -q "stub-agent" || fail "(F2) stub resume must invoke stub-agent (got: $cmd)"
-printf '%s\n' "$cmd" | "$GREP" -q "claude" && fail "(F2) stub resume must NOT invoke claude (got: $cmd)"
-printf '%s\n' "$cmd" | "$GREP" -q "go on" || fail "(F2) custom prompt not carried (got: $cmd)"
+"$GREP" -q "stub-agent" <<< "$cmd" || fail "(F2) stub resume must invoke stub-agent (got: $cmd)"
+"$GREP" -q "claude" <<< "$cmd" && fail "(F2) stub resume must NOT invoke claude (got: $cmd)"
+"$GREP" -q "go on" <<< "$cmd" || fail "(F2) custom prompt not carried (got: $cmd)"
 pass
 
 # Limit banner under default driver still matches the real banner; discussion does not.
