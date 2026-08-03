@@ -222,7 +222,14 @@ EXEMPT_PREFIX = (
 EXEMPT_PREFIX_EXCEPTIONS = {"HERD_BRAND"}
 # Explicit internal/computed vars (paths, ids, models resolved in-engine, single-word locals).
 EXEMPT_NAMES = {
-    "ADVISE_MODEL", "AGENTS_JSON", "BLOCKED", "CELEBRATE", "DEPS_FILE", "DEP_STATES_FILE",
+    "ADVISE_MODEL", "AGENTS_JSON", "BLOCKED", "CELEBRATE",
+    "CONSOLE_LEDGER_MAX",  # console-section.sh's bounded-ledger row cap. Its own header states these
+                           # console constants are inline ON PURPOSE — "a legibility property of the
+                           # console, not an operator knob (no config key, no manifest row)" — so
+                           # declaring it would be the wrong half of the declare-or-exempt choice.
+                           # Read cross-file by status.sh's NOTES summary (HERD-492) exactly as
+                           # bin/herd's `herd notes` and agent-watch.sh already read it.
+    "DEPS_FILE", "DEP_STATES_FILE",
     "DEP_WATCHER_LIB", "DRYRUN", "HERDKIT_HOME", "HERDR_MIN_VERSION", "ITEM_STATE", "ITEM_UPDATED",
     "WATCHER_RESURRECT_LIB",  # watcher-resurrect.sh lib-mode test seam (HERD-489), same shape as
                               # DEP_WATCHER_LIB above — never a .herd/config knob
