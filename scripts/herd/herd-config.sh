@@ -675,6 +675,18 @@ fi
 # the advisory and deferred-kill paths are unreachable. Non-numeric → 0 (never activate on a typo).
 # Set to ~20% of HEALTH_INFLIGHT_TIMEOUT as a starting point (e.g. 360 for the default 1800s timeout).
 : "${HEALTH_TIMEOUT_HEADROOM:="0"}"   # HERD-281: advisory + deferred-kill margin (seconds); 0 = off
+# HEALTH_EARLY_REAP_SECS (HERD-494) — an in-flight health suite whose tailable log is STILL 0 bytes
+# after this many seconds AND has no live bats/suite descendant left in its process group is
+# dead-at-spawn or wedged BEFORE ever producing output — waiting out the full HEALTH_INFLIGHT_TIMEOUT
+# (many minutes) on a run that will never produce a verdict just stalls the gate. When > 0, the
+# every-tick corpse sweep reaps such a worker immediately (same group-kill seam the timeout branch
+# uses) and journals health_early_reap, instead of waiting for HEALTH_INFLIGHT_TIMEOUT. A suite that
+# has written ANY bytes, or still has a live descendant, is NEVER touched by this — only a truly
+# silent, childless worker qualifies, so a legitimately slow-to-start suite is never falsely reaped.
+# SHIP-DORMANT: 0 (default) → corpse sweep is byte-identical to before (kills at
+# HEALTH_INFLIGHT_TIMEOUT exactly); the early-reap path is unreachable. Non-numeric → 0 (never
+# activate on a typo). Consumed by agent-watch.sh.
+: "${HEALTH_EARLY_REAP_SECS:="0"}"   # HERD-494: early-reap a dead-at-spawn/wedged worker (seconds); 0 = off
 # GATE_DISPATCH (HERD-73) — serial (default) | parallel. Governs WHEN the watcher's action pass fires
 # the pre-merge review relative to the healthcheck for a (pr,sha). serial → today's EXACT behavior,
 # byte-identical: the review dispatches only AFTER the healthcheck outcome lands, so gate wall-clock is

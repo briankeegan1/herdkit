@@ -533,23 +533,44 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   # slot — bats keeps draining the remaining queued tests through the other slots — so one leaked
   # process no longer serializes the whole suite behind it; the outer `timeout` below is still the
   # backstop either way, unchanged from before this change.
+  # HERD-498 TARGETED RETRY: HEALTHCHECK_BATS_FILTER, when set, names the health-worker's solo
+  # retry-before-red re-run of ONLY the test(s) that failed run 1 (agent-watch.sh's _health_worker
+  # extracts them from run 1's TAP via _health_bats_retry_filter and re-invokes THIS script with the
+  # filter set — never the full tests/*.bats suite, which is what turned a single reproduced failure
+  # into a ~25-minute full re-run, PR #610). Forces SERIAL (never --jobs: a 1-2 test rerun gains
+  # nothing from parallel workers, and --jobs would reintroduce the exact ordering-buffer HERD-494
+  # works around via HEALTHCHECK_PROGRESS_LOG below). Unset — every caller except that solo retry —
+  # is byte-identical to before this change.
   _hk_bats_jobs=()
   _hk_jobs_note=" (serial — install GNU 'parallel' for a bats --jobs speedup)"
-  if [ "$_HK_SUITE_WORKERS" -gt 1 ] && command -v parallel >/dev/null 2>&1; then
+  _hk_bats_filter=()
+  if [ -n "${HEALTHCHECK_BATS_FILTER:-}" ]; then
+    _hk_bats_filter=(--filter "$HEALTHCHECK_BATS_FILTER")
+    _hk_jobs_note=" (targeted retry: filtered)"
+  elif [ "$_HK_SUITE_WORKERS" -gt 1 ] && command -v parallel >/dev/null 2>&1; then
     _hk_bats_jobs=(--jobs "$_HK_SUITE_WORKERS")
     _hk_jobs_note=" (jobs=$_HK_SUITE_WORKERS)"
   fi
+  # HERD-494(a): HEALTHCHECK_PROGRESS_LOG, when inherited from the health worker (agent-watch.sh's
+  # _health_worker sets it to the tailable health log path), flows straight through to bats' children
+  # unchanged — no plumbing needed here. tests/herd.bats's herd_run_discovered_test appends one
+  # per-FILE completion line to it the INSTANT each discovered test finishes, independent of bats'
+  # own ordered TAP stream (which --jobs buffers until every EARLIER-registered test has also
+  # finished — the reason a healthy 24m run could show a 0-byte tailable log). This still captures
+  # the full buffered TAP into $_hk_bats_out below for the verdict parse, unchanged.
   if command -v timeout >/dev/null 2>&1; then
     PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
       JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
       BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
       timeout -k 15 "${HEALTHCHECK_SUITE_TIMEOUT:-1800}" \
-        bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" tests/*.bats </dev/null >"$_hk_bats_out" 2>&1 &
+        bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" "${_hk_bats_filter[@]+"${_hk_bats_filter[@]}"}" \
+        tests/*.bats </dev/null >"$_hk_bats_out" 2>&1 &
   else
     PATH="${_hk_dh_pp}$PATH" HERD_HERMETIC_GUARD="$_hk_dh_log" \
       JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
       BATS_TEST_TIMEOUT="$BATS_TEST_TIMEOUT" \
-      bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" tests/*.bats </dev/null >"$_hk_bats_out" 2>&1 &
+      bats "${_hk_bats_jobs[@]+"${_hk_bats_jobs[@]}"}" "${_hk_bats_filter[@]+"${_hk_bats_filter[@]}"}" \
+      tests/*.bats </dev/null >"$_hk_bats_out" 2>&1 &
   fi
   _hk_bats_wrapper_pid=$!
   # HERD-462 CHOKEPOINT GUARD: a leaked test child can wedge bats' own internal fd well AFTER every

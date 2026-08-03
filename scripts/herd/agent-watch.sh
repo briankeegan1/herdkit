@@ -12823,6 +12823,34 @@ _health_terminate_worker() {
   return 0
 }
 
+# ── HERD-494(b): EARLY-REAP PROBE for a dead-at-spawn / wedged health worker ────────────────────────
+# A worker whose process itself is alive but has written NOTHING to its tailable log and has no live
+# child left in its process group is never going to produce a verdict — waiting out the full
+# HEALTH_INFLIGHT_TIMEOUT (many minutes) on it just wedges the HEALTH_CONCURRENCY slot. Ship-dormant
+# behind HEALTH_EARLY_REAP_SECS (0 = off, default) — see herd-config.sh.
+
+# _health_early_reap_secs — the configured HEALTH_EARLY_REAP_SECS threshold in seconds, or 0 (off).
+# Non-numeric or unset → 0 so a typo can never activate the probe (fail safe = off).
+_health_early_reap_secs() {
+  local _hers_v="${HEALTH_EARLY_REAP_SECS:-0}"
+  case "$_hers_v" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$_hers_v" ;; esac
+}
+
+# _health_bats_descendants_live <pgid> — true iff the health worker's process group ($1) still has a
+# LIVE member OTHER than the group leader itself (the worker leads its own group — see
+# _bg_health_worker/HERD-283 — so the leader's own pid always shows up in the group and must be
+# excluded). A worker that spawned a real `bash healthcheck.sh` / bats / test child still has one;
+# a dead-at-spawn or already-reaped child leaves the leader alone in its group. Fail-soft toward
+# "still live" (never falsely reap): an unknown pgid or a missing `pgrep` always returns true.
+_health_bats_descendants_live() {
+  local _hbd_pgid="${1:-}" _hbd_n
+  [ -n "$_hbd_pgid" ] || return 0
+  command -v pgrep >/dev/null 2>&1 || return 0
+  _hbd_n="$(pgrep -g "$_hbd_pgid" 2>/dev/null | grep -vxF "$_hbd_pgid" | grep -c . 2>/dev/null)" || true
+  case "$_hbd_n" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_hbd_n" -gt 0 ]
+}
+
 # ── Sha-keyed healthcheck result cache (mirrors the review gate's .review-result-<pr>-<sha>) ──────
 # WHY: a held/awaiting-verify/awaiting-approval PR sits on the candidate list every ~90s tick with an
 # UNCHANGED head sha, yet the gate re-ran the FULL suite each tick (PR #65, 2026-07-02: ~8 full runs
@@ -12946,6 +12974,43 @@ _health_fail_identity() {
   printf '%s' "${_hf_id:0:200}"
 }
 
+# _health_bats_notok_descs <log> — every 'not ok N <description>' TAP description from a suite log,
+# one per line. Kept in the SAME extraction shape .herd/healthcheck.project.sh's own _hk_bats_notok
+# uses (sed 's/^[[:space:]]*not ok[[:space:]][0-9][0-9]*[[:space:]]//p'), so the two can never disagree
+# about what a bats failure's description text is. Empty when the log carries no TAP 'not ok' at all —
+# a non-bats failure (syntax/shellcheck/leak-guard/caps-sync/…) or the no-bats hermetic-suite fallback.
+_health_bats_notok_descs() {
+  [ -f "$1" ] || return 0
+  sed -n 's/^[[:space:]]*not ok[[:space:]][0-9][0-9]*[[:space:]]//p' "$1" 2>/dev/null
+}
+
+# _health_ere_escape <line> — ERE-escape one line so it matches LITERALLY inside a built alternation
+# (a bats test description routinely carries regex metacharacters — most commonly the dynamic-
+# discovery suffix "(dynamic)", or a ticket ref like "(HERD-288)").
+_health_ere_escape() { printf '%s' "$1" | sed -e 's/[.[\*^$()+?{|]/\\&/g'; }
+
+# _health_bats_retry_filter <log> — an ERE alternation (for `bats --filter`) anchored to name EXACTLY
+# the bats test(s) run 1 reported as 'not ok', or EMPTY when run 1's failure carried no bats TAP 'not
+# ok' line at all. HERD-498: this is what lets the retry-before-red re-run ONLY the reproduced
+# failure's own test(s) instead of blindly re-running the whole ~385-test suite (~25m to confirm ONE
+# deterministic failure, observed live on PR #610) — every other failure class (syntax/shellcheck/
+# leak-guard/caps-sync, or bats absent) yields an empty filter here and _health_worker falls back to
+# retrying the full suite exactly as before this change.
+_health_bats_retry_filter() {
+  local _hbf_descs _hbf_d _hbf_re _hbf_alt=""
+  _hbf_descs="$(_health_bats_notok_descs "$1")"
+  [ -n "$_hbf_descs" ] || return 0
+  while IFS= read -r _hbf_d; do
+    [ -n "$_hbf_d" ] || continue
+    _hbf_re="$(_health_ere_escape "$_hbf_d")"
+    if [ -n "$_hbf_alt" ]; then _hbf_alt="${_hbf_alt}|${_hbf_re}"; else _hbf_alt="$_hbf_re"; fi
+  done <<EOF
+$_hbf_descs
+EOF
+  [ -n "$_hbf_alt" ] || return 0
+  printf '^(%s)$' "$_hbf_alt"
+}
+
 # record_healthcheck <pr#> <slug> <attempt> <outcome> [failed-identity] — append one attempt to the
 # ledger. When the outcome is a code error, [failed-identity] carries WHICH test/step failed (from
 # _health_fail_identity) and is journaled as failed=<id> so a later FLAKY-collapsed offender is still
@@ -12978,16 +13043,32 @@ record_healthcheck() {
 #                                 collector's transient-exemption still fires); drives the red row.
 # The collector (_healthcheck_gate) records the ledger + journal + sha-cache from this line — keeping
 # every ledger write in the tick process, ordered. Runs in a subshell fork so all helpers are in scope.
+#
+# HERD-494(a): both runs below set HEALTHCHECK_PROGRESS_LOG to their OWN live log path — bats' own
+# discovered-test runner (tests/herd.bats's herd_run_discovered_test) appends a per-FILE completion
+# line there the instant each test finishes, independent of the ordered-TAP buffer a --jobs parallel
+# run imposes on its OWN stdout (which is what previously left a healthy run's tailable log at 0
+# bytes for its whole runtime). Both the pre-truncate (`: >`) and the run's own redirect use APPEND
+# mode (`>>`) so the two writers (bats' children appending progress lines, and this function's own
+# eventual full-log write) can never clobber each other's bytes — see the file-offset note in the
+# HERD-494 PR description; each is a fresh O_APPEND open, so every write lands at the CURRENT
+# end-of-file rather than at a stale, per-fd offset.
 _health_worker() {
-  local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line
+  local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line _hw_filter
   # BASELINE-AWARE GATE (HERD-190): hand healthcheck.sh the base checkout ($MAIN, the default-branch
   # tree) + a sha-keyed cache dir so a candidate whose failures ALL already fail on the base is
   # surfaced as an inherited ⚠️ (rc 0 → CLEAN) instead of a merge-blocking code error — no fix-PR
   # deadlocks on an inherited base failure. Scoped to THIS candidate gate only; the main-health worker
   # deliberately does NOT set it (comparing main against itself would mask a genuine MAIN RED).
   # FULL run streamed to the live log (redirect = tailable as it runs); rc drives the verdict class.
-  HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
-    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log" 2>&1; _hw_rc=$?
+  : > "$_hw_log" 2>/dev/null || true
+  # HEALTHCHECK_BATS_FILTER= (empty, not omitted): run 1 is ALWAYS the full, untargeted suite — clear
+  # any ambient value rather than merely not setting a new one, so a stray exported value in the
+  # watcher's OWN environment can never silently narrow the FIRST run (only _health_bats_retry_filter,
+  # below, may ever arm it, and only for the solo retry).
+  HEALTHCHECK_PROGRESS_LOG="$_hw_log" HEALTHCHECK_BATS_FILTER= \
+    HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
+    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log" 2>&1; _hw_rc=$?
   _hw_first="$(sed -n '1p' "$_hw_log" 2>/dev/null)"
   if [ "$_hw_rc" -eq 0 ]; then
     case "$_hw_first" in "⚠️"*) _hw_line=$'CLEAN\tdataenv' ;; *) _hw_line=$'CLEAN\tclean' ;; esac
@@ -12996,8 +13077,21 @@ _health_worker() {
     _hw_id="$(_health_fail_identity "$_hw_notok")"
     # RETRY-BEFORE-RED (solo): re-run once into a sibling log, keeping the LATEST run as the live log.
     # Baseline-aware on the retry too (HERD-190), so an inherited-only failure still collapses to rc 0.
-    HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
-      bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" > "$_hw_log.retry" 2>&1; _hw_rc2=$?
+    # HERD-498: when run 1's failure carries a bats TAP identity, target the retry at EXACTLY that
+    # test — never blindly re-run the whole suite. Every other failure class (syntax/shellcheck/
+    # leak-guard/caps-sync, or bats absent) yields an empty filter and this is byte-identical to
+    # before this change (a full, unfiltered re-run).
+    _hw_filter="$(_health_bats_retry_filter "$_hw_log")"
+    : > "$_hw_log.retry" 2>/dev/null || true
+    if [ -n "$_hw_filter" ]; then
+      HEALTHCHECK_PROGRESS_LOG="$_hw_log.retry" HEALTHCHECK_BATS_FILTER="$_hw_filter" \
+        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
+        bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
+    else
+      HEALTHCHECK_PROGRESS_LOG="$_hw_log.retry" HEALTHCHECK_BATS_FILTER= \
+        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
+        bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
+    fi
     if [ "$_hw_rc2" -eq 0 ]; then
       rm -f "$_hw_log.retry" 2>/dev/null || true                 # transient — the passing retry is the truth
       _hw_line="FLAKY"$'\t'"$_hw_id"
@@ -13251,7 +13345,7 @@ _sweep_gate_corpses() {
   # + idempotent); a CONCURRENT one corrupts the retry ledger and the infra breaker.
   _gate_corpse_claim || return 0
   trap '_gate_corpse_release' RETURN
-  local f base rest pr sha age pid _sw_margin _sw_timeout
+  local f base rest pr sha age pid _sw_margin _sw_timeout _sw_early _sw_log
   # ── review family: .review-inflight-<pr>-<sha> ──
   for f in "$TREES"/.review-inflight-*; do
     [ -e "$f" ] || continue
@@ -13291,6 +13385,26 @@ _sweep_gate_corpses() {
     if _health_pid_live "$f"; then
       age="$(_marker_age "$f")"
       case "$age" in ''|-1|*[!0-9]*) continue ;; esac
+      # HERD-494(b) EARLY-REAP PROBE: a worker whose tailable log is STILL 0 bytes after
+      # HEALTH_EARLY_REAP_SECS AND has no live bats/suite descendant left in its process group is
+      # dead-at-spawn or wedged before ever producing output — it will never yield a verdict, so
+      # reap it now instead of holding the HEALTH_CONCURRENCY slot out to the full
+      # HEALTH_INFLIGHT_TIMEOUT. Checked BEFORE the headroom/timeout logic below (an unrelated, much
+      # longer deadline) since a childless, silent worker is never "approaching" anything. A suite
+      # that has written ANY bytes (including the HERD-494(a) per-file progress lines) — or still has
+      # a live descendant — is never touched here; the ordinary timeout path below still governs it.
+      _sw_early="$(_health_early_reap_secs)"
+      if [ "$_sw_early" -gt 0 ] 2>/dev/null && [ "$age" -ge "$_sw_early" ] 2>/dev/null; then
+        _sw_log="$(_health_log_file "$rest")"
+        if [ ! -s "$_sw_log" ] && ! _health_bats_descendants_live "$(_marker_pgid "$f")"; then
+          pid="$(_marker_pid "$f")"
+          if [ "$pid" != "$$" ] && _health_terminate_worker "$f"; then
+            rm -f "$f" "$(_health_dispatch_file "$rest")" 2>/dev/null || true
+            journal_append infra_event component agent-watch reason health_early_reap key "$rest" age "$age"
+          fi
+          continue
+        fi
+      fi
       # HERD-281: headroom check — before the kill, honour HEALTH_TIMEOUT_HEADROOM.
       _sw_margin="$(_health_timeout_headroom)"
       _sw_timeout="${HEALTH_INFLIGHT_TIMEOUT:-1800}"

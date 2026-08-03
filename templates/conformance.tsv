@@ -300,6 +300,7 @@ HEALTH_CONCURRENCY	unit	tests/test_live_runtime.py
 REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_TIMEOUT_HEADROOM	sim	scripts/herd/sim/sandbox-suite-timeout-headroom-sim.sh
+HEALTH_EARLY_REAP_SECS	unit	tests/test-health-early-reap.sh
 GATE_DISPATCH	unit	tests/test-gate-dispatch.sh
 GATE_DISPATCH	sim	tests/test-sandbox-concurrency.sh
 GATE_STATUS	unit	tests/test-gate-status.sh
