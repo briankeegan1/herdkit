@@ -3,8 +3,12 @@
 # Sources status.sh standalone (it defines functions only, no live loop), points every ledger/backlog
 # path at a temp dir, and asserts the deterministic classifiers + ledger readers without touching git,
 # gh, herdr, or any real ledger:
-#   • _status_classify_builder  — building / done / idle / DEAD / agentdead / agentmissing buckets
-#                                  (DEAD = no agent + no PR + no commits; agentmissing = no agent but work exists)
+#   • _status_classify_builder  — building / done / idle / DEAD / agentdead / agentmissing / inuse buckets
+#                                  (DEAD = no agent + no PR + no commits; agentmissing = no agent but work
+#                                  exists; inuse (HERD-501) = the DEAD signature but a live process still
+#                                  holds the worktree dir open — never counted dead)
+#   • _status_dir_in_use        — HERD-501: lsof-backed occupancy check behind the inuse bucket, stubbed
+#                                  via HERD_STATUS_DIR_INUSE_CMD
 #   • _status_latest_review     — latest PASS/BLOCK for a PR+sha from the append-only review ledger
 #   • _status_latest_health     — latest healthcheck outcome for a PR from the health ledger
 #   • _status_pr_attention      — CONFLICTING / review-BLOCK / CHANGES_REQUESTED ⇒ needs a human
@@ -31,7 +35,7 @@ ok(){ pass=$((pass+1)); }
 # Source the helpers (functions only — no config walk, no live gather).
 # shellcheck source=/dev/null
 . "$LIB" || fail "sourcing status.sh failed"
-for fn in _status_classify_builder _status_latest_review _status_latest_health \
+for fn in _status_classify_builder _status_dir_in_use _status_latest_review _status_latest_health \
           _status_pr_attention _status_backlog_counts _status_watcher_pids \
           _status_note_age _status_notes_summary; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
@@ -52,6 +56,27 @@ done
 [ "$(_status_classify_builder 1 working   1 5)" = "done" ]     || fail "LIVE agent + PR dominates → done"
 # agentmissing never fires over a LIVE agent; agentdead still wins when the process is confirmed gone.
 [ "$(_status_classify_builder 1 done      1 0 dead)" = "agentdead" ] || fail "confirmed-dead session with a PR → agentdead"
+# HERD-501: the plain DEAD signature (no agent, no PR, no commits) must NOT fire while a live process
+# still holds the worktree dir open — an engine probe (healthcheck / main-health worker) can be running
+# there between the agent exiting and a PR landing. inuse=1 renders 'inuse' instead of 'dead'; the
+# default (inuse omitted / 0) is byte-identical to the pre-HERD-501 behaviour.
+[ "$(_status_classify_builder 0 ''        0 0 '' 1)" = "inuse" ] || fail "no agent/PR/commits but dir in use → inuse, never dead"
+[ "$(_status_classify_builder 0 ''        0 0 '' 0)" = "dead" ]  || fail "inuse explicitly 0 → still dead (byte-identical default)"
+[ "$(_status_classify_builder 0 ''        0 0)" = "dead" ]       || fail "inuse omitted entirely → still dead (byte-identical default)"
+# inuse must never override a stronger signal: agentmissing (work exists) and agentdead (confirmed-dead
+# session) both take precedence over a bare occupancy check.
+[ "$(_status_classify_builder 0 ''        1 0 '' 1)" = "agentmissing" ] || fail "inuse never overrides agentmissing (open PR)"
+[ "$(_status_classify_builder 0 ''        0 3 '' 1)" = "agentmissing" ] || fail "inuse never overrides agentmissing (commits)"
+[ "$(_status_classify_builder 1 done      1 0 dead 1)" = "agentdead" ]  || fail "inuse never overrides agentdead"
+ok
+
+# ── _status_dir_in_use: HERD_STATUS_DIR_INUSE_CMD test seam (no real lsof dependency) ─────────────
+type _status_dir_in_use >/dev/null 2>&1 || fail "_status_dir_in_use not defined"
+STUB_TRUE="$T/inuse-true.sh"; printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_TRUE"; chmod +x "$STUB_TRUE"
+STUB_FALSE="$T/inuse-false.sh"; printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB_FALSE"; chmod +x "$STUB_FALSE"
+HERD_STATUS_DIR_INUSE_CMD="$STUB_TRUE"  _status_dir_in_use "$T"  || fail "stubbed in-use cmd (rc0) should report in use"
+HERD_STATUS_DIR_INUSE_CMD="$STUB_FALSE" _status_dir_in_use "$T" && fail "stubbed free cmd (rc1) should report NOT in use"
+HERD_STATUS_DIR_INUSE_CMD="" _status_dir_in_use ""              && fail "empty dir → never in use (fail-soft)"
 ok
 
 # ── _status_latest_review: latest verdict per PR+sha from the append-only ledger ──────────────────
@@ -202,6 +227,48 @@ printf '%s\t%s\t%s\t%s\n' "$(( NOW - 90 ))" feat-gathered "a waiting finding" 09
 snap="$(gather_snap)"
 nrec="$(grep '^NOTES' <<< "$snap" | tr $'\037' ' ')"
 [ "$nrec" = "NOTES 1 feat-gathered 1m" ] || fail "gather NOTES record wrong: '$nrec'"
+ok
+
+# ── _status_gather wires _status_dir_in_use into the DEAD verdict end-to-end (HERD-501) ───────────
+# A REAL feature worktree (no agent roster, no open PR, zero commits over base) is exactly the
+# candidate the plain DEAD signature fires for — prove gather reports 'dead' by default, and 'inuse'
+# the moment HERD_STATUS_DIR_INUSE_CMD says a live process holds the dir. Real git (not the no-op
+# stub above): git worktree list --porcelain output shape is load-bearing here.
+command -v git >/dev/null 2>&1 || fail "git required for the HERD-501 end-to-end check"
+BROOT="$T/bproj"; BTREES="$T/btrees"; mkdir -p "$BTREES"
+git init -q -b main "$BROOT"
+git -C "$BROOT" config user.email t@example.com; git -C "$BROOT" config user.name tester
+printf 'seed\n' > "$BROOT/seed.txt"; git -C "$BROOT" -c commit.gpgsign=false add -A
+git -C "$BROOT" -c commit.gpgsign=false commit -q -m seed
+BWT="$BTREES/feat-inuse-check"
+git -C "$BROOT" worktree add -q -b feat-inuse-check "$BWT" main >/dev/null 2>&1 \
+  || fail "could not create the feature worktree fixture"
+
+GB2="$T/stubbin2"; mkdir -p "$GB2"
+printf '#!/bin/sh\nprintf "[]"\n' > "$GB2/gh"; chmod +x "$GB2/gh"
+# `git worktree list --porcelain` reports a REALPATH'd worktree dir (e.g. /private/var/... on macOS,
+# where $T itself is under a /var symlink) — resolve the same way before matching, or the stub never fires.
+BWT_RP="$(cd "$BWT" && pwd -P)"
+INUSE_YES="$T/inuse-yes.sh"; printf '#!/usr/bin/env bash\n[ "$1" = "%s" ] && exit 0; exit 1\n' "$BWT_RP" > "$INUSE_YES"; chmod +x "$INUSE_YES"
+
+bsnap() {
+  ( PATH="$GB2:$PATH" PROJECT_ROOT="$BROOT" WORKTREES_DIR="$BTREES" SCRIBE_BACKEND=file \
+      BACKLOG_FILE="$BROOT/BACKLOG.md" HERD_WATCH_ARGV0="herd-watch-nope-$$-does-not-exist" \
+      HERD_STATUS_DIR_INUSE_CMD="${1:-}" \
+      _status_gather 2>/dev/null )
+}
+
+snap="$(bsnap)"
+brec="$(grep '^BUILDER' <<< "$snap" | tr $'\037' ' ')"
+[ "$brec" = "BUILDER dead feat-inuse-check " ] || fail "no lsof stub → real DEAD signature unchanged, got: '$brec'"
+bc="$(grep '^BCOUNTS' <<< "$snap" | tr $'\037' ' ')"
+[ "$bc" = "BCOUNTS 0 0 0 1" ] || fail "no lsof stub → n_dead=1, got: '$bc'"
+
+snap="$(bsnap "$INUSE_YES")"
+brec="$(grep '^BUILDER' <<< "$snap" | tr $'\037' ' ')"
+[ "$brec" = "BUILDER inuse feat-inuse-check " ] || fail "in-use stub → gather must report inuse, got: '$brec'"
+bc="$(grep '^BCOUNTS' <<< "$snap" | tr $'\037' ' ')"
+[ "$bc" = "BCOUNTS 0 0 0 0" ] || fail "an in-use worktree must never be counted dead, got: '$bc'"
 ok
 
 echo "ALL PASS ($pass checks)"
