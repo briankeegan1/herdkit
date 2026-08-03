@@ -81,6 +81,10 @@ run() {
         *"comments(first: 50)"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","comments":{"nodes":[{"id":"cin_1","body":"please rebase before we merge","user":{"id":"other_op","name":"Dana"}},{"id":"cin_self","body":"my own note","user":{"id":"me_viewer","name":"Me"}},{"id":"cin_mark","body":"📌 queued by alice: sequenced after ENG-9 [1700000000]","user":{"id":"other_op","name":"Dana"}}]}}]}}}' ;;
         # queue resolves id+identifier+assignee (unassigned so set-assignee runs).
         *"id identifier"*)  echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","assignee":null}]}}}' ;;
+        # HERD-490: list_closed's `in: ["completed", "canceled"]` filter is the mirror of list_open's
+        # `nin` — must precede the generic issues( fallthrough (which serves list_open's shape) so the
+        # two are distinguishable in the test.
+        *"type: { in: [\"completed"*) echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-3","title":"first closed issue"},{"identifier":"ENG-5","title":"second closed issue"}]}}}' ;;
         *"issues("*)        echo '{"data":{"issues":{"nodes":[{"identifier":"ENG-7","title":"first open issue"},{"identifier":"ENG-9","title":"second open issue"}]}}}' ;;
         *)                  echo '{"data":{}}' ;;
       esac
@@ -157,6 +161,28 @@ open2="$( unset LINEAR_TEAM_ID; run _backend_list_open)"
 grep -q "issues(" "$GQLLOG" || fail "list_open (no team) did not issue an 'issues' query"
 grep -q 'team: { id:' "$GQLLOG" && fail "list_open (no team) must NOT scope by team — it leaked a team filter"
 grep -q "^#ENG-7 first open issue$" <<< "$open2" || fail "list_open (no team) missing '#ENG-7 first open issue' ($open2)"
+pass
+
+# 2c. HERD-490: list_closed (team scoped ON) → an issues() query filtered to completed/canceled,
+#     scoped to the team, parsed to "#<identifier> <title>" lines — the mirror of list_open, giving a
+#     caller a way to see items list_open structurally excludes (a manually-closed duplicate that a
+#     "does this already exist?" search over the open list alone would never find).
+: > "$GQLLOG"
+closed="$(run _backend_list_closed)"
+grep -q "issues(" "$GQLLOG" || fail "list_closed did not issue an 'issues' query"
+grep -q 'type: { in: \["completed", "canceled"\] }' "$GQLLOG" || fail "list_closed did not filter to completed/canceled state types"
+grep -q 'team: { id: { eq: $team }' "$GQLLOG" || fail "list_closed (team set) did not scope the query to the team"
+grep -q "team_xyz" "$GQLLOG" || fail "list_closed (team set) did not pass the team id in variables"
+grep -q "^#ENG-3 first closed issue$" <<< "$closed" || fail "list_closed missing '#ENG-3 first closed issue' ($closed)"
+grep -q "^#ENG-5 second closed issue$" <<< "$closed" || fail "list_closed missing '#ENG-5 second closed issue'"
+pass
+
+# 2d. list_closed (team scoped OFF) → no team filter, spans every team the key can see.
+: > "$GQLLOG"
+closed2="$( unset LINEAR_TEAM_ID; run _backend_list_closed)"
+grep -q 'type: { in: \["completed", "canceled"\] }' "$GQLLOG" || fail "list_closed (no team) did not filter to completed/canceled"
+grep -q 'team: { id:' "$GQLLOG" && fail "list_closed (no team) must NOT scope by team — it leaked a team filter"
+grep -q "^#ENG-3 first closed issue$" <<< "$closed2" || fail "list_closed (no team) missing '#ENG-3 first closed issue' ($closed2)"
 pass
 
 # 2c. list_open_rich → same open filter as list_open but also requests state {name type} +

@@ -4532,6 +4532,12 @@ cmd_backlog() {
   #                             backend defines _backend_list_open_rich (linear); backends
   #                             without the op fall back to the plain list, so a consumer can
   #                             always ask for --rich and key its rendering off the line shape
+  #   herd backlog --closed     plain "#<id> <title>" lines for CLOSED (completed/canceled) items
+  #                             (_backend_list_closed — HERD-490). The default list is OPEN-only by
+  #                             design, so a "does this already exist?" search that stops at the
+  #                             plain list can miss an item a human already filed and closed under
+  #                             different wording; this is the surface that catches it. A backend
+  #                             without the op prints a soft note and exits 0 (advisory, fail-soft).
   #   herd backlog show <#id>   one item's full detail (_backend_show_item) — state, title,
   #                             untruncated description, URL
   #   herd backlog browse       interactive fzf picker over the open list with a live detail
@@ -4552,7 +4558,8 @@ cmd_backlog() {
   # (a backend that cannot set assignee still posts the 📌 comment).
   local mode="plain" ref="" blocker=""
   case "${1:-}" in
-    --rich)  mode="rich" ;;
+    --rich)   mode="rich" ;;
+    --closed) mode="closed" ;;
     show)    mode="show"; ref="${2:-}"
              [ -n "$ref" ] || die "usage: herd backlog show <#id>" ;;
     browse)  mode="browse" ;;
@@ -4563,7 +4570,7 @@ cmd_backlog() {
     unqueue) mode="unqueue"; ref="${2:-}"
              [ -n "$ref" ] || die "usage: herd backlog unqueue <#id>" ;;
     '')      ;;
-    *)       die "usage: herd backlog [--rich | show <#id> | browse | queued | queue <#id> [--after <blocker>] | unqueue <#id>]" ;;
+    *)       die "usage: herd backlog [--rich | --closed | show <#id> | browse | queued | queue <#id> [--after <blocker>] | unqueue <#id>]" ;;
   esac
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
@@ -4591,6 +4598,14 @@ cmd_backlog() {
   case "$mode" in
     plain)
       _backend_list_open ;;
+    closed)
+      # HERD-490: OPTIONAL op — a backend that mints no ids of its own (file/changelog) has no
+      # separate closed set to show. Fail-soft: a note on stderr, empty list, exit 0 (advisory).
+      if command -v _backend_list_closed >/dev/null 2>&1; then
+        _backend_list_closed
+      else
+        echo "herd backlog --closed: backend '$SCRIBE_BACKEND' defines no _backend_list_closed op — nothing to show." >&2
+      fi ;;
     rich)
       # Rich is opt-in per backend; a backend without the op serves the plain list so the caller
       # (backlog-view.sh) can always request --rich and detect the shape from the output itself.

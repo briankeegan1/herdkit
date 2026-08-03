@@ -133,6 +133,27 @@ EOF
 build_tracker_drift
 ok
 
+# ── (7) HERD-490: a DUPLICATE healed row for the same ref renders ONCE, not twice ──────────────────
+# The observed bug (PR #606): two 'healed' lines for the same ref land in the ledger (e.g. two sweep
+# runs healing the same merged PR back-to-back) and both used to survive to the console. Reading
+# newest-first, only the newest healed row for a ref may render; an older duplicate is superseded
+# exactly like a failed row would be.
+cat > "$TRACKER_HEAL_FILE" <<EOF
+$H1 healed HERD-606 606 open
+$NOW healed HERD-606 606 open
+EOF
+
+build_tracker_drift
+[ "$(printf '%s' "$TRACKER_DRIFT" | grep -c .)" -eq 1 ] \
+  || fail "(7) a duplicate healed row for HERD-606 rendered twice (got: $TRACKER_DRIFT)"
+ok
+grep -q "HERD-606" <<< "$TRACKER_DRIFT" || fail "(7) the surviving healed row for HERD-606 must still render"
+ok
+# The OLDER duplicate is the one dropped — the newest heal is what's shown.
+grep -q "$(epoch_to_hhmm "$NOW")" <<< "$TRACKER_DRIFT" \
+  || fail "(7) the NEWEST duplicate must be the one that survives, not the oldest"
+ok
+
 # ── conformance row present ───────────────────────────────────────────────────────────────────────
 grep -q $'console-section.sh\tunit\ttests/test-tracker-heal-supersede.sh' "$REPO/templates/conformance.tsv" \
   || fail "conformance.tsv missing console-section.sh proof row for this test"

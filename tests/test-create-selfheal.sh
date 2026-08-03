@@ -504,6 +504,13 @@ grep -q '⏸' "$SWOUT"                         || fail "(10) the stand-down was 
 grep -q '^Relink merged PR #2' <<< "$(head -n1 "$SWQ"/*relink-2*.req)" \
   || fail "(10) the relink request's first line is not a short title (linear turns it into the issue title)"
 grep -q 'SEARCH FIRST' "$SWQ"/*relink-2*.req || fail "(10) the relink request does not instruct a search before filing"
+# HERD-490 (a)/(b)/(c): the request must (a) carry the machine UNMATCHED-MERGE marker so a filed item
+# is auto-shipped instead of left in Backlog, and (b) point the search at the CLOSED list too (a
+# manually-worded close won't show up in the default open-only listing).
+grep -q '^UNMATCHED-MERGE: https://x/pull/2$' "$SWQ"/*relink-2*.req \
+  || fail "(10) the relink request does not carry the machine UNMATCHED-MERGE marker for PR #2's url"
+grep -q 'herd backlog --closed' "$SWQ"/*relink-2*.req \
+  || fail "(10) the relink request does not point the search at the closed/done list too"
 ok; echo "PASS (10) relink acts only on a PROVABLE miss: punctuation, comments, and unanswerable refs are left alone"
 
 # ══ (15) A TRACKER OUTAGE IS NOT PROOF THAT THE ITEM IS MISSING ═══════════════════════════════════

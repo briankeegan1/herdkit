@@ -89,6 +89,23 @@ grep -q "🔜 add a dark-mode toggle" <<< "$out2d" || fail "browse fallback did 
 grep -q "fzf not found" "$T/browse.err" || fail "browse fallback missing the fzf install hint on stderr"
 pass
 
+# ── Case 2d2: HERD-490 --closed on a backend with no _backend_list_closed op (file) → fail-soft:
+#    a soft note on stderr, empty stdout, exit 0 (advisory, never a hard failure).
+out2d2="$( cd "$P2" && bash "$HERD" backlog --closed 2>"$T/closed.err" )" \
+  || fail "herd backlog --closed (file, no op) should exit 0 (fail-soft)"
+[ -z "$out2d2" ] || fail "herd backlog --closed (file, no op) should print nothing on stdout ($out2d2)"
+grep -q "defines no _backend_list_closed op" "$T/closed.err" \
+  || fail "herd backlog --closed (file, no op) missing the soft fail-soft note on stderr"
+pass
+
+# ── Case 1b: HERD-490 --closed on the github backend (also no op) → same fail-soft path ─────────
+out1b="$( cd "$P1" && PATH="$T/bin:$PATH" bash "$HERD" backlog --closed 2>"$T/closed-gh.err" )" \
+  || fail "herd backlog --closed (github, no op) should exit 0 (fail-soft)"
+[ -z "$out1b" ] || fail "herd backlog --closed (github, no op) should print nothing on stdout ($out1b)"
+grep -q "defines no _backend_list_closed op" "$T/closed-gh.err" \
+  || fail "herd backlog --closed (github, no op) missing the soft fail-soft note on stderr"
+pass
+
 # ── Case 2e: unknown flag → loud usage error, non-zero ──────────────────────────────────────────
 if ( cd "$P2" && bash "$HERD" backlog --bogus ) >/dev/null 2>&1; then
   fail "herd backlog --bogus should fail loudly with usage"

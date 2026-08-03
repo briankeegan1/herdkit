@@ -1151,12 +1151,22 @@ _sweep_relink_missing() {
 # _sweep_relink_request <pr> <url> <ref> — the scribe request text. First line is a SHORT title (the
 # Linear backend derives an issue title from it, and an essay-length first line becomes an essay-length
 # title); the body carries the SEARCH-FIRST instruction so a relink can never blindly duplicate an
-# item that was filed by hand in the meantime.
+# item that was filed by hand in the meantime — and now (HERD-490) an explicit pointer at the CLOSED
+# list too, since a duplicate a human filed AND resolved by hand, worded differently from this PR's
+# own `Refs:` line, is exactly the miss the default open-only search cannot catch: `herd backlog`
+# (no flag) lists OPEN items only, so a search that stops there will never see it.
+#
+# The trailing "UNMATCHED-MERGE: <url>" line is a MACHINE marker, not prose for the scribe to read —
+# scribe-step.sh's add-item path parses it (mirroring HERD-183's sequencing-clause marker) and, if a
+# new item does get filed, marks it done in the same breath it is created. This work already shipped;
+# a ship-record for it must never render as Backlog/unstarted (HERD-490).
 _sweep_relink_request() {
   local pr="$1" url="$2" ref="$3"
   printf 'Relink merged PR #%s — its tracker item is missing\n\n' "$pr"
   printf 'PR #%s (%s) merged with "Refs: %s", but no tracker item exists for that ref — the original create failed (see HERD-267: the tracker refused it, e.g. an issue cap, and the lane shipped a slug-only ref).\n\n' "$pr" "$url" "$ref"
-  printf 'SEARCH FIRST: look for an existing open or completed item covering this PR. If one exists, amend it with the PR link instead of filing a duplicate. Only if none exists, file a new item describing the merged work and link %s.\n' "$url"
+  printf 'SEARCH FIRST: look for an existing item covering this PR — check BOTH the open list (`herd backlog`) AND the closed/done list (`herd backlog --closed`), since a human may have already filed and resolved one by hand, worded differently from this PR. If one exists, amend it with the PR link instead of filing a duplicate. Only if none exists, file a new item describing the merged work and link %s.\n\n' "$url"
+  printf 'This work is ALREADY MERGED, not queued — if you do file a new item, it must never be left sitting in Backlog/unstarted (a Backlog row for already-shipped work is a phantom). Filing it below auto-marks it done; do not remove this line.\n'
+  printf 'UNMATCHED-MERGE: %s\n' "$url"
 }
 
 # sweep_leg_links <dry> — narrate every merged PR with a missing tracker item, enqueue its retroactive

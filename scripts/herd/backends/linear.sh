@@ -12,6 +12,7 @@
 #   _backend_add_item REQ_ID TEXT     — issueCreate; sets _BACKEND_RESULT=DONE|NOCHANGE
 #   _backend_mark_shipped SLUG PR_URL — comment PR link + issueUpdate into the Done state
 #   _backend_list_open                — open issues, one "#<identifier> <title>" line each
+#   _backend_list_closed              — OPTIONAL: closed (completed/canceled) issues, same shape
 # plus _backend_item_state REF for the link-state watcher, and the OPTIONAL planned-work markers
 # (HERD-52 / HERD-244): _backend_queue_item / _backend_unqueue_item / _backend_list_queued for
 # cross-operator plan-time visibility (a 📌 comment naming who sequenced the item after what and
@@ -536,6 +537,41 @@ print(json.dumps({"team": os.environ["TEAM"]}))')"
     else
         query='query {
   issues(filter: { state: { type: { nin: ["completed", "canceled"] } } }, first: 250) {
+    nodes { identifier title }
+  }
+}'
+        vars=""
+    fi
+    _linear_gql "$query" "$vars" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+for n in nodes:
+    print("#%s %s" % (n.get("identifier", ""), n.get("title", "")))' 2>/dev/null || true
+}
+
+# _backend_list_closed — OPTIONAL. Print CLOSED (completed/canceled) issues as one
+# "#<identifier> <title>" line each — the mirror image of _backend_list_open's `nin` filter, same
+# team scoping. Exists so a caller that needs to check whether a merged PR's work was already
+# tracked under a DIFFERENT ref (e.g. HERD-490: a human manually filed AND closed an issue for it,
+# worded differently from the PR's own `Refs:` line) has a way to see closed items at all —
+# _backend_list_open / `herd backlog` structurally excludes them, so a search that only consults the
+# open list can never find a manually-closed duplicate. Capped at 250 like list_open (recent-first
+# is not guaranteed by this query; a caller doing recency-sensitive matching should not assume it).
+_backend_list_closed() {
+    _linear_require_key
+    local query vars
+    if [ -n "${LINEAR_TEAM_ID:-}" ]; then
+        query='query L($team: ID!) {
+  issues(filter: { state: { type: { in: ["completed", "canceled"] } }, team: { id: { eq: $team } } }, first: 250) {
+    nodes { identifier title }
+  }
+}'
+        vars="$(TEAM="$LINEAR_TEAM_ID" python3 -c 'import os, json
+print(json.dumps({"team": os.environ["TEAM"]}))')"
+    else
+        query='query {
+  issues(filter: { state: { type: { in: ["completed", "canceled"] } } }, first: 250) {
     nodes { identifier title }
   }
 }'
