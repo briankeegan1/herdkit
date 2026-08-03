@@ -606,4 +606,49 @@ grep -q "api.linear.app/graphql" "$CURLLOG" || fail "_linear_gql did not POST to
 grep -q "Authorization: lin_test_key" "$CURLLOG" || fail "_linear_gql did not send the API key from secrets in the auth header"
 pass
 
+# 7. HERD-504: the curl round-trip is time-bounded, so a black-holed connection cannot hang forever.
+: > "$CURLLOG"
+( cd "$T" && . "$BACKEND"; _linear_gql 'query { __typename }' '{}' >/dev/null )
+grep -q -- "--max-time 10" "$CURLLOG" || fail "_linear_gql's curl call is missing --max-time (HERD-504 timeout hardening)"
+pass
+
+# HERD-504 fork-pressure hardening: a fake python3 that logs every invocation to PYLOG and, when
+# LINEAR_PY_FAIL=1, exits 1 without ever running (simulating a fork that fails under load) instead of
+# building the request payload. Delegates to the REAL python3 (captured before $T/bin joins PATH) so
+# the happy-path call still gets a correctly-built payload.
+REAL_PYTHON3="$(command -v python3)"
+PYLOG="$T/python3.log"
+cat > "$T/bin/python3" <<EOF
+#!/usr/bin/env bash
+echo call >> "$PYLOG"
+[ "\${LINEAR_PY_FAIL:-0}" = "1" ] && exit 1
+exec "$REAL_PYTHON3" "\$@"
+EOF
+chmod +x "$T/bin/python3"
+hash -r   # earlier direct `python3 -c` calls above hashed the real path; force a fresh PATH lookup
+
+# 8. HERD-504 happy path stays byte-identical: a successful payload build costs exactly ONE python3
+#    call (no wasted retry) and the request/response are unchanged.
+: > "$PYLOG"; : > "$CURLLOG"
+out8="$( cd "$T" && . "$BACKEND"; _linear_gql 'query { __typename }' '{}' )"
+[ "$(wc -l < "$PYLOG" | tr -d ' ')" = "1" ] || fail "happy path should build the payload in ONE python3 call, not retry ($(cat "$PYLOG"))"
+grep -q "api.linear.app/graphql" "$CURLLOG" || fail "happy path curl round-trip regressed"
+grep -q '"__typename":"Query"' <<<"$out8" || fail "happy path response body changed ($out8)"
+pass
+
+# 9. HERD-504 mutation-prove: a python3 that FAILS EVERY TIME (fork pressure that never clears) is
+#    retried exactly ONCE before _linear_gql gives up — and it gives up LOCALLY: curl is never
+#    invoked (never blames Linear for our own fork pressure), the return code is the distinct 3 (not
+#    the generic 1 every other failure path uses), and stderr says this is a local exec failure.
+: > "$PYLOG"; : > "$CURLLOG"
+set +e
+err9="$( cd "$T" && . "$BACKEND"; export LINEAR_PY_FAIL=1; _linear_gql 'query { __typename }' '{}' 2>&1 >/dev/null )"
+rc9=$?
+set -e
+[ "$rc9" = "3" ] || fail "a persistent local payload-build failure should return the distinct code 3, got $rc9 ($err9)"
+[ "$(wc -l < "$PYLOG" | tr -d ' ')" = "2" ] || fail "a persistent local failure should retry the payload build exactly once ($(cat "$PYLOG"))"
+grep -q "local exec failed under load" <<<"$err9" || fail "local exec failure message missing ($err9)"
+[ -s "$CURLLOG" ] && fail "a local payload-build failure must never reach curl — that would blame Linear for our own fork pressure"
+pass
+
 echo "ALL PASS ($PASS checks)"
