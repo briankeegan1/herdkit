@@ -151,12 +151,13 @@ run_proj "$F" --oneline
 [ "$RC" -eq 0 ] || fail "(d) all-pass should exit 0, got $RC — out: $OUT"
 echo "PASS (d) bats pass → exit 0"
 
-# ── (e)-(h): the HERD-462 box-load timeout tolerance for test-sandbox-posture-matrix.sh ──────────────
-# That sim is CPU-bound and borderline against BATS_TEST_TIMEOUT even in isolation, so a genuine
-# BATS_TEST_TIMEOUT kill (bats' own "# timeout after Ns" TAP suffix) on it ALONE is tolerated the same
-# way the HERD-187 env-only codemap case is — but a real assertion failure inside it, or a timeout on
-# ANY other test, must never be silently downgraded.
-TIMEOUT_TEST="hermetic test-sandbox-posture-matrix.sh (dynamic)"
+# ── (e)-(h): the HERD-462 box-load timeout tolerance, retargeted (HERD-495) to test-cli-reload.sh ────
+# That test's ~24 real bin/herd reload subprocess spawns already measure comfortably under
+# BATS_TEST_TIMEOUT in isolation (tests/test-caps.tsv), but tip over under real concurrent-builder box
+# contention, so a genuine BATS_TEST_TIMEOUT kill (bats' own "# timeout after Ns" TAP suffix) on it
+# ALONE is tolerated the same way the HERD-187 env-only codemap case is — but a real assertion failure
+# inside it, or a timeout on ANY other test, must never be silently downgraded.
+TIMEOUT_TEST="hermetic test-cli-reload.sh (dynamic)"
 
 # ── (e) SOLE timeout on the known-borderline test → exit 2 + detail quotes the real 'not ok' line ────
 TAP_TIMEOUT_ONLY="1..3

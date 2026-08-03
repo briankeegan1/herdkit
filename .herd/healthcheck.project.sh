@@ -342,21 +342,26 @@ EOF
 }
 
 # ── BOX-LOAD timeout tolerance (HERD-462, extends the HERD-187 pattern) ───────────────────────────
-# HERD-477 (2026-08-02): the file this tolerance was written for, test-sandbox-posture-matrix.sh (a
-# 7/8-posture gate-loop matrix legitimately CPU-bound and borderline against BATS_TEST_TIMEOUT=120s —
-# measured standalone ~123s on a quiet box, and reliably tipping over under real concurrent-builder box
-# contention), is now SPLIT into one thin file per posture (tests/test-sandbox-posture-matrix-<posture>.sh)
-# — none of which come anywhere near the 120s bound even under contention (the slowest, solo-auto,
-# measured 32-33s over 10 reps). No bats description will ever match _HK_TIMEOUT_TEST_DESC below again,
-# so this tolerance is now DORMANT (never matches → _hk_bats_timeout_only always returns 1) rather than
-# rewired to a new target: none of the split files are borderline enough to need it. Left in place,
-# harmless, as a historical record and in case a future test reintroduces this exact box-load shape.
+# HERD-477 (2026-08-02): the file this tolerance was originally written for, test-sandbox-posture-
+# matrix.sh, was SPLIT into one thin file per posture and stopped being borderline, so this tolerance
+# went DORMANT — exactly as anticipated ("left in place ... in case a future test reintroduces this
+# exact box-load shape").
+#
+# HERD-495 (2026-08-02): that future test arrived — test-cli-reload.sh. GROUNDED (PR #615): the local
+# bats gate timed out on it (BATS_TEST_TIMEOUT=120, no per-test override) while GitHub Actions' own
+# scripts/ci/run-suite.sh stayed green on the identical sha, because run-suite.sh already gives this
+# EXACT test 180s via its own accountable ledger (tests/test-caps.tsv: "~24 real bin/herd reload
+# subprocess spawns ... already flagged ... for periodically TIMING OUT against the shared 120s cap").
+# bats-core's BATS_TEST_TIMEOUT is one flat value for the whole run (no per-test override lever, unlike
+# run-suite.sh's ledger), so this dormant single-target tolerance — not a blanket timeout bump that
+# would loosen every other test's cap — is the narrow, already-precedented fix: point it at the test
+# tests/test-caps.tsv already proved needs the room, not a new mechanism.
 # SAFETY (same bar as HERD-187's tolerance): TOLERATED (exit 2) ONLY when (a) it is the SOLE failing
 # test AND (b) bats' own TAP line carries the "# timeout after Ns" directive it appends EXCLUSIVELY
 # for a genuine BATS_TEST_TIMEOUT kill — a real regression inside the test (any fail()/assertion) exits
 # on its own before ever reaching that timeout and produces a plain "not ok" line with NO such suffix.
 # This can never mask a real code error, only a confirmed, load-explained timeout.
-_HK_TIMEOUT_TEST_DESC="hermetic test-sandbox-posture-matrix.sh (dynamic)"
+_HK_TIMEOUT_TEST_DESC="hermetic test-cli-reload.sh (dynamic)"
 # ERE-escaped copy for the single-grep detail-line extraction below (_HK_TIMEOUT_TEST_DESC's literal
 # "(dynamic)" and "." would otherwise be read as regex metacharacters, never matching themselves).
 _HK_TIMEOUT_TEST_DESC_RE="$(printf '%s' "$_HK_TIMEOUT_TEST_DESC" | sed -e 's/[.[\*^$()+?{|]/\\&/g')"
@@ -614,8 +619,9 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
     else
       echo "BATS: BOX-LOAD TIMEOUT (tolerated, not a code bug)"
       echo "  $_hk_notok"
-      echo "  ($_HK_TIMEOUT_TEST_DESC — CPU-bound and borderline against BATS_TEST_TIMEOUT even in"
-      echo "   isolation; tips over under real concurrent-builder box contention. Load, not code.)"
+      echo "  ($_HK_TIMEOUT_TEST_DESC — ~24 real bin/herd reload subprocess spawns already measured"
+      echo "   comfortably under BATS_TEST_TIMEOUT in isolation (tests/test-caps.tsv), but tips over"
+      echo "   under real concurrent-builder box contention. Load, not code.)"
       printf '%s\n' "$to"
     fi
     exit 2
