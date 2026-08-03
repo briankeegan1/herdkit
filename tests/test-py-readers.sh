@@ -187,9 +187,10 @@ for fix in healthy watcher-down dup-detected handoff long-branch notes-unacked n
 done
 
 # HERD-492 — the unacked-builder-notes line. Parity alone cannot prove this: deleting the render from
-# BOTH formatters would keep them identical and green. So assert the CONTENT on each path separately
-# (that is the mutation proof — drop either render and exactly one of these four fails), and assert
+# BOTH formatters keeps them identical and green. So assert the CONTENT on each path separately, plus
 # the SILENT-AT-ZERO contract on a fixture with no NOTES record (a snapshot from before this change).
+# Verified by mutation: deleting the bash render alone reds the parity loop above; deleting BOTH
+# renders leaves parity green and is caught right here.
 for eng in 1 0; do
   notes_out="$(run_status "$eng" notes-unacked)"
   [[ "$notes_out" == *"NOTES"*"3 unacked"*"(newest: feat-beta 12m)"* ]] \
