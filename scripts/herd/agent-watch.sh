@@ -532,6 +532,14 @@ BUILDER_NOTES_LEDGER="$TREES/.agent-watch-builder-notes"
 BUILDER_NOTES_CURSOR="$TREES/.agent-watch-builder-notes-cursor"
 BUILDER_NOTES_ACK="$TREES/.agent-watch-builder-notes-acked"
 BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
+# Phase-anomaly console surface (HERD-496). ANOMALY_BASELINES compares a just-completed phase
+# instance's wall-clock duration against a rolling median/p95 baseline (pysrc/herd/store.py); a
+# reading past 2x its own LEARNED p95 appends one row here ("<epoch>\t<phase>\t<seconds>\t<p95>"),
+# rendered newest-first by build_phase_anomalies (calm — it ages out after CONSOLE_ROW_RETENTION,
+# same as a builder note). Ship-dormant: off (default) never appends, so the ledger stays empty and
+# render() adds nothing (byte-identical console).
+ANOMALY_LEDGER="$TREES/.agent-watch-phase-anomalies"
+ANOMALY_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # Orphan-PR advisory surface (HERD-330). The watcher gates work it DISCOVERS via git worktrees; an
 # open PR with no live builder worktree in this workspace (a collaborator PR, a main-checkout PR, a
 # PR whose worktree was reaped) is therefore never adopted — it sits ungated and, today, invisible.
@@ -918,7 +926,7 @@ build_spawn_holds() {
   SPAWN_HOLDS=""
   [ -s "$SPAWN_HELD_STATE" ] || return 0
   local _bsh_q="$TREES/spawn-queue" now rows="" kept id epoch slug lane after age human color glyph label sl
-  now="$(date +%s)"
+  now="$(_now_epoch)"  # HERD-491: the shared render-pass clock, not a fresh `date +%s` read
   kept="$(mktemp "${SPAWN_HELD_STATE}.XXXXXX" 2>/dev/null || true)"
   while read -r id epoch slug lane after; do
     [ -n "${id:-}" ] || continue
@@ -2282,6 +2290,12 @@ render() {
   if [ -n "${BUILDER_NOTES_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}builder notes${C_RESET}"$'\n'"${BUILDER_NOTES_ROWS}"$'\n'
   fi
+  # PHASE ANOMALIES (HERD-496) — a phase instance that blew past its own learned p95 baseline. Empty
+  # unless ANOMALY_BASELINES is on AND an anomaly has fired since the row aged out, so byte-identical
+  # when the lever is off (the ship default).
+  if [ -n "${ANOMALY_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}phase anomalies${C_RESET}"$'\n'"${ANOMALY_ROWS}"$'\n'
+  fi
   # ORPHAN PRs (HERD-330) — open PRs no live builder worktree owns, needs-you-adjacent. Empty unless
   # ORPHAN_PR_ROWS is on AND at least one open PR is orphaned this tick, so byte-identical when unused.
   if [ -n "${ORPHAN_PR_SECTION_ROWS:-}" ]; then
@@ -2737,8 +2751,53 @@ _review_registry_file() { printf '%s' "$TREES/.review-registry-$1-$2"; }
 # The every-tick corpse sweep (_sweep_gate_corpses) uses these to free a slot the SAME tick a worker
 # dies or blows its deadline, so no marker corpse can ever hold a slot again.
 
-# _now_epoch — seconds since the epoch (a seam: HERD_FAKE_NOW lets a unit test pin time deterministically).
-_now_epoch() { printf '%s' "${HERD_FAKE_NOW:-$(date +%s)}"; }
+# _now_epoch — seconds since the epoch: THE shared clock for every render-pass age reader (HERD-491).
+# HERD_FAKE_NOW is the primary test seam; HERD_NOW_EPOCH (the later-added, _now()-only seam — see
+# _now below) is honored as a fallback so the two clock overrides can never disagree when a caller
+# happens to set the "wrong" one. _tick_render_reconcile pins HERD_FAKE_NOW once per tick so every
+# reader below — _marker_age, _now, _console_now_epoch, and this function itself — observes the
+# SAME instant for the whole render pass, closing the race where two age reads that each forked
+# `date`(1) landed on different real wall-clock seconds under load (test-console-truth-pass.sh's
+# COUNT 4 / case 4a pins this away in its own fixture; nothing pinned it in the live watcher before).
+_now_epoch() {
+  printf '%s' "${HERD_FAKE_NOW:-${HERD_NOW_EPOCH:-$(date +%s)}}"
+}
+
+# _render_pass_clock_begin / _render_pass_clock_end (HERD-491) — pin HERD_FAKE_NOW for the DURATION of
+# one tick's render pass (_tick_render_reconcile's Phase A: the corpse sweep through the `render` call)
+# so every age reader sharing this file's clock seams — _now_epoch, _now, _console_now_epoch, and
+# therefore _marker_age/_fmt_age callers — reads the SAME frozen instant instead of forking `date`(1)
+# fresh at each call site. Without this, two rows built a fork apart in the same frame could observe
+# different wall-clock seconds under load (many builder rows, an oversubscribed runner) and render
+# inconsistent ages for what is, to the operator, the same tick — the class test-console-truth-pass.sh's
+# 4a case already pins away in its OWN fixture; this closes the same race in the live watcher, where
+# nothing pinned the clock before.
+#
+# _begin remembers whether HERD_FAKE_NOW was ALREADY set (an outer hermetic test driving a whole tick
+# under its own fixed clock, e.g. test-console-rows-ageout.sh) so _end restores that exact state — a
+# pin nested inside an outer pin is a no-op, since _now_epoch already prefers the outer value. Phase B
+# (the Python engine tick, via _engine_tick_watchdog) and Phase C (spawn-drain + reconcile/sweep) run
+# AFTER _end and are UNCHANGED: they keep reading a live clock exactly as before, so this fix stays
+# scoped to the render pass HERD-491 names, nothing wider.
+_RENDER_PASS_FAKE_NOW_PRIOR_SET=""
+_RENDER_PASS_FAKE_NOW_PRIOR=""
+_render_pass_clock_begin() {
+  if [ -n "${HERD_FAKE_NOW:-}" ]; then
+    _RENDER_PASS_FAKE_NOW_PRIOR_SET=1
+    _RENDER_PASS_FAKE_NOW_PRIOR="$HERD_FAKE_NOW"
+  else
+    _RENDER_PASS_FAKE_NOW_PRIOR_SET=""
+    _RENDER_PASS_FAKE_NOW_PRIOR=""
+  fi
+  export HERD_FAKE_NOW="$(_now_epoch)"
+}
+_render_pass_clock_end() {
+  if [ -n "$_RENDER_PASS_FAKE_NOW_PRIOR_SET" ]; then
+    export HERD_FAKE_NOW="$_RENDER_PASS_FAKE_NOW_PRIOR"
+  else
+    unset HERD_FAKE_NOW
+  fi
+}
 
 # _pid_starttime <pid> — a STABLE per-process start-time token: constant for a process's whole life,
 # different for a pid a later process recycled. `ps -o lstart=` is portable across macOS/BSD + Linux;
@@ -3636,6 +3695,10 @@ _review_gate_step() {
         if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then _rgs_echo=FAILED; else _rgs_echo=RETRY; fi
         ;;
     esac
+    # HERD-496: review dispatch→verdict wall-clock, against its rolling baseline — read BEFORE the
+    # inflight marker is removed below (mirrors the healthcheck gate's own _hg_elapsed / HERD-281).
+    local _rgs_elapsed; _rgs_elapsed="$(_marker_age "$inflight")"
+    case "$_rgs_elapsed" in ''|-1|*[!0-9]*) : ;; *) _phase_anomaly_observe review "review" "$_rgs_elapsed" ;; esac
     # Verdict is now durably in the ledger → drop the reviewer's scratch files. VERDICT CONSUMED →
     # retire the reviewer's pane (HERD-113): a PASS/BLOCK reviewer leaves its pane OPEN with an idle
     # session showing the verdict banner; now that the watcher has read the verdict that pane has done
@@ -7239,6 +7302,121 @@ _main_health_fix_clear() {
   return 0
 }
 
+# ── PER-PHASE DURATION BASELINES + anomaly self-filing (HERD-496) ──────────────────────────────────
+# The operator's self-observation ask: the watcher already TIMES every phase it runs (a dispatch
+# marker's age at collection, a bounce prompt to a wake result) — this teaches it what "normal" looks
+# like for each one and self-files when an instance blows past that LEARNED baseline. GROUNDED: a
+# 5-hour dead watcher (2026-08-02) was a tick-silence anomaly a learned cadence baseline would have
+# caught within minutes of the first missed tick; the failure mode this guards against is exactly
+# "the operator only notices because a human happened to look."
+#
+# Ship-dormant behind ANOMALY_BASELINES (default off): _anomaly_baselines_enabled is the ONE gate
+# every one of the 5 measurement call sites checks FIRST, so off is a hard no-op — not even a
+# python3 shellout — and turning it on is the only way this ever touches the pool or the journal.
+
+# _anomaly_baselines_enabled — true iff ANOMALY_BASELINES opts in. Default OFF (mirrors every other
+# MAIN_HEALTH_*-shaped lever); any unrecognized value reads as off (fail toward dormant).
+_anomaly_baselines_enabled() {
+  case "$(printf '%s' "${ANOMALY_BASELINES:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Inline constants (mirrors _MAIN_HEALTH_DIED_MAX / _MAIN_CI_SCAN_INTERVAL) — internal tuning, not
+# operator knobs: no config key, no manifest row.
+_ANOMALY_MIN_SAMPLES=5        # never judge a phase off a baseline that has not learned enough yet
+_ANOMALY_THRESHOLD_PCT=200    # an instance must exceed 2x its own LEARNED p95 to count as anomalous
+
+# _phase_duration_observe <phase> <seconds> — record one completed phase instance's wall-clock
+# duration against its rolling baseline (pysrc/herd/store.py phase_duration_observe) and print the
+# resulting "<median>\t<p95>\t<n>" over the retained window. Empty output (never a crash) on a
+# missing python3/pysrc, a non-numeric duration, or a store error — the caller then skips judging
+# rather than acting on a guessed number.
+_phase_duration_observe() {
+  local _pdo_phase="$1" _pdo_secs="$2" _pdo_pyp
+  case "$_pdo_secs" in ''|*[!0-9]*) return 1 ;; esac
+  _pdo_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_pdo_pyp" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_pdo_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --phase-duration-observe "$_pdo_phase" "$_pdo_secs" 2>/dev/null
+}
+
+# _phase_anomaly_row <ledger-line> — render ONE anomaly ledger line ("<epoch>\t<phase>\t<seconds>\t
+# <p95>") as a calm advisory console row, e.g. "health-check 28m — p95 19m".
+_phase_anomaly_row() {
+  local epoch phase secs p95
+  IFS=$'\t' read -r epoch phase secs p95 <<EOF
+$1
+EOF
+  [ -n "${phase:-}" ] || return 1
+  printf '    %s⏱ %s%s%s %s%s%s — p95 %s%s' \
+    "$C_YELLOW" "$C_BOLD" "$phase" "$C_RESET" "$C_YELLOW" "$(_fmt_age "${secs:-0}")" "$C_RESET" \
+    "$(_fmt_age "${p95:-0}")" "$C_RESET"
+}
+
+# build_phase_anomalies — the "phase anomalies" console section: the newest 5 STILL-RELEVANT ledger
+# entries, newest first (HERD-243 shared bounded-section helper — same age-out/trim rules as builder
+# notes). Empty (ANOMALY_ROWS="") whenever the ledger is absent/empty, so render() omits the section
+# and the console is byte-identical when ANOMALY_BASELINES is off (nothing was ever appended). Pure
+# renderer — no journal I/O, no store calls.
+build_phase_anomalies() {
+  ANOMALY_ROWS=""
+  local rows
+  rows="$(herd_console_section "$ANOMALY_LEDGER" 5 herd_console_classify_builder_note _phase_anomaly_row)"
+  [ -n "$rows" ] && ANOMALY_ROWS="${rows}"$'\n'
+  return 0
+}
+
+# _phase_anomaly_observe <phase-key> <human-label> <duration-secs> — the ONE shared call every one of
+# HERD-496's 5 measurement points calls once it knows how long its own instance just took. Ship-
+# dormant: returns immediately (no store touch, no journal, no row) unless ANOMALY_BASELINES is on.
+#
+# On enable: records <duration-secs> against <phase-key>'s rolling baseline; below
+# _ANOMALY_THRESHOLD_PCT of the LEARNED p95 (or before _ANOMALY_MIN_SAMPLES have accrued) is SILENT —
+# no journal, no row, no filing, exactly the mutation-prove's "below threshold" case. Past it:
+# journals `phase_anomaly`, appends one calm advisory row to $ANOMALY_LEDGER, and FILES ONCE via the
+# SAME shared-pool dedup marker MAIN_HEALTH_AUTOFIX's filing leg uses (_main_health_fix_mark /
+# _main_health_scribe, HERD-371) — an HONEST identity of phase+THIS measurement+the baseline it beat,
+# so a re-observed IDENTICAL reading dedups (journaled result=dedup) while a worse or different
+# reading of the same phase files fresh. Fully fail-soft; always returns 0.
+_phase_anomaly_observe() {
+  local _pa_phase="$1" _pa_label="$2" _pa_secs="$3"
+  local _pa_stats _pa_median _pa_p95 _pa_n _pa_threshold _pa_id _pa_mark_rc
+  _anomaly_baselines_enabled || return 0
+  case "$_pa_secs" in ''|*[!0-9]*) return 0 ;; esac
+  _pa_stats="$(_phase_duration_observe "$_pa_phase" "$_pa_secs")" || return 0
+  IFS=$'\t' read -r _pa_median _pa_p95 _pa_n <<EOF
+$_pa_stats
+EOF
+  case "${_pa_n:-}" in ''|*[!0-9]*) return 0 ;; esac
+  case "${_pa_p95:-}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_pa_n" -ge "$_ANOMALY_MIN_SAMPLES" ] || return 0      # baseline not learned yet — never judge
+  [ "$_pa_p95" -gt 0 ] || return 0
+  _pa_threshold=$(( _pa_p95 * _ANOMALY_THRESHOLD_PCT / 100 ))
+  [ "$_pa_secs" -gt "$_pa_threshold" ] || return 0          # under threshold — silent, byte-inert
+
+  journal_append phase_anomaly phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" \
+    median "${_pa_median:-0}" n "$_pa_n"
+  printf '%s\t%s\t%s\t%s\n' "$(_now_epoch)" "$_pa_label" "$_pa_secs" "$_pa_p95" >> "$ANOMALY_LEDGER" 2>/dev/null || true
+  herd_console_trim "$ANOMALY_LEDGER" "$ANOMALY_LEDGER_MAX"
+
+  _pa_id="anomaly:${_pa_phase}:${_pa_secs}:${_pa_p95}"
+  _main_health_fix_mark "$_pa_id" "0" ""; _pa_mark_rc=$?
+  case "$_pa_mark_rc" in
+    0)
+      _main_health_scribe "ANOMALY: ${_pa_label} took $(_fmt_age "$_pa_secs") — p95 $(_fmt_age "$_pa_p95")
+A ${_pa_label} run just took $(_fmt_age "$_pa_secs"), past its learned p95 baseline of $(_fmt_age "$_pa_p95") (median $(_fmt_age "${_pa_median:-0}") over ${_pa_n} samples). Look for a stuck dependency, a resource-contention window, or a genuine regression."
+      journal_append phase_anomaly_filed phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" result enqueued ;;
+    3)
+      journal_append phase_anomaly_filed phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" result dedup ;;
+    *)
+      journal_append phase_anomaly_filed phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" result skipped reason store-unavailable ;;
+  esac
+  return 0
+}
+
 # _main_health_ci_log_identity <run-id> — HERD-476: derive an HONEST failing-test identity for a
 # kind=ci red from the failing run's OWN logs, rather than trusting the bare workflow/conclusion pair
 # _main_health_ci_leg renders ("CI <workflow>: <conclusion>", which names no test and so
@@ -7834,6 +8012,9 @@ _collect_main_health() {
            detail "$_cm_out" ;;                                   # HERD-452: disposable worktree could not be created, never falls back to the live checkout
       *) journal_append main_health pr "$_cm_pr" sha "$_cm_sha" result infra_event reason "rc-${_cm_rc:-?}" ;;
     esac
+    # HERD-496: the post-merge suite's own wall-clock, against its rolling baseline.
+    local _cm_elapsed; _cm_elapsed="$(_marker_age "$(_health_inflight_file "main-$_cm_sha")")"
+    case "$_cm_elapsed" in ''|-1|*[!0-9]*) : ;; *) _phase_anomaly_observe main_health_suite "main-health suite" "$_cm_elapsed" ;; esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" \
           "$(_main_health_retry_file "$_cm_sha")" 2>/dev/null || true
     lifecycle_retire health-worker "main-$_cm_sha" collected   # HERD-193 RETIRE: verdict routed
@@ -9819,6 +10000,7 @@ Reproduce and fix ${_cfb_id} now, from your worktree. If the local suite later d
 CLEAN, this red retracts on its own via the normal rails — no action needed in that case.
 Fix the failure, re-run until clean, then push."
   _cfb_pane_id="$(_find_builder_pane_id_any "$_cfb_slug")"
+  local _cfb_t0; _cfb_t0="$(_now_epoch)"    # HERD-496: bounce→wake wall-clock starts at the FIRST send
   if [ -n "$_cfb_pane_id" ]; then
     local _cfb_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
     herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
@@ -9843,6 +10025,9 @@ Fix the failure, re-run until clean, then push."
   journal_append ci_fastbounce_wake_result pr "$_cfb_pr" sha "$_cfb_sha" slug "$_cfb_slug" \
     round "$_cfb_round_num" agent_status_before "${_cfb_before:-unknown}" \
     agent_status_after "${_cfb_after:-unknown}" woke "$_cfb_woke" escalated "$_cfb_escalated"
+  # HERD-496: a FAILED/escalated wake has no honest "time to wake" — only a woke=1 instance feeds the
+  # bounce→wake baseline.
+  [ "$_cfb_woke" = "1" ] && _phase_anomaly_observe bounce_wake "bounce→wake" "$(( $(_now_epoch) - _cfb_t0 ))"
   return 0
 }
 
@@ -10339,6 +10524,7 @@ A red on YOUR sha is YOUR diff — the baseline env above already forgives failu
 base branch, so what remains is yours.
 Fix the failure, re-run until the healthcheck is green, then push."
   _hhc_pane_id="$(_find_builder_pane_id_any "$_hhc_slug")"
+  local _hhc_t0; _hhc_t0="$(_now_epoch)"    # HERD-496: bounce→wake wall-clock starts at the FIRST send
   if [ -n "$_hhc_pane_id" ]; then
     local _hhc_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
     # Submit via the driver send-text seam (DRIVER_SEND_TEXT) — same wake path as review/stale refix
@@ -10365,6 +10551,9 @@ Fix the failure, re-run until the healthcheck is green, then push."
   journal_append health_refix_wake_result pr "$_hhc_pr" sha "$_hhc_sha" slug "$_hhc_slug" \
     round "$_hhc_round_num" agent_status_before "${_hhc_before:-unknown}" \
     agent_status_after "${_hhc_after:-unknown}" woke "$_hhc_woke" escalated "$_hhc_escalated"
+  # HERD-496: a FAILED/escalated wake has no honest "time to wake" — only a woke=1 instance feeds the
+  # bounce→wake baseline.
+  [ "$_hhc_woke" = "1" ] && _phase_anomaly_observe bounce_wake "bounce→wake" "$(( $(_now_epoch) - _hhc_t0 ))"
   return 0
 }
 
@@ -10374,10 +10563,15 @@ Fix the failure, re-run until the healthcheck is green, then push."
 # relaunch IN THE WORKTREE preserves context and wakes it. The SAME dead-session gap breaks the
 # auto-refix bounce when the target builder is already 'done'. One shared helper fixes both.
 
-# _now — current epoch, overridable via HERD_NOW_EPOCH (a hermetic-test clock seam). New code uses
-# this; the legacy `date +%s` call sites are intentionally left untouched to minimize churn.
+# _now — current epoch, overridable via HERD_NOW_EPOCH (a hermetic-test clock seam) or HERD_FAKE_NOW
+# (HERD-491: now a THIN alias over _now_epoch, so this and every _marker_age/_console_now_epoch
+# reader share the one clock precedence — HERD_FAKE_NOW, then HERD_NOW_EPOCH, then a real read — and
+# the render-pass pin in _tick_render_reconcile pins this seam too, not just _now_epoch's callers.
+# Byte-identical to the pre-HERD-491 behavior for every existing HERD_NOW_EPOCH-only test: this only
+# ever gains a HERD_FAKE_NOW check ABOVE the unchanged HERD_NOW_EPOCH branch. New code uses this; the
+# legacy `date +%s` call sites are intentionally left untouched to minimize churn.
 _now() {
-  if [ -n "${HERD_NOW_EPOCH:-}" ]; then printf '%s' "$HERD_NOW_EPOCH"; else date +%s; fi
+  _now_epoch
 }
 
 # _shq <str> — single-quote a string for safe embedding in a shell command line (POSIX-safe: any
@@ -13433,7 +13627,11 @@ _healthcheck_gate() {
     esac
     # HERD-281: record observed suite wall-clock duration for headroom tracking.
     local _hg_elapsed; _hg_elapsed="$(_marker_age "$_hg_inflight")"
-    case "$_hg_elapsed" in ''|-1|*[!0-9]*) : ;; *) _health_duration_record "$_hg_elapsed" ;; esac
+    case "$_hg_elapsed" in
+      ''|-1|*[!0-9]*) : ;;
+      *) _health_duration_record "$_hg_elapsed"
+         _phase_anomaly_observe healthcheck "health-check" "$_hg_elapsed" ;;   # HERD-496
+    esac
     rm -f "$_hg_disp" "$_hg_inflight" 2>/dev/null || true
     lifecycle_retire health-worker "$_hg_key" collected     # HERD-193 RETIRE: result consumed
     return 0
@@ -14542,6 +14740,22 @@ _engine_tick_watchdog() {
 }
 
 _tick_render_reconcile() {
+  # HERD-496: tick cadence — the gap between consecutive INVOCATIONS of this function (this tick's
+  # full work plus the caller's sleep), against its own rolling baseline. This is the ONE phase the
+  # watcher can observe about ITSELF from inside its own loop; it cannot catch its own full death
+  # (code that runs only while the process is alive can never notice the process is gone — that gap
+  # is what watcher-resurrect.sh's external cron probe exists for, HERD-489), but it DOES catch a tick
+  # running abnormally slowly long before it stalls outright. Silent on the very first call
+  # (_TICK_CADENCE_PREV starts unset — no prior invocation to measure against, never a fabricated
+  # cadence). Measured BEFORE the render-pass clock pin below, against a live, unpinned clock.
+  if [ -n "${_TICK_CADENCE_PREV:-}" ]; then
+    _phase_anomaly_observe tick_cadence "tick cadence" "$(( $(_now_epoch) - _TICK_CADENCE_PREV ))"
+  fi
+  _TICK_CADENCE_PREV="$(_now_epoch)"
+  # HERD-491: pin the render pass's clock FIRST, before any age is read — see
+  # _render_pass_clock_begin. Released right after `render` below, so the action/reconcile phases
+  # that follow keep observing a live clock exactly as before this fix.
+  _render_pass_clock_begin
   # HERD-281: reset the per-tick headroom-approaching signal before the corpse sweep sets it.
   _HEALTH_HEADROOM_APPROACHING=""
   # RESTART-SAFE GATE HYGIENE (HERD-185), FIRST thing each tick: free any slot held by a dead/timed-out
@@ -14841,7 +15055,7 @@ EOF
         # transcript-growing worktree reads as building; only a clean, commitless, quiet tree
         # earns the warning.
         _quiet="$(_stall_quiet_secs)"
-        _now="$(date +%s)"
+        _now="$(_now_epoch)"  # HERD-491: the shared render-pass clock, not a fresh `date +%s` read
         _newest_edit="$(_worktree_newest_edit "$dir")"
         if [ -n "$_newest_edit" ]; then _changes=1; _edit_age=$(( _now - _newest_edit )); else _changes=0; _edit_age=-1; fi
         _commits="$(git -C "$dir" rev-list HEAD --count --not "$DEFAULT_BRANCH" 2>/dev/null || echo 0)"
@@ -15027,6 +15241,11 @@ EOF
   _builder_notes_scan
   build_builder_notes
 
+  # HERD-496 phase anomalies — pure renderer of $ANOMALY_LEDGER (the 5 measurement call sites append
+  # to it directly, at the point each phase's duration is known — there is no journal-scan leg to run
+  # here). Empty ledger ⇒ ANOMALY_ROWS stays empty ⇒ byte-identical console when ANOMALY_BASELINES is off.
+  build_phase_anomalies
+
   # HERD-330 orphan PRs — rewrite + render the advisory section listing each open PR (in the tick's
   # already-fetched PRS_JSON) that NO discovered builder worktree owns. The claimed set is derived from
   # this tick's FEATS records (field 4 = PR number); an orphan is any open PR not in it. _orphan_prs_scan
@@ -15083,6 +15302,9 @@ EOF
   fi
 
   render
+  # HERD-491: release the render-pass clock pin now that the frame is painted — Phase B/C below read
+  # a live clock again, unchanged from before this fix.
+  _render_pass_clock_end
   # ENGINE (HERD-306, EPIC HERD-300 FINALE): hand the action pass to the SOLE engine core — the LIVE
   # Python engine (pysrc/herd/live_runtime.py) — through the watchdog. There is NO bash action pass to
   # fall back to anymore (_tick_act was deleted): the watchdog runs the Python tick, RETRIES a fault

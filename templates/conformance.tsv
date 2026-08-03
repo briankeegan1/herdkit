@@ -481,3 +481,5 @@ resolver-claim.sh	sim	tests/test-sandbox-multiseat.sh
 RESOLVE_CLAIM	unit	tests/test-resolver-claim.sh
 RESOLVE_CLAIM	sim	tests/test-sandbox-multiseat.sh
 RESOLVE_CLAIM_TTL	unit	tests/test-resolver-claim.sh
+ANOMALY_BASELINES	unit	tests/test-phase-anomaly-baselines.sh
+ANOMALY_BASELINES	unit	tests/test_store.py

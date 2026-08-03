@@ -161,6 +161,44 @@ class AccessorParity(_PoolCase):
             self.assertEqual(st.mark_finish_stall_seen(slug, 3000), (3000, "pending"),
                               "%s: a regression after clear could not re-anchor" % be)
 
+    def test_phase_duration_baseline_rolling_window_and_parity(self):
+        """HERD-496: a rolling median/p95 per named phase, so agent-watch.sh's anomaly leg can judge a
+        just-completed instance against a LEARNED baseline. Both backends must agree bit-for-bit on the
+        same observation sequence (nearest-rank percentiles, no floats); a distinct phase must never
+        share a baseline (a slow healthcheck must not poison review's numbers, or vice versa); the
+        window must actually trim (an old sample drops out once it fills); and — the correctness
+        property the anomaly leg depends on — every call returns stats over the PRIOR window, NEVER
+        including the observation just made, or a single outlier would drag its own p95 up to itself
+        and could never be flagged against its own baseline."""
+        seq = [10, 12, 11, 13, 12, 90]
+        results = {}
+        for be in ("flat", "sqlite"):
+            shutil.rmtree(self.pool); os.makedirs(os.path.join(self.pool, ".herd"))
+            st = self.store(be)
+            observed = [st.phase_duration_observe("healthcheck", v) for v in seq]
+            results[be] = observed
+            # a distinct phase never shares the baseline just built for "healthcheck"
+            self.assertEqual(st.phase_duration_observe("review", 5), (0, 0, 0),
+                              "%s: a second phase started with a non-empty baseline" % be)
+        self.assertEqual(results["flat"], results["sqlite"],
+                          "flat and sqlite diverged on the same duration sequence: %r vs %r"
+                          % (results["flat"], results["sqlite"]))
+        # the FIRST observation for any phase always judges against an empty baseline.
+        self.assertEqual(results["flat"][0], (0, 0, 0))
+        # the 90 lands LAST — every returned stat is over the PRIOR window, so 90 never appears in any
+        # of them: sorted([10,11,12,12,13]) (the prior 5) -> median (rank 3) = 12, p95 (rank 5) = 13.
+        self.assertEqual(results["flat"][-1], (12, 13, 5))
+        self.assertNotIn(90, results["flat"][-1], "the just-made observation leaked into its own baseline")
+
+        for be in ("flat", "sqlite"):
+            shutil.rmtree(self.pool); os.makedirs(os.path.join(self.pool, ".herd"))
+            st = self.store(be)
+            windowed = [st.phase_duration_observe("review", v, window=3) for v in [1, 2, 3, 4, 5]]
+            # once the window fills, the OLDEST sample drops out on the FOLLOWING observation's prior-
+            # window read: by the 5th call the retained prior window is [2, 3, 4] (1 already trimmed).
+            self.assertEqual(windowed[-1], (3, 4, 3),
+                              "%s: the rolling window did not trim to its bound" % be)
+
 
 class RoundTrip(_PoolCase):
     """files → db → files is byte-for-byte identical — the migration's lossless core."""
