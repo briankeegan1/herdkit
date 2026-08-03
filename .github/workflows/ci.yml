@@ -20,11 +20,17 @@ name: CI
 #
 # SHARDING (HERD-463): ~350 curated tests ran serially per platform (macos 24m, ubuntu 13m on PR
 # #579) — the #1 operator pain after HERD-437/440/441 re-armed 168 previously-exempt tests.
-# `shard` fans each platform out across 4 machines via a stable filename hash
-# (scripts/herd/suite-shard.sh: HERD_CI_SHARD_INDEX of HERD_CI_SHARD_COUNT); the two literal `4`s
-# below (the `shard:` array length and HERD_CI_SHARD_COUNT) MUST stay in sync — mutation-proven
-# membership (every test lands in exactly one shard, the union == the full curated set) lives in
-# tests/test-suite-shard.sh, not in this workflow. DOES NOT REDUCE what runs — only wall-clock.
+# `shard` fans each platform out across N machines via a stable filename hash
+# (scripts/herd/suite-shard.sh: HERD_CI_SHARD_INDEX of HERD_CI_SHARD_COUNT). PER-PLATFORM FAN-OUT
+# (HERD-493): macos gets 8 shards, ubuntu gets 6 — macOS's per-test time is ~1.8x ubuntu's (heavier
+# per-process fork/exec) so it still benefits from more shards before per-runner spin-up (checkout +
+# Python setup + brew install) eats the marginal wall-clock gain; ubuntu's suite is already short
+# enough that 6 sits at that knee. The `shard:` array below (1..8) MUST cover the largest per-platform
+# count, with `exclude:` trimming it back to each platform's own count, and each platform's
+# `shard_count` (used for HERD_CI_SHARD_COUNT) MUST match how many of its shard values survive the
+# exclude — mutation-proven membership (every test lands in exactly one shard, the union == the full
+# curated set, for BOTH counts) lives in tests/test-suite-shard.sh, not in this workflow. DOES NOT
+# REDUCE what runs — only wall-clock.
 
 on:
   push:
@@ -49,24 +55,32 @@ env:
 
 jobs:
   suite:
-    name: suite (${{ matrix.platform }}, shard ${{ matrix.shard }}/4)
+    name: suite (${{ matrix.platform }}, shard ${{ matrix.shard }}/${{ matrix.shard_count }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         platform: [ubuntu, macos]
-        shard: [1, 2, 3, 4]   # keep this length in sync with HERD_CI_SHARD_COUNT below
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]   # superset; exclude below trims per-platform
+        exclude:
+          # ubuntu runs 6 shards — trim the 7/8 slots the macos-only fan-out needs.
+          - platform: ubuntu
+            shard: 7
+          - platform: ubuntu
+            shard: 8
         include:
           - platform: ubuntu   # doubles as the WSL2 coverage (WSL2 == Linux semantics)
             os: ubuntu-latest
             locale: C.UTF-8         # glibc ships C.UTF-8
+            shard_count: 6          # keep in sync with the `exclude:` block above
           - platform: macos
             os: macos-latest
             locale: en_US.UTF-8     # BSD libc has no C.UTF-8 — use a real UTF-8 locale
+            shard_count: 8          # keep in sync with the `shard:` array's full range above
     env:
       HERD_CI_PLATFORM: ${{ matrix.platform }}
       HERD_CI_SHARD_INDEX: ${{ matrix.shard }}
-      HERD_CI_SHARD_COUNT: 4
+      HERD_CI_SHARD_COUNT: ${{ matrix.shard_count }}
       LANG: ${{ matrix.locale }}
       LC_ALL: ${{ matrix.locale }}
     steps:
