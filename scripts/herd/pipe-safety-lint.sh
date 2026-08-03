@@ -52,8 +52,15 @@
 HERD_PIPE_SAFETY_SKIP_REASON=""
 
 # The anti-pattern regex — a pipe into a producer-terminating consumer:
-#   • grep with an early-exit option (-q quiet / -m max-count) as the FIRST token after grep, so a
+#   • ANY command token — a literal name (grep), a quoted/braced/bare variable holding one
+#     ("$VAR" / ${VAR} / $VAR — the consumer is only known at runtime, so the lint cannot tell
+#     whether it early-exits and must treat it the same as a literal name), or any other bare
+#     word — followed by an early-exit option (-q quiet / -m max-count) as its FIRST flag, so a
 #     `q`/`m` buried inside a later quoted pattern (e.g. `grep -v 'a-quux'`) never false-reds.
+#     HERD-507: the lint used to hardcode the literal token `grep`, so `<producer> | "$VAR" -q`
+#     (VAR resolving to grep, or any other early-exiting consumer chosen at runtime) sailed
+#     through unflagged — the EPIPE bug does not care whether the consumer's name is a literal or
+#     a variable.
 #   • head — stops after N lines/bytes.
 # `-[[:alnum:]]*[qm]` matches -q, -qE, -qxF, -qiE, -Eq, -Eiq, -m, -m1, … (option cluster ending in q/m).
 #
@@ -63,7 +70,7 @@ HERD_PIPE_SAFETY_SKIP_REASON=""
 # ` grep -q`, yet that grep reads a FILE and has no producer process, so it can never EPIPE. That
 # class does not occur in scripts/herd, which is why the pre-HERD-441 scan surface never exposed it;
 # it is common in tests/ (13 instances), so precision here is a precondition for widening the scan.
-HERD_PIPE_SAFETY_RE='(^|[^|])\|[[:space:]]*(grep[[:space:]]+-[[:alnum:]]*[qm]|head\b)'  # pipe-ok: the detector's own pattern literal, not a pipeline
+HERD_PIPE_SAFETY_RE='(^|[^|])\|[[:space:]]*([^|[:space:]]+[[:space:]]+-[[:alnum:]]*[qm]|head\b)'  # pipe-ok: the detector's own pattern literal, not a pipeline
 
 # herd_pipe_safety_check <file>... — pure function; prints PIPE-UNSAFE lines + ADVISORY. Exit 0/1.
 herd_pipe_safety_check() {

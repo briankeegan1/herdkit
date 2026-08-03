@@ -64,7 +64,7 @@ FINDINGS="$T/findings.md"
 printf '# findings\nthe seam is one place to change behavior.\n' > "$FINDINGS"
 
 out="$(bash "$SCRIPTS/research-step.sh" report "$MINE" "$FINDINGS" 2>&1)" || fail "(A) research-step report exited non-zero: $out"
-echo "$out" | "$GREP" -q 'DONE req-XYZ' || fail "(A) report did not confirm DONE: $out"
+"$GREP" -q 'DONE req-XYZ' <<< "$out" || fail "(A) report did not confirm DONE: $out"
 pass
 
 # The headless driver's durable sink recorded the notification (title + body), and no desktop channel.

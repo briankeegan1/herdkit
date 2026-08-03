@@ -47,11 +47,13 @@ DRIVER_AGENT_SESSION_ID DRIVER_AGENT_COST_USAGE_KEYS"
     [ -n "${!k}" ]     || { echo "  stub: $k is empty"    >&2; exit 1; }
   done
 ) || fail "(1) stub.driver does not parse / bind every capability"
-if "$GREP" -E '^DRIVER_(AGENT_)?[A-Z_]+=' "$STUB" | "$GREP" -qiE '/users/|/home/|secret|password|apikey'; then
+_bindings="$("$GREP" -E '^DRIVER_(AGENT_)?[A-Z_]+=' "$STUB")"
+if "$GREP" -qiE '/users/|/home/|secret|password|apikey' <<< "$_bindings"; then
   fail "(1) stub.driver leaks a secret or absolute path"
 fi
 # The RUNTIME is non-claude: no agent-exec binding may name `claude` (that is the whole point).
-if "$GREP" -E '^DRIVER_AGENT_[A-Z_]+=' "$STUB" | "$GREP" -qw 'claude'; then
+_agent_bindings="$("$GREP" -E '^DRIVER_AGENT_[A-Z_]+=' "$STUB")"
+if "$GREP" -qw 'claude' <<< "$_agent_bindings"; then
   fail "(1) stub.driver's agent-exec bindings still name claude — not a non-claude runtime"
 fi
 runtime="$( . "$STUB"; printf '%s' "${DRIVER_AGENT_ONESHOT_EXEC%%[[:space:]]*}" )"
@@ -109,18 +111,19 @@ rt="$(HERD_DRIVER=stub HERD_DRIVERS_DIR="$ROOT/templates/drivers" \
 out="$(HERD_DRIVER=stub HERD_DRIVERS_DIR="$ROOT/templates/drivers" PATH="$FB:$PATH" \
       bash -c '. "'"$DRIVER_SH"'"; herd_driver_oneshot_exec "hi there" "m1" --auto-approve')" \
   || fail "(3) herd_driver_oneshot_exec under stub exited non-zero"
-echo "$out" | "$GREP" -q '^RUNTIME:stub-agent$' || fail "(3) one-shot seam did NOT run the stub runtime: $out"
-echo "$out" | "$GREP" -q '^RUNTIME:claude$'     && fail "(3) one-shot seam fell back to claude under HERD_DRIVER=stub: $out" || true
+"$GREP" -q '^RUNTIME:stub-agent$' <<< "$out" || fail "(3) one-shot seam did NOT run the stub runtime: $out"
+"$GREP" -q '^RUNTIME:claude$'     <<< "$out" && fail "(3) one-shot seam fell back to claude under HERD_DRIVER=stub: $out" || true
 # The prompt stayed one arg and --model carried the model — the arg composition is runtime-agnostic.
 [ "$(echo "$out" | "$GREP" -c '^ARG:hi there$')" = 1 ] || fail "(3) multi-word prompt was not one arg: $out"
-echo "$out" | "$GREP" -A1 '^ARG:--model$' | "$GREP" -q '^ARG:m1$' || fail "(3) --model not followed by the model value: $out"
+_model_argline="$(echo "$out" | "$GREP" -A1 '^ARG:--model$')"
+"$GREP" -q '^ARG:m1$' <<< "$_model_argline" || fail "(3) --model not followed by the model value: $out"
 pass; echo "PASS (3) the one-shot exec seam runs the stub (non-claude) runtime end-to-end"
 
 # ── 4. BYTE-IDENTICAL DEFAULT: unset driver → the seam runs claude. ───────────────────────────────
 out="$(HERD_DRIVERS_DIR="$ROOT/templates/drivers" PATH="$FB:$PATH" \
       bash -c '. "'"$DRIVER_SH"'"; herd_driver_oneshot_exec "hi" "m1"')" \
   || fail "(4) default-driver one-shot exec exited non-zero"
-echo "$out" | "$GREP" -q '^RUNTIME:claude$' || fail "(4) default driver did not run claude: $out"
+"$GREP" -q '^RUNTIME:claude$' <<< "$out" || fail "(4) default driver did not run claude: $out"
 pass; echo "PASS (4) default driver runs claude (byte-identical) through the same seam"
 
 # ── 5. ABSENT-BINDING DEGRADATION: a driver omitting the exec binding degrades to claude, no crash. ─
@@ -155,7 +158,7 @@ b="$(HERD_DRIVER=doesnotexist HERD_DRIVERS_DIR="$DD" \
 out="$(HERD_DRIVER=degraded HERD_DRIVERS_DIR="$DD" PATH="$FB:$PATH" \
       bash -c 'set -euo pipefail; . "'"$DRIVER_SH"'"; herd_driver_oneshot_exec "hi" "m1"')" \
   || fail "(5c) one-shot seam crashed under a driver missing its exec binding (must degrade, not crash)"
-echo "$out" | "$GREP" -q '^RUNTIME:claude$' || fail "(5c) absent binding did not degrade to the claude default: $out"
+"$GREP" -q '^RUNTIME:claude$' <<< "$out" || fail "(5c) absent binding did not degrade to the claude default: $out"
 pass; echo "PASS (5) a driver missing an agent-exec binding degrades cleanly to the default runtime"
 
 echo "ALL PASS ($PASS checks)"
