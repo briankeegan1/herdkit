@@ -70,6 +70,19 @@ if ! command -v _marker_live >/dev/null 2>&1; then
   unset AGENT_WATCH_LIB
 fi
 
+# ── borrow journal.sh if not already in scope (seam-conformance B4) ──────────────────────────────
+# This file journals sweep_flag / sweep_defer / sweep_once_guard / sweep_proc* / link_heal /
+# sweep_advice / sweep_auto / sweep_start / sweep_done but relied on its host having journal.sh
+# loaded BY CONVENTION. The borrow above already pulls it in on every real path (agent-watch.sh
+# sources journal.sh), so this is a no-op there; it only fires for a caller that pre-defines
+# _marker_live — skipping the borrow above — without having sourced journal.sh itself. Same
+# explicit-dependency form retirement.sh adopted under HERD-439: say where journal_append comes
+# from instead of assuming it.
+if ! command -v journal_append >/dev/null 2>&1; then
+  # shellcheck source=/dev/null
+  . "$_SWEEP_HERE/journal.sh"
+fi
+
 # The shared regenerable-derived-files list (HERD-214). Idempotent guard inside, so sourcing it here
 # is free when agent-watch.sh (above) already pulled it in.
 # shellcheck source=/dev/null

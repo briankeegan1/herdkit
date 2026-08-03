@@ -116,9 +116,20 @@ _scan_file() {
 # _journal_violates <file> — success (0) iff <file> calls journal_append WITHOUT the machinery loaded:
 # it invokes journal_append on a code line yet neither sources journal.sh nor guards with a
 # `command -v journal_append` presence check. That guarded best-effort form is the sanctioned pattern.
+#
+# HERD-299 class: the code-stream check reads via a here-string, NOT `_code_stream "$f" | grep -q`.
+# A producer piped into grep -q is pipe-unsafe — grep quits on the first match and closes its end of
+# the pipe while the producer may still be mid-write; on a file where the match lands well before EOF
+# the producer takes SIGPIPE, and under this script's `set -o pipefail` that nonzero exit silently
+# flips the pipeline's status, so a REAL journal_append call is misread as "no call at all" and the
+# violation goes uncaught (proven live: this exact shape hid scripts/herd/sweep.sh's unguarded
+# journal_append calls on the platforms/file sizes where it triggers). Capturing to a variable first
+# removes the producer process entirely — the here-string a grep -q then reads is a temp file, not a
+# pipe, so it can never EPIPE.
 _journal_violates() {
-  local f="$1"
-  _code_stream "$f" | "$GREP" -qE '\bjournal_append\b' || return 1     # no call at all → fine
+  local f="$1" code
+  code="$(_code_stream "$f")"
+  "$GREP" -qE '\bjournal_append\b' <<< "$code" || return 1             # no call at all → fine
   "$GREP" -qE 'journal\.sh' "$f" && return 1                           # sources the seam → fine
   "$GREP" -qE 'command -v journal_append' "$f" && return 1             # guarded best-effort → fine
   return 0
