@@ -196,6 +196,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `ADOPT_REMOTE_PRS` → `agent-watch.sh`
 - `AGENT_UPDATE` → `bin/herd`, `agent-update.sh`
 - `AGING_PR_TTL` → `agent-watch.sh`, `aging-pr.sh`, `journal-audit.sh`
+- `ANOMALY_BASELINES` → `agent-watch.sh`
 - `ANTHROPIC_BASE_URL` → `driver.sh`
 - `APP_PREVIEW_CMD` → `bin/herd`, `app-monitor.sh`, `herd-feature.sh`, `herd-resolve.sh`
 - `APP_PREVIEW_HEALTH_CMD` → `app-monitor.sh`
