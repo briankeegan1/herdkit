@@ -6728,6 +6728,12 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
   return 0
 }
 
+# ── herd watcher-resurrect: external-cadence probe (HERD-489) ─────────────────────────────────────
+# A cron/launchd job — never agent-watch.sh's own tick loop, which cannot run once the watcher is
+# actually dead — invokes this on a schedule. Ship-dormant behind WATCHER_RESURRECT (default off);
+# the probe itself decides whether to act (see scripts/herd/watcher-resurrect.sh's header).
+cmd_watcher_resurrect() { bash "$SCRIPTS_DIR/watcher-resurrect.sh" "$@"; }
+
 cmd_pane_watch() {
   _pane_init
   say "${c_bold}herd pane watch${c_rst} — restarting the watcher in its pane"
@@ -8098,6 +8104,12 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       off) additionally starts the coordinator agent when NONE
                                       is live (e.g. run from a bare terminal); refuses instead
                                       of touching one that is already live
+  herd watcher-resurrect               external-cadence probe (HERD-489): meant for an operator
+                                      cron/launchd job, NOT the watcher's own tick loop (which
+                                      cannot run once the watcher is actually dead). Ship-dormant
+                                      behind WATCHER_RESURRECT (default off); when on, resurrects
+                                      via 'herd reload' ONLY on a confirmed zero-watcher verdict —
+                                      a live watcher is never touched, never doubled
   herd pane <target>                  restart ONE control-room pane in place (no full reload):
                                         watch        stop + rerun the watcher in its pane
                                         backlog      rerun the backlog viewer in its pane
@@ -8257,6 +8269,7 @@ case "${1:-help}" in
   governance) shift; cmd_governance "$@" ;;
   posture) shift; cmd_posture "$@" ;;
   reload)  shift; cmd_reload "$@" ;;
+  watcher-resurrect) shift; _herd_require_project_config; cmd_watcher_resurrect "$@" ;;
   pane)    shift; cmd_pane "$@" ;;
   log)     shift; cmd_log "$@" ;;
   status)  shift; cmd_status "$@" ;;

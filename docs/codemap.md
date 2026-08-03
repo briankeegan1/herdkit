@@ -101,6 +101,7 @@ Role summarized from each file's top-of-file comment.
 - `tracker-state-sweep.sh` — periodic, ADVISORY tracker-state SELF-HEAL sweep (HERD-86).
 - `triggers.sh` — SCHEDULED / TRIGGERED RUNS (HERD-169): a cron-style trigger spawns a defined workflow
 - `watcher-exempt.sh` — THE ONE shared WATCHER-IDENTITY check (HERD-266).
+- `watcher-resurrect.sh` — external-cadence WATCHER RESURRECTION (HERD-489).
 - `work-unit.sh` — the work-unit delivery abstraction facade (HERD-395/HERD-396/HERD-398). Phase 1 NAMED
 
 ### Work-unit adapters (`scripts/herd/work-units/`)
@@ -183,6 +184,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `task-spec-view.sh` → `theme.sh`
 - `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`
 - `triggers.sh` → `herd-config.sh`, `journal.sh`
+- `watcher-resurrect.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
 - `work-unit.sh` → `agent-watch.sh`, `journal.sh`
 - `git-pr.sh` → `journal.sh`
 
@@ -301,7 +303,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `ORPHAN_PR_ROWS` → `agent-watch.sh`
 - `OSS_TRIAGE` → `bin/herd`, `oss-triage.sh`
 - `PROJECT_ARCHETYPE` → `bin/herd`
-- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `changelog.sh`, `codemap.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `oss-triage.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`
+- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `changelog.sh`, `codemap.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `oss-triage.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`, `watcher-resurrect.sh`
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`
@@ -344,6 +346,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
 - `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`
+- `WATCHER_RESURRECT` → `bin/herd`, `watcher-resurrect.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`, `resolver-claim.sh`
 - `WATCHER_SELF_RESTART` → `agent-watch.sh`
 - `WATCHER_SINGLETON_RECONCILE` → `agent-watch.sh`
@@ -357,6 +360,6 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCH_CLAUDE_PROBE_TIMEOUT` → `agent-watch.sh`
 - `WEDGE_AUTOWAKE` → `agent-watch.sh`
 - `WEDGE_GRACE_MIN` → `agent-watch.sh`
-- `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`, `sweep.sh`
+- `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`, `sweep.sh`, `watcher-resurrect.sh`
 - `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
 - `WORK_UNIT_KIND` → `agent-watch.sh`, `work-unit.sh`
