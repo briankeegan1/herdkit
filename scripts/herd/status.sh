@@ -11,7 +11,10 @@
 #   • `git worktree list` + `herdr agent list` + `gh pr list` to enumerate in-flight builders;
 #   • the watcher's OWN append-only ledgers ($WORKTREES_DIR/.agent-watch-reviewed and
 #     .agent-watch-healthchecks) for the last review/health verdict — never writing them;
-#   • the backlog file (file backend) for open/in-progress counts.
+#   • the backlog file (file backend) for open/in-progress counts;
+#   • the builder-notes ledger + its ack sidecar ($WORKTREES_DIR/.agent-watch-builder-notes[-acked])
+#     for the count of notes still waiting on an operator — through console-section.sh, the SAME
+#     ack-aware reader `herd notes` and the watcher console use, so the three can never disagree.
 #
 # The DEAD-builder check here is a SMALL, INDEPENDENT, read-only replica of the watcher's DEAD
 # signature (worktree present + NO live agent + NO open PR + NO commits) — it does NOT call into or
@@ -111,6 +114,64 @@ _status_backlog_counts() {
     inprog="$(grep -c '🚧' "$f" 2>/dev/null || true)"; inprog="${inprog:-0}"
   fi
   printf '%s %s' "$open" "$inprog"
+}
+
+# ── Builder notes waiting on an operator (HERD-492) ──────────────────────────────────────────────
+# A builder files a load-bearing finding with `herd note`; it lands on the watcher console and in
+# `herd notes` until someone acks it. Both of those are LIVE surfaces — a coordinator whose session
+# monitor has dropped the notes leg (or a human who simply is not looking at the console) misses the
+# note entirely, which is exactly how a refusal note sat unread for ~30 min on 2026-08-02. `herd status`
+# is the one-shot pulse everyone runs constantly, so it carries the count too. READ-ONLY, and silent at
+# zero: no unacked note ⇒ no record ⇒ no line ⇒ byte-identical output.
+
+# _status_note_age <seconds> — compact age token for the NOTES line ("42s", "12m", "3h", "2d").
+# Empty for anything that does not parse as a non-negative integer (a clock that ran backwards, an
+# unparseable ledger epoch) — the caller then prints the slug alone rather than a nonsense age. Pure.
+_status_note_age() {
+  local s="${1:-}"
+  case "$s" in ''|*[!0-9]*) return 0 ;; esac
+  if   [ "$s" -lt 60 ];    then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ];  then printf '%dm' "$(( s / 60 ))"
+  elif [ "$s" -lt 86400 ]; then printf '%dh' "$(( s / 3600 ))"
+  else                          printf '%dd' "$(( s / 86400 ))"
+  fi
+}
+
+# _status_notes_summary <notes-ledger> <ack-sidecar> — echo "<count>\t<newest-slug>\t<newest-age>"
+# for the builder notes STILL waiting on an operator; echo NOTHING when there are none.
+#
+# "Still waiting" is not this file's decision to make: it delegates to console-section.sh's
+# herd_console_visible_lines with the builder-note classifier and the ack sidecar — literally the call
+# `herd notes` makes (bin/herd cmd_notes), with the same CONSOLE_LEDGER_MAX bound. So an acked note and
+# a note aged out of the display are invisible HERE too, and this count can never disagree with what
+# `herd notes` lists. That reader hands rows back newest-first, so the first line is the newest note.
+#
+# Fail-soft everywhere: a missing/empty ledger, an unavailable console-section.sh, or a reader that
+# errors all yield NOTHING (no NOTES record, no line) rather than a red row or a broken snapshot.
+_status_notes_summary() {
+  local ledger="${1:-}" ack="${2:-}" visible count newest epoch slug now age=""
+  [ -s "$ledger" ] || return 0
+  # The reader lives in console-section.sh, which bin/herd only sources inside `herd notes`. Load it
+  # here when it is not already in scope (also the standalone-source path the hermetic test drives).
+  if ! declare -f herd_console_visible_lines >/dev/null 2>&1; then
+    local lib; lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/console-section.sh"
+    [ -f "$lib" ] && { . "$lib" 2>/dev/null || true; }
+  fi
+  declare -f herd_console_visible_lines >/dev/null 2>&1 || return 0
+  visible="$(herd_console_visible_lines "$ledger" "${CONSOLE_LEDGER_MAX:-20}" \
+    herd_console_classify_builder_note "$ack" 2>/dev/null || true)"
+  [ -n "$visible" ] || return 0
+  count="$(printf '%s\n' "$visible" | grep -c . 2>/dev/null || printf 0)"
+  case "${count:-0}" in ''|*[!0-9]*|0) return 0 ;; esac
+  newest="${visible%%$'\n'*}"   # newest first out of the shared reader
+  IFS=$'\t' read -r epoch slug _ <<EOF
+$newest
+EOF
+  now="$(_console_now_epoch 2>/dev/null || true)"
+  case "${now:-}" in ''|*[!0-9]*) : ;; *)
+    case "${epoch:-}" in ''|*[!0-9]*) : ;; *) age="$(_status_note_age "$(( now - epoch ))")" ;; esac ;;
+  esac
+  printf '%s\t%s\t%s' "$count" "${slug:-}" "$age"
 }
 
 # ── Watcher liveness ─────────────────────────────────────────────────────────────────────────────
@@ -230,6 +291,8 @@ _status_dup_verified() {
 #   PRCOUNT   <n>
 #   PR        <num> <branch> <mergeable> <mstate> <review> <health> <decision> <attn>   repeated
 #   BACKLOG   file <open> <inprog>   |   BACKLOG other <backend>
+#   NOTES     <count> <newest-slug> <newest-age>   OMITTED ENTIRELY when zero notes wait (HERD-492),
+#                                             so a control room with nothing to drain is byte-identical
 #   CODEMAP   <present 0|1> <fresh 0|1>        no CODEMAP section rendered when present=0
 #   ATTENTION <0|1>
 #   REASONS   <reasons string>                 leading-space-joined tokens, printed verbatim
@@ -425,7 +488,21 @@ EOF
     printf 'BACKLOG%sother%s%s\n' "$US" "$US" "${SCRIBE_BACKEND}"
   fi
 
-  # (e) CODEMAP — freshness of the committed docs/codemap.md. INFORMATIONAL ONLY (always dim, never an
+  # (e) NOTES — builder notes still waiting on an operator (HERD-492). INFORMATIONAL ONLY: an unacked
+  #     note is a nudge to drain, not a broken control room, so it never flips ATTENTION or the exit
+  #     code. Emitted ONLY when at least one note waits — zero notes ⇒ no record ⇒ no line ⇒ output
+  #     byte-identical to before this change (and every pre-HERD-492 snapshot fixture still renders).
+  local notes_sum n_notes note_slug note_age
+  notes_sum="$(_status_notes_summary \
+    "$trees/.agent-watch-builder-notes" "$trees/.agent-watch-builder-notes-acked" 2>/dev/null || true)"
+  if [ -n "$notes_sum" ]; then
+    IFS=$'\t' read -r n_notes note_slug note_age <<EOF
+$notes_sum
+EOF
+    printf 'NOTES%s%s%s%s%s%s\n' "$US" "$n_notes" "$US" "$note_slug" "$US" "$note_age"
+  fi
+
+  # (f) CODEMAP — freshness of the committed docs/codemap.md. INFORMATIONAL ONLY (always dim, never an
   #     attention condition — a stale doc is not a broken build). Shown only when the project has adopted
   #     the codemap. Uses the read-only `codemap.sh --check` probe (exit 0 fresh / non-zero stale), which
   #     never writes the committed file. Independent of CODEMAP_AUTOREFRESH.
@@ -456,6 +533,7 @@ _status_format_bash() {
   local n_build=0 n_done=0 n_idle=0 n_dead=0 builder_rows=""
   local n_prs=0 pr_rows=""
   local bl_kind="" bl_open="" bl_inprog="" bl_backend=""
+  local nt_count="" nt_slug="" nt_age=""
   local cm_present=0 cm_fresh=0 attention=0 reasons=""
   local line key rest
   while IFS= read -r line || [ -n "$line" ]; do
@@ -511,6 +589,10 @@ $rest
 EOF
         [ "$bl_kind" = "other" ] && bl_backend="$bl_open"
         ;;
+      NOTES)     IFS=$US read -r nt_count nt_slug nt_age <<EOF
+$rest
+EOF
+        ;;
       CODEMAP)   IFS=$US read -r cm_present cm_fresh <<EOF
 $rest
 EOF
@@ -546,6 +628,13 @@ EOF
   else
     printf '  %sBACKLOG%s   %s(backend: %s — no local counts)%s\n' \
       "$b" "$x" "$d" "$bl_backend" "$x"
+  fi
+
+  # NOTES (HERD-492) — printed ONLY when a note is waiting; no record ⇒ no line ⇒ byte-identical.
+  # The age token is omitted (slug alone) when it could not be computed, never rendered as garbage.
+  if [ -n "$nt_count" ] && [ "$nt_count" != "0" ]; then
+    printf '  %sNOTES%s     %s%s unacked%s %s(newest: %s%s)%s\n' \
+      "$b" "$x" "$y" "$nt_count" "$x" "$d" "$nt_slug" "${nt_age:+ $nt_age}" "$x"
   fi
 
   if [ "$cm_present" = "1" ]; then

@@ -182,9 +182,28 @@ assert_status_parity() {
   }
   ok
 }
-for fix in healthy watcher-down dup-detected handoff long-branch; do
+for fix in healthy watcher-down dup-detected handoff long-branch notes-unacked notes-no-age; do
   assert_status_parity "$fix"
 done
+
+# HERD-492 — the unacked-builder-notes line. Parity alone cannot prove this: deleting the render from
+# BOTH formatters keeps them identical and green. So assert the CONTENT on each path separately, plus
+# the SILENT-AT-ZERO contract on a fixture with no NOTES record (a snapshot from before this change).
+# Verified by mutation: deleting the bash render alone reds the parity loop above; deleting BOTH
+# renders leaves parity green and is caught right here.
+for eng in 1 0; do
+  notes_out="$(run_status "$eng" notes-unacked)"
+  [[ "$notes_out" == *"NOTES"*"3 unacked"*"(newest: feat-beta 12m)"* ]] \
+    || { printf '%s\n' "$notes_out" >&2; fail "status notes-unacked (engine=$eng): missing the 'N unacked (newest: <slug> <age>)' line"; }
+  # Fail-soft age: an uncomputable age renders the slug alone, never a dangling separator.
+  noage_out="$(run_status "$eng" notes-no-age)"
+  [[ "$noage_out" == *"1 unacked"*"(newest: feat-gamma)"* ]] \
+    || { printf '%s\n' "$noage_out" >&2; fail "status notes-no-age (engine=$eng): empty age must render the slug alone"; }
+  # Zero notes ⇒ no NOTES record ⇒ NO line at all (byte-identical to before HERD-492).
+  [[ "$(run_status "$eng" healthy)" != *"NOTES"* ]] \
+    || fail "status healthy (engine=$eng): a snapshot with no NOTES record must print no NOTES line"
+done
+ok
 
 # Exit-code contract: an attention fixture must exit 1 (both paths), a healthy fixture 0.
 run_status 1 dup-detected >/dev/null; [ "$?" = 1 ] || fail "status dup-detected: python path must exit 1 (attention)"

@@ -17,6 +17,7 @@ Snapshot record grammar (fields joined by US=\x1f), mirrored from status.sh:
   BCOUNTS <build> <done> <idle> <dead> · BUILDER <verdict> <slug> <prnum>
   PRCOUNT <n> · PR <num> <branch> <mergeable> <mstate> <review> <health> <decision> <attn>
   BACKLOG file <open> <inprog> | BACKLOG other <backend>
+  NOTES <count> <newest-slug> <newest-age>   omitted entirely when no builder note waits (HERD-492)
   CODEMAP <present 0|1> <fresh 0|1> · ATTENTION <0|1> · REASONS <string>
 """
 import sys
@@ -40,6 +41,7 @@ def main():
     n_prs = "0"
     prs = []                 # (num, branch, mergeable, mstate, review, health, decision, attn)
     bl_kind = bl_open = bl_inprog = bl_backend = ""
+    nt_count = nt_slug = nt_age = ""
     cm_present = cm_fresh = "0"
     attention = "0"
     reasons = ""
@@ -76,6 +78,8 @@ def main():
                 bl_open, bl_inprog = gf(1), gf(2)
             else:
                 bl_backend = gf(1)
+        elif key == "NOTES":
+            nt_count, nt_slug, nt_age = gf(0), gf(1), gf(2)
         elif key == "CODEMAP":
             cm_present, cm_fresh = gf(0), gf(1)
         elif key == "ATTENTION":
@@ -134,6 +138,12 @@ def main():
         out.append("  %sBACKLOG%s   %s open · %s in-progress\n" % (b, x, bl_open, bl_inprog))
     else:
         out.append("  %sBACKLOG%s   %s(backend: %s — no local counts)%s\n" % (b, x, d, bl_backend, x))
+
+    # NOTES (HERD-492) — only when a builder note waits; no record ⇒ no line ⇒ byte-identical.
+    # The age token is omitted (slug alone) when gather could not compute one.
+    if nt_count and nt_count != "0":
+        out.append("  %sNOTES%s     %s%s unacked%s %s(newest: %s%s)%s\n"
+                   % (b, x, y, nt_count, x, d, nt_slug, (" %s" % nt_age) if nt_age else "", x))
 
     if cm_present == "1":
         if cm_fresh == "1":

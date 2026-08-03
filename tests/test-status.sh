@@ -10,6 +10,11 @@
 #   • _status_pr_attention      — CONFLICTING / review-BLOCK / CHANGES_REQUESTED ⇒ needs a human
 #   • _status_backlog_counts    — 🔜 open / 🚧 in-progress counts from a file-backend backlog
 #   • _status_watcher_pids      — self-contained argv0 fallback returns empty for a bogus marker
+#   • _status_note_age          — compact age token, empty for anything unparseable (HERD-492)
+#   • _status_notes_summary     — count + newest slug/age of the builder notes still awaiting an ack,
+#                                  read through the SAME console-section.sh reader `herd notes` uses
+# plus ONE end-to-end gather assertion (HERD-492) that drives _status_gather itself against a real
+# notes ledger, with git/gh stubbed on PATH, so deleting the read from gather goes red here.
 # Run:  bash tests/test-status.sh
 # No `set -e`: some predicates deliberately return non-zero; we assert explicitly.
 set -uo pipefail
@@ -27,7 +32,8 @@ ok(){ pass=$((pass+1)); }
 # shellcheck source=/dev/null
 . "$LIB" || fail "sourcing status.sh failed"
 for fn in _status_classify_builder _status_latest_review _status_latest_health \
-          _status_pr_attention _status_backlog_counts _status_watcher_pids; do
+          _status_pr_attention _status_backlog_counts _status_watcher_pids \
+          _status_note_age _status_notes_summary; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
 
@@ -107,6 +113,95 @@ ok
 # fallback runs. A random, certainly-not-running marker must produce no pids — never a crash.
 out="$(HERD_WATCH_ARGV0="herd-watch-nope-$$-does-not-exist" _status_watcher_pids)"
 [ -z "$out" ] || fail "bogus watcher marker should yield no pids, got '$out'"
+ok
+
+# ── _status_note_age: compact age token, empty for anything unparseable (HERD-492) ────────────────
+[ "$(_status_note_age 0)"     = "0s" ]  || fail "age 0 → 0s"
+[ "$(_status_note_age 42)"    = "42s" ] || fail "age 42 → 42s"
+[ "$(_status_note_age 60)"    = "1m" ]  || fail "age 60 → 1m"
+[ "$(_status_note_age 3599)"  = "59m" ] || fail "age 3599 → 59m"
+[ "$(_status_note_age 3600)"  = "1h" ]  || fail "age 3600 → 1h"
+[ "$(_status_note_age 86399)" = "23h" ] || fail "age 86399 → 23h"
+[ "$(_status_note_age 86400)" = "1d" ]  || fail "age 86400 → 1d"
+# Fail-soft: a clock that ran backwards or an unparseable epoch yields NO age (the caller then prints
+# the slug alone) — never a negative/garbage token on the operator's console.
+[ -z "$(_status_note_age -5)" ]   || fail "negative age → empty"
+[ -z "$(_status_note_age abc)" ]  || fail "non-numeric age → empty"
+[ -z "$(_status_note_age '')" ]   || fail "empty age → empty"
+ok
+
+# ── _status_notes_summary: the unacked-builder-note count behind `herd status`'s NOTES line ───────
+# Ledger shape is the watcher's: "<epoch>\t<slug>\t<text>\t<ts>", appended oldest-first. The shared
+# console-section.sh reader hands them back NEWEST FIRST, drops acked rows, and ages rows out after
+# CONSOLE_ROW_RETENTION (2h) — this asserts `herd status` inherits ALL THREE decisions unchanged.
+NOW=1700000000
+NL="$T/.agent-watch-builder-notes"
+NA="$T/.agent-watch-builder-notes-acked"
+
+# ZERO is the byte-identical case: no ledger, and an empty ledger, must both produce NOTHING (no
+# record ⇒ no line). This is the assertion that keeps `herd status` silent on a drained control room.
+[ -z "$(HERD_FAKE_NOW="$NOW" _status_notes_summary "$T/no-such-ledger" "$NA")" ] \
+  || fail "missing notes ledger → no summary"
+: > "$NL"
+[ -z "$(HERD_FAKE_NOW="$NOW" _status_notes_summary "$NL" "$NA")" ] || fail "empty notes ledger → no summary"
+
+OLD_NOTE="$(( NOW - 720 ))"$'\tfeat-old\tthe older finding\t09:48'
+NEW_NOTE="$(( NOW - 300 ))"$'\tfeat-new\tthe newest finding\t09:55'
+printf '%s\n%s\n' "$OLD_NOTE" "$NEW_NOTE" > "$NL"
+: > "$NA"
+sum="$(HERD_FAKE_NOW="$NOW" _status_notes_summary "$NL" "$NA")"
+[ "$sum" = $'2\tfeat-new\t5m' ] || fail "two unacked notes → '2 feat-new 5m', got '$(printf '%s' "$sum" | tr '\t' ' ')'"
+ok
+
+# ACK-AWARE: acking the newest drops it from the count AND re-points 'newest' at the survivor — the
+# same verbatim-line ack sidecar `herd notes ack` writes, so the two surfaces cannot disagree.
+printf '%s\n' "$NEW_NOTE" > "$NA"
+sum="$(HERD_FAKE_NOW="$NOW" _status_notes_summary "$NL" "$NA")"
+[ "$sum" = $'1\tfeat-old\t12m' ] || fail "newest acked → '1 feat-old 12m', got '$(printf '%s' "$sum" | tr '\t' ' ')'"
+printf '%s\n%s\n' "$OLD_NOTE" "$NEW_NOTE" > "$NA"
+[ -z "$(HERD_FAKE_NOW="$NOW" _status_notes_summary "$NL" "$NA")" ] || fail "every note acked → no summary (silent)"
+ok
+
+# AGED OUT: a note past CONSOLE_ROW_RETENTION (2h) has already left the console — status must not
+# resurrect it. A note just inside the window still counts.
+: > "$NA"
+printf '%s\t%s\t%s\t%s\n' "$(( NOW - 7201 ))" feat-stale "an aged-out finding" 07:56 > "$NL"
+[ -z "$(HERD_FAKE_NOW="$NOW" _status_notes_summary "$NL" "$NA")" ] || fail "aged-out note → no summary"
+printf '%s\t%s\t%s\t%s\n' "$(( NOW - 7199 ))" feat-fresh "a just-inside finding" 07:56 > "$NL"
+sum="$(HERD_FAKE_NOW="$NOW" _status_notes_summary "$NL" "$NA")"
+[ "$sum" = $'1\tfeat-fresh\t1h' ] || fail "note inside retention → '1 feat-fresh 1h', got '$(printf '%s' "$sum" | tr '\t' ' ')'"
+ok
+
+# FAIL-SOFT on a malformed epoch: console-section.sh SHOWS a row it cannot classify (a surface never
+# silently swallows a note), so the count includes it — with an EMPTY age rather than a garbage one.
+printf '%s\t%s\t%s\t%s\n' "notanepoch" feat-weird "a malformed finding" 09:55 > "$NL"
+sum="$(HERD_FAKE_NOW="$NOW" _status_notes_summary "$NL" "$NA")"
+[ "$sum" = $'1\tfeat-weird\t' ] || fail "malformed epoch → counted with empty age, got '$(printf '%s' "$sum" | tr '\t' ' ')'"
+ok
+
+# ── _status_gather emits the NOTES record (HERD-492) ──────────────────────────────────────────────
+# The helpers above prove the READ; this proves gather actually CALLS it — delete the read from
+# _status_gather and this assertion goes red (a pure-helper test alone would stay green).
+# Hermetic: git/gh are stubbed on PATH so no live probe runs, and the bogus argv0 marker keeps the
+# watcher probe empty. Also asserts the silent-at-zero contract at the SNAPSHOT layer.
+GB="$T/stubbin"; mkdir -p "$GB"
+printf '#!/bin/sh\nexit 0\n'     > "$GB/git"; chmod +x "$GB/git"
+printf '#!/bin/sh\nprintf "[]"\n' > "$GB/gh";  chmod +x "$GB/gh"
+GROOT="$T/proj"; GTREES="$T/gtrees"; mkdir -p "$GROOT" "$GTREES"
+gather_snap() {
+  ( PATH="$GB:$PATH" PROJECT_ROOT="$GROOT" WORKTREES_DIR="$GTREES" SCRIBE_BACKEND=file \
+      BACKLOG_FILE="$GROOT/BACKLOG.md" HERD_FAKE_NOW="$NOW" \
+      HERD_WATCH_ARGV0="herd-watch-nope-$$-does-not-exist" \
+      _status_gather 2>/dev/null )
+}
+snap="$(gather_snap)"
+[ -n "$snap" ] || fail "gather produced no snapshot at all"
+grep -q '^NOTES' <<< "$snap" && fail "gather must emit NO NOTES record when no note waits"
+printf '%s\t%s\t%s\t%s\n' "$(( NOW - 90 ))" feat-gathered "a waiting finding" 09:58 \
+  > "$GTREES/.agent-watch-builder-notes"
+snap="$(gather_snap)"
+nrec="$(grep '^NOTES' <<< "$snap" | tr $'\037' ' ')"
+[ "$nrec" = "NOTES 1 feat-gathered 1m" ] || fail "gather NOTES record wrong: '$nrec'"
 ok
 
 echo "ALL PASS ($pass checks)"
