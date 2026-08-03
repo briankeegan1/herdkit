@@ -312,6 +312,16 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # byte-identical to the pre-HERD-250 UNSTABLE-fail path. Watcher-affecting.
 # CI_AUTOREPAIR="off"       # off (default) | on
 
+# CI fast-bounce (HERD-495) — on | off (default off, ship-dormant; yolo posture adopts on). on → when
+# a PR's own CI concludes FAILURE naming a real test (same honest-identity log extraction as HERD-476/
+# #600) and CI_AUTOREPAIR did not already heal it as an inherited red, the watcher bounces the builder
+# IMMEDIATELY with that evidence marked PROVISIONAL — the local healthcheck suite is still the
+# authoritative verdict. Shares the HEALTH rail (kind=health, not a new rail): same sha-keyed
+# once-guard, same REFIX_MAX_ROUNDS budget a local CODE ERROR bounce also spends; a later local CLEAN
+# retracts this red via the existing rail, no new state. off (default) → byte-identical to the
+# pre-HERD-495 needs-you path. Watcher-affecting.
+# CI_FAST_BOUNCE="off"      # off (default) | on
+
 # merge fairness / ready-PR priority (HERD-231) — on | off (default off, ship-dormant). on → in the
 # watcher's action pass, a candidate whose gates are ALREADY green for its head sha (cached CLEAN/FLAKY
 # healthcheck + review PASS, or a human-overridden BLOCK) is visited BEFORE any candidate that still

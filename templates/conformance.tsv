@@ -325,6 +325,7 @@ STALE_DUP_DETECT	sim	tests/test-sandbox-self-restart.sh
 STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
 STALE_BASE_AUTOFIX	sim	tests/test-sandbox-self-restart.sh
 CI_AUTOREPAIR	unit	tests/test-ci-autorepair.sh
+CI_FAST_BOUNCE	unit	tests/test-ci-fastbounce.sh
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh
