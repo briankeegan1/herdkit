@@ -193,7 +193,7 @@ pass
 
 # ── Case 6: build_spawn_holds — a stalled hold is LOUD; a fresh one is calm; vanished intents GC ────
 BUILD_SRC="$T/build.sh"; : > "$BUILD_SRC"
-for fn in _slug_ref_file _slug_ref _slug_cell _fmt_age build_spawn_holds; do
+for fn in _slug_ref_file _slug_ref _slug_cell _fmt_age _now_epoch build_spawn_holds; do
   sed -n "/^$fn()/,/^}/p" "$WATCH" >> "$BUILD_SRC"
   grep -q "^$fn()" "$BUILD_SRC" || fail "could not extract $fn from agent-watch.sh"
 done

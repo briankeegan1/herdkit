@@ -52,6 +52,8 @@ unresolvable pool / unreadable db degrades to the safe default, never a red row 
     python3 -m herd.store --finish-stall-clear SLUG [--pool DIR]                     # drop the record
     python3 -m herd.store --once KEY [--pool DIR]     # generic shared-pool once-guard
         # rc 0 = won (fire the side effect), rc 3 = already claimed (dedup)
+    python3 -m herd.store --phase-duration-observe PHASE SECONDS [--pool DIR]  # HERD-496 baseline
+        # records one duration, prints the rolling "<median>\t<p95>\t<n>" over the retained window
 """
 
 import os
@@ -233,6 +235,21 @@ class Store:
     def clear_main_health_fix(self, identity):
         """Drop the marker once main is GREEN for this identity, so a LATER regression files fresh."""
         return self._b.clear_main_health_fix(identity)
+
+    # phase-duration baselines ── HERD-496: a bounded ROLLING WINDOW of observed wall-clock durations
+    # per named phase (healthcheck, review, the post-merge main-health suite, bounce→wake, tick
+    # cadence), so agent-watch.sh's anomaly leg compares a just-completed instance against a LEARNED
+    # median/p95 instead of a guessed constant. Dedup/filing for an anomalous reading reuses the
+    # main-health-fix seam just above (an anomaly identity is just another string) — this is the only
+    # NEW persistence HERD-496 needed.
+    def phase_duration_observe(self, phase, seconds, window=40):
+        """Record one observed duration (seconds) for ``phase`` and return ``(median, p95, n)`` over
+        the PRIOR window — what THIS instance should be judged against, before it is folded in — then
+        trim the retained window to the last ``window`` samples for the NEXT call. Nearest-rank
+        percentiles over the sorted window, so both backends agree bit-for-bit. ``n`` is the number of
+        prior samples the baseline was built from, so a caller can withhold judgment until enough have
+        accrued (comparing an instance to a baseline that already contains it can never flag it)."""
+        return self._b.phase_duration_observe(phase, seconds, window)
 
     # finish-stall clock ── HERD-392: the shared-pool anchor + state for the finish-line watchdog, so
     # multiple seats ticking the SAME PR-less worktree converge on ONE first-seen anchor instead of
@@ -510,6 +527,40 @@ class _FlatBackend:
             pass
         return n
 
+    # phase-duration baselines ── HERD-496 (see the Store facade docstring) ────────────────────────
+    def _phase_duration_file(self, phase):
+        return self._p(".agent-watch-phase-duration-%s" % _safe(phase))
+
+    def phase_duration_observe(self, phase, seconds, window=40):
+        path = self._phase_duration_file(phase)
+        if not path:
+            return (0, 0, 0)
+        _ensure_parent(path)
+        vals = []
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if line.lstrip("-").isdigit():
+                            vals.append(int(line))
+            except Exception:
+                vals = []
+        # Stats are computed over the PRIOR window — what a caller judges THIS instance against —
+        # before this observation is folded in. Folding it in first would let one outlier drag its
+        # own p95 up to (or past) itself, since nearest-rank p95 collapses to the window MAXIMUM for
+        # any n < 20; comparing an instance to a baseline that already contains it can never flag it.
+        stats = _phase_duration_stats(vals)
+        vals.append(_int(seconds))
+        window = max(1, _int(window) or _PHASE_DURATION_WINDOW)
+        vals = vals[-window:]
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(str(v) for v in vals) + "\n")
+        except Exception:
+            pass
+        return stats
+
     # once-guards ────────────────────────────────────────────────────────────────────────────────
     def once(self, key):
         path = self._hp("once-%s" % _safe(key))
@@ -746,6 +797,8 @@ CREATE TABLE IF NOT EXISTS once_guards  (key TEXT PRIMARY KEY, epoch INTEGER);
 CREATE TABLE IF NOT EXISTS seat_registry(epoch INTEGER, id TEXT, level INTEGER, state TEXT);
 CREATE INDEX IF NOT EXISTS seat_id ON seat_registry(id);
 CREATE TABLE IF NOT EXISTS main_health_fix(identity TEXT PRIMARY KEY, epoch INTEGER, pr TEXT, sha TEXT);
+CREATE TABLE IF NOT EXISTS phase_duration(phase TEXT, epoch INTEGER, seconds INTEGER);
+CREATE INDEX IF NOT EXISTS phase_duration_phase ON phase_duration(phase);
 CREATE TABLE IF NOT EXISTS finish_stall(slug TEXT PRIMARY KEY, epoch INTEGER, state TEXT);
 CREATE TABLE IF NOT EXISTS state_blob  (path TEXT PRIMARY KEY, content BLOB, mode INTEGER);
 CREATE TABLE IF NOT EXISTS meta        (key TEXT PRIMARY KEY, value TEXT);
@@ -938,6 +991,28 @@ class _SqliteBackend:
         except Exception:
             return self.refix_count(key, sha)
 
+    # phase-duration baselines ── HERD-496 (see the Store facade docstring) ────────────────────────
+    def phase_duration_observe(self, phase, seconds, window=40):
+        window = max(1, _int(window) or _PHASE_DURATION_WINDOW)
+
+        def body(conn):
+            # PRIOR window first — what THIS instance is judged against — before inserting it.
+            prior = [int(r[0]) for r in conn.execute(
+                "SELECT seconds FROM phase_duration WHERE phase=? ORDER BY rowid",
+                (str(phase),)).fetchall()]
+            conn.execute("INSERT INTO phase_duration(phase, epoch, seconds) VALUES (?,?,?)",
+                        (str(phase), _now(), _int(seconds)))
+            conn.execute(
+                "DELETE FROM phase_duration WHERE phase=? AND rowid NOT IN ("
+                " SELECT rowid FROM phase_duration WHERE phase=? ORDER BY rowid DESC LIMIT ?)",
+                (str(phase), str(phase), window))
+            return prior
+        try:
+            prior_vals = self._rmw(body)
+        except Exception:
+            prior_vals = []
+        return _phase_duration_stats(prior_vals)
+
     # once-guards ────────────────────────────────────────────────────────────────────────────────
     def once(self, key):
         def body(conn):
@@ -1058,7 +1133,8 @@ class _SqliteBackend:
     def counts(self):
         out = {}
         for t in ("approvals", "review_ledger", "health_results", "claims", "refix_rounds",
-                  "once_guards", "seat_registry", "main_health_fix", "finish_stall", "state_blob"):
+                  "once_guards", "seat_registry", "main_health_fix", "phase_duration",
+                  "finish_stall", "state_blob"):
             try:
                 out[t] = self._conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
             except Exception:
@@ -1094,6 +1170,29 @@ def _int(v):
         return int(v)
     except (TypeError, ValueError):
         return 0
+
+
+# Default rolling-window size for phase-duration baselines (HERD-496) — an internal implementation
+# constant, not an operator knob (mirrors agent-watch.sh's inline-constant convention, e.g.
+# _MAIN_HEALTH_DIED_MAX): large enough to smooth out one-off blips, small enough that a genuine
+# regression (a new steady-state, not a one-tick anomaly) shifts the baseline within a day's ticks.
+_PHASE_DURATION_WINDOW = 40
+
+
+def _phase_duration_stats(vals):
+    """``(median, p95, n)`` over ``vals`` — NEAREST-RANK percentiles over the SORTED sample set, so the
+    flat and sqlite backends agree bit-for-bit given the same retained window (no interpolation, no
+    floats). ``n == 0`` ⇒ ``(0, 0, 0)`` — a caller with nothing observed yet never invents a baseline."""
+    n = len(vals)
+    if n == 0:
+        return (0, 0, 0)
+    s = sorted(vals)
+
+    def _rank(num, den):
+        idx = -(-num // den) - 1          # ceil(num/den), 0-based
+        return s[max(0, min(n - 1, idx))]
+
+    return (_rank(n, 2), _rank(19 * n, 20), n)
 
 
 # ── the migration runner ──────────────────────────────────────────────────────────────────────────
@@ -1402,18 +1501,27 @@ def main(argv=None):
     sha = ""
     epoch = ""
     state = ""
+    phase_name = None
+    phase_seconds = None
     _FINISH_STALL_ACTIONS = ("--finish-stall-record", "--finish-stall-mark",
                              "--finish-stall-state", "--finish-stall-reset", "--finish-stall-clear")
     _IDENTITY_ACTIONS = ("--main-health-fix-mark", "--main-health-fix-clear", "--once") \
         + _FINISH_STALL_ACTIONS
+    _TWO_ARG_ACTIONS = ("--phase-duration-observe",)
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a in (("--migrate", "--rollback", "--status", "--verify") + _IDENTITY_ACTIONS):
+        if a in (("--migrate", "--rollback", "--status", "--verify")
+                 + _IDENTITY_ACTIONS + _TWO_ARG_ACTIONS):
             action = a
             if a in _IDENTITY_ACTIONS:
                 i += 1
                 identity = argv[i] if i < len(argv) else None
+            elif a in _TWO_ARG_ACTIONS:
+                i += 1
+                phase_name = argv[i] if i < len(argv) else None
+                i += 1
+                phase_seconds = argv[i] if i < len(argv) else None
         elif a == "--pool":
             i += 1
             pool = argv[i] if i < len(argv) else None
@@ -1451,6 +1559,21 @@ def main(argv=None):
     if action == "--main-health-fix-clear":
         if identity:
             open_store(pool).clear_main_health_fix(identity)
+        return 0
+    if action == "--phase-duration-observe":
+        # HERD-496: record one completed phase instance's wall-clock duration and report the rolling
+        # baseline back — "<median>\t<p95>\t<n>" — so the bash anomaly leg can judge THIS instance
+        # against it without a second round-trip.
+        if not phase_name or phase_seconds is None:
+            sys.stderr.write("herd store: --phase-duration-observe requires <phase> <seconds>\n")
+            return 2
+        try:
+            secs = int(phase_seconds)
+        except (TypeError, ValueError):
+            sys.stderr.write("herd store: --phase-duration-observe seconds must be an integer\n")
+            return 2
+        median, p95, n = open_store(pool).phase_duration_observe(phase_name, secs)
+        sys.stdout.write("%s\t%s\t%s\n" % (median, p95, n))
         return 0
     if action == "--finish-stall-record":
         if not identity:
