@@ -224,6 +224,8 @@ EXEMPT_PREFIX_EXCEPTIONS = {"HERD_BRAND"}
 EXEMPT_NAMES = {
     "ADVISE_MODEL", "AGENTS_JSON", "BLOCKED", "CELEBRATE", "DEPS_FILE", "DEP_STATES_FILE",
     "DEP_WATCHER_LIB", "DRYRUN", "HERDKIT_HOME", "HERDR_MIN_VERSION", "ITEM_STATE", "ITEM_UPDATED",
+    "WATCHER_RESURRECT_LIB",  # watcher-resurrect.sh lib-mode test seam (HERD-489), same shape as
+                              # DEP_WATCHER_LIB above — never a .herd/config knob
     "JOURNAL_FILE", "JOURNAL_MAX_BYTES", "LEDGER_FILE", "LOG", "MAIN", "MAIN_HEALTH", "NO_COLOR",
     "OPERATOR_INBOX_ROWS",  # agent-watch.sh: rendered inbox body for this tick (not a config knob)
     "OSC8_LINK_BASE",  # backlog-view.sh: computed from the Linear slug for OSC-8 hyperlinks (not a config knob)
