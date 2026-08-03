@@ -351,15 +351,40 @@ _linear_resolve_by_title() {
     # {"data":{"issues":{"nodes":[…]}}} shape as the identifier query so ONE parser handles both.
     # Deliberately CONSERVATIVE: first:2 so the caller can require a UNIQUE match and never mislabel
     # the wrong issue when a phrase is ambiguous.
+    # HERD-502: the node also carries its OWN `state { type } updatedAt` (in addition to the team's
+    # states-of-type sub-selection the write path needs to pick a transition target) so the SAME
+    # response shape can answer _backend_item_state's question too — one lookup, two possible readers.
     local title="$1" stype="$2" q v
     q="query T(\$t: String!) {
   issues(filter: { title: { containsIgnoreCase: \$t } }, first: 2) {
-    nodes { id identifier title team { $(_linear_states_field "$stype") } }
+    nodes { id identifier title state { type } updatedAt team { $(_linear_states_field "$stype") } }
   }
 }"
     v="$(T="$title" python3 -c 'import os, json
 print(json.dumps({"t": os.environ["T"]}))')"
     _linear_gql "$q" "$v"
+}
+
+_linear_resolve_ref() {
+    # HERD-502: the ONE shared scoped lookup both the heal WRITER (_backend_update_state/
+    # _backend_amend) and the heal RESOLVER (_backend_item_state) must use — an identifier-first
+    # resolve via issues(filter: {number, team}) (scoped to the ref's OWN team key, never
+    # LINEAR_TEAM_ID — see _linear_issue_query), falling back to the conservative title match when the
+    # ref does not parse as a TEAMKEY-NUMBER identifier. Before this, _backend_item_state had its OWN
+    # abbreviated resolve (identifier-only, no title fallback) and silently defaulted to
+    # ITEM_STATE=open on ANY parse failure — so a ref no Linear issue could ever match (e.g. a stray
+    # branch-slug token mis-parsed out of a PR body, the live 'full-auto'/#606 incident) read as a
+    # confirmed-open item forever instead of surfacing as unknown and letting the sweep's N-failure
+    # backoff (tracker-state-sweep.sh) take over.
+    # $1 = ref; $2 = GraphQL sub-selection fields (identifier path only); $3 = state type for the
+    # title-fallback's states sub-filter (may be empty — only the writer paths use it).
+    # Prints the raw GraphQL response on stdout; caller is responsible for requiring a unique node.
+    local ref="$1" fields="$2" stype="${3:-}"
+    if _linear_issue_query "$ref" "$fields"; then
+        _linear_gql "$_LQ_QUERY" "$_LQ_VARS"
+    else
+        _linear_resolve_by_title "$ref" "$stype"
+    fi
 }
 
 _linear_issue_update_state_verified() {
@@ -401,11 +426,7 @@ _backend_update_state() {
     fi
     pref="$(_linear_preferred_state_name "$stype")"
     fields="id identifier title team { $(_linear_states_field "$stype") }"
-    if _linear_issue_query "$ref" "$fields"; then
-        resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"          # identifier path (HERD-22 → number+team)
-    else
-        resp="$(_linear_resolve_by_title "$ref" "$stype")"      # conservative title match
-    fi
+    resp="$(_linear_resolve_ref "$ref" "$fields" "$stype")"    # HERD-502: shared scoped lookup
     # ONE parser for both shapes: require EXACTLY ONE matching node (uniqueness = conservatism), then
     # read its id + the mapped-type state id chosen name-first-then-lowest-position (gh #169), so a
     # workspace with both 'In Progress' and 'In Review' started states resolves to 'In Progress'.
@@ -461,11 +482,7 @@ _backend_amend() {
     local ref="$1" note="$2" resp issue_id ok
     _BACKEND_RESULT="NOCHANGE"
     _linear_require_key
-    if _linear_issue_query "$ref" "id identifier"; then
-        resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"          # identifier path (HERD-22 → number+team)
-    else
-        resp="$(_linear_resolve_by_title "$ref" started)"       # conservative title match (first:2 → unique-only)
-    fi
+    resp="$(_linear_resolve_ref "$ref" "id identifier" started)"  # HERD-502: shared scoped lookup
     # Require EXACTLY ONE matching node — uniqueness IS the conservatism, mirroring _backend_update_state.
     issue_id="$(printf '%s' "$resp" | python3 -c 'import sys, json
 try: d = json.load(sys.stdin)
@@ -750,31 +767,46 @@ sys.exit(0 if len(nodes) == 0 else 1)  # a clean answer: 0 matches = provably mi
 
 _backend_item_state() {
     # $1 = <link-name>#<id> — caller has resolved the link; LINEAR_API_KEY is in env.
-    # Resolves the issue via issues(filter:) (issueSearch was deprecated/removed by Linear 2026-07)
-    # and reads state.type, setting ITEM_STATE=open|closed|in-progress. Also sets ITEM_UPDATED to the
-    # issue's last-updated day (YYYY-MM-DD, best-effort — empty if absent), used by the HERD-117 claim
-    # guard as evidence when it refuses a stale (Done/Canceled) pick.
+    # Resolves via the SAME shared scoped lookup the writer ops use (_linear_resolve_ref: identifier
+    # first, conservative title match as fallback — issueSearch was deprecated/removed by Linear
+    # 2026-07) and reads state.type, setting ITEM_STATE=open|closed|in-progress. Also sets
+    # ITEM_UPDATED to the issue's last-updated day (YYYY-MM-DD, best-effort — empty if absent), used
+    # by the HERD-117 claim guard as evidence when it refuses a stale (Done/Canceled) pick.
     # Linear state types: completed/canceled → closed; started → in-progress; all others → open.
-    local ref="$1" slug resp parsed stype
+    #
+    # HERD-502: this used to skip the title-fallback entirely and default ITEM_STATE=open on ANY
+    # identifier-parse failure — indistinguishable from a backend that explicitly confirmed the issue
+    # open. A ref no issue can ever match (e.g. a stray branch-slug token mis-parsed out of a PR body
+    # — the live 'full-auto'/#606 incident) then looped as "found open, heal failed" every sweep
+    # forever instead of surfacing as unknown and backing off (tracker-state-sweep.sh's N-failure
+    # escalation). Requiring EXACTLY ONE resolved node (uniqueness = conservatism, mirroring
+    # _backend_update_state/_backend_amend) and returning non-zero with ITEM_STATE unset otherwise
+    # closes that gap: the resolver can never again silently degrade a "no match" into "open".
+    local ref="$1" slug resp parsed stype found
     _linear_require_key
     slug="${ref#*#}"
     ITEM_UPDATED=""
-    if ! _linear_issue_query "$slug" 'state { type } updatedAt'; then
-        ITEM_STATE="open"
-        return 0
-    fi
-    resp="$(_linear_gql "$_LQ_QUERY" "$_LQ_VARS")"
-    # Emit "<type>\t<updated-day>" so a single parse yields both the state class and the evidence stamp.
+    resp="$(_linear_resolve_ref "$slug" 'state { type } updatedAt' started)"
+    # Emit "<type>\t<updated-day>\t<found>" — found=1 only for EXACTLY ONE matching node.
     parsed="$(printf '%s' "$resp" | python3 -c '
 import sys, json
 try:    d = json.load(sys.stdin)
 except Exception: d = {}
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
-n = nodes[0] if nodes else {}
-print("%s\t%s" % ((n.get("state") or {}).get("type", ""), (n.get("updatedAt") or "")[:10]))
-' 2>/dev/null || printf '\t')"
+if len(nodes) != 1:
+    print("\t\t0")
+else:
+    n = nodes[0]
+    print("%s\t%s\t1" % ((n.get("state") or {}).get("type", ""), (n.get("updatedAt") or "")[:10]))
+' 2>/dev/null || printf '\t\t0')"
     stype="${parsed%%$'\t'*}"
-    ITEM_UPDATED="${parsed#*$'\t'}"
+    local rest="${parsed#*$'\t'}"
+    ITEM_UPDATED="${rest%%$'\t'*}"
+    found="${rest#*$'\t'}"
+    if [ "$found" != "1" ]; then
+        ITEM_STATE=""
+        return 1
+    fi
     case "$stype" in
         completed|canceled|cancelled) ITEM_STATE="closed"      ;;
         started)                      ITEM_STATE="in-progress" ;;

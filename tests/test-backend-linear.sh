@@ -298,6 +298,25 @@ grep -q 'team_xyz' "$GQLLOG"      && fail "cross-team item_state leaked the conf
 grep -q 'team: { id:' "$GQLLOG"   && fail "cross-team item_state must resolve by team key, not team id"
 pass
 
+# 4b2. HERD-502 mutation-prove: a ref that resolves via NEITHER the identifier path (not a
+#      TEAMKEY-NUMBER shape) NOR the conservative title fallback (zero matches) must report
+#      ITEM_STATE UNSET and a non-zero return — NOT silently "open". This is the live
+#      'full-auto'/#606 incident reproduced: a malformed `Refs:` token that is not a real tracker
+#      identifier. Reverting the HERD-502 fix (dropping the `len(nodes) != 1` requirement back to a
+#      bare identifier-parse check) makes this fail — the old code defaulted ITEM_STATE=open the
+#      moment the identifier parse failed, without ever requiring the title fallback to find a match.
+unresolvable_item_state() {
+  ( cd "$T" && . "$BACKEND"
+    _linear_gql() { echo '{"data":{"issues":{"nodes":[]}}}'; }   # NOTHING resolves, identifier or title
+    ITEM_STATE="PRESET"
+    if _backend_item_state "full-auto"; then rc=0; else rc=1; fi
+    printf 'RC=%s\nITEM_STATE=%s\n' "$rc" "${ITEM_STATE:-}" )
+}
+outu="$(unresolvable_item_state)"
+grep -q "^RC=1$" <<< "$outu" || fail "HERD-502 mutation-prove: an unresolvable ref must return non-zero from _backend_item_state ($outu)"
+grep -q "^ITEM_STATE=$" <<< "$outu" || fail "HERD-502 mutation-prove: an unresolvable ref must leave ITEM_STATE unset, not default to open ($outu)"
+pass
+
 # 4c. update_state (done) → resolves the issue by the identifier's OWN team key via issues(filter:)
 #     (never the deprecated issueSearch, never LINEAR_TEAM_ID), requests a workflow state of the
 #     MAPPED type (done→completed), then issueUpdate moves it there. It must NOT issueCreate — a

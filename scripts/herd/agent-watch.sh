@@ -876,7 +876,10 @@ build_blocked() {
 
 # _tracker_heal_row — render ONE heal ledger line ("<epoch> <status> <ref> <pr> <found-state>").
 # A `healed` row is calm green (drift was auto-corrected); a `failed` row is loud red (still stuck,
-# retries next sweep) — either way the drift is VISIBLE, never a silent correction (HERD-86).
+# retries next sweep) — either way the drift is VISIBLE, never a silent correction (HERD-86). An
+# `escalated` row (HERD-502) is loud too, but glyphed distinctly: it means the sweep has GIVEN UP
+# on this ref (N-failure backoff — no further sweeps will probe it), a different, more final
+# condition than "still retrying" and worth telling apart at a glance.
 _tracker_heal_row() {
   local epoch status ref pr state hhmm glyph color
   local IFS=$' \t\n'
@@ -886,8 +889,9 @@ EOF
   [ -n "${ref:-}" ] || return 1
   hhmm="$(epoch_to_hhmm "$epoch")"
   case "$status" in
-    healed) glyph='🩹'; color="$C_GREEN" ;;
-    *)      glyph='⚠️'; color="$C_RED"   ;;
+    healed)    glyph='🩹'; color="$C_GREEN" ;;
+    escalated) glyph='⛔'; color="$C_RED"   ;;
+    *)         glyph='⚠️'; color="$C_RED"   ;;
   esac
   printf '    %s%s%s %s%s%s %s%s%s %s#%s was %s · %s%s' \
     "$color" "$glyph" "$C_RESET" "$C_BOLD" "$ref" "$C_RESET" \

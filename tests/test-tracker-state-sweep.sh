@@ -195,7 +195,7 @@ printf '199\tHERD-99\n' > "$T/prs3.tsv"
 out="$(run_sweep "$T/prs3.tsv")" || fail "sweep 1/3 (resolve-failure) exited non-zero: $out"
 [ "$(journal_events tracker_state_unresolvable)" -eq 0 ] || fail "escalated on sweep 1 (too early)"
 awk '$2=="HERD-99"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null && fail "ledgered on sweep 1 (too early)"
-[ -s "$HERD_TSWEEP_NOTE_FILE" ] && fail "a resolve-failure must never write the console-note ledger (sweep 1)"
+[ -s "$HERD_TSWEEP_NOTE_FILE" ] && fail "a resolve-failure must not write a console note before it escalates (sweep 1)"
 
 out="$(run_sweep "$T/prs3.tsv")" || fail "sweep 2/3 (resolve-failure) exited non-zero: $out"
 [ "$(journal_events tracker_state_unresolvable)" -eq 0 ] || fail "escalated on sweep 2 (too early)"
@@ -205,15 +205,20 @@ out="$(run_sweep "$T/prs3.tsv")" || fail "sweep 3/3 (resolve-failure) exited non
 grep -q '"ref":"HERD-99"' "$JOURNAL_FILE"                     || fail "unresolvable event does not name HERD-99"
 awk '$2=="HERD-99"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null || fail "HERD-99 was not ledgered as unresolvable after 3 sweeps"
 grep -qF 'HERD-99' "$HERD_TSWEEP_UNRESOLVED_FILE" 2>/dev/null && fail "the per-ref counter should be cleared once ledgered"
-[ -s "$HERD_TSWEEP_NOTE_FILE" ] && fail "an unresolvable ref must never write the console-note ledger (it would render as a permanent loud row)"
+# HERD-502: exactly ONE escalated console note is written the moment it ledgers — never silence
+# (the old behavior) and never one per sweep (the pre-fix bug this whole item exists to close).
+grep -q ' escalated HERD-99 199 unknown$' "$HERD_TSWEEP_NOTE_FILE" || fail "an escalated-unresolvable ref must surface exactly one 'escalated' console note (HERD-502) ($(cat "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null))"
+[ "$(grep -c . "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null)" -eq 1 ] || fail "expected exactly one console note for HERD-99, got $(grep -c . "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null)"
 [ "$(journal_events tracker_state_heal_failed)" -eq 0 ] || fail "a resolve-failure must never journal tracker_state_heal_failed"
 reads_before="$(grep -c . "$STUB_READS" 2>/dev/null || echo 0)"
 
-# Once ledgered, a 4th sweep must never probe the backend again for HERD-99.
+# Once ledgered, a 4th sweep must never probe the backend again for HERD-99, and must not add a
+# second console note (still exactly one, ever).
 : > "$STUB_READS"
 out="$(run_sweep "$T/prs3.tsv")" || fail "sweep 4 (post-unresolvable) exited non-zero: $out"
 [ -s "$STUB_READS" ] && fail "a ledgered-unresolvable ref must never be re-probed ($(cat "$STUB_READS"))"
 [ "$(journal_events tracker_state_unresolvable)" -eq 1 ] || fail "sweep 4 must not re-journal tracker_state_unresolvable"
+[ "$(grep -c . "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null)" -eq 1 ] || fail "sweep 4 must not write a second escalated note for HERD-99"
 pass
 
 # ── (8) HERD-411: a genuinely-open ref among resolve-failures still heals exactly as today ────
@@ -239,7 +244,10 @@ grep -q '"ref":"#514"' "$JOURNAL_FILE"                        || fail "unresolva
 awk '$2=="#514"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null || fail "#514 was not ledgered as unresolvable"
 [ -s "$STUB_READS" ] && fail "a ref-shape mismatch must never probe the backend at all ($(cat "$STUB_READS"))"
 [ -s "$STUB_UPDATES" ] && fail "a ref-shape mismatch must never attempt a state write"
-[ -s "$HERD_TSWEEP_NOTE_FILE" ] && fail "a shape-mismatch ref must never write the console-note ledger"
+# HERD-502: a shape-mismatch classifies (and thus escalates) IMMEDIATELY, so it too gets exactly
+# one 'escalated' console note — a shape-mismatch ref is exactly as "given up on" as an N-failure one.
+grep -q ' escalated #514 515 unknown$' "$HERD_TSWEEP_NOTE_FILE" || fail "a shape-mismatch ref must surface exactly one 'escalated' console note (HERD-502) ($(cat "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null))"
+[ "$(grep -c . "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null)" -eq 1 ] || fail "expected exactly one console note for #514, got $(grep -c . "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null)"
 pass
 
 # ── (6) the file backend (no update-state op) makes the sweep byte-inert ───────

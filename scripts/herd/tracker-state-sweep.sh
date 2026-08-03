@@ -49,12 +49,22 @@
 # item that never shipped (HERD-411 review finding). _pms_tracker_ledgered guards against this itself
 # (it requires NF==3), but any THIRD reader of this file must apply the same guard — column 2 alone
 # means "this ref appears in the ledger", not "this ref is Done"; column count (3 vs 4) is what
-# distinguishes them. It deliberately never touches the console-note ledger for this case:
-# console-section.sh's tracker-heal renderer treats any non-`healed` status as a permanently-loud row,
-# and an unresolvable ref will never produce a future `healed` row to supersede it — writing there
-# would recreate the exact every-sweep-⚠ this
-# fixes. LATENT HAZARD, noted honestly: if a numeric-only slug were ever a real identifier on some
-# future non-github backend, this shape check would misclassify it before ever probing — no backend in
+# distinguishes them.
+#
+# HERD-502 (evidence 2026-08-03: the live 'full-auto'/#606 incident — a malformed `Refs:` line
+# captured a diagnostic token, not a real identifier, and the resolver bug below let it read as
+# "open" forever): _tsweep_mark_unresolvable ALSO writes exactly ONE console note, status
+# `escalated`. Earlier this function deliberately never touched the console-note ledger, reasoning
+# that any note would render as a permanently-loud row with no future `healed` row to supersede it —
+# true, but that made a genuinely-abandoned ref TOTALLY SILENT on the console, which is its own
+# failure mode (no-false-red-consoles cuts both ways: a real, permanent problem should stay visible,
+# not vanish). It is safe to write exactly once because _tsweep_ledgered skips this ref on every
+# future sweep — this function can never run for it again — and console-section.sh's supersede logic
+# (extended for HERD-502 to also treat `escalated` as a superseding status, alongside `healed`) hides
+# any older `failed` rows already sitting in the ledger for the same ref, so the net effect on screen
+# is ONE row, not N-per-sweep spam plus a straggling tail of now-stale `failed` duplicates.
+# LATENT HAZARD, noted honestly: if a numeric-only slug were ever a real identifier on some future
+# non-github backend, the shape check above would misclassify it before ever probing — no backend in
 # this repo uses bare-number identifiers today.
 #
 # Hermetic seams (default to the real gh/backend; the tests override them):
@@ -279,6 +289,18 @@ _tsweep_mark_unresolvable() {
   local ref="$1" pr="$2" reason="$3"
   journal_append tracker_state_unresolvable ref "$ref" pr "$pr" component sweep reason "$reason"
   _tsweep_record "$ref" "$pr" unresolvable
+  # HERD-502: surface EXACTLY ONE distinct console row for a ref the sweep has given up on. Before
+  # this, a ref reaching this function left NO trace on the console at all (by design — see the
+  # file-header rationale: any note here used to render as a PERMANENTLY loud row, and this ref will
+  # never produce a future `healed` row to supersede it). That silence is itself a problem: an
+  # operator watching the console had no way to learn "the sweep stopped trying $ref" short of
+  # reading the journal. A single `escalated` note is now safe because _tsweep_ledgered skips this
+  # ref on every future sweep — this function can never run for it again, so exactly one row is ever
+  # written — and console-section.sh's supersede logic (HERD-502) retroactively hides any OLDER
+  # `failed` rows already sitting in the ledger for this same ref, so the net effect on screen is ONE
+  # row, never the N-per-sweep spam this closes out (the live 'full-auto'/#606 incident: 20/20
+  # console slots and 11+ journal events for a ref that could never resolve).
+  _tsweep_note escalated "$ref" "$pr" unknown
   echo "tracker-state-sweep: $ref is unresolvable ($reason) — ledgered; no further sweeps will probe it."
 }
 

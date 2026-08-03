@@ -154,6 +154,32 @@ grep -q "$(epoch_to_hhmm "$NOW")" <<< "$TRACKER_DRIFT" \
   || fail "(7) the NEWEST duplicate must be the one that survives, not the oldest"
 ok
 
+# ── (8) HERD-502: an `escalated` row supersedes older `failed` rows for the same ref, exactly like
+#      a `healed` row does — the sweep gave up on this ref (N-failure backoff), and the console must
+#      show ONE explanatory row, not the whole failed history plus the escalation on top of it.
+cat > "$TRACKER_HEAL_FILE" <<EOF
+$((H1 - 3600)) failed HERD-606 606 open
+$H1 failed HERD-606 606 open
+$NOW escalated HERD-606 606 unknown
+EOF
+
+build_tracker_drift
+[ "$(printf '%s' "$TRACKER_DRIFT" | grep -c .)" -eq 1 ] \
+  || fail "(8) an escalated row must collapse prior failed rows to exactly 1 (got: $TRACKER_DRIFT)"
+ok
+grep -q "HERD-606" <<< "$TRACKER_DRIFT" || fail "(8) the surviving escalated row for HERD-606 must still render"
+ok
+grep -q "escalated" <<< "$TRACKER_DRIFT" || fail "(8) the surviving row must be the escalated one, not a failed one"
+ok
+# An escalated row is LOUD (never ages out) exactly like a failed row — unlike a healed row, which
+# is calm. Prove it stays visible past CONSOLE_ROW_RETENTION.
+cat > "$TRACKER_HEAL_FILE" <<EOF
+$((NOW - 999999)) escalated HERD-707 707 unknown
+EOF
+build_tracker_drift
+grep -q "HERD-707" <<< "$TRACKER_DRIFT" || fail "(8) an old escalated row must never age out of the console (it is loud)"
+ok
+
 # ── conformance row present ───────────────────────────────────────────────────────────────────────
 grep -q $'console-section.sh\tunit\ttests/test-tracker-heal-supersede.sh' "$REPO/templates/conformance.tsv" \
   || fail "conformance.tsv missing console-section.sh proof row for this test"
