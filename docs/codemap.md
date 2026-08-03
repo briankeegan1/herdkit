@@ -211,6 +211,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `BUDGET_DAILY` → `cost.sh`, `herd-feature.sh`, `herd-quick.sh`
 - `CHECKOUT_GUARD` → `agent-watch.sh`
 - `CI_AUTOREPAIR` → `ci-repair.sh`
+- `CI_FAST_BOUNCE` → `agent-watch.sh`
 - `CLAIM_RELEASE` → `herd-claim.sh`
 - `CLAIM_REQUIRED` → `bin/herd`, `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
