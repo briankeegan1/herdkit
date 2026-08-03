@@ -16,6 +16,10 @@
 #   (3) HEALTHCHECK_SUITE_WORKERS=1 → no --jobs even with parallel present (bound<=1 is a strict
 #       serial request, matching scripts/herd/burst.sh's own "bound<=1 is strict serial" contract).
 #   (4) an over-requested HEALTHCHECK_SUITE_WORKERS is capped at the box's own (stubbed) core count.
+#   (5)/(6) HERD-499: the fan-out is ALSO clamped by live CONCURRENT sibling suites (mutation-proof
+#       of _hk_live_sibling_suites / the new divisor in _hk_suite_workers) — a solo suite (no
+#       $WORKTREES_DIR/.health-inflight-* markers, or none with a live pid) gets the FULL count;
+#       two live fake sibling markers HALVE it (cores / max(1, siblings)).
 #
 # Run:  bash tests/test-suite-parallel-wiring.sh
 set -uo pipefail
@@ -128,5 +132,34 @@ grep -qE -- '--jobs 8\b' <<< "$ARGV" || fail "(4) expected --jobs capped at the 
 ok
 echo "PASS (4) an over-requested HEALTHCHECK_SUITE_WORKERS is capped at the box's own core count"
 
+# ── (5)/(6) HERD-499: fan-out is ALSO clamped by live CONCURRENT sibling suites ───────────────────
+# $F has no .herd/config through cases (1)-(4) above, so _hk_live_sibling_suites() was reading 0
+# siblings (fail-soft) the whole time — those cases are unaffected by what follows. Only now do we
+# point the fixture's own .herd/config at a throwaway $WORKTREES_DIR pool, mirroring how a real
+# project resolves it (_hk_regtabs() reads .herd/config the same way, not an inherited env var).
+POOL="$T/pool"; mkdir -p "$POOL" "$F/.herd"
+printf 'WORKTREES_DIR="%s"\n' "$POOL" > "$F/.herd/config"
+
+# (5) solo: pool exists but holds no markers → the sibling divisor is max(1,0)=1 → FULL count, same
+# as the box's own core cap (workers=8 requires HEALTHCHECK_SUITE_WORKERS >= cores so the sibling
+# clamp, not the request cap, is what's under test).
+run_proj yes HEALTHCHECK_SUITE_WORKERS=8
+[ "$RC" -eq 0 ] || fail "(5) expected clean exit, got $RC — out: $OUT"
+grep -qE -- '--jobs 8\b' <<< "$ARGV" || fail "(5) expected FULL --jobs 8 with no sibling markers, got: $ARGV"
+ok
+echo "PASS (5) HERD-499: no live sibling markers → sibling divisor=1 → full worker count (unchanged)"
+
+# (6) two FAKE sibling markers, each recording THIS test script's own live pid (kill -0 "$$" succeeds
+# for as long as this script is running) → sibling divisor=2 → workers halved (8/2=4), even though
+# HEALTHCHECK_SUITE_WORKERS still requests 8.
+printf '%s\n' "$$" > "$POOL/.health-inflight-fakeA-deadbeef"
+printf '%s\n' "$$" > "$POOL/.health-inflight-fakeB-deadbeef"
+run_proj yes HEALTHCHECK_SUITE_WORKERS=8
+[ "$RC" -eq 0 ] || fail "(6) expected clean exit, got $RC — out: $OUT"
+grep -qE -- '--jobs 4\b' <<< "$ARGV" || fail "(6) expected HALVED --jobs 4 with two live sibling markers, got: $ARGV"
+ok
+echo "PASS (6) HERD-499: two live sibling suite markers → workers halved (cores / siblings)"
+rm -f "$POOL/.health-inflight-fakeA-deadbeef" "$POOL/.health-inflight-fakeB-deadbeef"
+
 echo
-echo "ALL PASS ($pass checks) — HERD-463 local heavy-gate bats --jobs wiring: present + bounded when GNU parallel is available, byte-identical serial fallback when it is not."
+echo "ALL PASS ($pass checks) — HERD-463 local heavy-gate bats --jobs wiring: present + bounded when GNU parallel is available, byte-identical serial fallback when it is not. HERD-499: fan-out also clamped by live concurrent sibling suites."

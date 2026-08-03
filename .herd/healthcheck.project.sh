@@ -489,9 +489,11 @@ _hk_dh_verdict() {
 # every worker below runs INSIDE one suite invocation, already holding its one HEALTH_CONCURRENCY slot.
 #
 # HEALTHCHECK_SUITE_WORKERS bounds the fan-out (default 4, never above the box's own core count so a
-# small/shared runner is never oversubscribed). This is a dogfood-only env knob (like
-# HEALTHCHECK_SUITE_TIMEOUT / HERD_SHELLCHECK_RETRY_SECS above) — not a herd-config.sh capability, since
-# this file is herdkit's OWN health command, not the generic engine surface.
+# small/shared runner is never oversubscribed — and, since HERD-499 below, never above cores / live
+# CONCURRENT suites either, so several suites sharing one box don't oversubscribe it TOGETHER). This
+# is a dogfood-only env knob (like HEALTHCHECK_SUITE_TIMEOUT / HERD_SHELLCHECK_RETRY_SECS above) —
+# not a herd-config.sh capability, since this file is herdkit's OWN health command, not the generic
+# engine surface.
 _hk_suite_cores() {
   local n=""
   n="$(nproc 2>/dev/null)" || n=""
@@ -501,13 +503,51 @@ _hk_suite_cores() {
   [ "$n" -ge 1 ] 2>/dev/null || n=1
   printf '%s' "$n"
 }
+
+# _hk_live_sibling_suites — how many OTHER healthcheck suites are concurrently running RIGHT NOW,
+# read from the SAME $WORKTREES_DIR/.health-inflight-<pr>-<sha> markers the watcher's own slot check
+# (_count_live_healthchecks / _health_slot_free in agent-watch.sh) reads — same directory, same
+# marker naming, so this fan-out clamp and the HEALTH_CONCURRENCY slot gate never disagree on how
+# many suites are actually in flight. Deliberately a SIMPLE pid-liveness probe (kill -0), not that
+# function's full pid-recycling identity check (_inflight_verified_live, start-time comparison via
+# `ps`) — this is a worker-COUNT heuristic feeding bats --jobs, not a merge-correctness gate, so a
+# rare stale-marker over-count only makes THIS suite a touch more conservative, never wrong.
+# Resolved the SAME way _hk_regtabs() above resolves WORKTREES_DIR — read fresh from .herd/config in
+# a subshell — rather than trusting an inherited env var, since a solo/local run outside the watcher
+# never has one exported. Fail-soft: no .herd/config, no WORKTREES_DIR, or no markers at all → 0
+# (solo — the pre-HERD-499 behavior, unchanged).
+_hk_live_sibling_suites() {
+  local _hls_tree="" _hls_f _hls_pid _hls_n=0
+  [ -f .herd/config ] && _hls_tree="$(. .herd/config 2>/dev/null && printf '%s' "${WORKTREES_DIR:-}")"
+  [ -n "$_hls_tree" ] && [ -d "$_hls_tree" ] || { printf 0; return; }
+  for _hls_f in "$_hls_tree"/.health-inflight-*; do
+    [ -e "$_hls_f" ] || continue
+    _hls_pid="$(head -n1 "$_hls_f" 2>/dev/null)"
+    case "$_hls_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$_hls_pid" 2>/dev/null && _hls_n=$((_hls_n + 1))
+  done
+  printf '%s' "$_hls_n"
+}
 _hk_suite_workers() {
-  local cores req w
+  local cores req w divisor cap
   cores="$(_hk_suite_cores)"
   req="${HEALTHCHECK_SUITE_WORKERS:-4}"
   case "$req" in ''|*[!0-9]*) req=4 ;; esac
   [ "$req" -ge 1 ] 2>/dev/null || req=1
-  w="$req"; [ "$w" -le "$cores" ] || w="$cores"
+  # HERD-499: clamp the box-core ceiling by how many sibling suites are CURRENTLY sharing this box's
+  # cores — effective ceiling = max(1, cores / max(1, live sibling suites)) — not just this box's raw
+  # core count. GROUNDED: 3 concurrent suites × 10 workers/suite = load 37 on a 14-core box
+  # false-redded an unrelated 8-comment diff on bats timeout-only tests — an OVERSUBSCRIBED-load
+  # flake, not a code error. This complements, rather than replaces, the retry-before-red FLAKY
+  # reclassification agent-watch.sh's _health_worker already does (a timeout-only red that passes
+  # clean on the solo retry is reported FLAKY, not CODEERROR) — that masks the cost of oversubscription
+  # AFTER paying it once; clamping fan-out here avoids causing it in the first place.
+  divisor="$(_hk_live_sibling_suites)"
+  case "$divisor" in ''|*[!0-9]*) divisor=0 ;; esac
+  [ "$divisor" -ge 1 ] 2>/dev/null || divisor=1
+  cap=$((cores / divisor))
+  [ "$cap" -ge 1 ] 2>/dev/null || cap=1
+  w="$req"; [ "$w" -le "$cap" ] || w="$cap"
   printf '%s' "$w"
 }
 _HK_SUITE_WORKERS="$(_hk_suite_workers)"
