@@ -4779,11 +4779,19 @@ cmd_backend_switch() {
         fi
       fi
       # Live round-trip: prove the key works before touching config. viewer{} is the cheapest
-      # authenticated query; any error/HTML/empty response fails the grep.
+      # authenticated query; any error/HTML/empty response fails the grep. HERD-504: _linear_gql
+      # returns 3 for a LOCAL exec failure (payload-build fork pressure, never reached curl) — that
+      # is OUR problem, not Linear's, so it gets its own message instead of being lumped in with a
+      # real API/network/auth failure.
       # shellcheck source=/dev/null
       . "$target_file"
-      _linear_gql 'query { viewer { id } }' 2>/dev/null | grep -q '"id"' \
-        || die "Linear API round-trip FAILED (bad key or network) — nothing was changed"  # pipe-ok: bounded command output, under a pipe buffer
+      local _linear_viewer_resp _linear_viewer_rc
+      _linear_viewer_resp="$(_linear_gql 'query { viewer { id } }' 2>/dev/null)" && _linear_viewer_rc=0 || _linear_viewer_rc=$?
+      if [ "$_linear_viewer_rc" -eq 3 ]; then
+        die "Linear API round-trip FAILED: local exec failed under load (retried once) — nothing was changed"
+      fi
+      printf '%s' "$_linear_viewer_resp" | grep -q '"id"' \
+        || die "Linear API round-trip FAILED: API unreachable (bad key or network) — nothing was changed"  # pipe-ok: bounded command output, under a pipe buffer
       say "✓ Linear API reachable (viewer check passed)"
       ;;
     github)

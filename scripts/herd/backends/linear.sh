@@ -77,17 +77,36 @@ _backend_tw_journal() {
     fi
 }
 
+_linear_gql_build_payload() {
+    # Build the {"query","variables"} POST body for $1=query $2=vars. Split out of _linear_gql so
+    # the one fork-heavy step can be retried in isolation (see _linear_gql below).
+    QUERY="$1" VARS="$2" python3 -c 'import os, json
+print(json.dumps({"query": os.environ["QUERY"], "variables": json.loads(os.environ.get("VARS") or "{}")}))' 2>/dev/null
+}
+
 _linear_gql() {
     # The one HTTP entry point. $1 = GraphQL query/mutation text; $2 = JSON variables (optional).
     # Builds the {"query","variables"} envelope with python3 (so titles/bodies with quotes or
     # newlines are encoded safely) and POSTs it with the API key in the Authorization header.
     # Prints the raw JSON response on stdout. Tests stub this whole function or the `curl` it calls.
-    local query="$1" vars="${2:-}" payload
+    #
+    # HERD-504: under concurrent load (many builders/panes shelling out at once) the payload-build
+    # fork can fail to even exec python3 — a LOCAL resource-exhaustion hiccup that has nothing to do
+    # with Linear's API being reachable. Retrying the build once absorbs a transient fork failure; if
+    # it STILL fails, this returns 3 (a distinct code from every other failure path) and never touches
+    # curl, so a caller can tell "we couldn't build the request" apart from "we asked Linear and it
+    # didn't answer" instead of blaming Linear for our own fork pressure.
+    local query="$1" vars="${2:-}" payload=""
     [ -n "$vars" ] || vars='{}'
     _linear_require_curl
-    payload="$(QUERY="$query" VARS="$vars" python3 -c 'import os, json
-print(json.dumps({"query": os.environ["QUERY"], "variables": json.loads(os.environ.get("VARS") or "{}")}))')" || return 1
-    curl -sS -X POST "$_LINEAR_API_URL" \
+    payload="$(_linear_gql_build_payload "$query" "$vars")" || payload="$(_linear_gql_build_payload "$query" "$vars")"
+    if [ -z "$payload" ]; then
+        echo "linear backend: local exec failed under load (could not build the request payload after retry) — not a Linear API failure" >&2
+        return 3
+    fi
+    # --max-time bounds a hung/black-holed connection so a dead network never wedges the caller
+    # forever (HERD-504) — a real timeout still counts as an API-reachability failure, not a local one.
+    curl -sS --max-time 10 -X POST "$_LINEAR_API_URL" \
         -H "Content-Type: application/json" \
         -H "Authorization: ${LINEAR_API_KEY}" \
         --data "$payload"
