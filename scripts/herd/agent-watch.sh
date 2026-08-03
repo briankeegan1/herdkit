@@ -14626,6 +14626,18 @@ _engine_tick_watchdog() {
 }
 
 _tick_render_reconcile() {
+  # HERD-496: tick cadence — the gap between consecutive INVOCATIONS of this function (this tick's
+  # full work plus the caller's sleep), against its own rolling baseline. This is the ONE phase the
+  # watcher can observe about ITSELF from inside its own loop; it cannot catch its own full death
+  # (code that runs only while the process is alive can never notice the process is gone — that gap
+  # is what watcher-resurrect.sh's external cron probe exists for, HERD-489), but it DOES catch a tick
+  # running abnormally slowly long before it stalls outright. Silent on the very first call
+  # (_TICK_CADENCE_PREV starts unset — no prior invocation to measure against, never a fabricated
+  # cadence). Measured BEFORE the render-pass clock pin below, against a live, unpinned clock.
+  if [ -n "${_TICK_CADENCE_PREV:-}" ]; then
+    _phase_anomaly_observe tick_cadence "tick cadence" "$(( $(_now_epoch) - _TICK_CADENCE_PREV ))"
+  fi
+  _TICK_CADENCE_PREV="$(_now_epoch)"
   # HERD-491: pin the render pass's clock FIRST, before any age is read — see
   # _render_pass_clock_begin. Released right after `render` below, so the action/reconcile phases
   # that follow keep observing a live clock exactly as before this fix.
@@ -15757,19 +15769,7 @@ _sweep_reviewer_registry
 AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 _sweep_stale_resolve_tabs
 
-# HERD-496: tick cadence — the gap between consecutive tick STARTS (this tick's full
-# _tick_render_reconcile work plus the sleep below), against its own rolling baseline. This is the
-# ONE phase the watcher can observe about ITSELF from inside its own loop; it cannot catch its own
-# full death (code that runs only while the process is alive can never notice the process is gone —
-# that gap is what watcher-resurrect.sh's external cron probe exists for, HERD-489), but it DOES catch
-# a tick that is running abnormally slowly long before it stalls outright. Empty on the very first
-# iteration (no prior tick to measure against) — never a fabricated cadence.
-_TICK_CADENCE_PREV=""
 while true; do
-  if [ -n "$_TICK_CADENCE_PREV" ]; then
-    _phase_anomaly_observe tick_cadence "tick cadence" "$(( $(_now_epoch) - _TICK_CADENCE_PREV ))"
-  fi
-  _TICK_CADENCE_PREV="$(_now_epoch)"
   _tick_render_reconcile
   sleep 4
 done
