@@ -1428,8 +1428,8 @@ this scan cannot see).
 - `herd_model_resolve` — def `scripts/herd/driver.sh:163` — callers: `bin/herd:2933`, `scripts/herd/agent-watch.sh:11906`, `scripts/herd/config-viability.sh:259`, `scripts/herd/herd-review.sh:152`
 - `herd_numeric` — def `scripts/herd/herd-config.sh:1693` — callers: `scripts/herd/agent-watch.sh:678`, `scripts/herd/agent-watch.sh:679`, `scripts/herd/agent-watch.sh:680`, `scripts/herd/agent-watch.sh:15782`, `scripts/herd/agent-watch.sh:15783`, `scripts/herd/herd-spawn-gate.sh:138`, `scripts/herd/herd-spawn-gate.sh:139`
 - `herd_pane_launch` — def `scripts/herd/driver.sh:536` — callers: `scripts/herd/coordinator.sh:91`, `scripts/herd/coordinator.sh:126`
-- `herd_pipe_safety_check` — def `scripts/herd/pipe-safety-lint.sh:69` — callers: —
-- `herd_pipe_safety_lint` — def `scripts/herd/healthcheck.sh:133`, `scripts/herd/pipe-safety-lint.sh:135` — callers: —
+- `herd_pipe_safety_check` — def `scripts/herd/pipe-safety-lint.sh:76` — callers: —
+- `herd_pipe_safety_lint` — def `scripts/herd/healthcheck.sh:133`, `scripts/herd/pipe-safety-lint.sh:142` — callers: —
 - `herd_pr_ref_from_body` — def `scripts/herd/agent-watch.sh:5639` — callers: `scripts/herd/work-units/git-pr.sh:148`
 - `herd_preflight` — def `scripts/herd/herd-preflight.sh:51` — callers: `scripts/herd/coordinator.sh:37`, `scripts/herd/new-feature.sh:13`
 - `herd_pretrust_worktree` — def `scripts/herd/herd-config.sh:1132` — callers: `scripts/herd/new-feature.sh:73`
