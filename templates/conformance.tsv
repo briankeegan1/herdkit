@@ -82,6 +82,7 @@ herd notes [list|ack <n|all>]	unit	tests/test-console-rows-ageout.sh
 herd notes [list|ack <n|all>]	unit	tests/test-note-full-sidecar.sh
 herd reload	unit	tests/test-cli-reload.sh
 herd pane <watch|backlog|coordinator>	unit	tests/test-cli-pane.sh
+herd watcher-resurrect	unit	tests/test-watcher-resurrect.sh
 herd update [--force]	unit	tests/test-cli-update.sh
 herd log [--pr N] [--tail]	unit	tests/test-journal.sh
 herd why <pr#>	unit	tests/test-journal.sh
@@ -358,6 +359,7 @@ WATCHER_FLAIR	unit	tests/test-watcher-flair.sh
 WATCHER_SELF_RESTART	unit	tests/test-watcher-self-restart.sh
 WATCHER_SINGLETON_RECONCILE	unit	tests/test-watcher-singleton-reconcile.sh
 WATCHER_STOP_REAP_MAIN_HEALTH	unit	tests/test-watcher-singleton-reconcile.sh
+WATCHER_RESURRECT	unit	tests/test-watcher-resurrect.sh
 WATCHER_SELF_RESTART	sim	tests/test-sandbox-self-restart.sh
 OPERATOR_INBOX	unit	tests/test-operator-inbox.sh
 ORPHAN_PR_ROWS	unit	tests/test-orphan-pr-rows.sh
