@@ -250,6 +250,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
 - `HEALTH_CONCURRENCY` → `agent-watch.sh`
+- `HEALTH_EARLY_REAP_SECS` → `agent-watch.sh`
 - `HEALTH_INFLIGHT_TIMEOUT` → `bin/herd`, `agent-watch.sh`, `lifecycle.sh`, `sweep.sh`
 - `HEALTH_PANE` → `agent-watch.sh`
 - `HEALTH_TIMEOUT_HEADROOM` → `agent-watch.sh`
