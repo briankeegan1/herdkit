@@ -14,6 +14,13 @@
 #       caught red (exit 1) — a REAL parse error, not flag-the-absence.
 #   (5) MISSING TOOLCHAIN — *.go with gofmt absent → a data/env ⚠️ (exit 0), never red and never a
 #       confident ✅ (we still flag that we could not check it).
+#   (6) SHEBANG DISPATCH (HERD-505) — an EXTENSIONLESS file (bin/herd, a git hook) declares its
+#       language in its first line, so the extension-keyed bucketing skipped it entirely and the
+#       engine's own CLI went unprobed. Now: a broken extensionless bash script is caught RED, a
+#       broken extensionless python script is caught RED, clean ones are counted in the sh/py
+#       summary, and an interpreter with no dependency-free probe (perl/node/…), a file with no
+#       shebang at all, and a dotted-but-unrecognized name all skip SILENTLY — byte-identical to the
+#       pre-fix verdict, never red, never "unchecked". Removing the dispatch reds (6a)/(6b)/(6c).
 #
 # Network-free: a temp git repo, temp config via HERD_CONFIG_FILE, and a stubbed/curated PATH so the
 # gofmt-present and gofmt-absent branches are both deterministic regardless of the host toolchain.
@@ -155,6 +162,64 @@ oneout="$(PATH="$CBIN" bash "$HC" "$WT" --light --oneline)"; orc=$?
 [ "$(nlines "$oneout")" -eq 1 ] || fail "(5) oneline must be exactly one line (got: $oneout)"
 grep -q '⚠️' <<< "$oneout" || fail "(5) oneline missing-gofmt should carry a ⚠️ (got: $oneout)"
 grep -q '✅' <<< "$oneout" && fail "(5) oneline must not claim ✅ when the .go went unchecked (got: $oneout)"
+ok
+
+# ── (6) SHEBANG DISPATCH — extensionless files are classified by their first line (HERD-505) ─────
+# (6a) a broken extensionless BASH script is caught red, exactly like a broken *.sh.
+clear_diff
+printf '#!/usr/bin/env bash\nif then fi\n' > "$WT/src/herdlike"; chmod +x "$WT/src/herdlike"
+out="$(run_hc)"; rc=$?
+[ "$rc" -eq 1 ] || fail "(6a) broken extensionless bash script must be caught red (exit 1, got $rc): $out"
+grep -q 'SYNTAX ERROR' <<< "$out" || fail "(6a) broken extensionless bash should report a SYNTAX ERROR (got: $out)"
+grep -q 'bash -n .*herdlike' <<< "$out" || fail "(6a) the error should cite 'bash -n <file>' (got: $out)"
+ok
+
+# (6b) a CLEAN extensionless bash script passes and is counted in the shell bucket (not ignored).
+clear_diff
+printf '#!/bin/sh\nexec echo hi "$@"\n' > "$WT/src/hook"; chmod +x "$WT/src/hook"
+out="$(run_hc)"; rc=$?
+[ "$rc" -eq 0 ] || fail "(6b) clean extensionless sh script should exit 0 (got $rc): $out"
+grep -q 'LIGHT CHECK CLEAN' <<< "$out" || fail "(6b) clean extensionless sh should be a confident clean (got: $out)"
+grep -q 'shell:  1 changed' <<< "$out" || fail "(6b) extensionless sh must be COUNTED in the shell bucket, not ignored (got: $out)"
+ok
+
+# (6c) a broken extensionless PYTHON script is caught red by the py_compile probe.
+if [ -n "$(command -v python3 || true)" ]; then
+  clear_diff
+  printf '#!/usr/bin/env -S python3 -u\ndef broken(:\n' > "$WT/src/pytool"; chmod +x "$WT/src/pytool"
+  out="$(run_hc)"; rc=$?
+  [ "$rc" -eq 1 ] || fail "(6c) broken extensionless python script must be caught red (exit 1, got $rc): $out"
+  grep -q 'SYNTAX ERROR' <<< "$out" || fail "(6c) broken extensionless python should report a SYNTAX ERROR (got: $out)"
+  grep -q 'py_compile .*pytool' <<< "$out" || fail "(6c) the error should cite 'py_compile <file>' (got: $out)"
+  ok
+fi
+
+# (6d) FAIL-SOFT — an interpreter with no dependency-free probe, and a file with no shebang at all,
+# skip SILENTLY: no red, no "unchecked" flag, and the verdict is byte-identical to the pre-fix one.
+clear_diff
+printf '#!/usr/bin/perl\nthis is (not perl at all\n'   > "$WT/src/perltool"; chmod +x "$WT/src/perltool"
+printf '#!/usr/bin/env node\nfunction ( broken {\n'    > "$WT/src/nodetool"; chmod +x "$WT/src/nodetool"
+printf 'plain data, no shebang, if then fi\n'          > "$WT/src/NOTICE"
+out="$(run_hc)"; rc=$?
+[ "$rc" -eq 0 ] || fail "(6d) unknown-interpreter/no-shebang files must never red (exit 0, got $rc): $out"
+exp="$(printf '✅ LIGHT CHECK CLEAN (non-heavy change)\n   shell:  0 changed *.sh — bash -n ok\n   python: 0 changed *.py — py_compile ok')"
+[ "$out" = "$exp" ] || fail "(6d) verdict must be byte-identical to the pre-fix skip; got:
+$out"
+ok
+
+# (6e) BYTE-IDENTICAL — an extensioned but unrecognized file (docs/JSON/config) is still ignored,
+# and is never sent through the shebang path even when it carries a shebang-looking first line.
+clear_diff
+printf '#!/usr/bin/env bash\nif then fi\n' > "$WT/src/notes.md"
+printf '{ "a": 1 }\n'                     > "$WT/src/data.json"
+out="$(run_hc)"; rc=$?
+[ "$rc" -eq 0 ] || fail "(6e) unrecognized extensions must stay ignored (exit 0, got $rc): $out"
+[ "$out" = "$exp" ] || fail "(6e) verdict must be byte-identical to the pre-fix skip; got:
+$out"
+ok
+oneout="$(run_hc --oneline)"; orc=$?
+[ "$orc" -eq 0 ] || fail "(6e) oneline should exit 0 (got $orc)"
+[ "$oneout" = "✅ light clean — 0 sh, 0 py ok" ] || fail "(6e) oneline not byte-identical (got: $oneout)"
 ok
 
 echo "ALL PASS ($pass checks) — light-profile per-language probes flag the absence, never false-green."

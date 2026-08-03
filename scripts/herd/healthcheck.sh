@@ -18,6 +18,8 @@
 #       Fast. Source types it has NO dependency-free probe for (.rs/.java/.ts/…) are never silently
 #       green-lit — they are flagged-the-absence with a loud ⚠️ (like the interaction gate), so a
 #       diff that only touches an unprobed language reads as ⚠️, never a confident ✅.
+#       EXTENSIONLESS files (bin/herd, hooks) are classified by SHEBANG (HERD-505) so the engine's own
+#       CLI is probed too; an interpreter with no probe here skips silently (fail-soft, never red).
 #       After the syntax pass it also runs the SHARED caps-sync guard (scripts/herd/caps-sync-lint.sh,
 #       HERD-220) — the same lint the heavy project gate runs — so a builder whose change grows the
 #       capability surface without touching templates/capabilities.tsv sees the red here, pre-PR,
@@ -389,6 +391,35 @@ run_heavy() {
 # that only touches an unprobed language never reads as a confident ✅ (Leak B, external-consumer
 # audit). A missing toolchain (e.g. no gofmt) is a data/env ⚠️ — never red. Non-source files (docs,
 # JSON, config) are ignored exactly as before. Only a REAL parse/syntax error is red (exit 1).
+# EXTENSIONLESS executables (bin/herd, git hooks, …) carry their language in the SHEBANG, not the
+# filename, so the extension-keyed bucketing below used to skip them outright — the engine's own CLI,
+# bin/herd, went entirely unprobed by the light gate (HERD-505). They are now classified by their
+# first line and folded into the matching bucket; an unrecognized interpreter skips SILENTLY.
+#
+# _shebang_lang <file> — the light-probe bucket for an extensionless file, read from its shebang:
+# "sh" (→ bash -n), "py" (→ py_compile), or NOTHING at all. Empty means SKIP SILENTLY (fail-soft):
+# no shebang, an unreadable/binary file, or an interpreter we have no dependency-free probe for
+# (perl, node, awk, ruby, zsh …) must never red the gate and must never be counted as "unchecked"
+# either — we make no claim about a language we never promised to probe. One awk pass, no pipes and
+# no word-splitting, so a shebang containing a glob char or CRLF line ending cannot misbehave.
+_shebang_lang() {
+  awk 'NR==1 {
+         if ($0 !~ /^#!/) exit
+         gsub(/\r/, "", $0)
+         sub(/^#![[:space:]]*/, "", $0)
+         n = split($0, w, /[[:space:]]+/)
+         for (i = 1; i <= n; i++) {
+           t = w[i]
+           sub(/^.*\//, "", t)                                   # basename of the interpreter word
+           # Skip the `env` trampoline plus its own flags (-S, -i) and VAR=val prefixes, so
+           # "#!/usr/bin/env -S python3 -u" resolves exactly like "#!/usr/bin/python3".
+           if (t == "" || t == "env" || t ~ /^-/ || t ~ /=/) continue
+           if (t == "bash" || t == "sh") print "sh"
+           else if (t ~ /^python[0-9.]*$/) print "py"
+           exit
+         }
+       }' "$1" 2>/dev/null
+}
 run_light() {
   changed="$(_changed_files)"
   sh=(); py=(); go=(); unchecked=()
@@ -403,6 +434,20 @@ run_light() {
       # green. Extend this list (and add a probe above) as safe single-file checks become available.
       *.rs|*.java|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.rb|*.c|*.h|*.cc|*.cpp|*.cxx|*.hpp|*.hh|*.cs|*.kt|*.kts|*.swift|*.php|*.scala|*.m|*.mm|*.pl|*.lua|*.dart|*.ex|*.exs|*.clj|*.hs)
         unchecked+=("$f") ;;
+      # Everything else: an EXTENSIONLESS file (basename with no dot) is classified by its shebang —
+      # that is the only place bin/herd and friends declare their language. Any other extension
+      # (docs, JSON, config) falls through and is ignored exactly as before.
+      *)
+        case "${f##*/}" in
+          *.*) ;;                                                # extensioned but unrecognized → ignore
+          *)
+            case "$(_shebang_lang "$f")" in
+              sh) sh+=("$f") ;;
+              py) py+=("$f") ;;
+            esac
+            ;;
+        esac
+        ;;
     esac
   done <<EOF
 $changed
