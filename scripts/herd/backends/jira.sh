@@ -264,6 +264,25 @@ if isinstance(e, dict):
 sys.exit(1 if errs else 0)' 2>/dev/null
 }
 
+_jira_resolve_ref() {
+    # HERD-502: the ONE shared scoped lookup both the heal WRITER (_backend_update_state/
+    # _backend_amend) and the heal RESOLVER (_backend_item_state) must use — a KEY-NUMBER identifier
+    # first, falling back to the conservative (unique-match-only) summary search when the ref carries
+    # no key. $1 = ref. Prints the resolved key (empty when neither path found a unique match).
+    # Before this, _backend_item_state had its OWN abbreviated resolve (key-only, no summary
+    # fallback) and silently defaulted to ITEM_STATE=open on ANY parse failure — so a ref no Jira
+    # issue could ever match read as a confirmed-open item forever instead of surfacing as unknown and
+    # letting the sweep's N-failure backoff (tracker-state-sweep.sh) take over.
+    local ref="$1" key
+    if key="$(_jira_issue_key "$ref")"; then
+        printf '%s' "$key"
+        return 0
+    fi
+    key="$(_jira_resolve_by_title "$ref")"
+    [ -n "$key" ] || return 1
+    printf '%s' "$key"
+}
+
 _jira_resolve_by_title() {
     # Fallback resolution when the request names no key: match issues by a summary substring via JQL
     # `summary ~ "<text>"`, capped at 2 so the caller can require a UNIQUE match and never mislabel the
@@ -368,9 +387,7 @@ _backend_update_state() {
         return 0
     fi
     pref="$(_jira_preferred_status_name "$want")"
-    if ! key="$(_jira_issue_key "$ref")"; then
-        key="$(_jira_resolve_by_title "$ref")"                   # conservative summary match (unique-only)
-    fi
+    key="$(_jira_resolve_ref "$ref")"    # HERD-502: shared scoped lookup
     if [ -z "$key" ]; then
         echo "jira backend: no unique issue matching '$ref' — state unchanged (skipping, not filing)" >&2
         _BACKEND_RESULT="NOCHANGE"
@@ -400,9 +417,7 @@ _backend_amend() {
     local ref="$1" note="$2" key body ok
     _BACKEND_RESULT="NOCHANGE"
     _jira_require_key
-    if ! key="$(_jira_issue_key "$ref")"; then
-        key="$(_jira_resolve_by_title "$ref")"
-    fi
+    key="$(_jira_resolve_ref "$ref")"    # HERD-502: shared scoped lookup
     if [ -z "$key" ]; then
         echo "jira backend: no unique issue matching '$ref' — nothing to amend (skipping, not posting)" >&2
         _backend_tw_journal "$ref" amend "$_BACKEND_RESULT"
@@ -544,28 +559,47 @@ if meta:
 
 _backend_item_state() {
     # $1 = <link-name>#<id> — caller has resolved the link; the JIRA_* creds are in env.
-    # Resolves the issue via GET /issue and reads its statusCategory, setting ITEM_STATE=
-    # open|closed|in-progress. Also sets ITEM_UPDATED to the issue's last-updated day (YYYY-MM-DD,
-    # best-effort — empty if absent), used by the HERD-117 claim guard as evidence when it refuses a
-    # stale (Done) pick. Category map: done → closed; indeterminate → in-progress; new/other → open.
-    local ref="$1" slug key resp parsed cat
+    # Resolves via the SAME shared scoped lookup the writer ops use (_jira_resolve_ref: key first,
+    # conservative summary match as fallback), then reads statusCategory via GET /issue, setting
+    # ITEM_STATE=open|closed|in-progress. Also sets ITEM_UPDATED to the issue's last-updated day
+    # (YYYY-MM-DD, best-effort — empty if absent), used by the HERD-117 claim guard as evidence when
+    # it refuses a stale (Done) pick. Category map: done → closed; indeterminate → in-progress;
+    # new/other → open.
+    #
+    # HERD-502: this used to skip the summary-fallback entirely and default ITEM_STATE=open on ANY
+    # key-parse failure — indistinguishable from a backend that explicitly confirmed the issue open.
+    # A ref no issue can ever match then looped as "found open, heal failed" every sweep forever
+    # instead of surfacing as unknown and backing off (tracker-state-sweep.sh's N-failure escalation).
+    # Also now distinguishes a genuine API/permission failure (no `fields` envelope at all) from a
+    # cleanly-read status — both used to collapse into the same "open" default.
+    local ref="$1" slug key resp parsed cat found
     _jira_require_key
     slug="${ref#*#}"
     ITEM_UPDATED=""
-    if ! key="$(_jira_issue_key "$slug")"; then
-        ITEM_STATE="open"
-        return 0
+    key="$(_jira_resolve_ref "$slug")"
+    if [ -z "$key" ]; then
+        ITEM_STATE=""
+        return 1
     fi
     resp="$(_jira_api GET "/rest/api/3/issue/$key?fields=status,updated")"
     parsed="$(printf '%s' "$resp" | python3 -c 'import sys, json
 try: d = json.load(sys.stdin)
 except Exception: d = {}
-f = d.get("fields") or {}
-st = f.get("status") or {}
-cat = (st.get("statusCategory") or {}).get("key") or ""
-print("%s\t%s" % (cat, (f.get("updated") or "")[:10]))' 2>/dev/null || printf '\t')"
-    cat="${parsed%%	*}"
-    ITEM_UPDATED="${parsed#*	}"
+f = d.get("fields")
+if not isinstance(f, dict):
+    print("\t\t0")
+else:
+    st = f.get("status") or {}
+    cat = (st.get("statusCategory") or {}).get("key") or ""
+    print("%s\t%s\t1" % (cat, (f.get("updated") or "")[:10]))' 2>/dev/null || printf '\t\t0')"
+    cat="${parsed%%$'\t'*}"
+    local rest="${parsed#*$'\t'}"
+    ITEM_UPDATED="${rest%%$'\t'*}"
+    found="${rest#*$'\t'}"
+    if [ "$found" != "1" ]; then
+        ITEM_STATE=""
+        return 1
+    fi
     case "$cat" in
         done)          ITEM_STATE="closed"      ;;
         indeterminate) ITEM_STATE="in-progress" ;;

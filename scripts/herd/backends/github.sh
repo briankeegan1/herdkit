@@ -214,15 +214,36 @@ for it in data:
 
 _backend_item_state() {
     # $1 = <link-name>#<id> — caller has resolved the link; HERD_REPO is already set.
-    # Queries the issue state and sets ITEM_STATE=open|closed.
-    # GitHub issues have no native in-progress state; OPEN maps to open, CLOSED to closed.
-    local ref="$1" num raw
+    # Resolves via the SAME shared scoped lookup the writer ops use (_github_resolve_issue: a numeric
+    # slug directly, else an open-issue title search), then queries the issue state and sets
+    # ITEM_STATE=open|closed. GitHub issues have no native in-progress state; OPEN maps to open,
+    # CLOSED to closed.
+    #
+    # HERD-502: this used to bypass _github_resolve_issue entirely (a bare `${ref#*#}` fed straight
+    # into `gh issue view`) and, on ANY failure — a non-numeric/unresolvable slug, or `gh` erroring —
+    # silently defaulted to ITEM_STATE=open via a `|| printf 'OPEN'` fallback, indistinguishable from a
+    # backend that explicitly confirmed the issue open. A ref no issue can ever match (e.g. a stray
+    # branch-slug token mis-parsed out of a PR body) then looped as "found open, heal failed" every
+    # sweep forever instead of surfacing as unknown and backing off (tracker-state-sweep.sh's
+    # N-failure escalation). Returns non-zero (ITEM_STATE unset) when the ref cannot be resolved to
+    # any issue at all, or the state read itself fails — the caller must treat that as unknown, not
+    # open.
+    local ref="$1" slug num raw
     _github_require_gh
-    num="${ref#*#}"
+    slug="${ref#*#}"
+    num="$(_github_resolve_issue "$slug")"
+    if [ -z "$num" ]; then
+        ITEM_STATE=""
+        return 1
+    fi
     raw="$(_gh issue view "$num" --json state 2>/dev/null \
-            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("state","OPEN").upper())' \
-              2>/dev/null \
-            || printf 'OPEN')"
+            | python3 -c 'import sys, json
+try: print(json.load(sys.stdin).get("state", "").upper())
+except Exception: pass' 2>/dev/null)"
+    if [ -z "$raw" ]; then
+        ITEM_STATE=""
+        return 1
+    fi
     case "$raw" in
         CLOSED) ITEM_STATE="closed" ;;
         *)      ITEM_STATE="open"   ;;

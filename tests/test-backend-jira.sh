@@ -244,6 +244,24 @@ grep -q "ITEM_STATE=closed" <<< "$outg" || fail "guard precondition: Done issue 
 grep -q "ITEM_UPDATED=2026-07-08" <<< "$outg" || fail "guard precondition: last-updated day not surfaced ($outg)"
 pass
 
+# 4b. HERD-502 mutation-prove: a ref that resolves via NEITHER the KEY-NUMBER path NOR the
+#     conservative summary fallback (zero matches) must report ITEM_STATE UNSET and a non-zero
+#     return — NOT silently "open". This is the live 'full-auto'/#606 incident reproduced: a
+#     malformed `Refs:` token that is not a real tracker identifier. Reverting the HERD-502 fix
+#     (dropping the summary fallback + the `found` guard back to a bare key-parse check) makes this
+#     fail — the old code defaulted ITEM_STATE=open the moment the key parse failed.
+unresolvable_item_state() {
+  ( cd "$T" && . "$BACKEND"
+    _jira_api() { echo '{"issues":[]}'; }   # NOTHING resolves, key or summary
+    ITEM_STATE="PRESET"
+    if _backend_item_state "full-auto"; then rc=0; else rc=1; fi
+    printf 'RC=%s\nITEM_STATE=%s\n' "$rc" "${ITEM_STATE:-}" )
+}
+outu="$(unresolvable_item_state)"
+grep -q "^RC=1$" <<< "$outu" || fail "HERD-502 mutation-prove: an unresolvable ref must return non-zero from _backend_item_state ($outu)"
+grep -q "^ITEM_STATE=$" <<< "$outu" || fail "HERD-502 mutation-prove: an unresolvable ref must leave ITEM_STATE unset, not default to open ($outu)"
+pass
+
 # 4c. update_state (done) → resolves by key via GET /issue transitions, then POSTs a Done-category
 #     transition. It must NOT POST /issue (a state change is not a new item — the gh #139 junk bug).
 : > "$APILOG"

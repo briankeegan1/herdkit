@@ -120,7 +120,10 @@ herd_console_section() {
 # herd_console_visible_lines_tracker <ledger> <limit> [ack-file]
 #   Like herd_console_visible_lines but with HEALED-SUPERSEDES-FAILED (HERD-284): when a `healed`
 #   row for a tracker ref has been seen (reading newest-first), any earlier `failed` rows for that
-#   same ref are dropped. Display-only and fail-soft — a missing or malformed ref never hides a row.
+#   same ref are dropped. HERD-502: an `escalated` row (the sweep gave up on this ref after N
+#   consecutive failures — tracker-state-sweep.sh's _tsweep_mark_unresolvable) supersedes the same
+#   way, so a ref's whole `failed` history collapses to the one row that explains its final outcome.
+#   Display-only and fail-soft — a missing or malformed ref never hides a row.
 herd_console_visible_lines_tracker() {
   local _cs_file="$1" _cs_limit="$2" _cs_ack="${3:-}"
   [ -s "$_cs_file" ] || return 0
@@ -140,12 +143,15 @@ EOF
 $_cs_line
 EOF
     case "${_cs_status:-}" in
-      healed)
+      healed|escalated)
         if [ -n "${_cs_ref:-}" ]; then
           # HERD-490: a SECOND healed row for a ref already recorded healed (newest-first, so this
           # is an OLDER duplicate — e.g. the same merged PR healed twice across sweep runs) is
           # itself superseded, exactly like a failed row is — the console must never render the
-          # identical heal twice for one ref.
+          # identical heal twice for one ref. HERD-502: an `escalated` row (the sweep gave up on
+          # this ref) joins the same accumulator, so it supersedes older `failed` rows for the ref
+          # too — the whole point being ONE distinct row survives, not the failed history plus a
+          # new escalated row on top of it.
           case "${_cs_healed}" in *" ${_cs_ref} "*) continue ;; esac
           _cs_healed="${_cs_healed}${_cs_ref} "
         fi

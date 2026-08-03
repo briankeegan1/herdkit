@@ -108,6 +108,30 @@ out="$(run _backend_item_state "provider-lib#7")"
 grep -q "ITEM_STATE=open" <<< "$out" || fail "_backend_item_state OPEN did not return ITEM_STATE=open ($out)"
 pass
 
+# 5a. HERD-502 mutation-prove: a ref that matches NO open issue at all (identifier or title search)
+#     must return non-zero from _backend_item_state with ITEM_STATE left UNSET — NOT silently
+#     "open". Before this fix, item_state bypassed _github_resolve_issue entirely (a bare
+#     `${ref#*#}` fed straight into `gh issue view`) and defaulted to OPEN on ANY failure — the live
+#     'full-auto'/#606-shaped incident: a non-numeric, unresolvable slug read as a confirmed-open
+#     item forever instead of surfacing as unknown. Reverting the fix makes this fail.
+cp "$T/bin/gh" "$T/bin/gh.saved"
+cat > "$T/bin/gh" <<'EOF2'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "issue list") printf '[]' ;;   # nothing matches ANY title search — proves the total-failure path
+  *) : ;;
+esac
+EOF2
+chmod +x "$T/bin/gh"
+outu="$( ( cd "$T" && . "$BACKEND"
+  ITEM_STATE="PRESET"
+  if _backend_item_state "full-auto"; then rc=0; else rc=1; fi
+  printf 'RC=%s\nITEM_STATE=%s\n' "$rc" "${ITEM_STATE:-}" ) )"
+grep -q "^RC=1$" <<< "$outu" || fail "HERD-502 mutation-prove: an unresolvable ref must return non-zero from _backend_item_state ($outu)"
+grep -q "^ITEM_STATE=$" <<< "$outu" || fail "HERD-502 mutation-prove: an unresolvable ref must leave ITEM_STATE unset, not default to open ($outu)"
+cp "$T/bin/gh.saved" "$T/bin/gh"
+pass
+
 # 5b. update_state (done) → closes the resolved issue with reason "completed"; never creates one.
 #     (Intent dispatch, gh #139: a state change transitions the EXISTING issue, not a new one.)
 : > "$GHLOG"
