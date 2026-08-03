@@ -179,7 +179,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
 - `stale-dup-gate.sh` → `derived-files.sh`
 - `steps.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
-- `sweep.sh` → `agent-watch.sh`, `create-retry.sh`, `derived-files.sh`, `watcher-exempt.sh`
+- `sweep.sh` → `agent-watch.sh`, `create-retry.sh`, `derived-files.sh`, `journal.sh`, `watcher-exempt.sh`
 - `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
 - `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`
