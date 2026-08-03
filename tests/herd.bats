@@ -163,6 +163,17 @@ HERD_DISCOVERY_BESPOKE="test-codemap-project.sh test-backlog-view-width.sh test-
 # skip / missing-dep guard) — a plain exit-0 check would pass it silently.
 herd_run_discovered_test() {
   run bash "$BATS_TEST_DIRNAME/$1"
+  # HERD-494(a): a --jobs parallel run buffers bats' own TAP stream in REGISTRATION order — a test
+  # that finishes early still waits behind every earlier-registered test still running, so the
+  # tailable health log (agent-watch.sh's _health_worker) can read 0 bytes for the suite's ENTIRE
+  # runtime even on a healthy run. THIS test's completion, right here, is a real-time signal that
+  # ordering buffer never delays — append one terse per-FILE line straight to the tailable log the
+  # instant it happens. Silent no-op when HEALTHCHECK_PROGRESS_LOG is unset (a bare `bats
+  # tests/herd.bats`, or any caller that never asks for it) — byte-identical to before.
+  if [ -n "${HEALTHCHECK_PROGRESS_LOG:-}" ]; then
+    printf '[health-progress] %s %s\n' "$1" "$([ "$status" -eq 0 ] && echo ok || echo FAIL)" \
+      >> "$HEALTHCHECK_PROGRESS_LOG" 2>/dev/null || true
+  fi
   if [ "$status" -ne 0 ]; then
     echo "tests/$1 FAILED (exit $status)"; echo "$output"; return 1
   fi
