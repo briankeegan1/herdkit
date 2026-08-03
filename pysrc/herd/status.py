@@ -122,6 +122,9 @@ def main():
                        % (r, b, sl, x, r, prsuf, x))
         elif verdict == "dead":
             out.append("    %s💀 %s%s%s %sDEAD (no agent, no PR, no commits)%s\n" % (r, b, sl, x, r, x))
+        elif verdict == "inuse":
+            out.append("    %s⚙ %s%s%s %sengine · in use (no agent/PR/commits yet, but a live process holds this dir) — not dead%s\n"
+                       % (y, b, sl, x, y, x))
 
     out.append("  %sPRS%s       %d open\n" % (b, x, _to_int(n_prs)))
     for (pnum, pbr, pmerge, pmstate, preview, phealth, pdec, pattn) in prs:

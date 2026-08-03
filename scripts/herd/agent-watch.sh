@@ -1172,6 +1172,37 @@ build_checkout_cleanliness() {
   CHECKOUT_CLEAN="    ${C_RED}🚨 ${C_BOLD}CHECKOUT UNCLEAN${C_RESET}${C_RED} — ${_bc_why} · a tool wrote the shared checkout; investigate in ${MAIN} before discarding (evidence preserved, never auto-cleaned)${C_RESET}"$'\n'
 }
 
+# build_main_health_contam — HERD-500: the visible counterpart to $MAIN_HEALTH_CONTAM_STATE. A
+# contaminated checkout withholds every main-health verdict silently (_main_health_contaminated raises
+# no row of its own by design, leaning on build_checkout_cleanliness's debounced row for the SAME
+# underlying condition) — but that row can clear (or never fire, on a single-tick transient) while the
+# marker still stands, so the operator sees a healthy console while main-health has, in truth, gone
+# dark. This row is the honest statement "no verdict is landing right now, and here is why".
+#
+# RENDER-TICK RECONCILE (mirrors build_main_freshness / HERD-455): _main_health_contam_recheck runs
+# once per tick to clear a healed marker, but a render is not entitled to assume it already ran (a
+# standalone caller, an unusual call order, a future refactor) — so this checks the SAME
+# _main_checkout_sound claim itself, fresh, before painting. A disproved marker is dropped here (and,
+# outside DRYRUN, the state file cleared + contam_cleared journaled — the same mutation
+# _main_health_contam_recheck performs, deduped by the file's own absence on a repeat call) rather than
+# painted one tick stale. Empty on the happy path (no marker) → byte-identical whenever unused.
+build_main_health_contam() {
+  MAIN_HEALTH_SUPPRESSED=""
+  _main_health_enabled || return 0
+  [ -s "$MAIN_HEALTH_CONTAM_STATE" ] || return 0
+  local _bmc_sha _bmc_reason _bmc_line
+  _bmc_line="$(cat "$MAIN_HEALTH_CONTAM_STATE" 2>/dev/null || true)"
+  [ -n "$_bmc_line" ] || return 0
+  _bmc_sha="${_bmc_line%%|*}"
+  _bmc_reason="${_bmc_line#*|}"
+  [ "$_bmc_reason" != "$_bmc_line" ] || _bmc_reason="unknown"
+  if _main_checkout_sound >/dev/null 2>&1; then
+    [ -n "${DRYRUN:-}" ] || _main_health_contam_clear "$_bmc_sha" "$_bmc_reason"
+    return 0
+  fi
+  MAIN_HEALTH_SUPPRESSED="    ${C_YELLOW}⏸ ${C_BOLD}main-health suppressed${C_RESET}${C_YELLOW} · checkout contaminated ${_bmc_sha:0:7} (${_bmc_reason}) · resumes on its own once ${MAIN} is clean${C_RESET}"$'\n'
+}
+
 # _fmt_age <seconds> — compact human age (e.g. 45s, 12m, 3h, 2d) for the blocked-on rows.
 _fmt_age() {
   local s="${1:-0}"
@@ -2225,8 +2256,8 @@ render() {
   # thing seen. Empty unless main is currently red, so byte-identical when the feature is unused.
   # MAIN-freshness (HERD-233) shares that section: a diverged/held checkout, and the restart note
   # after a pull carried new engine code. Both empty on the happy path.
-  if [ -n "${MAIN_HEALTH:-}" ] || [ -n "${MAIN_FRESHNESS:-}" ] || [ -n "${CHECKOUT_CLEAN:-}" ]; then
-    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH:-}${MAIN_FRESHNESS:-}${CHECKOUT_CLEAN:-}"$'\n'
+  if [ -n "${MAIN_HEALTH:-}" ] || [ -n "${MAIN_FRESHNESS:-}" ] || [ -n "${CHECKOUT_CLEAN:-}" ] || [ -n "${MAIN_HEALTH_SUPPRESSED:-}" ]; then
+    frame="${frame}  ${C_RED}default branch${C_RESET}"$'\n'"${MAIN_HEALTH:-}${MAIN_FRESHNESS:-}${CHECKOUT_CLEAN:-}${MAIN_HEALTH_SUPPRESSED:-}"$'\n'
   fi
   # Watcher SINGLETON violation (HERD-450) — its own section directly under the default-branch block:
   # a second watcher (or a lockfile that names nobody) invalidates every OTHER row on this console,
@@ -6894,7 +6925,7 @@ MAIN_HEALTH_DEFER="$TREES/.agent-watch-main-health-defer"  # "<sha> <reason>" �
 # SHARED POOL through pysrc/herd/store.py's main_health_fix_* accessors (see _main_health_fix_mark /
 # _main_health_fix_clear below) so every seat sees the same "already filed" state, not just this process.
 MAIN_HEALTH_CI_STATE="$TREES/.agent-watch-main-health-ci"  # "<sha> <conclusion>" — the last branch-CI red we fired (HERD-334)
-MAIN_HEALTH_CONTAM_STATE="$TREES/.agent-watch-main-health-contam"  # "<sha>|<reason>" dedup sig for the HERD-452 withheld-verdict journal (see _main_health_contaminated)
+MAIN_HEALTH_CONTAM_STATE="$TREES/.agent-watch-main-health-contam"  # "<sha>|<reason>" dedup sig for the HERD-452 withheld-verdict journal (see _main_health_contaminated); reconciled against live git status + rendered by _main_health_contam_recheck / build_main_health_contam (HERD-500)
 
 # Throttle the branch-CI probe (HERD-334 leg b): one `gh run list` every ~40 s (10 × 4 s sleep) instead
 # of every tick, so the steady-state network profile barely moves. Inline constant — no config key
@@ -7696,6 +7727,40 @@ _main_health_contaminated() {
   printf '%s\n' "$_mhc_key" > "$MAIN_HEALTH_CONTAM_STATE" 2>/dev/null || true
   journal_append main_health pr "$_mhc_pr" sha "$_mhc_sha" result contaminated reason "$_mhc_reason"
   return 0
+}
+
+# _main_health_contam_clear <sha> <reason> — the shared mutation both contam-reconcile paths below
+# call on a proven-healed checkout: drop the marker and journal contam_cleared, the audited bookend to
+# the contaminated event _main_health_contaminated wrote. Never called under DRYRUN (both callers guard
+# it themselves, mirroring _main_fresh_recovered's contract).
+_main_health_contam_clear() {
+  rm -f "$MAIN_HEALTH_CONTAM_STATE" 2>/dev/null || true
+  journal_append main_health sha "${1:-}" result contam_cleared reason "${2:-unknown}"
+  return 0
+}
+
+# _main_health_contam_recheck — HERD-500: $MAIN_HEALTH_CONTAM_STATE is a WRITE-ONLY dedup marker —
+# _main_health_contaminated stamps it the moment a dispatch is withheld, but nothing ever looked at it
+# again. Dispatch itself already self-heals (_main_checkout_sound is read FRESH on every call, never
+# this file), so a healed checkout resumes VERDICTS on its own next tick — but the marker just sat
+# there, standing evidence of a contamination episode nobody ever confirmed had ended. Live: a checkout
+# dirtied by a stray tool stayed flagged in this file for 24h+ after the tree was provably clean again
+# (the offending process had long since exited), because nothing ever re-checked it — the only visible
+# symptom was main-health quietly never running, with no row naming why. Called once per tick, ahead of
+# (and independent from) the render pass, so the marker never outlives a healed checkout even on a run
+# with rendering suppressed. Byte-inert when the lever is off or no marker stands; fail-soft throughout.
+_main_health_contam_recheck() {
+  _main_health_enabled || return 0
+  [ -n "${DRYRUN:-}" ] && return 0              # an observation run mutates no state (as the reconcile does not)
+  [ -s "$MAIN_HEALTH_CONTAM_STATE" ] || return 0
+  local _mcr_line _mcr_sha _mcr_reason
+  _mcr_line="$(cat "$MAIN_HEALTH_CONTAM_STATE" 2>/dev/null || true)"
+  [ -n "$_mcr_line" ] || return 0
+  _mcr_sha="${_mcr_line%%|*}"
+  _mcr_reason="${_mcr_line#*|}"
+  [ "$_mcr_reason" != "$_mcr_line" ] || _mcr_reason="unknown"
+  _main_checkout_sound >/dev/null 2>&1 || return 0             # still contaminated — leave the marker + row standing
+  _main_health_contam_clear "$_mcr_sha" "$_mcr_reason"
 }
 
 # _main_health_dispatch <pr#> <sha> <provenance> — the SHARED dispatch seam behind both the do_merge fast
@@ -14795,6 +14860,8 @@ _tick_render_reconcile() {
   _main_fresh_recheck
   build_main_freshness
   build_checkout_cleanliness   # HERD-361: the shared-checkout cleanliness row (empty unless contaminated)
+  _main_health_contam_recheck  # HERD-500: reconcile the withheld-verdict marker against LIVE git status
+  build_main_health_contam     # HERD-500: visible suppression row while that marker stands
   build_watcher_singleton      # HERD-450: the duplicate-watcher / lock-drift row (empty unless violated)
   build_sweep_note
   build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT

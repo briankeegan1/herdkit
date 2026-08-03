@@ -19,7 +19,12 @@
 # The DEAD-builder check here is a SMALL, INDEPENDENT, read-only replica of the watcher's DEAD
 # signature (worktree present + NO live agent + NO open PR + NO commits) — it does NOT call into or
 # edit agent-watch.sh (which owns the grace-window ledger + the 💀 notification). A one-shot snapshot
-# has no cross-tick memory, so it flags the plain signature deterministically.
+# has no cross-tick memory, so it flags the plain signature deterministically. HERD-501: that signature
+# alone cannot tell "silently exited, produced nothing" from "an engine probe is mid-run in this dir,
+# between the agent exiting and a PR landing" — so before it calls DEAD it also checks (via lsof,
+# _status_dir_in_use) whether a live process still holds the worktree dir open, and reports 'inuse'
+# instead when one does. Grounded: the coordinator once force-removed a live verify's dir on the plain
+# DEAD signal, which cascaded into the HERD-500 checkout contamination.
 #
 # Uses say / the colour vars from bin/herd at CALL time (bash late-binds), and every colour is
 # referenced with a ${x:-} default so a standalone `set -u` source (the test) never trips on an
@@ -27,8 +32,8 @@
 
 # ── Pure classifiers (unit-tested by tests/test-status.sh) ───────────────────────────────────────
 
-# _status_classify_builder <has_agent 0|1> <agent_status> <has_pr 0|1> <commits> [liveness] — the
-# deterministic bucket for one feature worktree. Echoes exactly one token:
+# _status_classify_builder <has_agent 0|1> <agent_status> <has_pr 0|1> <commits> [liveness] [inuse 0|1]
+# — the deterministic bucket for one feature worktree. Echoes exactly one token:
 #   agentdead    — the agent SESSION is confirmed DEAD (its process is gone though herdr may still list
 #                  it, and even when an open PR exists): the HERD-114 signature. Surfaced distinctly
 #                  instead of a misleading done/idle so a review bounce is never sent into a dead pane.
@@ -39,14 +44,22 @@
 #                  session, so a vanished agent over real work is NOT 'done' — it is 'agent missing'
 #                  (distinct from 'agent dead' = pane present but unresponsive), so a refix bounce is
 #                  never attempted against nobody and the operator sees the truth (the #249 incident).
-#   dead     — no live agent record + no open PR + zero commits: the watcher's DEAD signature,
-#              replicated READ-ONLY (a silently-exited pre-PR builder that produced nothing).
+#   inuse    — HERD-501: the plain 'dead' signature (no agent, no PR, no commits) is TRUE, but a LIVE
+#              process still holds the worktree dir open (inuse=1) — an engine probe (a healthcheck /
+#              main-health worker) can be sitting in a builder's tree between the agent exiting and its
+#              PR landing. Grounded: the coordinator once force-removed a live verify's dir on the plain
+#              DEAD signal, destroying a still-running check and cascading into the HERD-500 checkout
+#              contamination. 'inuse' is deliberately distinct from — and never counted as — 'dead': it
+#              says "nothing has finished yet, but do not touch this directory."
+#   dead     — no live agent record + no open PR + zero commits + NO live process holding the dir: the
+#              watcher's DEAD signature, replicated READ-ONLY (a silently-exited pre-PR builder that
+#              produced nothing and that nothing else is using).
 #   building — a live agent is WORKING on it (no PR yet).
 #   done     — a LIVE agent is present and it reached its finish line (an open PR, agent-reported done,
 #              or commits produced). REQUIRES a live session in the roster (has_agent=1) — HERD-135.
 #   idle     — a live agent is present but not working and has produced no PR/commits yet.
 _status_classify_builder() {
-  local has_agent="${1:-0}" astatus="${2:-}" has_pr="${3:-0}" commits="${4:-0}" liveness="${5:-}"
+  local has_agent="${1:-0}" astatus="${2:-}" has_pr="${3:-0}" commits="${4:-0}" liveness="${5:-}" inuse="${6:-0}"
   case "$commits" in ''|*[!0-9]*) commits=0 ;; esac
   # A confirmed-dead agent session (process gone though herdr may still list it / a PR may be open) is
   # the HERD-114 signature — surface it distinctly. Never override a WORKING agent (a probe race).
@@ -55,9 +68,11 @@ _status_classify_builder() {
   fi
   # HERD-135: NO agent in the roster at all. 'done' requires a LIVE session, so a vanished agent is
   # never 'done'. If it produced work (open PR or commits) the tab lost its agent pane AFTER finishing:
-  # 'agent missing' — a refix would hit nobody. Nothing produced → the classic pre-PR 'dead' signature.
+  # 'agent missing' — a refix would hit nobody. Nothing produced → the classic pre-PR 'dead' signature,
+  # UNLESS a live process still holds the directory open (HERD-501) — that is 'in use', never 'dead'.
   if [ "$has_agent" != "1" ]; then
     { [ "$has_pr" = "1" ] || [ "$commits" -gt 0 ]; } && { printf 'agentmissing'; return 0; }
+    [ "$inuse" = "1" ] && { printf 'inuse'; return 0; }
     printf 'dead'; return 0
   fi
   # From here a LIVE agent is present (has_agent=1). An open PR is an unambiguous finish-line signal.
@@ -69,6 +84,22 @@ _status_classify_builder() {
   # Present but idle/other: done if it already produced commits, else genuinely idle.
   [ "$commits" -gt 0 ] && { printf 'done'; return 0; }
   printf 'idle'
+}
+
+# _status_dir_in_use <dir> — success iff a LIVE process holds <dir> (or anything under it) open, most
+# importantly as its CWD — an engine probe (a healthcheck / main-health worker) can be running against a
+# builder's worktree in the window between its agent exiting and a PR landing, which reads identically
+# to the DEAD signature (no agent, no PR, no commits) unless something checks for exactly this. Mirrors
+# sweep.sh's _sweep_dir_in_use (same lsof probe, same fail-soft "cannot check → proceed" bias) as its
+# own small INDEPENDENT copy, matching this file's own convention (see the DEAD-builder note at the top
+# of this file: a read-only replica, never a call into a sibling engine script, so the hermetic
+# standalone source stays self-contained). Seam: HERD_STATUS_DIR_INUSE_CMD (test stub). Without lsof we
+# cannot check and report "not in use" — byte-identical to the pre-HERD-501 classifier.
+_status_dir_in_use() {
+  local dir="${1:-}"; [ -n "$dir" ] || return 1
+  if [ -n "${HERD_STATUS_DIR_INUSE_CMD:-}" ]; then "$HERD_STATUS_DIR_INUSE_CMD" "$dir"; return $?; fi
+  command -v lsof >/dev/null 2>&1 || return 1
+  [ -n "$(lsof -t +D "$dir" 2>/dev/null | head -1)" ]  # pipe-ok: head in a command or process substitution; pipeline status not gated
 }
 
 # _status_latest_review <ledger-file> <pr> <sha> — echo the MOST-RECENT recorded review verdict
@@ -401,7 +432,7 @@ for wt, branch in feats:
 ' 2>/dev/null || true)"
 
   local n_build=0 n_done=0 n_idle=0 n_dead=0 builder_recs=""
-  local rec wt slug branch prnum mergeable mstate decision headsha astatus has_agent has_pr commits verdict liveness
+  local rec wt slug branch prnum mergeable mstate decision headsha astatus has_agent has_pr commits verdict liveness inuse
   while IFS= read -r rec; do
     [ -n "$rec" ] || continue
     IFS=$'\037' read -r wt slug branch prnum mergeable mstate decision headsha astatus <<EOF
@@ -419,7 +450,14 @@ EOF
     if [ "$has_agent" = "1" ] && [ "$astatus" != "working" ] && declare -f herd_driver_agent_liveness >/dev/null 2>&1; then
       liveness="$(herd_driver_agent_liveness "$slug" 2>/dev/null || printf 'unknown')"
     fi
-    verdict="$(_status_classify_builder "$has_agent" "$astatus" "$has_pr" "$commits" "$liveness")"
+    # HERD-501: only worth an lsof probe on the exact candidate the plain DEAD signature would fire for
+    # (no agent, no PR, no commits) — every other bucket already has a stronger signal and never reaches
+    # this check in the classifier, so skipping it elsewhere is byte-identical, not a missed guard.
+    inuse=0
+    if [ "$has_agent" != "1" ] && [ "$has_pr" != "1" ] && [ "$commits" -eq 0 ]; then
+      _status_dir_in_use "$wt" && inuse=1
+    fi
+    verdict="$(_status_classify_builder "$has_agent" "$astatus" "$has_pr" "$commits" "$liveness" "$inuse")"
     case "$verdict" in
       building)     n_build=$((n_build+1)) ;;
       done)         n_done=$((n_done+1)) ;;
@@ -427,6 +465,7 @@ EOF
       agentdead)    n_dead=$((n_dead+1)); attention=1; reasons="${reasons} agent-dead:${slug}" ;;
       agentmissing) n_dead=$((n_dead+1)); attention=1; reasons="${reasons} agent-missing:${slug}" ;;
       dead)         n_dead=$((n_dead+1)); attention=1; reasons="${reasons} dead-builder:${slug}" ;;
+      inuse)        : ;;  # HERD-501: informational only — a live process is using it, never a dead count / attention
     esac
     builder_recs="${builder_recs}BUILDER${US}${verdict}${US}${slug}${US}${prnum}"$'\n'
   done <<EOF
@@ -567,6 +606,7 @@ EOF
           agentdead)    builder_rows="${builder_rows}    ${r}💀 ${b}${sl}${x} ${r}AGENT DEAD (session unwakeable${bpr:+ · PR #$bpr}) — re-task by hand${x}"$'\n' ;;
           agentmissing) builder_rows="${builder_rows}    ${r}🫥 ${b}${sl}${x} ${r}AGENT MISSING (no agent pane${bpr:+ · PR #$bpr}) — re-task by hand${x}"$'\n' ;;
           dead)         builder_rows="${builder_rows}    ${r}💀 ${b}${sl}${x} ${r}DEAD (no agent, no PR, no commits)${x}"$'\n' ;;
+          inuse)        builder_rows="${builder_rows}    ${y}⚙ ${b}${sl}${x} ${y}engine · in use (no agent/PR/commits yet, but a live process holds this dir) — not dead${x}"$'\n' ;;
         esac
         ;;
       PRCOUNT)   n_prs="$rest" ;;
