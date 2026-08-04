@@ -63,6 +63,11 @@ _phase_anomaly_observe off_phase "off phase" 99999
 ok
 
 export ANOMALY_BASELINES=on
+# HERD-512: pin the per-phase FILING COOLDOWN off, so the legacy legs below keep exercising the
+# HONEST-IDENTITY dedup rail in isolation (with the 1800s default armed, step (3)'s repeat would be
+# withheld as result=cooldown before it ever reached the identity marker, and the assertion would be
+# testing the wrong rail). The cooldown itself has its own prove: tests/test-phase-anomaly-suspend-skip.sh.
+export ANOMALY_FILE_COOLDOWN_SECS=0
 
 # ── (1) under-learned: fewer than 5 prior readings never judges, however slow ───────────────────────
 : > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
