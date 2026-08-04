@@ -28,8 +28,10 @@
 #   herd_is_derived_path <path>   success iff <path> is derived (exact, repo-relative match)
 #   herd_strip_derived            filter: read paths on stdin, print only the NON-derived ones
 #
-# The rendered skill's basename follows COORDINATOR_CMD when the config is loaded; it falls back to
-# the shipped default (`coordinator`) so this library is safe to source with no config in scope.
+# The rendered coordinator skill's basename follows COORDINATOR_CMD when the config is loaded; it
+# falls back to the shipped default (`coordinator`) so this library is safe to source with no config
+# in scope. The /autopilot skill (HERD-515) renders from the same machinery under a FIXED basename
+# (no config key selects it), and is derived for exactly the same reasons.
 #
 # Sourced by sweep.sh, agent-watch.sh, and stale-dup-gate.sh — each of which may source it more than
 # once through their own source graph, hence the idempotence guard.
@@ -46,6 +48,7 @@ herd_derived_paths() {
   _dp_name="${_dp_name#/}"; _dp_name="${_dp_name:-coordinator}"
   printf '%s\n' \
     ".claude/commands/${_dp_name}.md" \
+    ".claude/commands/autopilot.md" \
     ".herd/config.local"
 }
 

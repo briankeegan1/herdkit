@@ -40,6 +40,11 @@
 # doctrine as .herd/config.local: consumers share the TEMPLATE, each machine renders its own artifact.
 .claude/commands/coordinator.md
 
+# Rendered /autopilot standing watch-and-drain skill (HERD-515) — same render machinery, same tokens,
+# same per-machine contract as the coordinator render above (templates/autopilot.md.tmpl is the
+# shared artifact; the render is never tracked).
+.claude/commands/autopilot.md
+
 # Per-user / per-machine .herd/config overlay (HERD-47) — sourced AFTER .herd/config so its keys
 # override the committed baseline; gitignored so a collaborator's local tuning never diverges main
 # or dirties the ff-only `herd update` pull. The baseline .herd/config stays tracked.
