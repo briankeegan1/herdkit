@@ -130,6 +130,62 @@ with open(archive, "w", encoding="utf-8") as f:
 PY
 }
 
+# _backend_hash_file <path> — a content hash for a working-tree file, "ABSENT" when it does not
+# exist. Tries the two shipped digests, then python3 (a hard engine dep — mirrors
+# create-retry.sh's _create_retry_hash_file). Never used for security, only for a cheap
+# changed-since-snapshot comparison, so any of the three is fine.
+_backend_hash_file() {
+    [ -f "$1" ] || { printf 'ABSENT'; return 0; }
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 1 < "$1" 2>/dev/null | cut -c1-40
+    elif command -v sha1sum >/dev/null 2>&1; then
+        sha1sum < "$1" 2>/dev/null | cut -c1-40
+    else
+        python3 -c 'import sys, hashlib
+print(hashlib.sha1(open(sys.argv[1], "rb").read()).hexdigest())' "$1" 2>/dev/null
+    fi
+}
+
+# _backend_snapshot_dirty <claimed-path> — HERD-514 (GH #627) delta-snapshot staging. Called from
+# scribe-step.sh's `next`, right after the atomic claim (and the post-claim `git pull`) — i.e. BEFORE
+# the scribe agent applies THIS request's edit — so _backend_add_item can later tell the request's own
+# edit surface apart from whatever was already dirty/untracked in the tree for unrelated reasons (the
+# #627 sweep). Writes one "<path><TAB><hash-or-ABSENT>" line per path `git status --porcelain` reports
+# right now, to "<claimed-path>.snapshot". Fail-soft: any failure here just means the snapshot is
+# missing or partial when _backend_add_item looks for it later, which it already treats as "fall back
+# to today's behavior, warn loudly" — never a crash, and never something that can block the claim.
+_backend_snapshot_dirty() {
+    local mine="$1" snap="${1}.snapshot"
+    # NOTE: the script is passed via `-c` (a string), not a `<<PY` heredoc — a heredoc would redirect
+    # stdin to the SCRIPT itself, leaving nothing on stdin for sys.stdin.read() to read the piped
+    # `git status` data from.
+    # --untracked-files=all: a brand-new untracked DIRECTORY otherwise collapses to one "?? dir/" line,
+    # which would hash as a non-file (ABSENT) both before and after a request adds a file inside it —
+    # indistinguishable, and the new file would wrongly read as "unchanged pre-existing". Expanding to
+    # per-file lines fixes that WITHOUT weakening nested-repo isolation: git still reports a nested
+    # repo's own directory as a single collapsed entry regardless of this flag (its own .git boundary),
+    # so _file_path_is_nested_repo's callers still see it as one path (tests/test-nested-repo-isolation.sh).
+    git status --porcelain=v1 --untracked-files=all 2>/dev/null | cut -c4- | SNAP="$snap" python3 -c '
+import hashlib, os, sys
+snap = os.environ["SNAP"]
+lines = []
+for path in sys.stdin.read().splitlines():
+    path = path.strip()
+    if not path:
+        continue
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        digest = "ABSENT"
+    lines.append(path + "\t" + digest)
+with open(snap, "w", encoding="utf-8") as f:
+    for line in lines:
+        f.write(line + "\n")
+' 2>/dev/null || rm -f "$snap" 2>/dev/null
+    return 0
+}
+
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID); $2 = short commit summary.
     # The agent has already edited $BACKLOG_FILE — and, for a multi-file request ("move this item to
@@ -137,6 +193,8 @@ _backend_add_item() {
     # into the archive, then stage EVERY changed path, commit, and push. Sets
     # _BACKEND_RESULT=DONE|NOCHANGE.
     local mine="$1" sum="$2" _changed _dirty_after _dirty_real
+    local _snap="${mine}.snapshot" _snap_ok=0 _snap_warned=0 _pre_hash _now_hash
+    [ -r "$_snap" ] && _snap_ok=1
     _backend_archive_shipped
     git add "$BACKLOG_FILE"
     # The archive file only exists once something has rotated out; stage it when present so the
@@ -154,6 +212,17 @@ _backend_add_item() {
     # tests/test-scribe-deny-paths.sh, which asserts exactly this). An unrelated NESTED git repo
     # (_file_path_is_nested_repo) is excluded too — staging it would silently swallow it as a gitlink
     # (HERD-435 / GH #547 / tests/test-nested-repo-isolation.sh).
+    # HERD-514 (GH #627): staging every OTHER changed path also swept in pre-existing dirty/untracked
+    # files that had NOTHING to do with this request (a live OAuth token sitting in the working tree,
+    # a stray .bak, …) — the inverse failure mode of #566, fixed by narrowing to the request's own EDIT
+    # SURFACE. _backend_snapshot_dirty (scribe-step.sh's `next`) recorded, BEFORE the agent touched
+    # anything, every path already dirty at claim time plus a content hash each — keyed by this same
+    # $mine. When that snapshot is readable, a candidate path here is staged only if it is NEW since
+    # the claim, or an already-dirty path this request edited FURTHER (its hash changed) — never a
+    # pre-existing path whose content is unchanged. A missing/unreadable snapshot (an older drainer, a
+    # disk hiccup) falls back to TODAY's behavior — stage every non-denied/non-nested path — with one
+    # loud warn + journal line so the coordinator can see the fallback happened; this is fail-soft, not
+    # a crash. See tests/test-scribe-edit-surface.sh for both inverse modes in one test.
     # herd-scope-ok: index-scoped — every path this loop stages is a NAMED `git add -- <path>` read
     # from `git status --porcelain`; nothing here stages by a repo-wide `-A`/`.`/`:/` selector
     # (HERD-435 / scripts/herd/git-scope-lint.sh).
@@ -161,8 +230,21 @@ _backend_add_item() {
         [ -n "$_changed" ] || continue
         _file_path_denied "$_changed" && continue
         _file_path_is_nested_repo "$_changed" && continue
+        if [ "$_snap_ok" = 1 ]; then
+            _pre_hash="$(awk -F'\t' -v p="$_changed" '$1==p{print $2; exit}' "$_snap" 2>/dev/null || true)"
+            if [ -n "$_pre_hash" ]; then
+                _now_hash="ABSENT"
+                [ -f "$_changed" ] && _now_hash="$(_backend_hash_file "$_changed" 2>/dev/null || true)"
+                [ "$_now_hash" = "$_pre_hash" ] && continue
+            fi
+        elif [ "$_snap_warned" = 0 ]; then
+            _snap_warned=1
+            echo "scribe-step: no edit-surface snapshot for '$mine' — falling back to staging every non-denied dirty path (a pre-existing unrelated file may ride along). [HERD-514]" >&2
+            command -v journal_append >/dev/null 2>&1 && journal_append scribe_snapshot_missing mine "$mine"
+        fi
         git add -- "$_changed" 2>/dev/null || true
-    done < <(git status --porcelain=v1 2>/dev/null | cut -c4-)
+    done < <(git status --porcelain=v1 --untracked-files=all 2>/dev/null | cut -c4-)
+    rm -f "$_snap" 2>/dev/null || true
     if git diff --cached --quiet; then
         _BACKEND_RESULT="NOCHANGE"
     else
@@ -176,7 +258,10 @@ _backend_add_item() {
         # never staged above) so they are filtered out here too; anything else still dirty right after
         # this commit is a real defect: warn loudly (never silent) and journal it so the coordinator
         # can find it without a human pasting a log.
-        _dirty_after="$(git status --porcelain 2>/dev/null)"
+        # --untracked-files=all (HERD-514): name the actual leftover FILE, not a collapsed "?? dir/" —
+        # a coordinator reading this warning needs to know which file didn't land, same reasoning as
+        # the snapshot/staging loop above.
+        _dirty_after="$(git status --porcelain --untracked-files=all 2>/dev/null)"
         _dirty_real=""
         while IFS= read -r _changed; do
             [ -n "$_changed" ] || continue
