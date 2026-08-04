@@ -15,7 +15,7 @@
 > • Same-file calls are omitted by design — this indexes CROSS-file reach only.
 > Treat it as a navigation aid (jump to a def, find likely callers), never as ground truth.
 
-- Functions indexed: 1655 (defined in >1 file: 37) · with cross-file callers: 284
+- Functions indexed: 1662 (defined in >1 file: 37) · with cross-file callers: 284
 
 ## Functions (def → cross-file callers)
 
@@ -23,35 +23,39 @@ Each entry: the function, its definition site(s), and every cross-file call site
 callers means no cross-file call was found (an internal helper, or a dynamic-dispatch caller
 this scan cannot see).
 
-- `_acquire_watcher_singleton` — def `scripts/herd/agent-watch.sh:14539` — callers: —
-- `_active_fix_note` — def `scripts/herd/agent-watch.sh:9319` — callers: —
-- `_active_resolve_note` — def `scripts/herd/agent-watch.sh:9312` — callers: —
-- `_adopt_branch_checked_out` — def `scripts/herd/agent-watch.sh:2071` — callers: —
-- `_adopt_branch_worktree_dir` — def `scripts/herd/agent-watch.sh:2082` — callers: —
-- `_adopt_failed_journaled` — def `scripts/herd/agent-watch.sh:2053` — callers: —
-- `_adopt_journal_failed` — def `scripts/herd/agent-watch.sh:2060` — callers: —
-- `_adopt_pr_mark_adopted` — def `scripts/herd/agent-watch.sh:2046` — callers: —
-- `_adopt_pr_recorded` — def `scripts/herd/agent-watch.sh:2040` — callers: —
-- `_adopt_remote_pr` — def `scripts/herd/agent-watch.sh:2141` — callers: —
-- `_adopt_remote_prs_enabled` — def `scripts/herd/agent-watch.sh:2029` — callers: —
-- `_adopt_remote_prs_scan` — def `scripts/herd/agent-watch.sh:2180` — callers: —
-- `_adopt_self_heal_mismatch` — def `scripts/herd/agent-watch.sh:2111` — callers: —
-- `_adopt_selfheal_failed_journaled` — def `scripts/herd/agent-watch.sh:2092` — callers: —
+- `_acquire_watcher_singleton` — def `scripts/herd/agent-watch.sh:14675` — callers: —
+- `_active_fix_note` — def `scripts/herd/agent-watch.sh:9455` — callers: —
+- `_active_resolve_note` — def `scripts/herd/agent-watch.sh:9448` — callers: —
+- `_adopt_branch_checked_out` — def `scripts/herd/agent-watch.sh:2076` — callers: —
+- `_adopt_branch_worktree_dir` — def `scripts/herd/agent-watch.sh:2087` — callers: —
+- `_adopt_failed_journaled` — def `scripts/herd/agent-watch.sh:2058` — callers: —
+- `_adopt_journal_failed` — def `scripts/herd/agent-watch.sh:2065` — callers: —
+- `_adopt_pr_mark_adopted` — def `scripts/herd/agent-watch.sh:2051` — callers: —
+- `_adopt_pr_recorded` — def `scripts/herd/agent-watch.sh:2045` — callers: —
+- `_adopt_remote_pr` — def `scripts/herd/agent-watch.sh:2146` — callers: —
+- `_adopt_remote_prs_enabled` — def `scripts/herd/agent-watch.sh:2034` — callers: —
+- `_adopt_remote_prs_scan` — def `scripts/herd/agent-watch.sh:2185` — callers: —
+- `_adopt_self_heal_mismatch` — def `scripts/herd/agent-watch.sh:2116` — callers: —
+- `_adopt_selfheal_failed_journaled` — def `scripts/herd/agent-watch.sh:2097` — callers: —
 - `_advise_degrade` — def `scripts/herd/herd-advise.sh:86` — callers: —
 - `_advise_usage` — def `scripts/herd/herd-advise.sh:37` — callers: —
-- `_agent_liveness` — def `scripts/herd/agent-watch.sh:9438` — callers: —
-- `_agent_status` — def `scripts/herd/agent-watch.sh:9416` — callers: —
+- `_agent_liveness` — def `scripts/herd/agent-watch.sh:9574` — callers: —
+- `_agent_status` — def `scripts/herd/agent-watch.sh:9552` — callers: —
 - `_agent_update_cli` — def `scripts/herd/agent-update.sh:178` — callers: —
 - `_agent_update_is_darwin` — def `scripts/herd/agent-update.sh:29` — callers: —
 - `_agent_update_os` — def `scripts/herd/agent-update.sh:25` — callers: —
 - `_agent_update_realpath` — def `scripts/herd/agent-update.sh:36` — callers: —
-- `_aging_decorate_row` — def `scripts/herd/agent-watch.sh:4605` — callers: —
-- `_aging_noted_file` — def `scripts/herd/agent-watch.sh:4592` — callers: —
-- `_aging_pr_armed` — def `scripts/herd/aging-pr.sh:28` — callers: `scripts/herd/agent-watch.sh:4607`
-- `_aging_pr_over_ttl` — def `scripts/herd/aging-pr.sh:38` — callers: `scripts/herd/agent-watch.sh:4622`
-- `_aging_pr_ttl_secs` — def `scripts/herd/aging-pr.sh:19` — callers: `scripts/herd/agent-watch.sh:4643`, `scripts/herd/journal-audit.sh:128`
-- `_aging_seen_file` — def `scripts/herd/agent-watch.sh:4589` — callers: —
-- `_anomaly_baselines_enabled` — def `scripts/herd/agent-watch.sh:7354` — callers: —
+- `_aging_decorate_row` — def `scripts/herd/agent-watch.sh:4610` — callers: —
+- `_aging_noted_file` — def `scripts/herd/agent-watch.sh:4597` — callers: —
+- `_aging_pr_armed` — def `scripts/herd/aging-pr.sh:28` — callers: `scripts/herd/agent-watch.sh:4612`
+- `_aging_pr_over_ttl` — def `scripts/herd/aging-pr.sh:38` — callers: `scripts/herd/agent-watch.sh:4627`
+- `_aging_pr_ttl_secs` — def `scripts/herd/aging-pr.sh:19` — callers: `scripts/herd/agent-watch.sh:4648`, `scripts/herd/journal-audit.sh:128`
+- `_aging_seen_file` — def `scripts/herd/agent-watch.sh:4594` — callers: —
+- `_anomaly_baselines_enabled` — def `scripts/herd/agent-watch.sh:7359` — callers: —
+- `_anomaly_file_cooldown_secs` — def `scripts/herd/agent-watch.sh:7487` — callers: —
+- `_anomaly_file_in_cooldown` — def `scripts/herd/agent-watch.sh:7502` — callers: —
+- `_anomaly_file_stamp` — def `scripts/herd/agent-watch.sh:7517` — callers: —
+- `_anomaly_file_stamp_path` — def `scripts/herd/agent-watch.sh:7494` — callers: —
 - `_append` — def `scripts/herd/ledger.sh:84` — callers: —
 - `_approvals_file` — def `scripts/herd/approvals.sh:33` — callers: `scripts/herd/agent-watch.sh:358`, `scripts/herd/herd-approve.sh:50`
 - `_archetype_ask` — def `bin/herd:205` — callers: —
@@ -63,7 +67,7 @@ this scan cannot see).
 - `_backend_item_missing` — def `scripts/herd/backends/linear.sh:761` — callers: `scripts/herd/sweep.sh:1153`
 - `_backend_item_state` — def `scripts/herd/backends/changelog.sh:76`, `scripts/herd/backends/file.sh:323`, `scripts/herd/backends/github.sh:215`, `scripts/herd/backends/jira.sh:560`, `scripts/herd/backends/linear.sh:787` — callers: `bin/herd:5213`, `scripts/herd/dep-watcher.sh:133`, `scripts/herd/herd-claim.sh:124`
 - `_backend_list_closed` — def `scripts/herd/backends/linear.sh:597` — callers: `bin/herd:4605`
-- `_backend_list_inbox_comments` — def `scripts/herd/backends/linear.sh:1215` — callers: `scripts/herd/agent-watch.sh:1641`
+- `_backend_list_inbox_comments` — def `scripts/herd/backends/linear.sh:1215` — callers: `scripts/herd/agent-watch.sh:1646`
 - `_backend_list_open` — def `scripts/herd/backends/changelog.sh:67`, `scripts/herd/backends/file.sh:291`, `scripts/herd/backends/github.sh:203`, `scripts/herd/backends/jira.sh:452`, `scripts/herd/backends/linear.sh:558` — callers: `bin/herd:4600`, `bin/herd:4615`, `bin/herd:4622`, `bin/herd:4627`, `bin/herd:4849`, `bin/herd:4873`, `bin/herd:5445`
 - `_backend_list_open_rich` — def `scripts/herd/backends/jira.sh:468`, `scripts/herd/backends/linear.sh:624` — callers: `bin/herd:4613`
 - `_backend_list_queued` — def `scripts/herd/backends/file.sh:660`, `scripts/herd/backends/github.sh:470`, `scripts/herd/backends/jira.sh:754`, `scripts/herd/backends/linear.sh:1164` — callers: `bin/herd:4649`
@@ -74,42 +78,42 @@ this scan cannot see).
 - `_backend_show_item` — def `scripts/herd/backends/jira.sh:513`, `scripts/herd/backends/linear.sh:678` — callers: `bin/herd:4619`
 - `_backend_tw_journal` — def `scripts/herd/backends/file.sh:49`, `scripts/herd/backends/github.sh:36`, `scripts/herd/backends/jira.sh:70`, `scripts/herd/backends/linear.sh:68` — callers: —
 - `_backend_unqueue_item` — def `scripts/herd/backends/file.sh:625`, `scripts/herd/backends/github.sh:427`, `scripts/herd/backends/jira.sh:724`, `scripts/herd/backends/linear.sh:1107` — callers: `bin/herd:4684`
-- `_backend_update_state` — def `scripts/herd/backends/changelog.sh:59`, `scripts/herd/backends/github.sh:134`, `scripts/herd/backends/jira.sh:374`, `scripts/herd/backends/linear.sh:430` — callers: `scripts/herd/agent-watch.sh:5686`, `scripts/herd/scribe-step.sh:511`, `scripts/herd/tracker-state-sweep.sh:214`
+- `_backend_update_state` — def `scripts/herd/backends/changelog.sh:59`, `scripts/herd/backends/github.sh:134`, `scripts/herd/backends/jira.sh:374`, `scripts/herd/backends/linear.sh:430` — callers: `scripts/herd/agent-watch.sh:5691`, `scripts/herd/scribe-step.sh:511`, `scripts/herd/tracker-state-sweep.sh:214`
 - `_baseline_all_inherited` — def `scripts/herd/healthcheck.sh:241` — callers: —
 - `_baseline_aware_enabled` — def `scripts/herd/healthcheck.sh:219` — callers: —
 - `_baseline_base_set` — def `scripts/herd/healthcheck.sh:265` — callers: —
 - `_baseline_notok_set` — def `scripts/herd/healthcheck.sh:232` — callers: —
 - `_baseline_sandbox_note` — def `scripts/herd/healthcheck.sh:250` — callers: —
-- `_bg_health_worker` — def `scripts/herd/agent-watch.sh:3314` — callers: —
-- `_bg_new_session` — def `scripts/herd/agent-watch.sh:3274` — callers: —
-- `_blk_trim` — def `scripts/herd/agent-watch.sh:2617` — callers: —
+- `_bg_health_worker` — def `scripts/herd/agent-watch.sh:3319` — callers: —
+- `_bg_new_session` — def `scripts/herd/agent-watch.sh:3279` — callers: —
+- `_blk_trim` — def `scripts/herd/agent-watch.sh:2622` — callers: —
 - `_block` — def `scripts/herd/governance-hook.sh:58` — callers: —
-- `_branch_mismatch_text` — def `scripts/herd/agent-watch.sh:14155` — callers: —
-- `_breaker_cooldown` — def `scripts/herd/agent-watch.sh:3483` — callers: —
-- `_breaker_enabled` — def `scripts/herd/agent-watch.sh:3475` — callers: —
-- `_breaker_gate` — def `scripts/herd/agent-watch.sh:3562` — callers: —
-- `_breaker_read` — def `scripts/herd/agent-watch.sh:3494` — callers: —
-- `_breaker_record_infra` — def `scripts/herd/agent-watch.sh:3511` — callers: —
-- `_breaker_record_ok` — def `scripts/herd/agent-watch.sh:3536` — callers: —
-- `_breaker_write` — def `scripts/herd/agent-watch.sh:3503` — callers: —
+- `_branch_mismatch_text` — def `scripts/herd/agent-watch.sh:14291` — callers: —
+- `_breaker_cooldown` — def `scripts/herd/agent-watch.sh:3488` — callers: —
+- `_breaker_enabled` — def `scripts/herd/agent-watch.sh:3480` — callers: —
+- `_breaker_gate` — def `scripts/herd/agent-watch.sh:3567` — callers: —
+- `_breaker_read` — def `scripts/herd/agent-watch.sh:3499` — callers: —
+- `_breaker_record_infra` — def `scripts/herd/agent-watch.sh:3516` — callers: —
+- `_breaker_record_ok` — def `scripts/herd/agent-watch.sh:3541` — callers: —
+- `_breaker_write` — def `scripts/herd/agent-watch.sh:3508` — callers: —
 - `_build_request` — def `scripts/herd/backlog-reconcile-sweep.sh:304`, `scripts/herd/backlog-reconcile.sh:168` — callers: —
-- `_builder_note_row` — def `scripts/herd/agent-watch.sh:1783` — callers: —
-- `_builder_notes_journal` — def `scripts/herd/agent-watch.sh:1676` — callers: —
-- `_builder_notes_scan` — def `scripts/herd/agent-watch.sh:1685` — callers: —
-- `_cand_gates_ready` — def `scripts/herd/agent-watch.sh:4339` — callers: —
+- `_builder_note_row` — def `scripts/herd/agent-watch.sh:1788` — callers: —
+- `_builder_notes_journal` — def `scripts/herd/agent-watch.sh:1681` — callers: —
+- `_builder_notes_scan` — def `scripts/herd/agent-watch.sh:1690` — callers: —
+- `_cand_gates_ready` — def `scripts/herd/agent-watch.sh:4344` — callers: —
 - `_changed_files` — def `scripts/herd/healthcheck.sh:185` — callers: —
 - `_changelog_ensure_unreleased` — def `scripts/herd/backends/changelog.sh:13` — callers: —
-- `_checkout_exempt_backlog` — def `scripts/herd/agent-watch.sh:6572` — callers: —
-- `_checkout_guard_enabled` — def `scripts/herd/agent-watch.sh:6592` — callers: —
-- `_checkout_guard_heal` — def `scripts/herd/agent-watch.sh:6607` — callers: —
-- `_checkout_offenders` — def `scripts/herd/agent-watch.sh:6554` — callers: `scripts/herd/herd-config.sh:720`
-- `_ci_checks_normalize` — def `scripts/herd/agent-watch.sh:4478` — callers: —
-- `_ci_checks_noted` — def `scripts/herd/agent-watch.sh:4447` — callers: —
-- `_ci_fastbounce_enabled` — def `scripts/herd/agent-watch.sh:9922` — callers: —
-- `_ci_fastbounce_identity` — def `scripts/herd/agent-watch.sh:9939` — callers: —
-- `_ci_gate_eval` — def `scripts/herd/agent-watch.sh:4537` — callers: —
-- `_ci_names_summary` — def `scripts/herd/agent-watch.sh:4520` — callers: —
-- `_ci_record_checked` — def `scripts/herd/agent-watch.sh:4454` — callers: —
+- `_checkout_exempt_backlog` — def `scripts/herd/agent-watch.sh:6577` — callers: —
+- `_checkout_guard_enabled` — def `scripts/herd/agent-watch.sh:6597` — callers: —
+- `_checkout_guard_heal` — def `scripts/herd/agent-watch.sh:6612` — callers: —
+- `_checkout_offenders` — def `scripts/herd/agent-watch.sh:6559` — callers: `scripts/herd/herd-config.sh:720`
+- `_ci_checks_normalize` — def `scripts/herd/agent-watch.sh:4483` — callers: —
+- `_ci_checks_noted` — def `scripts/herd/agent-watch.sh:4452` — callers: —
+- `_ci_fastbounce_enabled` — def `scripts/herd/agent-watch.sh:10058` — callers: —
+- `_ci_fastbounce_identity` — def `scripts/herd/agent-watch.sh:10075` — callers: —
+- `_ci_gate_eval` — def `scripts/herd/agent-watch.sh:4542` — callers: —
+- `_ci_names_summary` — def `scripts/herd/agent-watch.sh:4525` — callers: —
+- `_ci_record_checked` — def `scripts/herd/agent-watch.sh:4459` — callers: —
 - `_ci_repair_truthy` — def `scripts/herd/ci-repair.sh:62` — callers: —
 - `_cl_build_unreleased_body` — def `scripts/herd/changelog.sh:231` — callers: —
 - `_cl_collect_merges` — def `scripts/herd/changelog.sh:174` — callers: —
@@ -122,17 +126,17 @@ this scan cannot see).
 - `_cl_strip_pr_suffix` — def `scripts/herd/changelog.sh:168` — callers: —
 - `_cl_subjects_file` — def `scripts/herd/changelog.sh:109` — callers: —
 - `_class_rank` — def `scripts/herd/oss-triage.sh:66` — callers: —
-- `_classify_builder` — def `scripts/herd/agent-watch.sh:11426` — callers: —
-- `_classify_conflict` — def `scripts/herd/agent-watch.sh:5495` — callers: —
-- `_classify_dead_builder` — def `scripts/herd/agent-watch.sh:11569` — callers: —
-- `_classify_finish_stall` — def `scripts/herd/agent-watch.sh:12322` — callers: —
-- `_classify_respawn` — def `scripts/herd/agent-watch.sh:11767` — callers: —
-- `_classify_review_tier` — def `scripts/herd/work-units/git-pr.sh:92` — callers: `scripts/herd/agent-watch.sh:3132`
-- `_classify_wedged_builder` — def `scripts/herd/agent-watch.sh:12059` — callers: —
-- `_claude_exec_hung` — def `scripts/herd/agent-watch.sh:3648` — callers: —
-- `_claude_hang_clear` — def `scripts/herd/agent-watch.sh:3672` — callers: —
-- `_claude_probe_run_timeout` — def `scripts/herd/agent-watch.sh:3618` — callers: —
-- `_claude_probe_secs` — def `scripts/herd/agent-watch.sh:3606` — callers: —
+- `_classify_builder` — def `scripts/herd/agent-watch.sh:11562` — callers: —
+- `_classify_conflict` — def `scripts/herd/agent-watch.sh:5500` — callers: —
+- `_classify_dead_builder` — def `scripts/herd/agent-watch.sh:11705` — callers: —
+- `_classify_finish_stall` — def `scripts/herd/agent-watch.sh:12458` — callers: —
+- `_classify_respawn` — def `scripts/herd/agent-watch.sh:11903` — callers: —
+- `_classify_review_tier` — def `scripts/herd/work-units/git-pr.sh:92` — callers: `scripts/herd/agent-watch.sh:3137`
+- `_classify_wedged_builder` — def `scripts/herd/agent-watch.sh:12195` — callers: —
+- `_claude_exec_hung` — def `scripts/herd/agent-watch.sh:3653` — callers: —
+- `_claude_hang_clear` — def `scripts/herd/agent-watch.sh:3677` — callers: —
+- `_claude_probe_run_timeout` — def `scripts/herd/agent-watch.sh:3623` — callers: —
+- `_claude_probe_secs` — def `scripts/herd/agent-watch.sh:3611` — callers: —
 - `_cm_config_pairs` — def `scripts/herd/codemap.sh:134` — callers: —
 - `_cm_detect_lang` — def `scripts/herd/codemap.sh:252` — callers: —
 - `_cm_env_pairs` — def `scripts/herd/codemap.sh:480` — callers: —
@@ -148,11 +152,11 @@ this scan cannot see).
 - `_cm_srcfiles` — def `scripts/herd/codemap.sh:264` — callers: —
 - `_cmd_report` — def `scripts/herd/oss-triage.sh:320` — callers: —
 - `_cmd_run` — def `scripts/herd/oss-triage.sh:328` — callers: —
-- `_codemap_auto` — def `scripts/herd/agent-watch.sh:683` — callers: —
+- `_codemap_auto` — def `scripts/herd/agent-watch.sh:688` — callers: —
 - `_collect_and_write_shortlist` — def `scripts/herd/oss-triage.sh:239` — callers: —
-- `_collect_main_health` — def `scripts/herd/agent-watch.sh:8062` — callers: —
+- `_collect_main_health` — def `scripts/herd/agent-watch.sh:8198` — callers: —
 - `_combine_verdicts` — def `scripts/herd/herd-review.sh:361` — callers: —
-- `_compose_block_reason` — def `scripts/herd/agent-watch.sh:2664` — callers: —
+- `_compose_block_reason` — def `scripts/herd/agent-watch.sh:2669` — callers: —
 - `_config_adopt_additive` — def `bin/herd:2590` — callers: —
 - `_config_caps_file` — def `bin/herd:2217` — callers: —
 - `_config_effective_value` — def `bin/herd:2497` — callers: —
@@ -179,25 +183,25 @@ this scan cannot see).
 - `_config_template_keys` — def `bin/herd:2559` — callers: —
 - `_config_validate_value` — def `bin/herd:2306` — callers: —
 - `_config_when_to_surface` — def `bin/herd:2418` — callers: —
-- `_conflict_row` — def `scripts/herd/agent-watch.sh:5478` — callers: —
+- `_conflict_row` — def `scripts/herd/agent-watch.sh:5483` — callers: —
 - `_conformance_analyze` — def `bin/herd:4036` — callers: —
 - `_conformance_class_file` — def `bin/herd:4019` — callers: —
 - `_conformance_class_violations` — def `bin/herd:4090` — callers: —
 - `_conformance_map_file` — def `bin/herd:4018` — callers: —
 - `_conformance_out` — def `bin/herd:4021` — callers: —
 - `_conformance_root` — def `bin/herd:4020` — callers: —
-- `_console_now_epoch` — def `scripts/herd/console-section.sh:32` — callers: `scripts/herd/agent-watch.sh:1860`, `scripts/herd/agent-watch.sh:1960`, `scripts/herd/status.sh:201`
+- `_console_now_epoch` — def `scripts/herd/console-section.sh:32` — callers: `scripts/herd/agent-watch.sh:1865`, `scripts/herd/agent-watch.sh:1965`, `scripts/herd/status.sh:201`
 - `_console_reverse_file` — def `scripts/herd/console-section.sh:33` — callers: —
 - `_consume_nearmiss_verdict` — def `scripts/herd/herd-review.sh:679` — callers: —
 - `_coord_die` — def `scripts/herd/coordinator.sh:42` — callers: —
-- `_coordinator_launch_lock_acquire` — def `scripts/herd/agent-watch.sh:11164` — callers: —
-- `_coordinator_launch_lock_release` — def `scripts/herd/agent-watch.sh:11173` — callers: —
-- `_coordinator_pane_id` — def `scripts/herd/agent-watch.sh:11159` — callers: —
+- `_coordinator_launch_lock_acquire` — def `scripts/herd/agent-watch.sh:11300` — callers: —
+- `_coordinator_launch_lock_release` — def `scripts/herd/agent-watch.sh:11309` — callers: —
+- `_coordinator_pane_id` — def `scripts/herd/agent-watch.sh:11295` — callers: —
 - `_cost_emit_merge_impl` — def `scripts/herd/cost.sh:399` — callers: —
-- `_cost_transcript_dir` — def `scripts/herd/cost.sh:281` — callers: `bin/herd:7473`, `scripts/herd/agent-watch.sh:8939`
-- `_count_gate_workers` — def `scripts/herd/agent-watch.sh:6044` — callers: —
-- `_count_live_healthchecks` — def `scripts/herd/agent-watch.sh:13200` — callers: —
-- `_count_live_reviews` — def `scripts/herd/agent-watch.sh:3144` — callers: —
+- `_cost_transcript_dir` — def `scripts/herd/cost.sh:281` — callers: `bin/herd:7473`, `scripts/herd/agent-watch.sh:9075`
+- `_count_gate_workers` — def `scripts/herd/agent-watch.sh:6049` — callers: —
+- `_count_live_healthchecks` — def `scripts/herd/agent-watch.sh:13336` — callers: —
+- `_count_live_reviews` — def `scripts/herd/agent-watch.sh:3149` — callers: —
 - `_create_retry_backoff` — def `scripts/herd/create-retry.sh:168` — callers: —
 - `_create_retry_hash` — def `scripts/herd/create-retry.sh:67` — callers: —
 - `_create_retry_hash_file` — def `scripts/herd/create-retry.sh:190` — callers: —
@@ -205,8 +209,8 @@ this scan cannot see).
 - `_create_retry_meta_set` — def `scripts/herd/create-retry.sh:154` — callers: —
 - `_create_retry_now` — def `scripts/herd/create-retry.sh:59` — callers: —
 - `_create_retry_write_failed` — def `scripts/herd/create-retry.sh:182` — callers: —
-- `_cross_seat_block_row` — def `scripts/herd/agent-watch.sh:4087` — callers: —
-- `_cross_seat_block_standing` — def `scripts/herd/agent-watch.sh:4028` — callers: —
+- `_cross_seat_block_row` — def `scripts/herd/agent-watch.sh:4092` — callers: —
+- `_cross_seat_block_standing` — def `scripts/herd/agent-watch.sh:4033` — callers: —
 - `_cv_caps_file` — def `scripts/herd/config-viability.sh:68` — callers: —
 - `_cv_coupled_keys` — def `scripts/herd/config-viability.sh:85` — callers: —
 - `_cv_doctor_render_rows` — def `scripts/herd/config-viability.sh:390` — callers: —
@@ -223,15 +227,15 @@ this scan cannot see).
 - `_cv_report_merge` — def `scripts/herd/config-viability.sh:335` — callers: —
 - `_cv_report_path` — def `scripts/herd/config-viability.sh:326` — callers: —
 - `_cv_required_check_list` — def `scripts/herd/config-viability.sh:149` — callers: —
-- `_dead_autorespawn_on` — def `scripts/herd/agent-watch.sh:11730` — callers: —
-- `_dead_grace_secs` — def `scripts/herd/agent-watch.sh:11475` — callers: —
-- `_dead_upsert` — def `scripts/herd/agent-watch.sh:11497` — callers: —
-- `_defer_for_suite` — def `scripts/herd/agent-watch.sh:9497` — callers: —
+- `_dead_autorespawn_on` — def `scripts/herd/agent-watch.sh:11866` — callers: —
+- `_dead_grace_secs` — def `scripts/herd/agent-watch.sh:11611` — callers: —
+- `_dead_upsert` — def `scripts/herd/agent-watch.sh:11633` — callers: —
+- `_defer_for_suite` — def `scripts/herd/agent-watch.sh:9633` — callers: —
 - `_delete_branch_flag` — def `scripts/herd/work-units/git-pr.sh:131` — callers: —
-- `_delta_is_integration_only` — def `scripts/herd/agent-watch.sh:2527` — callers: —
-- `_delta_main_ref` — def `scripts/herd/agent-watch.sh:2512` — callers: —
-- `_delta_review_enabled` — def `scripts/herd/agent-watch.sh:2494` — callers: —
-- `_dep_state_style` — def `scripts/herd/agent-watch.sh:852` — callers: —
+- `_delta_is_integration_only` — def `scripts/herd/agent-watch.sh:2532` — callers: —
+- `_delta_main_ref` — def `scripts/herd/agent-watch.sh:2517` — callers: —
+- `_delta_review_enabled` — def `scripts/herd/agent-watch.sh:2499` — callers: —
+- `_dep_state_style` — def `scripts/herd/agent-watch.sh:857` — callers: —
 - `_deps_ensure_file` — def `bin/herd:5178` — callers: —
 - `_deps_epoch` — def `bin/herd:5152` — callers: —
 - `_deps_file_path` — def `bin/herd:5155` — callers: —
@@ -242,19 +246,19 @@ this scan cannot see).
 - `_deps_set_kind` — def `scripts/herd/deps-parse.sh:36` — callers: `bin/herd:5226`, `bin/herd:5298`
 - `_deps_state` — def `bin/herd:5198` — callers: —
 - `_deps_validate_ref` — def `bin/herd:5170` — callers: —
-- `_detect_limit_hit` — def `scripts/herd/agent-watch.sh:10831` — callers: —
+- `_detect_limit_hit` — def `scripts/herd/agent-watch.sh:10967` — callers: —
 - `_die` — def `scripts/herd/changelog.sh:39`, `scripts/herd/oss-triage.sh:38` — callers: —
 - `_die_usage` — def `scripts/herd/ledger.sh:63` — callers: —
-- `_discard_stale_health` — def `scripts/herd/agent-watch.sh:13360` — callers: —
-- `_discard_stale_reviews` — def `scripts/herd/agent-watch.sh:3243` — callers: —
-- `_discover_feature_worktrees` — def `scripts/herd/agent-watch.sh:14208` — callers: —
-- `_dispatch_review` — def `scripts/herd/agent-watch.sh:3391` — callers: —
+- `_discard_stale_health` — def `scripts/herd/agent-watch.sh:13496` — callers: —
+- `_discard_stale_reviews` — def `scripts/herd/agent-watch.sh:3248` — callers: —
+- `_discover_feature_worktrees` — def `scripts/herd/agent-watch.sh:14344` — callers: —
+- `_dispatch_review` — def `scripts/herd/agent-watch.sh:3396` — callers: —
 - `_dm_reap_unsafe` — def `scripts/herd/work-units/git-pr.sh:194` — callers: —
-- `_draft_auto_promote_enabled` — def `scripts/herd/agent-watch.sh:12697` — callers: —
-- `_draft_promote_once` — def `scripts/herd/agent-watch.sh:12709` — callers: —
-- `_draft_promote_pr` — def `scripts/herd/agent-watch.sh:12723` — callers: —
-- `_drain_lane_worker` — def `scripts/herd/agent-watch.sh:15698` — callers: —
-- `_drain_spawn_queue` — def `scripts/herd/agent-watch.sh:15740` — callers: —
+- `_draft_auto_promote_enabled` — def `scripts/herd/agent-watch.sh:12833` — callers: —
+- `_draft_promote_once` — def `scripts/herd/agent-watch.sh:12845` — callers: —
+- `_draft_promote_pr` — def `scripts/herd/agent-watch.sh:12859` — callers: —
+- `_drain_lane_worker` — def `scripts/herd/agent-watch.sh:15834` — callers: —
+- `_drain_spawn_queue` — def `scripts/herd/agent-watch.sh:15876` — callers: —
 - `_dw_check_state` — def `scripts/herd/dep-watcher.sh:109` — callers: —
 - `_dw_clear_since` — def `scripts/herd/dep-watcher.sh:90` — callers: —
 - `_dw_derive_state` — def `scripts/herd/dep-watcher.sh:138` — callers: —
@@ -267,20 +271,20 @@ this scan cannot see).
 - `_dw_warn` — def `scripts/herd/dep-watcher.sh:71` — callers: —
 - `_dw_write_states` — def `scripts/herd/dep-watcher.sh:176` — callers: —
 - `_effective` — def `scripts/herd/governance-drift-sweep.sh:71` — callers: —
-- `_effective_health_pane` — def `scripts/herd/agent-watch.sh:4842` — callers: —
-- `_effective_human_verify_policy` — def `scripts/herd/agent-watch.sh:656` — callers: —
-- `_effective_merge_policy` — def `scripts/herd/merge-policy.sh:35` — callers: `bin/herd:6533`, `scripts/herd/agent-watch.sh:610`, `scripts/herd/agent-watch.sh:15187`, `scripts/herd/posture-lint.sh:60`, `scripts/herd/posture-lint.sh:77`, `scripts/herd/posture-lint.sh:139`
+- `_effective_health_pane` — def `scripts/herd/agent-watch.sh:4847` — callers: —
+- `_effective_human_verify_policy` — def `scripts/herd/agent-watch.sh:661` — callers: —
+- `_effective_merge_policy` — def `scripts/herd/merge-policy.sh:35` — callers: `bin/herd:6533`, `scripts/herd/agent-watch.sh:615`, `scripts/herd/agent-watch.sh:15323`, `scripts/herd/posture-lint.sh:60`, `scripts/herd/posture-lint.sh:77`, `scripts/herd/posture-lint.sh:139`
 - `_effective_resolve_claim` — def `scripts/herd/resolver-claim.sh:36` — callers: —
-- `_effective_resolver_pane` — def `scripts/herd/resolver-pane.sh:21` — callers: `scripts/herd/agent-watch.sh:4764`, `scripts/herd/herd-resolve.sh:82`
+- `_effective_resolver_pane` — def `scripts/herd/resolver-pane.sh:21` — callers: `scripts/herd/agent-watch.sh:4769`, `scripts/herd/herd-resolve.sh:82`
 - `_emit_verdict` — def `scripts/herd/herd-review.sh:227` — callers: —
-- `_engine_pause_config_value` — def `scripts/herd/agent-watch.sh:14714` — callers: —
-- `_engine_paused` — def `scripts/herd/agent-watch.sh:14735` — callers: —
-- `_engine_seat_reconcile_tick` — def `scripts/herd/agent-watch.sh:1003` — callers: —
-- `_engine_tick_watchdog` — def `scripts/herd/agent-watch.sh:14742` — callers: —
+- `_engine_pause_config_value` — def `scripts/herd/agent-watch.sh:14850` — callers: —
+- `_engine_paused` — def `scripts/herd/agent-watch.sh:14871` — callers: —
+- `_engine_seat_reconcile_tick` — def `scripts/herd/agent-watch.sh:1008` — callers: —
+- `_engine_tick_watchdog` — def `scripts/herd/agent-watch.sh:14878` — callers: —
 - `_enqueue_research` — def `scripts/herd/oss-triage.sh:135` — callers: —
 - `_ensure_dir` — def `scripts/herd/oss-triage.sh:77` — callers: —
 - `_ensure_gitignored` — def `bin/herd:335` — callers: `scripts/herd/fleet.sh:244`, `scripts/herd/fleet.sh:245`
-- `_escalate_refix_stuck` — def `scripts/herd/agent-watch.sh:9285` — callers: —
+- `_escalate_refix_stuck` — def `scripts/herd/agent-watch.sh:9421` — callers: —
 - `_file_claim_verify` — def `scripts/herd/backends/file.sh:440` — callers: —
 - `_file_line_for_slug` — def `scripts/herd/backends/file.sh:308` — callers: —
 - `_file_marker_commit` — def `scripts/herd/backends/file.sh:678` — callers: —
@@ -288,29 +292,29 @@ this scan cannot see).
 - `_file_path_is_nested_repo` — def `scripts/herd/backends/file.sh:40` — callers: —
 - `_file_release_abort` — def `scripts/herd/backends/file.sh:465` — callers: —
 - `_file_remote_configured` — def `scripts/herd/backends/file.sh:458` — callers: —
-- `_file_size` — def `scripts/herd/agent-watch.sh:11297`, `scripts/herd/agent-watch.sh:11301` — callers: —
-- `_find_builder_pane_id` — def `scripts/herd/agent-watch.sh:9397` — callers: —
-- `_find_builder_pane_id_any` — def `scripts/herd/agent-watch.sh:10658` — callers: —
-- `_finish_stall_action_once` — def `scripts/herd/agent-watch.sh:12544` — callers: —
-- `_finish_stall_clear` — def `scripts/herd/agent-watch.sh:12394` — callers: —
-- `_finish_stall_commits_ahead` — def `scripts/herd/agent-watch.sh:12274` — callers: —
-- `_finish_stall_dirty` — def `scripts/herd/agent-watch.sh:12291` — callers: —
-- `_finish_stall_enabled` — def `scripts/herd/agent-watch.sh:12259` — callers: `scripts/herd/work-units/git-pr.sh:378`
-- `_finish_stall_grace_secs` — def `scripts/herd/agent-watch.sh:12262` — callers: —
-- `_finish_stall_mark` — def `scripts/herd/agent-watch.sh:12359` — callers: —
-- `_finish_stall_min` — def `scripts/herd/agent-watch.sh:12251` — callers: —
-- `_finish_stall_note_escape` — def `scripts/herd/agent-watch.sh:12413` — callers: —
-- `_finish_stall_note_pr_opened` — def `scripts/herd/agent-watch.sh:12432` — callers: —
-- `_finish_stall_note_still_working` — def `scripts/herd/agent-watch.sh:12458` — callers: —
-- `_finish_stall_record` — def `scripts/herd/agent-watch.sh:12347` — callers: —
-- `_finish_stall_reset` — def `scripts/herd/agent-watch.sh:12384` — callers: —
-- `_finish_stall_retask` — def `scripts/herd/agent-watch.sh:12512` — callers: —
-- `_finish_stall_scan_summary` — def `scripts/herd/agent-watch.sh:12484` — callers: —
-- `_finish_stall_state` — def `scripts/herd/agent-watch.sh:12373` — callers: —
-- `_finish_stall_wake_prompt` — def `scripts/herd/agent-watch.sh:12498` — callers: —
-- `_flair_celebration_line` — def `scripts/herd/agent-watch.sh:1395` — callers: —
-- `_flair_enabled` — def `scripts/herd/agent-watch.sh:1366` — callers: `scripts/herd/work-units/git-pr.sh:294`
-- `_flair_glyph` — def `scripts/herd/agent-watch.sh:1376` — callers: —
+- `_file_size` — def `scripts/herd/agent-watch.sh:11433`, `scripts/herd/agent-watch.sh:11437` — callers: —
+- `_find_builder_pane_id` — def `scripts/herd/agent-watch.sh:9533` — callers: —
+- `_find_builder_pane_id_any` — def `scripts/herd/agent-watch.sh:10794` — callers: —
+- `_finish_stall_action_once` — def `scripts/herd/agent-watch.sh:12680` — callers: —
+- `_finish_stall_clear` — def `scripts/herd/agent-watch.sh:12530` — callers: —
+- `_finish_stall_commits_ahead` — def `scripts/herd/agent-watch.sh:12410` — callers: —
+- `_finish_stall_dirty` — def `scripts/herd/agent-watch.sh:12427` — callers: —
+- `_finish_stall_enabled` — def `scripts/herd/agent-watch.sh:12395` — callers: `scripts/herd/work-units/git-pr.sh:378`
+- `_finish_stall_grace_secs` — def `scripts/herd/agent-watch.sh:12398` — callers: —
+- `_finish_stall_mark` — def `scripts/herd/agent-watch.sh:12495` — callers: —
+- `_finish_stall_min` — def `scripts/herd/agent-watch.sh:12387` — callers: —
+- `_finish_stall_note_escape` — def `scripts/herd/agent-watch.sh:12549` — callers: —
+- `_finish_stall_note_pr_opened` — def `scripts/herd/agent-watch.sh:12568` — callers: —
+- `_finish_stall_note_still_working` — def `scripts/herd/agent-watch.sh:12594` — callers: —
+- `_finish_stall_record` — def `scripts/herd/agent-watch.sh:12483` — callers: —
+- `_finish_stall_reset` — def `scripts/herd/agent-watch.sh:12520` — callers: —
+- `_finish_stall_retask` — def `scripts/herd/agent-watch.sh:12648` — callers: —
+- `_finish_stall_scan_summary` — def `scripts/herd/agent-watch.sh:12620` — callers: —
+- `_finish_stall_state` — def `scripts/herd/agent-watch.sh:12509` — callers: —
+- `_finish_stall_wake_prompt` — def `scripts/herd/agent-watch.sh:12634` — callers: —
+- `_flair_celebration_line` — def `scripts/herd/agent-watch.sh:1400` — callers: —
+- `_flair_enabled` — def `scripts/herd/agent-watch.sh:1371` — callers: `scripts/herd/work-units/git-pr.sh:294`
+- `_flair_glyph` — def `scripts/herd/agent-watch.sh:1381` — callers: —
 - `_fleet_branch` — def `scripts/herd/fleet.sh:719` — callers: —
 - `_fleet_count_builders` — def `scripts/herd/fleet.sh:1677` — callers: —
 - `_fleet_count_reviews` — def `scripts/herd/fleet.sh:1689` — callers: —
@@ -339,20 +343,20 @@ this scan cannot see).
 - `_fleet_slug` — def `scripts/herd/fleet.sh:33` — callers: —
 - `_fleet_status_row` — def `scripts/herd/fleet.sh:772` — callers: —
 - `_fleet_watcher_state` — def `scripts/herd/fleet.sh:741` — callers: —
-- `_fmt_age` — def `scripts/herd/agent-watch.sh:1211` — callers: `scripts/herd/retirement.sh:906`
-- `_fmt_hhmm` — def `scripts/herd/agent-watch.sh:10891` — callers: —
-- `_gate_bless_eligible` — def `scripts/herd/agent-watch.sh:4108` — callers: —
-- `_gate_corpse_claim` — def `scripts/herd/agent-watch.sh:13805` — callers: —
-- `_gate_corpse_release` — def `scripts/herd/agent-watch.sh:13814` — callers: —
-- `_gate_dispatch_mode` — def `scripts/herd/agent-watch.sh:4120` — callers: —
-- `_gate_health_inflight` — def `scripts/herd/agent-watch.sh:13112` — callers: —
-- `_gate_phase_row` — def `scripts/herd/agent-watch.sh:13126` — callers: —
-- `_gate_status_blessed` — def `scripts/herd/agent-watch.sh:3912` — callers: `scripts/herd/ci-repair.sh:101`
-- `_gate_status_current` — def `scripts/herd/agent-watch.sh:3988` — callers: —
-- `_gate_status_desc` — def `scripts/herd/agent-watch.sh:3863` — callers: —
-- `_gate_status_enabled` — def `scripts/herd/agent-watch.sh:3848` — callers: —
-- `_gate_status_posted` — def `scripts/herd/agent-watch.sh:3852` — callers: —
-- `_gate_work_invested` — def `scripts/herd/agent-watch.sh:4237` — callers: —
+- `_fmt_age` — def `scripts/herd/agent-watch.sh:1216` — callers: `scripts/herd/retirement.sh:906`
+- `_fmt_hhmm` — def `scripts/herd/agent-watch.sh:11027` — callers: —
+- `_gate_bless_eligible` — def `scripts/herd/agent-watch.sh:4113` — callers: —
+- `_gate_corpse_claim` — def `scripts/herd/agent-watch.sh:13941` — callers: —
+- `_gate_corpse_release` — def `scripts/herd/agent-watch.sh:13950` — callers: —
+- `_gate_dispatch_mode` — def `scripts/herd/agent-watch.sh:4125` — callers: —
+- `_gate_health_inflight` — def `scripts/herd/agent-watch.sh:13248` — callers: —
+- `_gate_phase_row` — def `scripts/herd/agent-watch.sh:13262` — callers: —
+- `_gate_status_blessed` — def `scripts/herd/agent-watch.sh:3917` — callers: `scripts/herd/ci-repair.sh:101`
+- `_gate_status_current` — def `scripts/herd/agent-watch.sh:3993` — callers: —
+- `_gate_status_desc` — def `scripts/herd/agent-watch.sh:3868` — callers: —
+- `_gate_status_enabled` — def `scripts/herd/agent-watch.sh:3853` — callers: —
+- `_gate_status_posted` — def `scripts/herd/agent-watch.sh:3857` — callers: —
+- `_gate_work_invested` — def `scripts/herd/agent-watch.sh:4242` — callers: —
 - `_gh` — def `scripts/herd/backends/github.sh:48` — callers: —
 - `_gh_command` — def `scripts/herd/governance-hook.sh:33` — callers: —
 - `_gh_merge_methods` — def `bin/herd:694` — callers: —
@@ -392,65 +396,65 @@ this scan cannot see).
 - `_ground_yes` — def `bin/herd:185` — callers: —
 - `_gs_continues` — def `scripts/herd/git-scope-lint.sh:101` — callers: —
 - `_gs_is_fixture` — def `scripts/herd/git-scope-lint.sh:89` — callers: —
-- `_handle_block_verdict` — def `scripts/herd/agent-watch.sh:9515` — callers: —
-- `_handle_ci_fastbounce` — def `scripts/herd/agent-watch.sh:9965` — callers: —
-- `_handle_ci_repair` — def `scripts/herd/agent-watch.sh:9721` — callers: —
-- `_handle_coordinator_watchdog` — def `scripts/herd/agent-watch.sh:11178` — callers: —
-- `_handle_health_codeerror` — def `scripts/herd/agent-watch.sh:10471` — callers: —
-- `_handle_limit_blocked` — def `scripts/herd/agent-watch.sh:11039` — callers: —
-- `_handle_stale_dup` — def `scripts/herd/agent-watch.sh:10158` — callers: —
+- `_handle_block_verdict` — def `scripts/herd/agent-watch.sh:9651` — callers: —
+- `_handle_ci_fastbounce` — def `scripts/herd/agent-watch.sh:10101` — callers: —
+- `_handle_ci_repair` — def `scripts/herd/agent-watch.sh:9857` — callers: —
+- `_handle_coordinator_watchdog` — def `scripts/herd/agent-watch.sh:11314` — callers: —
+- `_handle_health_codeerror` — def `scripts/herd/agent-watch.sh:10607` — callers: —
+- `_handle_limit_blocked` — def `scripts/herd/agent-watch.sh:11175` — callers: —
+- `_handle_stale_dup` — def `scripts/herd/agent-watch.sh:10294` — callers: —
 - `_handoff_cli` — def `scripts/herd/handoff.sh:207` — callers: —
 - `_handoff_oneline` — def `scripts/herd/handoff.sh:127` — callers: —
 - `_handoff_parse_flags` — def `scripts/herd/handoff.sh:189` — callers: —
 - `_has_ai_trailer` — def `scripts/herd/governance-hook.sh:50` — callers: —
-- `_health_acquire` — def `scripts/herd/agent-watch.sh:13217` — callers: —
-- `_health_autofix_enabled` — def `scripts/herd/agent-watch.sh:10127` — callers: —
-- `_health_bats_descendants_live` — def `scripts/herd/agent-watch.sh:13315` — callers: —
-- `_health_bats_notok_descs` — def `scripts/herd/agent-watch.sh:13452` — callers: —
-- `_health_bats_retry_filter` — def `scripts/herd/agent-watch.sh:13469` — callers: —
-- `_health_cached_verdict` — def `scripts/herd/agent-watch.sh:4327` — callers: —
-- `_health_cachehit_file` — def `scripts/herd/agent-watch.sh:13401` — callers: —
-- `_health_conc` — def `scripts/herd/agent-watch.sh:680` — callers: —
-- `_health_dispatch_file` — def `scripts/herd/agent-watch.sh:12831` — callers: `scripts/herd/sweep.sh:484`, `scripts/herd/sweep.sh:510`
-- `_health_duration_file` — def `scripts/herd/agent-watch.sh:12931` — callers: —
-- `_health_duration_observed` — def `scripts/herd/agent-watch.sh:12945` — callers: —
-- `_health_duration_record` — def `scripts/herd/agent-watch.sh:12935` — callers: —
-- `_health_early_reap_secs` — def `scripts/herd/agent-watch.sh:13304` — callers: —
-- `_health_ere_escape` — def `scripts/herd/agent-watch.sh:13460` — callers: —
-- `_health_fail_detail` — def `scripts/herd/agent-watch.sh:13037` — callers: —
-- `_health_fail_identity` — def `scripts/herd/agent-watch.sh:13434` — callers: —
-- `_health_first_notok` — def `scripts/herd/agent-watch.sh:12851` — callers: —
-- `_health_headroom_advisory_file` — def `scripts/herd/agent-watch.sh:12958` — callers: —
-- `_health_headroom_journal_once` — def `scripts/herd/agent-watch.sh:12962` — callers: —
-- `_health_inflight_file` — def `scripts/herd/agent-watch.sh:12827` — callers: —
-- `_health_inflight_note` — def `scripts/herd/agent-watch.sh:13078` — callers: —
-- `_health_infra_bump` — def `scripts/herd/agent-watch.sh:12916` — callers: —
-- `_health_infra_file` — def `scripts/herd/agent-watch.sh:12913` — callers: —
-- `_health_is_leak_guard_detail` — def `scripts/herd/agent-watch.sh:12884` — callers: —
-- `_health_leak_guard_line` — def `scripts/herd/agent-watch.sh:12894` — callers: —
-- `_health_leak_guard_red` — def `scripts/herd/agent-watch.sh:12902` — callers: —
-- `_health_log_file` — def `scripts/herd/agent-watch.sh:12835` — callers: —
-- `_health_needs_you_row` — def `scripts/herd/agent-watch.sh:10462` — callers: —
-- `_health_pane_registry_file` — def `scripts/herd/agent-watch.sh:4849` — callers: —
-- `_health_pid_live` — def `scripts/herd/agent-watch.sh:13194` — callers: —
-- `_health_progress` — def `scripts/herd/agent-watch.sh:13060` — callers: —
-- `_health_release` — def `scripts/herd/agent-watch.sh:13219` — callers: —
-- `_health_result_file` — def `scripts/herd/agent-watch.sh:13339` — callers: —
-- `_health_running_row` — def `scripts/herd/agent-watch.sh:13094` — callers: —
-- `_health_slot_free` — def `scripts/herd/agent-watch.sh:13212` — callers: —
-- `_health_term_sleep` — def `scripts/herd/agent-watch.sh:13225` — callers: —
-- `_health_terminate_worker` — def `scripts/herd/agent-watch.sh:13254` — callers: —
-- `_health_timeout_headroom` — def `scripts/herd/agent-watch.sh:12952` — callers: —
-- `_health_worker` — def `scripts/herd/agent-watch.sh:13526` — callers: —
-- `_healthcheck_gate` — def `scripts/herd/agent-watch.sh:13596` — callers: —
+- `_health_acquire` — def `scripts/herd/agent-watch.sh:13353` — callers: —
+- `_health_autofix_enabled` — def `scripts/herd/agent-watch.sh:10263` — callers: —
+- `_health_bats_descendants_live` — def `scripts/herd/agent-watch.sh:13451` — callers: —
+- `_health_bats_notok_descs` — def `scripts/herd/agent-watch.sh:13588` — callers: —
+- `_health_bats_retry_filter` — def `scripts/herd/agent-watch.sh:13605` — callers: —
+- `_health_cached_verdict` — def `scripts/herd/agent-watch.sh:4332` — callers: —
+- `_health_cachehit_file` — def `scripts/herd/agent-watch.sh:13537` — callers: —
+- `_health_conc` — def `scripts/herd/agent-watch.sh:685` — callers: —
+- `_health_dispatch_file` — def `scripts/herd/agent-watch.sh:12967` — callers: `scripts/herd/sweep.sh:484`, `scripts/herd/sweep.sh:510`
+- `_health_duration_file` — def `scripts/herd/agent-watch.sh:13067` — callers: —
+- `_health_duration_observed` — def `scripts/herd/agent-watch.sh:13081` — callers: —
+- `_health_duration_record` — def `scripts/herd/agent-watch.sh:13071` — callers: —
+- `_health_early_reap_secs` — def `scripts/herd/agent-watch.sh:13440` — callers: —
+- `_health_ere_escape` — def `scripts/herd/agent-watch.sh:13596` — callers: —
+- `_health_fail_detail` — def `scripts/herd/agent-watch.sh:13173` — callers: —
+- `_health_fail_identity` — def `scripts/herd/agent-watch.sh:13570` — callers: —
+- `_health_first_notok` — def `scripts/herd/agent-watch.sh:12987` — callers: —
+- `_health_headroom_advisory_file` — def `scripts/herd/agent-watch.sh:13094` — callers: —
+- `_health_headroom_journal_once` — def `scripts/herd/agent-watch.sh:13098` — callers: —
+- `_health_inflight_file` — def `scripts/herd/agent-watch.sh:12963` — callers: —
+- `_health_inflight_note` — def `scripts/herd/agent-watch.sh:13214` — callers: —
+- `_health_infra_bump` — def `scripts/herd/agent-watch.sh:13052` — callers: —
+- `_health_infra_file` — def `scripts/herd/agent-watch.sh:13049` — callers: —
+- `_health_is_leak_guard_detail` — def `scripts/herd/agent-watch.sh:13020` — callers: —
+- `_health_leak_guard_line` — def `scripts/herd/agent-watch.sh:13030` — callers: —
+- `_health_leak_guard_red` — def `scripts/herd/agent-watch.sh:13038` — callers: —
+- `_health_log_file` — def `scripts/herd/agent-watch.sh:12971` — callers: —
+- `_health_needs_you_row` — def `scripts/herd/agent-watch.sh:10598` — callers: —
+- `_health_pane_registry_file` — def `scripts/herd/agent-watch.sh:4854` — callers: —
+- `_health_pid_live` — def `scripts/herd/agent-watch.sh:13330` — callers: —
+- `_health_progress` — def `scripts/herd/agent-watch.sh:13196` — callers: —
+- `_health_release` — def `scripts/herd/agent-watch.sh:13355` — callers: —
+- `_health_result_file` — def `scripts/herd/agent-watch.sh:13475` — callers: —
+- `_health_running_row` — def `scripts/herd/agent-watch.sh:13230` — callers: —
+- `_health_slot_free` — def `scripts/herd/agent-watch.sh:13348` — callers: —
+- `_health_term_sleep` — def `scripts/herd/agent-watch.sh:13361` — callers: —
+- `_health_terminate_worker` — def `scripts/herd/agent-watch.sh:13390` — callers: —
+- `_health_timeout_headroom` — def `scripts/herd/agent-watch.sh:13088` — callers: —
+- `_health_worker` — def `scripts/herd/agent-watch.sh:13662` — callers: —
+- `_healthcheck_gate` — def `scripts/herd/agent-watch.sh:13732` — callers: —
 - `_healthcheck_template_for` — def `bin/herd:636` — callers: —
 - `_herd_agent_dir` — def `scripts/herd/driver.sh:403` — callers: —
 - `_herd_agents_dir` — def `scripts/herd/driver.sh:399` — callers: —
 - `_herd_attr_scan` — def `scripts/herd/commit-lint.sh:21` — callers: `scripts/herd/healthcheck.sh:666`
-- `_herd_branch_template` — def `scripts/herd/herd-config.sh:1619` — callers: —
+- `_herd_branch_template` — def `scripts/herd/herd-config.sh:1620` — callers: —
 - `_herd_brand` — def `scripts/herd/herd-preflight.sh:34` — callers: `scripts/herd/posture-lint.sh:207`
 - `_herd_claim_dispatch` — def `scripts/herd/herd-claim.sh:79` — callers: —
-- `_herd_claim_identity` — def `scripts/herd/herd-claim.sh:67` — callers: `scripts/herd/agent-watch.sh:11638`
+- `_herd_claim_identity` — def `scripts/herd/herd-claim.sh:67` — callers: `scripts/herd/agent-watch.sh:11774`
 - `_herd_commit_convention_scan` — def `scripts/herd/commit-lint.sh:47` — callers: `scripts/herd/healthcheck.sh:698`
 - `_herd_commit_shas` — def `scripts/herd/commit-lint.sh:10` — callers: —
 - `_herd_config_dup_keys` — def `scripts/herd/herd-config.sh:39` — callers: `bin/herd:2646`, `bin/herd:2647`, `scripts/herd/herd-preflight.sh:634`, `scripts/herd/herd-preflight.sh:652`
@@ -472,7 +476,7 @@ this scan cannot see).
 - `_herd_doctor_run_timeout` — def `scripts/herd/herd-preflight.sh:385` — callers: —
 - `_herd_doctor_soft` — def `scripts/herd/herd-preflight.sh:284` — callers: —
 - `_herd_driver_cli` — def `scripts/herd/driver.sh:1598` — callers: —
-- `_herd_driver_is_headless` — def `scripts/herd/driver.sh:29` — callers: `scripts/herd/agent-watch.sh:4863`, `scripts/herd/context-guard.sh:198`
+- `_herd_driver_is_headless` — def `scripts/herd/driver.sh:29` — callers: `scripts/herd/agent-watch.sh:4868`, `scripts/herd/context-guard.sh:198`
 - `_herd_drivers_dir` — def `scripts/herd/driver.sh:67` — callers: —
 - `_herd_engine_cooldown_active` — def `scripts/herd/engine-version.sh:212` — callers: —
 - `_herd_engine_cooldown_file` — def `scripts/herd/engine-version.sh:203` — callers: —
@@ -511,33 +515,34 @@ this scan cannot see).
 - `_herd_resolve_project_config` — def `bin/herd:6586` — callers: —
 - `_herd_soft_dep_startup_notice` — def `scripts/herd/herd-preflight.sh:302` — callers: `bin/herd:6565`, `scripts/herd/coordinator.sh:167`
 - `_herd_state_dispatch` — def `scripts/herd/herd-claim.sh:108` — callers: —
-- `_herd_tabs_drop_row` — def `scripts/herd/agent-watch.sh:8394` — callers: —
-- `_herd_tabs_prune_orphans` — def `scripts/herd/agent-watch.sh:8436` — callers: —
+- `_herd_tabs_drop_row` — def `scripts/herd/agent-watch.sh:8530` — callers: —
+- `_herd_tabs_prune_orphans` — def `scripts/herd/agent-watch.sh:8572` — callers: —
 - `_herd_theme_dir_ok` — def `scripts/herd/theme.sh:39` — callers: —
 - `_herd_theme_name` — def `scripts/herd/theme.sh:30` — callers: —
 - `_herd_theme_no_color` — def `scripts/herd/theme.sh:80` — callers: —
 - `_herd_theme_resolve` — def `scripts/herd/theme.sh:65` — callers: —
 - `_herd_theme_source_palettes` — def `scripts/herd/theme.sh:90` — callers: —
 - `_herd_theme_warn` — def `scripts/herd/theme.sh:47` — callers: —
-- `_herd_val_warn_once` — def `scripts/herd/herd-config.sh:1648` — callers: `scripts/herd/agent-watch.sh:690`
+- `_herd_val_warn_once` — def `scripts/herd/herd-config.sh:1649` — callers: `scripts/herd/agent-watch.sh:695`
 - `_herd_wsl_interop_path` — def `scripts/herd/driver.sh:1180` — callers: `scripts/herd/herd-preflight.sh:573`, `scripts/herd/herd-preflight.sh:586`
 - `_herd_wsl_proc_version_file` — def `scripts/herd/driver.sh:1166` — callers: —
-- `_hold_decision` — def `scripts/herd/agent-watch.sh:4699` — callers: —
-- `_hold_ready_label` — def `scripts/herd/agent-watch.sh:4718` — callers: —
+- `_hold_decision` — def `scripts/herd/agent-watch.sh:4704` — callers: —
+- `_hold_ready_label` — def `scripts/herd/agent-watch.sh:4723` — callers: —
 - `_inbox_append` — def `scripts/herd/journal-audit.sh:668` — callers: —
-- `_inbox_extract_pr_comments` — def `scripts/herd/agent-watch.sh:1553` — callers: —
-- `_inbox_fetch_pr_comments` — def `scripts/herd/agent-watch.sh:1545` — callers: —
-- `_inbox_flatten` — def `scripts/herd/agent-watch.sh:1460` — callers: —
-- `_inbox_mark_seen` — def `scripts/herd/agent-watch.sh:1476` — callers: —
-- `_inbox_note_live` — def `scripts/herd/agent-watch.sh:1483` — callers: —
-- `_inbox_pr_numbers` — def `scripts/herd/agent-watch.sh:1574` — callers: —
-- `_inbox_record` — def `scripts/herd/agent-watch.sh:1530` — callers: —
-- `_inbox_scan` — def `scripts/herd/agent-watch.sh:1588` — callers: —
-- `_inbox_seen` — def `scripts/herd/agent-watch.sh:1468` — callers: —
-- `_inbox_trim_seen` — def `scripts/herd/agent-watch.sh:1494` — callers: —
-- `_inflight_verified_live` — def `scripts/herd/agent-watch.sh:13174` — callers: —
+- `_inbox_extract_pr_comments` — def `scripts/herd/agent-watch.sh:1558` — callers: —
+- `_inbox_fetch_pr_comments` — def `scripts/herd/agent-watch.sh:1550` — callers: —
+- `_inbox_flatten` — def `scripts/herd/agent-watch.sh:1465` — callers: —
+- `_inbox_mark_seen` — def `scripts/herd/agent-watch.sh:1481` — callers: —
+- `_inbox_note_live` — def `scripts/herd/agent-watch.sh:1488` — callers: —
+- `_inbox_pr_numbers` — def `scripts/herd/agent-watch.sh:1579` — callers: —
+- `_inbox_record` — def `scripts/herd/agent-watch.sh:1535` — callers: —
+- `_inbox_scan` — def `scripts/herd/agent-watch.sh:1593` — callers: —
+- `_inbox_seen` — def `scripts/herd/agent-watch.sh:1473` — callers: —
+- `_inbox_trim_seen` — def `scripts/herd/agent-watch.sh:1499` — callers: —
+- `_inflight_verified_live` — def `scripts/herd/agent-watch.sh:13310` — callers: —
 - `_init_governance_adoption` — def `bin/herd:945` — callers: —
 - `_init_grounding_interview` — def `bin/herd:802` — callers: —
+- `_interval_spans_wake` — def `scripts/herd/agent-watch.sh:7466` — callers: —
 - `_is_drainer_or_reviewer_label` — def `scripts/herd/layout-reconcile.sh:239` — callers: —
 - `_is_git_commit` — def `scripts/herd/governance-hook.sh:45` — callers: —
 - `_is_git_push` — def `scripts/herd/governance-hook.sh:46` — callers: —
@@ -558,21 +563,21 @@ this scan cannot see).
 - `_jira_short_title` — def `scripts/herd/backends/jira.sh:180` — callers: —
 - `_jira_state_category_for` — def `scripts/herd/backends/jira.sh:203` — callers: —
 - `_journal_all_files` — def `bin/herd:7189` — callers: —
-- `_journal_cache_hit` — def `scripts/herd/agent-watch.sh:13406` — callers: —
-- `_journal_file` — def `scripts/herd/journal.sh:104` — callers: `scripts/herd/agent-watch.sh:8794`, `scripts/herd/cost.sh:334`, `scripts/herd/herd-approve.sh:122`
+- `_journal_cache_hit` — def `scripts/herd/agent-watch.sh:13542` — callers: —
+- `_journal_file` — def `scripts/herd/journal.sh:104` — callers: `scripts/herd/agent-watch.sh:8930`, `scripts/herd/cost.sh:334`, `scripts/herd/herd-approve.sh:122`
 - `_journal_impl` — def `scripts/herd/journal.sh:149` — callers: —
 - `_journal_in_test_context` — def `scripts/herd/journal.sh:43` — callers: —
 - `_journal_load_config` — def `bin/herd:7180` — callers: —
-- `_journal_main_detached` — def `scripts/herd/agent-watch.sh:5759` — callers: —
+- `_journal_main_detached` — def `scripts/herd/agent-watch.sh:5764` — callers: —
 - `_journal_max_bytes` — def `scripts/herd/journal.sh:131` — callers: —
 - `_journal_path_is_verdict` — def `scripts/herd/journal.sh:58` — callers: —
 - `_journal_reject_verdict_path` — def `scripts/herd/journal.sh:74` — callers: —
 - `_journal_summary` — def `scripts/herd/backlog-reconcile-sweep.sh:329` — callers: —
 - `_journal_ts` — def `scripts/herd/journal.sh:33` — callers: —
-- `_lane_lifecycle_key` — def `scripts/herd/agent-watch.sh:2989` — callers: —
-- `_lane_lifecycle_retire` — def `scripts/herd/agent-watch.sh:3014` — callers: —
-- `_lane_lifecycle_spawn` — def `scripts/herd/agent-watch.sh:3006` — callers: —
-- `_lane_spawn_inflight` — def `scripts/herd/agent-watch.sh:3076` — callers: —
+- `_lane_lifecycle_key` — def `scripts/herd/agent-watch.sh:2994` — callers: —
+- `_lane_lifecycle_retire` — def `scripts/herd/agent-watch.sh:3019` — callers: —
+- `_lane_lifecycle_spawn` — def `scripts/herd/agent-watch.sh:3011` — callers: —
+- `_lane_spawn_inflight` — def `scripts/herd/agent-watch.sh:3081` — callers: —
 - `_lc_agent_liveness` — def `scripts/herd/lifecycle.sh:207` — callers: —
 - `_lc_beat_age` — def `scripts/herd/lifecycle.sh:193` — callers: —
 - `_lc_inbox_append` — def `scripts/herd/lifecycle.sh:334` — callers: —
@@ -584,10 +589,10 @@ this scan cannot see).
 - `_lc_state` — def `scripts/herd/lifecycle.sh:297` — callers: —
 - `_ledger_file` — def `scripts/herd/ledger.sh:56` — callers: —
 - `_legacy_automerge_policy` — def `scripts/herd/merge-policy.sh:27` — callers: `scripts/herd/posture-lint.sh:140`
-- `_limit_buffer_secs` — def `scripts/herd/agent-watch.sh:10876` — callers: —
-- `_limit_menu_keys` — def `scripts/herd/agent-watch.sh:10937` — callers: —
-- `_limit_sentinel_file` — def `scripts/herd/agent-watch.sh:10718` — callers: —
-- `_limit_unknown_wait` — def `scripts/herd/agent-watch.sh:10884` — callers: —
+- `_limit_buffer_secs` — def `scripts/herd/agent-watch.sh:11012` — callers: —
+- `_limit_menu_keys` — def `scripts/herd/agent-watch.sh:11073` — callers: —
+- `_limit_sentinel_file` — def `scripts/herd/agent-watch.sh:10854` — callers: —
+- `_limit_unknown_wait` — def `scripts/herd/agent-watch.sh:11020` — callers: —
 - `_linear_error_text` — def `scripts/herd/backends/linear.sh:189` — callers: —
 - `_linear_gql` — def `scripts/herd/backends/linear.sh:87` — callers: `bin/herd:4789`
 - `_linear_gql_build_payload` — def `scripts/herd/backends/linear.sh:80` — callers: —
@@ -608,75 +613,75 @@ this scan cannot see).
 - `_link_scan_peer_backend` — def `bin/herd:4973` — callers: —
 - `_list_open_issues` — def `scripts/herd/oss-triage.sh:195` — callers: —
 - `_list_project_watchers` — def `bin/herd:5776` — callers: `scripts/herd/status.sh:217`
-- `_main_checkout_sound` — def `scripts/herd/agent-watch.sh:7713` — callers: —
-- `_main_ci_classify` — def `scripts/herd/agent-watch.sh:7901` — callers: —
-- `_main_fresh_clear` — def `scripts/herd/agent-watch.sh:6211` — callers: —
-- `_main_fresh_dirty_status` — def `scripts/herd/agent-watch.sh:6234` — callers: —
-- `_main_fresh_generated_only` — def `scripts/herd/agent-watch.sh:6374` — callers: —
-- `_main_fresh_hold` — def `scripts/herd/agent-watch.sh:6360` — callers: —
-- `_main_fresh_note_restart` — def `scripts/herd/agent-watch.sh:6386` — callers: —
-- `_main_fresh_reason_disproved` — def `scripts/herd/agent-watch.sh:6259` — callers: —
-- `_main_fresh_recheck` — def `scripts/herd/agent-watch.sh:6321` — callers: —
-- `_main_fresh_recovered` — def `scripts/herd/agent-watch.sh:6217` — callers: —
-- `_main_head_attached` — def `scripts/herd/agent-watch.sh:5752` — callers: `scripts/herd/herd-config.sh:720`
-- `_main_health_autofix` — def `scripts/herd/agent-watch.sh:7537` — callers: —
-- `_main_health_autofix_enabled` — def `scripts/herd/agent-watch.sh:6964` — callers: —
-- `_main_health_autofix_spawn` — def `scripts/herd/agent-watch.sh:7596` — callers: —
-- `_main_health_autofix_spawn_enabled` — def `scripts/herd/agent-watch.sh:6975` — callers: —
-- `_main_health_ci_gate_enabled` — def `scripts/herd/agent-watch.sh:6984` — callers: —
-- `_main_health_ci_identity_persist` — def `scripts/herd/agent-watch.sh:7501` — callers: —
-- `_main_health_ci_leg` — def `scripts/herd/agent-watch.sh:7948` — callers: —
-- `_main_health_ci_log_identity` — def `scripts/herd/agent-watch.sh:7469` — callers: —
-- `_main_health_clear` — def `scripts/herd/agent-watch.sh:7193` — callers: —
-- `_main_health_contam_clear` — def `scripts/herd/agent-watch.sh:7740` — callers: —
-- `_main_health_contam_recheck` — def `scripts/herd/agent-watch.sh:7756` — callers: —
-- `_main_health_contaminated` — def `scripts/herd/agent-watch.sh:7726` — callers: —
-- `_main_health_defer` — def `scripts/herd/agent-watch.sh:7680` — callers: —
-- `_main_health_defer_note` — def `scripts/herd/agent-watch.sh:7047` — callers: —
-- `_main_health_died` — def `scripts/herd/agent-watch.sh:7852` — callers: —
-- `_main_health_dispatch` — def `scripts/herd/agent-watch.sh:7788` — callers: —
-- `_main_health_enabled` — def `scripts/herd/agent-watch.sh:6946` — callers: —
-- `_main_health_file_age_mins` — def `scripts/herd/agent-watch.sh:7864` — callers: —
-- `_main_health_fix_clear` — def `scripts/herd/agent-watch.sh:7329` — callers: —
-- `_main_health_fix_mark` — def `scripts/herd/agent-watch.sh:7315` — callers: —
-- `_main_health_fix_pysrc` — def `scripts/herd/agent-watch.sh:7302` — callers: —
-- `_main_health_green_supersedes` — def `scripts/herd/agent-watch.sh:7029` — callers: —
-- `_main_health_honest_identity` — def `scripts/herd/agent-watch.sh:7286` — callers: —
-- `_main_health_marker` — def `scripts/herd/agent-watch.sh:7063` — callers: —
-- `_main_health_observed_pr` — def `scripts/herd/agent-watch.sh:7079` — callers: —
-- `_main_health_observed_sha` — def `scripts/herd/agent-watch.sh:6997` — callers: —
-- `_main_health_pr_file` — def `scripts/herd/agent-watch.sh:7067` — callers: —
-- `_main_health_recheck_mins` — def `scripts/herd/agent-watch.sh:6955` — callers: —
-- `_main_health_retry_file` — def `scripts/herd/agent-watch.sh:7069` — callers: —
-- `_main_health_sandbox_note` — def `scripts/herd/agent-watch.sh:7091` — callers: —
-- `_main_health_scribe` — def `scripts/herd/agent-watch.sh:7297` — callers: —
-- `_main_health_set_red` — def `scripts/herd/agent-watch.sh:7633` — callers: —
-- `_main_health_slug_identity` — def `scripts/herd/agent-watch.sh:7257` — callers: —
-- `_main_health_verdict_state` — def `scripts/herd/agent-watch.sh:7003` — callers: —
-- `_main_health_worker` — def `scripts/herd/agent-watch.sh:7124` — callers: —
-- `_main_reattach_if_detached` — def `scripts/herd/agent-watch.sh:6404` — callers: —
-- `_map_reconcile_memo_file` — def `scripts/herd/agent-watch.sh:6782` — callers: —
-- `_map_reconcile_memo_write` — def `scripts/herd/agent-watch.sh:6785` — callers: —
-- `_map_reconcile_mid_op` — def `scripts/herd/agent-watch.sh:6774` — callers: —
+- `_main_checkout_sound` — def `scripts/herd/agent-watch.sh:7849` — callers: —
+- `_main_ci_classify` — def `scripts/herd/agent-watch.sh:8037` — callers: —
+- `_main_fresh_clear` — def `scripts/herd/agent-watch.sh:6216` — callers: —
+- `_main_fresh_dirty_status` — def `scripts/herd/agent-watch.sh:6239` — callers: —
+- `_main_fresh_generated_only` — def `scripts/herd/agent-watch.sh:6379` — callers: —
+- `_main_fresh_hold` — def `scripts/herd/agent-watch.sh:6365` — callers: —
+- `_main_fresh_note_restart` — def `scripts/herd/agent-watch.sh:6391` — callers: —
+- `_main_fresh_reason_disproved` — def `scripts/herd/agent-watch.sh:6264` — callers: —
+- `_main_fresh_recheck` — def `scripts/herd/agent-watch.sh:6326` — callers: —
+- `_main_fresh_recovered` — def `scripts/herd/agent-watch.sh:6222` — callers: —
+- `_main_head_attached` — def `scripts/herd/agent-watch.sh:5757` — callers: `scripts/herd/herd-config.sh:720`
+- `_main_health_autofix` — def `scripts/herd/agent-watch.sh:7673` — callers: —
+- `_main_health_autofix_enabled` — def `scripts/herd/agent-watch.sh:6969` — callers: —
+- `_main_health_autofix_spawn` — def `scripts/herd/agent-watch.sh:7732` — callers: —
+- `_main_health_autofix_spawn_enabled` — def `scripts/herd/agent-watch.sh:6980` — callers: —
+- `_main_health_ci_gate_enabled` — def `scripts/herd/agent-watch.sh:6989` — callers: —
+- `_main_health_ci_identity_persist` — def `scripts/herd/agent-watch.sh:7637` — callers: —
+- `_main_health_ci_leg` — def `scripts/herd/agent-watch.sh:8084` — callers: —
+- `_main_health_ci_log_identity` — def `scripts/herd/agent-watch.sh:7605` — callers: —
+- `_main_health_clear` — def `scripts/herd/agent-watch.sh:7198` — callers: —
+- `_main_health_contam_clear` — def `scripts/herd/agent-watch.sh:7876` — callers: —
+- `_main_health_contam_recheck` — def `scripts/herd/agent-watch.sh:7892` — callers: —
+- `_main_health_contaminated` — def `scripts/herd/agent-watch.sh:7862` — callers: —
+- `_main_health_defer` — def `scripts/herd/agent-watch.sh:7816` — callers: —
+- `_main_health_defer_note` — def `scripts/herd/agent-watch.sh:7052` — callers: —
+- `_main_health_died` — def `scripts/herd/agent-watch.sh:7988` — callers: —
+- `_main_health_dispatch` — def `scripts/herd/agent-watch.sh:7924` — callers: —
+- `_main_health_enabled` — def `scripts/herd/agent-watch.sh:6951` — callers: —
+- `_main_health_file_age_mins` — def `scripts/herd/agent-watch.sh:8000` — callers: —
+- `_main_health_fix_clear` — def `scripts/herd/agent-watch.sh:7334` — callers: —
+- `_main_health_fix_mark` — def `scripts/herd/agent-watch.sh:7320` — callers: —
+- `_main_health_fix_pysrc` — def `scripts/herd/agent-watch.sh:7307` — callers: —
+- `_main_health_green_supersedes` — def `scripts/herd/agent-watch.sh:7034` — callers: —
+- `_main_health_honest_identity` — def `scripts/herd/agent-watch.sh:7291` — callers: —
+- `_main_health_marker` — def `scripts/herd/agent-watch.sh:7068` — callers: —
+- `_main_health_observed_pr` — def `scripts/herd/agent-watch.sh:7084` — callers: —
+- `_main_health_observed_sha` — def `scripts/herd/agent-watch.sh:7002` — callers: —
+- `_main_health_pr_file` — def `scripts/herd/agent-watch.sh:7072` — callers: —
+- `_main_health_recheck_mins` — def `scripts/herd/agent-watch.sh:6960` — callers: —
+- `_main_health_retry_file` — def `scripts/herd/agent-watch.sh:7074` — callers: —
+- `_main_health_sandbox_note` — def `scripts/herd/agent-watch.sh:7096` — callers: —
+- `_main_health_scribe` — def `scripts/herd/agent-watch.sh:7302` — callers: —
+- `_main_health_set_red` — def `scripts/herd/agent-watch.sh:7769` — callers: —
+- `_main_health_slug_identity` — def `scripts/herd/agent-watch.sh:7262` — callers: —
+- `_main_health_verdict_state` — def `scripts/herd/agent-watch.sh:7008` — callers: —
+- `_main_health_worker` — def `scripts/herd/agent-watch.sh:7129` — callers: —
+- `_main_reattach_if_detached` — def `scripts/herd/agent-watch.sh:6409` — callers: —
+- `_map_reconcile_memo_file` — def `scripts/herd/agent-watch.sh:6787` — callers: —
+- `_map_reconcile_memo_write` — def `scripts/herd/agent-watch.sh:6790` — callers: —
+- `_map_reconcile_mid_op` — def `scripts/herd/agent-watch.sh:6779` — callers: —
 - `_mark_review_done` — def `scripts/herd/herd-review.sh:455` — callers: —
-- `_marker_age` — def `scripts/herd/agent-watch.sh:2889` — callers: `scripts/herd/sweep.sh:515`
-- `_marker_age_or_mtime` — def `scripts/herd/agent-watch.sh:13147` — callers: —
-- `_marker_dispatch_ts` — def `scripts/herd/agent-watch.sh:2871` — callers: —
-- `_marker_live` — def `scripts/herd/agent-watch.sh:2878` — callers: `scripts/herd/sweep.sh:487`, `scripts/herd/sweep.sh:514`, `scripts/herd/watcher-exempt.sh:132`, `scripts/herd/watcher-exempt.sh:156`
-- `_marker_pgid` — def `scripts/herd/agent-watch.sh:2872` — callers: —
-- `_marker_pid` — def `scripts/herd/agent-watch.sh:2869` — callers: `scripts/herd/sweep.sh:518`
-- `_marker_starttime` — def `scripts/herd/agent-watch.sh:2870` — callers: —
-- `_marker_write` — def `scripts/herd/agent-watch.sh:2860` — callers: —
+- `_marker_age` — def `scripts/herd/agent-watch.sh:2894` — callers: `scripts/herd/sweep.sh:515`
+- `_marker_age_or_mtime` — def `scripts/herd/agent-watch.sh:13283` — callers: —
+- `_marker_dispatch_ts` — def `scripts/herd/agent-watch.sh:2876` — callers: —
+- `_marker_live` — def `scripts/herd/agent-watch.sh:2883` — callers: `scripts/herd/sweep.sh:487`, `scripts/herd/sweep.sh:514`, `scripts/herd/watcher-exempt.sh:132`, `scripts/herd/watcher-exempt.sh:156`
+- `_marker_pgid` — def `scripts/herd/agent-watch.sh:2877` — callers: —
+- `_marker_pid` — def `scripts/herd/agent-watch.sh:2874` — callers: `scripts/herd/sweep.sh:518`
+- `_marker_starttime` — def `scripts/herd/agent-watch.sh:2875` — callers: —
+- `_marker_write` — def `scripts/herd/agent-watch.sh:2865` — callers: —
 - `_match` — def `scripts/herd/backlog-reconcile-sweep.sh:117` — callers: —
-- `_maybe_arm_review_escalation` — def `scripts/herd/agent-watch.sh:9386` — callers: —
-- `_maybe_autorespawn_dead_builder` — def `scripts/herd/agent-watch.sh:11934` — callers: —
-- `_maybe_autowake_wedged_builder` — def `scripts/herd/agent-watch.sh:12120` — callers: —
-- `_maybe_carry_forward_review` — def `scripts/herd/agent-watch.sh:2571` — callers: —
-- `_maybe_release_claim` — def `scripts/herd/agent-watch.sh:11609` — callers: —
-- `_merge_fairness_enabled` — def `scripts/herd/agent-watch.sh:4317` — callers: —
-- `_merge_fairness_reorder` — def `scripts/herd/agent-watch.sh:4362` — callers: —
+- `_maybe_arm_review_escalation` — def `scripts/herd/agent-watch.sh:9522` — callers: —
+- `_maybe_autorespawn_dead_builder` — def `scripts/herd/agent-watch.sh:12070` — callers: —
+- `_maybe_autowake_wedged_builder` — def `scripts/herd/agent-watch.sh:12256` — callers: —
+- `_maybe_carry_forward_review` — def `scripts/herd/agent-watch.sh:2576` — callers: —
+- `_maybe_release_claim` — def `scripts/herd/agent-watch.sh:11745` — callers: —
+- `_merge_fairness_enabled` — def `scripts/herd/agent-watch.sh:4322` — callers: —
+- `_merge_fairness_reorder` — def `scripts/herd/agent-watch.sh:4367` — callers: —
 - `_merge_method_flag` — def `scripts/herd/work-units/git-pr.sh:119` — callers: —
-- `_merge_policy_is_typo` — def `scripts/herd/merge-policy.sh:46` — callers: `scripts/herd/agent-watch.sh:620`
+- `_merge_policy_is_typo` — def `scripts/herd/merge-policy.sh:46` — callers: `scripts/herd/agent-watch.sh:625`
 - `_merged_prs` — def `scripts/herd/backlog-reconcile-sweep.sh:75` — callers: —
 - `_merged_prs_exact` — def `scripts/herd/backlog-reconcile-sweep.sh:84` — callers: —
 - `_merged_refs` — def `scripts/herd/tracker-state-sweep.sh:146` — callers: —
@@ -684,23 +689,23 @@ this scan cannot see).
 - `_models_catalog_file` — def `bin/herd:2224` — callers: —
 - `_models_catalog_lint` — def `bin/herd:2251` — callers: —
 - `_models_catalog_row` — def `bin/herd:2239` — callers: —
-- `_now` — def `scripts/herd/agent-watch.sh:10642` — callers: `scripts/herd/aging-pr.sh:45`, `scripts/herd/lifecycle.sh:198`, `scripts/herd/lifecycle.sh:199`, `scripts/herd/lifecycle.sh:301`, `scripts/herd/lifecycle.sh:305`, `scripts/herd/lifecycle.sh:323`
-- `_now_epoch` — def `scripts/herd/agent-watch.sh:2797` — callers: `scripts/herd/retirement.sh:136`, `scripts/herd/retirement.sh:363`, `scripts/herd/retirement.sh:382`, `scripts/herd/retirement.sh:906`, `scripts/herd/retirement.sh:1052`, `scripts/herd/sweep.sh:577`, `scripts/herd/sweep.sh:1196`, `scripts/herd/sweep.sh:1245`, `scripts/herd/sweep.sh:1349`
+- `_now` — def `scripts/herd/agent-watch.sh:10778` — callers: `scripts/herd/aging-pr.sh:45`, `scripts/herd/lifecycle.sh:198`, `scripts/herd/lifecycle.sh:199`, `scripts/herd/lifecycle.sh:301`, `scripts/herd/lifecycle.sh:305`, `scripts/herd/lifecycle.sh:323`
+- `_now_epoch` — def `scripts/herd/agent-watch.sh:2802` — callers: `scripts/herd/retirement.sh:136`, `scripts/herd/retirement.sh:363`, `scripts/herd/retirement.sh:382`, `scripts/herd/retirement.sh:906`, `scripts/herd/retirement.sh:1052`, `scripts/herd/sweep.sh:577`, `scripts/herd/sweep.sh:1196`, `scripts/herd/sweep.sh:1245`, `scripts/herd/sweep.sh:1349`
 - `_num_or` — def `scripts/herd/journal-audit.sh:116` — callers: —
-- `_operator_inbox_enabled` — def `scripts/herd/agent-watch.sh:1451` — callers: —
-- `_orphan_pr_classify` — def `scripts/herd/agent-watch.sh:1828` — callers: —
-- `_orphan_pr_row` — def `scripts/herd/agent-watch.sh:1838` — callers: —
-- `_orphan_pr_rows_enabled` — def `scripts/herd/agent-watch.sh:1817` — callers: —
-- `_orphan_prs_scan` — def `scripts/herd/agent-watch.sh:1856` — callers: —
-- `_orphan_tab_ids` — def `scripts/herd/agent-watch.sh:8224` — callers: `scripts/herd/sweep.sh:436`
+- `_operator_inbox_enabled` — def `scripts/herd/agent-watch.sh:1456` — callers: —
+- `_orphan_pr_classify` — def `scripts/herd/agent-watch.sh:1833` — callers: —
+- `_orphan_pr_row` — def `scripts/herd/agent-watch.sh:1843` — callers: —
+- `_orphan_pr_rows_enabled` — def `scripts/herd/agent-watch.sh:1822` — callers: —
+- `_orphan_prs_scan` — def `scripts/herd/agent-watch.sh:1861` — callers: —
+- `_orphan_tab_ids` — def `scripts/herd/agent-watch.sh:8360` — callers: `scripts/herd/sweep.sh:436`
 - `_osc8` — def `scripts/herd/backlog-view.sh:250` — callers: —
 - `_oss_triage_enabled` — def `scripts/herd/oss-triage.sh:58` — callers: —
 - `_pane_agent_start` — def `bin/herd:6634` — callers: —
 - `_pane_by_agent_name` — def `scripts/herd/herd-review.sh:759` — callers: —
-- `_pane_confirms_limit_wait` — def `scripts/herd/agent-watch.sh:10980` — callers: —
+- `_pane_confirms_limit_wait` — def `scripts/herd/agent-watch.sh:11116` — callers: —
 - `_pane_init` — def `bin/herd:6664` — callers: —
-- `_pane_menu_confirmed` — def `scripts/herd/agent-watch.sh:10963` — callers: —
-- `_pane_shows_limit_menu` — def `scripts/herd/agent-watch.sh:10944` — callers: —
+- `_pane_menu_confirmed` — def `scripts/herd/agent-watch.sh:11099` — callers: —
+- `_pane_shows_limit_menu` — def `scripts/herd/agent-watch.sh:11080` — callers: —
 - `_pane_usage` — def `bin/herd:6990` — callers: —
 - `_pane_write_registry` — def `bin/herd:6648` — callers: —
 - `_panel_engaged` — def `scripts/herd/herd-review.sh:207` — callers: —
@@ -709,36 +714,36 @@ this scan cannot see).
 - `_panel_member` — def `scripts/herd/herd-review.sh:406` — callers: —
 - `_panel_member_file` — def `scripts/herd/herd-review.sh:390` — callers: —
 - `_panel_ref_for` — def `scripts/herd/herd-review.sh:383` — callers: —
-- `_parse_block_fields` — def `scripts/herd/agent-watch.sh:2625` — callers: —
+- `_parse_block_fields` — def `scripts/herd/agent-watch.sh:2630` — callers: —
 - `_parse_classification` — def `scripts/herd/oss-triage.sh:153` — callers: —
 - `_parse_reply_snippet` — def `scripts/herd/oss-triage.sh:165` — callers: —
-- `_parse_reset_epoch` — def `scripts/herd/agent-watch.sh:10768` — callers: —
-- `_persist_block_fields` — def `scripts/herd/agent-watch.sh:2650` — callers: —
+- `_parse_reset_epoch` — def `scripts/herd/agent-watch.sh:10904` — callers: —
+- `_persist_block_fields` — def `scripts/herd/agent-watch.sh:2655` — callers: —
 - `_pg_current` — def `scripts/herd/push-gate.sh:72` — callers: —
 - `_pg_epoch` — def `scripts/herd/push-gate.sh:64` — callers: —
 - `_pg_pr_create` — def `scripts/herd/push-gate.sh:222` — callers: —
 - `_pg_push` — def `scripts/herd/push-gate.sh:211` — callers: —
 - `_pg_worktree_sha` — def `scripts/herd/push-gate.sh:67` — callers: —
-- `_phase_anomaly_observe` — def `scripts/herd/agent-watch.sh:7419` — callers: —
-- `_phase_anomaly_row` — def `scripts/herd/agent-watch.sh:7383` — callers: —
-- `_phase_duration_observe` — def `scripts/herd/agent-watch.sh:7371` — callers: —
-- `_pid_pgid` — def `scripts/herd/agent-watch.sh:2851` — callers: —
-- `_pid_starttime` — def `scripts/herd/agent-watch.sh:2842` — callers: `scripts/herd/sweep.sh:832`, `scripts/herd/sweep.sh:930`
-- `_pin_review_sha` — def `scripts/herd/agent-watch.sh:3341` — callers: —
-- `_pms_approvals_rows` — def `scripts/herd/agent-watch.sh:8774` — callers: —
-- `_pms_ci_rows` — def `scripts/herd/agent-watch.sh:8778` — callers: —
-- `_pms_defer_note` — def `scripts/herd/agent-watch.sh:9006` — callers: —
-- `_pms_journal_has` — def `scripts/herd/agent-watch.sh:8792` — callers: —
-- `_pms_merged_prs` — def `scripts/herd/agent-watch.sh:8847` — callers: —
-- `_pms_note` — def `scripts/herd/agent-watch.sh:8757` — callers: —
-- `_pms_noted` — def `scripts/herd/agent-watch.sh:8753` — callers: —
-- `_pms_reconcile_handled` — def `scripts/herd/agent-watch.sh:8825` — callers: —
-- `_pms_reconcile_one` — def `scripts/herd/agent-watch.sh:8885` — callers: —
-- `_pms_record` — def `scripts/herd/agent-watch.sh:8727` — callers: —
-- `_pms_state_row` — def `scripts/herd/agent-watch.sh:8766` — callers: —
-- `_pms_swept` — def `scripts/herd/agent-watch.sh:8717` — callers: —
-- `_pms_tracker_ledgered` — def `scripts/herd/agent-watch.sh:8811` — callers: —
-- `_pms_trim_ledger` — def `scripts/herd/agent-watch.sh:8734` — callers: —
+- `_phase_anomaly_observe` — def `scripts/herd/agent-watch.sh:7539` — callers: —
+- `_phase_anomaly_row` — def `scripts/herd/agent-watch.sh:7388` — callers: —
+- `_phase_duration_observe` — def `scripts/herd/agent-watch.sh:7376` — callers: —
+- `_pid_pgid` — def `scripts/herd/agent-watch.sh:2856` — callers: —
+- `_pid_starttime` — def `scripts/herd/agent-watch.sh:2847` — callers: `scripts/herd/sweep.sh:832`, `scripts/herd/sweep.sh:930`
+- `_pin_review_sha` — def `scripts/herd/agent-watch.sh:3346` — callers: —
+- `_pms_approvals_rows` — def `scripts/herd/agent-watch.sh:8910` — callers: —
+- `_pms_ci_rows` — def `scripts/herd/agent-watch.sh:8914` — callers: —
+- `_pms_defer_note` — def `scripts/herd/agent-watch.sh:9142` — callers: —
+- `_pms_journal_has` — def `scripts/herd/agent-watch.sh:8928` — callers: —
+- `_pms_merged_prs` — def `scripts/herd/agent-watch.sh:8983` — callers: —
+- `_pms_note` — def `scripts/herd/agent-watch.sh:8893` — callers: —
+- `_pms_noted` — def `scripts/herd/agent-watch.sh:8889` — callers: —
+- `_pms_reconcile_handled` — def `scripts/herd/agent-watch.sh:8961` — callers: —
+- `_pms_reconcile_one` — def `scripts/herd/agent-watch.sh:9021` — callers: —
+- `_pms_record` — def `scripts/herd/agent-watch.sh:8863` — callers: —
+- `_pms_state_row` — def `scripts/herd/agent-watch.sh:8902` — callers: —
+- `_pms_swept` — def `scripts/herd/agent-watch.sh:8853` — callers: —
+- `_pms_tracker_ledgered` — def `scripts/herd/agent-watch.sh:8947` — callers: —
+- `_pms_trim_ledger` — def `scripts/herd/agent-watch.sh:8870` — callers: —
 - `_poll_read_key` — def `scripts/herd/backlog-view.sh:161` — callers: —
 - `_posture_add_finding` — def `scripts/herd/posture-lint.sh:128` — callers: —
 - `_posture_apply_bundle` — def `bin/herd:263` — callers: —
@@ -759,46 +764,46 @@ this scan cannot see).
 - `_posture_tuple_field` — def `scripts/herd/posture-lint.sh:117` — callers: —
 - `_posture_tuple_pretty` — def `scripts/herd/posture-lint.sh:106` — callers: —
 - `_posture_write_extra` — def `bin/herd:320` — callers: —
-- `_pr_body` — def `scripts/herd/agent-watch.sh:4666` — callers: —
-- `_predispatch_review_if_parallel` — def `scripts/herd/agent-watch.sh:4150` — callers: —
-- `_prs_fetch_tick` — def `scripts/herd/work-units/git-pr.sh:392` — callers: `scripts/herd/agent-watch.sh:14888`
-- `_purge_slug_ledgers` — def `scripts/herd/agent-watch.sh:11545` — callers: —
+- `_pr_body` — def `scripts/herd/agent-watch.sh:4671` — callers: —
+- `_predispatch_review_if_parallel` — def `scripts/herd/agent-watch.sh:4155` — callers: —
+- `_prs_fetch_tick` — def `scripts/herd/work-units/git-pr.sh:392` — callers: `scripts/herd/agent-watch.sh:15024`
+- `_purge_slug_ledgers` — def `scripts/herd/agent-watch.sh:11681` — callers: —
 - `_purge_stale_review_tab` — def `scripts/herd/herd-review.sh:715` — callers: —
-- `_rc_body` — def `scripts/herd/agent-watch.sh:5831` — callers: —
-- `_rc_j` — def `scripts/herd/agent-watch.sh:5816` — callers: —
+- `_rc_body` — def `scripts/herd/agent-watch.sh:5836` — callers: —
+- `_rc_j` — def `scripts/herd/agent-watch.sh:5821` — callers: —
 - `_read` — def `scripts/herd/ledger.sh:208` — callers: —
 - `_reap_agent_working` — def `scripts/herd/retirement.sh:223` — callers: `scripts/herd/sweep.sh:363`, `scripts/herd/sweep.sh:377`, `scripts/herd/work-units/git-pr.sh:198`
-- `_reap_builder_corpse` — def `scripts/herd/agent-watch.sh:11793` — callers: —
-- `_reap_idle_resolver_for_redispatch` — def `scripts/herd/agent-watch.sh:5179` — callers: —
-- `_reap_slug` — def `scripts/herd/agent-watch.sh:6861` — callers: `scripts/herd/retirement.sh:693`, `scripts/herd/sweep.sh:397`, `scripts/herd/work-unit.sh:184`, `scripts/herd/work-units/git-pr.sh:359`
-- `_reattach_default_branch` — def `scripts/herd/agent-watch.sh:5766` — callers: —
+- `_reap_builder_corpse` — def `scripts/herd/agent-watch.sh:11929` — callers: —
+- `_reap_idle_resolver_for_redispatch` — def `scripts/herd/agent-watch.sh:5184` — callers: —
+- `_reap_slug` — def `scripts/herd/agent-watch.sh:6866` — callers: `scripts/herd/retirement.sh:693`, `scripts/herd/sweep.sh:397`, `scripts/herd/work-unit.sh:184`, `scripts/herd/work-units/git-pr.sh:359`
+- `_reattach_default_branch` — def `scripts/herd/agent-watch.sh:5771` — callers: —
 - `_recent_commits` — def `scripts/herd/backlog-reconcile-sweep.sh:92` — callers: —
 - `_recon_backend_manages_backlog` — def `scripts/herd/backlog-reconcile.sh:50` — callers: —
 - `_recon_die` — def `scripts/herd/backlog-reconcile.sh:33` — callers: —
-- `_reconcile_dead_builder` — def `scripts/herd/agent-watch.sh:11660` — callers: —
-- `_reconcile_draft_stall` — def `scripts/herd/agent-watch.sh:12735` — callers: —
-- `_reconcile_finish_stall` — def `scripts/herd/agent-watch.sh:12578` — callers: —
-- `_reconcile_health_panes` — def `scripts/herd/agent-watch.sh:4911` — callers: —
-- `_reconcile_pending_row` — def `scripts/herd/agent-watch.sh:807` — callers: —
-- `_reconcile_pr_ref` — def `scripts/herd/work-units/git-pr.sh:144` — callers: `scripts/herd/agent-watch.sh:8829`, `scripts/herd/agent-watch.sh:8961`
-- `_reconcile_resolver_panes` — def `scripts/herd/agent-watch.sh:4816` — callers: —
-- `_reconcile_via_ref` — def `scripts/herd/agent-watch.sh:5668` — callers: `scripts/herd/work-units/git-pr.sh:173`
-- `_reconcile_wedged_builder` — def `scripts/herd/agent-watch.sh:12167` — callers: —
-- `_record_advisory_notes` — def `scripts/herd/agent-watch.sh:2689` — callers: —
-- `_record_gate_status` — def `scripts/herd/agent-watch.sh:3858` — callers: —
-- `_record_refix_dead` — def `scripts/herd/agent-watch.sh:9379` — callers: —
-- `_record_refix_stuck` — def `scripts/herd/agent-watch.sh:9277` — callers: —
-- `_refix_budget_reason` — def `scripts/herd/agent-watch.sh:9201` — callers: —
-- `_refix_cap_num` — def `scripts/herd/agent-watch.sh:9140` — callers: —
-- `_refix_dead_marker` — def `scripts/herd/agent-watch.sh:9377` — callers: —
-- `_refix_dead_seen` — def `scripts/herd/agent-watch.sh:9378` — callers: —
-- `_refix_stalled_row` — def `scripts/herd/agent-watch.sh:9354` — callers: —
-- `_refix_stuck_file` — def `scripts/herd/agent-watch.sh:9275` — callers: —
-- `_refix_stuck_reason` — def `scripts/herd/agent-watch.sh:9278` — callers: —
-- `_refix_stuck_seen` — def `scripts/herd/agent-watch.sh:9276` — callers: —
-- `_refresh_guard_attached` — def `scripts/herd/agent-watch.sh:5780` — callers: —
-- `_refresh_lock_file` — def `scripts/herd/agent-watch.sh:5708` — callers: —
-- `_refresh_run_locked` — def `scripts/herd/agent-watch.sh:5722` — callers: —
+- `_reconcile_dead_builder` — def `scripts/herd/agent-watch.sh:11796` — callers: —
+- `_reconcile_draft_stall` — def `scripts/herd/agent-watch.sh:12871` — callers: —
+- `_reconcile_finish_stall` — def `scripts/herd/agent-watch.sh:12714` — callers: —
+- `_reconcile_health_panes` — def `scripts/herd/agent-watch.sh:4916` — callers: —
+- `_reconcile_pending_row` — def `scripts/herd/agent-watch.sh:812` — callers: —
+- `_reconcile_pr_ref` — def `scripts/herd/work-units/git-pr.sh:144` — callers: `scripts/herd/agent-watch.sh:8965`, `scripts/herd/agent-watch.sh:9097`
+- `_reconcile_resolver_panes` — def `scripts/herd/agent-watch.sh:4821` — callers: —
+- `_reconcile_via_ref` — def `scripts/herd/agent-watch.sh:5673` — callers: `scripts/herd/work-units/git-pr.sh:173`
+- `_reconcile_wedged_builder` — def `scripts/herd/agent-watch.sh:12303` — callers: —
+- `_record_advisory_notes` — def `scripts/herd/agent-watch.sh:2694` — callers: —
+- `_record_gate_status` — def `scripts/herd/agent-watch.sh:3863` — callers: —
+- `_record_refix_dead` — def `scripts/herd/agent-watch.sh:9515` — callers: —
+- `_record_refix_stuck` — def `scripts/herd/agent-watch.sh:9413` — callers: —
+- `_refix_budget_reason` — def `scripts/herd/agent-watch.sh:9337` — callers: —
+- `_refix_cap_num` — def `scripts/herd/agent-watch.sh:9276` — callers: —
+- `_refix_dead_marker` — def `scripts/herd/agent-watch.sh:9513` — callers: —
+- `_refix_dead_seen` — def `scripts/herd/agent-watch.sh:9514` — callers: —
+- `_refix_stalled_row` — def `scripts/herd/agent-watch.sh:9490` — callers: —
+- `_refix_stuck_file` — def `scripts/herd/agent-watch.sh:9411` — callers: —
+- `_refix_stuck_reason` — def `scripts/herd/agent-watch.sh:9414` — callers: —
+- `_refix_stuck_seen` — def `scripts/herd/agent-watch.sh:9412` — callers: —
+- `_refresh_guard_attached` — def `scripts/herd/agent-watch.sh:5785` — callers: —
+- `_refresh_lock_file` — def `scripts/herd/agent-watch.sh:5713` — callers: —
+- `_refresh_run_locked` — def `scripts/herd/agent-watch.sh:5727` — callers: —
 - `_reg_pane_validated` — def `bin/herd:5706` — callers: —
 - `_reg_role_ok` — def `bin/herd:5721` — callers: —
 - `_reload_agent_pane` — def `bin/herd:5668` — callers: —
@@ -817,10 +822,10 @@ this scan cannot see).
 - `_reload_tab_panes` — def `scripts/herd/layout-reconcile.sh:79` — callers: `bin/herd:6728`, `bin/herd:6884`
 - `_reload_tabs` — def `scripts/herd/layout-reconcile.sh:223` — callers: —
 - `_reload_timeout` — def `scripts/herd/layout-reconcile.sh:39` — callers: `bin/herd:5517`, `bin/herd:5559`, `bin/herd:5616`, `bin/herd:5617`, `bin/herd:5618`
-- `_render_pass_clock_begin` — def `scripts/herd/agent-watch.sh:2819` — callers: —
-- `_render_pass_clock_end` — def `scripts/herd/agent-watch.sh:2829` — callers: —
-- `_repair_branch_ref` — def `scripts/herd/agent-watch.sh:14127` — callers: —
-- `_repair_branch_ref_try` — def `scripts/herd/agent-watch.sh:14137` — callers: —
+- `_render_pass_clock_begin` — def `scripts/herd/agent-watch.sh:2824` — callers: —
+- `_render_pass_clock_end` — def `scripts/herd/agent-watch.sh:2834` — callers: —
+- `_repair_branch_ref` — def `scripts/herd/agent-watch.sh:14263` — callers: —
+- `_repair_branch_ref_try` — def `scripts/herd/agent-watch.sh:14273` — callers: —
 - `_report_and_cleanup` — def `scripts/herd/scribe-step.sh:147` — callers: —
 - `_report_find_dups` — def `bin/herd:5324` — callers: —
 - `_report_norm` — def `bin/herd:5318` — callers: —
@@ -832,38 +837,38 @@ this scan cannot see).
 - `_resolve_claim_load` — def `scripts/herd/resolver-claim.sh:130` — callers: —
 - `_resolve_claim_parse` — def `scripts/herd/resolver-claim.sh:89` — callers: —
 - `_resolve_claim_publish` — def `scripts/herd/resolver-claim.sh:178` — callers: —
-- `_resolve_claim_publish_claimed` — def `scripts/herd/resolver-claim.sh:231` — callers: `scripts/herd/agent-watch.sh:5273`
-- `_resolve_claim_publish_terminal` — def `scripts/herd/resolver-claim.sh:242` — callers: `scripts/herd/agent-watch.sh:5528`, `scripts/herd/agent-watch.sh:5539`
+- `_resolve_claim_publish_claimed` — def `scripts/herd/resolver-claim.sh:231` — callers: `scripts/herd/agent-watch.sh:5278`
+- `_resolve_claim_publish_terminal` — def `scripts/herd/resolver-claim.sh:242` — callers: `scripts/herd/agent-watch.sh:5533`, `scripts/herd/agent-watch.sh:5544`
 - `_resolve_claim_render` — def `scripts/herd/resolver-claim.sh:81` — callers: —
 - `_resolve_claim_seat` — def `scripts/herd/resolver-claim.sh:60` — callers: —
 - `_resolve_claim_should_hold` — def `scripts/herd/resolver-claim.sh:203` — callers: —
 - `_resolve_claim_ttl` — def `scripts/herd/resolver-claim.sh:50` — callers: —
-- `_resolve_lane_lock_acquire` — def `scripts/herd/agent-watch.sh:5351` — callers: —
-- `_resolve_lane_lock_release` — def `scripts/herd/agent-watch.sh:5392` — callers: —
-- `_resolve_lane_lock_scrap` — def `scripts/herd/agent-watch.sh:5341` — callers: —
+- `_resolve_lane_lock_acquire` — def `scripts/herd/agent-watch.sh:5356` — callers: —
+- `_resolve_lane_lock_release` — def `scripts/herd/agent-watch.sh:5397` — callers: —
+- `_resolve_lane_lock_scrap` — def `scripts/herd/agent-watch.sh:5346` — callers: —
 - `_resolve_range` — def `scripts/herd/backlog-reconcile.sh:62` — callers: —
-- `_resolve_registry_file` — def `scripts/herd/agent-watch.sh:4758` — callers: —
-- `_resolve_result` — def `scripts/herd/agent-watch.sh:4743` — callers: —
-- `_resolve_result_file` — def `scripts/herd/agent-watch.sh:4739` — callers: —
-- `_resolve_watcher_owner` — def `scripts/herd/agent-watch.sh:14081` — callers: —
-- `_resolver_agent_alive` — def `scripts/herd/agent-watch.sh:4999` — callers: —
-- `_resolver_agent_status` — def `scripts/herd/agent-watch.sh:5050` — callers: —
-- `_resolver_grace_active` — def `scripts/herd/agent-watch.sh:5008` — callers: —
-- `_resolver_in_flight` — def `scripts/herd/agent-watch.sh:5150` — callers: —
-- `_resolver_lane_inflight` — def `scripts/herd/agent-watch.sh:3089` — callers: —
-- `_resolver_lane_starting` — def `scripts/herd/agent-watch.sh:3112` — callers: —
-- `_resolver_limit_parked` — def `scripts/herd/agent-watch.sh:5099` — callers: —
-- `_resolver_liveness_verdict` — def `scripts/herd/agent-watch.sh:5029` — callers: —
-- `_resolver_pane_enabled` — def `scripts/herd/agent-watch.sh:4763` — callers: —
+- `_resolve_registry_file` — def `scripts/herd/agent-watch.sh:4763` — callers: —
+- `_resolve_result` — def `scripts/herd/agent-watch.sh:4748` — callers: —
+- `_resolve_result_file` — def `scripts/herd/agent-watch.sh:4744` — callers: —
+- `_resolve_watcher_owner` — def `scripts/herd/agent-watch.sh:14217` — callers: —
+- `_resolver_agent_alive` — def `scripts/herd/agent-watch.sh:5004` — callers: —
+- `_resolver_agent_status` — def `scripts/herd/agent-watch.sh:5055` — callers: —
+- `_resolver_grace_active` — def `scripts/herd/agent-watch.sh:5013` — callers: —
+- `_resolver_in_flight` — def `scripts/herd/agent-watch.sh:5155` — callers: —
+- `_resolver_lane_inflight` — def `scripts/herd/agent-watch.sh:3094` — callers: —
+- `_resolver_lane_starting` — def `scripts/herd/agent-watch.sh:3117` — callers: —
+- `_resolver_limit_parked` — def `scripts/herd/agent-watch.sh:5104` — callers: —
+- `_resolver_liveness_verdict` — def `scripts/herd/agent-watch.sh:5034` — callers: —
+- `_resolver_pane_enabled` — def `scripts/herd/agent-watch.sh:4768` — callers: —
 - `_resolver_pane_is_typo` — def `scripts/herd/resolver-pane.sh:29` — callers: —
-- `_resolver_probe` — def `scripts/herd/agent-watch.sh:4989` — callers: —
-- `_resolver_roster_listed` — def `scripts/herd/agent-watch.sh:4967` — callers: —
-- `_resolver_round_finished` — def `scripts/herd/agent-watch.sh:5075` — callers: —
-- `_respawn_builder_in_worktree` — def `scripts/herd/agent-watch.sh:11869` — callers: —
-- `_restale_decorate_row` — def `scripts/herd/agent-watch.sh:4296` — callers: —
-- `_restale_note` — def `scripts/herd/agent-watch.sh:4266` — callers: —
-- `_resume_builder` — def `scripts/herd/agent-watch.sh:10683` — callers: —
-- `_retire_age` — def `scripts/herd/retirement.sh:903` — callers: `scripts/herd/agent-watch.sh:1307`
+- `_resolver_probe` — def `scripts/herd/agent-watch.sh:4994` — callers: —
+- `_resolver_roster_listed` — def `scripts/herd/agent-watch.sh:4972` — callers: —
+- `_resolver_round_finished` — def `scripts/herd/agent-watch.sh:5080` — callers: —
+- `_respawn_builder_in_worktree` — def `scripts/herd/agent-watch.sh:12005` — callers: —
+- `_restale_decorate_row` — def `scripts/herd/agent-watch.sh:4301` — callers: —
+- `_restale_note` — def `scripts/herd/agent-watch.sh:4271` — callers: —
+- `_resume_builder` — def `scripts/herd/agent-watch.sh:10819` — callers: —
+- `_retire_age` — def `scripts/herd/retirement.sh:903` — callers: `scripts/herd/agent-watch.sh:1312`
 - `_retire_agent_listed` — def `scripts/herd/retirement.sh:195` — callers: —
 - `_retire_anchor` — def `scripts/herd/retirement.sh:350` — callers: —
 - `_retire_attempts` — def `scripts/herd/retirement.sh:117` — callers: —
@@ -873,11 +878,11 @@ this scan cannot see).
 - `_retire_branch_unique` — def `scripts/herd/retirement.sh:413` — callers: —
 - `_retire_classify_orphan` — def `scripts/herd/retirement.sh:454` — callers: —
 - `_retire_delete_branch` — def `scripts/herd/retirement.sh:663` — callers: —
-- `_retire_detail_of` — def `scripts/herd/retirement.sh:894` — callers: `scripts/herd/agent-watch.sh:14998`
+- `_retire_detail_of` — def `scripts/herd/retirement.sh:894` — callers: `scripts/herd/agent-watch.sh:15134`
 - `_retire_drop_probes` — def `scripts/herd/retirement.sh:268` — callers: —
 - `_retire_drop_registry_rows` — def `scripts/herd/retirement.sh:640` — callers: —
 - `_retire_first_epoch` — def `scripts/herd/retirement.sh:125` — callers: —
-- `_retire_health_pane` — def `scripts/herd/agent-watch.sh:4888` — callers: —
+- `_retire_health_pane` — def `scripts/herd/agent-watch.sh:4893` — callers: —
 - `_retire_last_left` — def `scripts/herd/retirement.sh:145` — callers: —
 - `_retire_ledger_files` — def `scripts/herd/retirement.sh:304` — callers: —
 - `_retire_ledger_pr` — def `scripts/herd/retirement.sh:405` — callers: —
@@ -890,45 +895,45 @@ this scan cannot see).
 - `_retire_record` — def `scripts/herd/retirement.sh:877` — callers: —
 - `_retire_registry_slugs` — def `scripts/herd/retirement.sh:741` — callers: —
 - `_retire_residual_slugs` — def `scripts/herd/retirement.sh:801` — callers: —
-- `_retire_resolver_pane` — def `scripts/herd/agent-watch.sh:4779` — callers: —
-- `_retire_reviewer_pane` — def `scripts/herd/agent-watch.sh:3183` — callers: —
+- `_retire_resolver_pane` — def `scripts/herd/agent-watch.sh:4784` — callers: —
+- `_retire_reviewer_pane` — def `scripts/herd/agent-watch.sh:3188` — callers: —
 - `_retire_state_bump` — def `scripts/herd/retirement.sh:133` — callers: —
 - `_retire_state_clear` — def `scripts/herd/retirement.sh:151` — callers: —
 - `_retire_state_file` — def `scripts/herd/retirement.sh:114` — callers: —
-- `_retire_state_of` — def `scripts/herd/retirement.sh:885` — callers: `scripts/herd/agent-watch.sh:14992`
+- `_retire_state_of` — def `scripts/herd/retirement.sh:885` — callers: `scripts/herd/agent-watch.sh:15128`
 - `_retire_step` — def `scripts/herd/retirement.sh:1014` — callers: —
 - `_retire_suffixed` — def `scripts/herd/retirement.sh:256` — callers: —
 - `_retire_tab_ids` — def `scripts/herd/retirement.sh:170` — callers: —
 - `_retire_tail_ok` — def `scripts/herd/retirement.sh:247` — callers: —
 - `_retire_worktrees_enumerable` — def `scripts/herd/retirement.sh:780` — callers: —
-- `_review_block_file` — def `scripts/herd/agent-watch.sh:2755` — callers: —
-- `_review_conc` — def `scripts/herd/agent-watch.sh:678` — callers: —
-- `_review_escalate_file` — def `scripts/herd/agent-watch.sh:2759` — callers: —
-- `_review_gate_step` — def `scripts/herd/agent-watch.sh:3686` — callers: —
-- `_review_inflight_file` — def `scripts/herd/agent-watch.sh:2748` — callers: —
-- `_review_last_passed_sha` — def `scripts/herd/agent-watch.sh:2504` — callers: —
-- `_review_pid_live` — def `scripts/herd/agent-watch.sh:3139` — callers: —
-- `_review_registry_file` — def `scripts/herd/agent-watch.sh:2769` — callers: —
-- `_review_result_file` — def `scripts/herd/agent-watch.sh:2749` — callers: `scripts/herd/sweep.sh:480`, `scripts/herd/sweep.sh:505`
-- `_review_retry_count` — def `scripts/herd/agent-watch.sh:3154` — callers: —
-- `_review_tier` — def `scripts/herd/agent-watch.sh:3128` — callers: —
-- `_review_tier_file` — def `scripts/herd/agent-watch.sh:2750` — callers: —
-- `_reviewer_registry_live` — def `scripts/herd/agent-watch.sh:3168` — callers: —
-- `_roster_readable` — def `scripts/herd/agent-watch.sh:4946` — callers: —
-- `_rotate_health_logs` — def `scripts/herd/agent-watch.sh:12839` — callers: —
-- `_row_awaiting_task` — def `scripts/herd/agent-watch.sh:1260` — callers: —
-- `_row_branch_mismatch` — def `scripts/herd/agent-watch.sh:14162` — callers: —
-- `_row_draft_stall` — def `scripts/herd/agent-watch.sh:12801` — callers: —
-- `_row_finish_stall` — def `scripts/herd/agent-watch.sh:12559` — callers: —
-- `_row_pr_match_pending` — def `scripts/herd/agent-watch.sh:1344` — callers: —
-- `_row_retirement` — def `scripts/herd/agent-watch.sh:1305` — callers: —
-- `_row_wedged` — def `scripts/herd/agent-watch.sh:1276` — callers: —
-- `_rs_body` — def `scripts/herd/agent-watch.sh:5930` — callers: —
-- `_rs_j` — def `scripts/herd/agent-watch.sh:5915` — callers: —
+- `_review_block_file` — def `scripts/herd/agent-watch.sh:2760` — callers: —
+- `_review_conc` — def `scripts/herd/agent-watch.sh:683` — callers: —
+- `_review_escalate_file` — def `scripts/herd/agent-watch.sh:2764` — callers: —
+- `_review_gate_step` — def `scripts/herd/agent-watch.sh:3691` — callers: —
+- `_review_inflight_file` — def `scripts/herd/agent-watch.sh:2753` — callers: —
+- `_review_last_passed_sha` — def `scripts/herd/agent-watch.sh:2509` — callers: —
+- `_review_pid_live` — def `scripts/herd/agent-watch.sh:3144` — callers: —
+- `_review_registry_file` — def `scripts/herd/agent-watch.sh:2774` — callers: —
+- `_review_result_file` — def `scripts/herd/agent-watch.sh:2754` — callers: `scripts/herd/sweep.sh:480`, `scripts/herd/sweep.sh:505`
+- `_review_retry_count` — def `scripts/herd/agent-watch.sh:3159` — callers: —
+- `_review_tier` — def `scripts/herd/agent-watch.sh:3133` — callers: —
+- `_review_tier_file` — def `scripts/herd/agent-watch.sh:2755` — callers: —
+- `_reviewer_registry_live` — def `scripts/herd/agent-watch.sh:3173` — callers: —
+- `_roster_readable` — def `scripts/herd/agent-watch.sh:4951` — callers: —
+- `_rotate_health_logs` — def `scripts/herd/agent-watch.sh:12975` — callers: —
+- `_row_awaiting_task` — def `scripts/herd/agent-watch.sh:1265` — callers: —
+- `_row_branch_mismatch` — def `scripts/herd/agent-watch.sh:14298` — callers: —
+- `_row_draft_stall` — def `scripts/herd/agent-watch.sh:12937` — callers: —
+- `_row_finish_stall` — def `scripts/herd/agent-watch.sh:12695` — callers: —
+- `_row_pr_match_pending` — def `scripts/herd/agent-watch.sh:1349` — callers: —
+- `_row_retirement` — def `scripts/herd/agent-watch.sh:1310` — callers: —
+- `_row_wedged` — def `scripts/herd/agent-watch.sh:1281` — callers: —
+- `_rs_body` — def `scripts/herd/agent-watch.sh:5935` — callers: —
+- `_rs_j` — def `scripts/herd/agent-watch.sh:5920` — callers: —
 - `_say` — def `scripts/herd/changelog.sh:40`, `scripts/herd/oss-triage.sh:39` — callers: —
 - `_scan` — def `scripts/herd/backlog-reconcile.sh:124` — callers: —
 - `_scan_source` — def `scripts/herd/governance-drift-sweep.sh:91` — callers: —
-- `_scope_permits_automerge` — def `scripts/herd/agent-watch.sh:14098` — callers: —
+- `_scope_permits_automerge` — def `scripts/herd/agent-watch.sh:14234` — callers: —
 - `_scribe_auto_marker` — def `scripts/herd/scribe-step.sh:294` — callers: —
 - `_scribe_auto_ship` — def `scripts/herd/scribe-step.sh:349` — callers: —
 - `_scribe_backend_dispatches_creates` — def `scripts/herd/scribe-step.sh:210` — callers: —
@@ -938,18 +943,18 @@ this scan cannot see).
 - `_scribe_retry_close` — def `scripts/herd/scribe-step.sh:223` — callers: —
 - `_scribe_seq_blocker` — def `scripts/herd/scribe-step.sh:244` — callers: —
 - `_scribe_unmatched_merge_pr` — def `scripts/herd/scribe-step.sh:329` — callers: —
-- `_seen` — def `scripts/herd/oss-triage.sh:85` — callers: `scripts/herd/agent-watch.sh:4614`
+- `_seen` — def `scripts/herd/oss-triage.sh:85` — callers: `scripts/herd/agent-watch.sh:4619`
 - `_seen_has` — def `scripts/herd/journal-audit.sh:467` — callers: —
 - `_seen_mark` — def `scripts/herd/journal-audit.sh:471` — callers: —
 - `_seg` — def `scripts/herd/sweep.sh:1303` — callers: —
-- `_self_restart_arm` — def `scripts/herd/agent-watch.sh:6112` — callers: —
-- `_self_restart_enabled` — def `scripts/herd/agent-watch.sh:6101` — callers: —
-- `_self_restart_exec` — def `scripts/herd/agent-watch.sh:6156` — callers: —
-- `_self_restart_hold_dispatch` — def `scripts/herd/agent-watch.sh:6108` — callers: —
-- `_self_restart_journal` — def `scripts/herd/agent-watch.sh:6143` — callers: —
-- `_self_restart_quiescing` — def `scripts/herd/agent-watch.sh:6104` — callers: —
-- `_self_restart_should_exec` — def `scripts/herd/agent-watch.sh:6131` — callers: —
-- `_self_restart_tick` — def `scripts/herd/agent-watch.sh:6180` — callers: —
+- `_self_restart_arm` — def `scripts/herd/agent-watch.sh:6117` — callers: —
+- `_self_restart_enabled` — def `scripts/herd/agent-watch.sh:6106` — callers: —
+- `_self_restart_exec` — def `scripts/herd/agent-watch.sh:6161` — callers: —
+- `_self_restart_hold_dispatch` — def `scripts/herd/agent-watch.sh:6113` — callers: —
+- `_self_restart_journal` — def `scripts/herd/agent-watch.sh:6148` — callers: —
+- `_self_restart_quiescing` — def `scripts/herd/agent-watch.sh:6109` — callers: —
+- `_self_restart_should_exec` — def `scripts/herd/agent-watch.sh:6136` — callers: —
+- `_self_restart_tick` — def `scripts/herd/agent-watch.sh:6185` — callers: —
 - `_severed` — def `scripts/herd/herd-review.sh:264` — callers: —
 - `_sg_count_inflight_builders` — def `scripts/herd/herd-spawn-gate.sh:113` — callers: —
 - `_sg_count_live_reviews` — def `scripts/herd/herd-spawn-gate.sh:50` — callers: —
@@ -960,45 +965,45 @@ this scan cannot see).
 - `_sg_trees` — def `scripts/herd/herd-spawn-gate.sh:40` — callers: —
 - `_sg_verdict_recorded` — def `scripts/herd/herd-spawn-gate.sh:64` — callers: —
 - `_shebang_lang` — def `scripts/herd/healthcheck.sh:405` — callers: —
-- `_should_automerge` — def `scripts/herd/agent-watch.sh:2379` — callers: —
-- `_shq` — def `scripts/herd/agent-watch.sh:10648` — callers: —
+- `_should_automerge` — def `scripts/herd/agent-watch.sh:2384` — callers: —
+- `_shq` — def `scripts/herd/agent-watch.sh:10784` — callers: —
 - `_si_calls` — def `scripts/herd/symbol-index.sh:74` — callers: —
 - `_si_defs` — def `scripts/herd/symbol-index.sh:48` — callers: —
 - `_si_render` — def `scripts/herd/symbol-index.sh:95` — callers: —
-- `_slug_builder_tab_ids` — def `scripts/herd/agent-watch.sh:11849` — callers: —
-- `_slug_cell` — def `scripts/herd/agent-watch.sh:770` — callers: —
-- `_slug_ref` — def `scripts/herd/agent-watch.sh:757` — callers: `scripts/herd/work-units/git-pr.sh:281`
-- `_slug_ref_file` — def `scripts/herd/agent-watch.sh:752` — callers: —
-- `_spawn_ahead` — def `scripts/herd/agent-watch.sh:679` — callers: —
-- `_spawn_clear_held` — def `scripts/herd/agent-watch.sh:15626` — callers: —
-- `_spawn_dep_merged` — def `scripts/herd/agent-watch.sh:15584` — callers: —
-- `_spawn_health_pane` — def `scripts/herd/agent-watch.sh:4859` — callers: —
-- `_spawn_held_epoch` — def `scripts/herd/agent-watch.sh:15608` — callers: —
-- `_spawn_inflight_bg` — def `scripts/herd/agent-watch.sh:3050` — callers: —
-- `_spawn_inflight_file` — def `scripts/herd/agent-watch.sh:2950` — callers: —
-- `_spawn_inflight_sweep` — def `scripts/herd/agent-watch.sh:3062` — callers: —
-- `_spawn_mark_held` — def `scripts/herd/agent-watch.sh:15617` — callers: —
+- `_slug_builder_tab_ids` — def `scripts/herd/agent-watch.sh:11985` — callers: —
+- `_slug_cell` — def `scripts/herd/agent-watch.sh:775` — callers: —
+- `_slug_ref` — def `scripts/herd/agent-watch.sh:762` — callers: `scripts/herd/work-units/git-pr.sh:281`
+- `_slug_ref_file` — def `scripts/herd/agent-watch.sh:757` — callers: —
+- `_spawn_ahead` — def `scripts/herd/agent-watch.sh:684` — callers: —
+- `_spawn_clear_held` — def `scripts/herd/agent-watch.sh:15762` — callers: —
+- `_spawn_dep_merged` — def `scripts/herd/agent-watch.sh:15720` — callers: —
+- `_spawn_health_pane` — def `scripts/herd/agent-watch.sh:4864` — callers: —
+- `_spawn_held_epoch` — def `scripts/herd/agent-watch.sh:15744` — callers: —
+- `_spawn_inflight_bg` — def `scripts/herd/agent-watch.sh:3055` — callers: —
+- `_spawn_inflight_file` — def `scripts/herd/agent-watch.sh:2955` — callers: —
+- `_spawn_inflight_sweep` — def `scripts/herd/agent-watch.sh:3067` — callers: —
+- `_spawn_mark_held` — def `scripts/herd/agent-watch.sh:15753` — callers: —
 - `_spawn_next_seq` — def `scripts/herd/spawn.sh:78` — callers: —
 - `_spawn_owner_alive` — def `scripts/herd/spawn-step.sh:59` — callers: —
 - `_spawn_pid_starttime` — def `scripts/herd/spawn-step.sh:49` — callers: —
 - `_spawn_require_claim` — def `scripts/herd/spawn-step.sh:71` — callers: —
-- `_spawn_resolver_lane` — def `scripts/herd/agent-watch.sh:5413` — callers: —
-- `_spawn_resolver_local` — def `scripts/herd/agent-watch.sh:5264` — callers: —
-- `_spawn_resolver_wait` — def `scripts/herd/agent-watch.sh:5296` — callers: —
-- `_spawn_slug_key` — def `scripts/herd/agent-watch.sh:2948` — callers: —
-- `_srs_gh_view` — def `scripts/herd/agent-watch.sh:8098` — callers: `scripts/herd/retirement.sh:367`, `scripts/herd/retirement.sh:483`, `scripts/herd/retirement.sh:500`, `scripts/herd/retirement.sh:865`, `scripts/herd/sweep.sh:356`, `scripts/herd/sweep.sh:598`
-- `_stale_base_autofix_enabled` — def `scripts/herd/agent-watch.sh:9695` — callers: —
-- `_stale_dup_gate_step` — def `scripts/herd/agent-watch.sh:10414` — callers: —
+- `_spawn_resolver_lane` — def `scripts/herd/agent-watch.sh:5418` — callers: —
+- `_spawn_resolver_local` — def `scripts/herd/agent-watch.sh:5269` — callers: —
+- `_spawn_resolver_wait` — def `scripts/herd/agent-watch.sh:5301` — callers: —
+- `_spawn_slug_key` — def `scripts/herd/agent-watch.sh:2953` — callers: —
+- `_srs_gh_view` — def `scripts/herd/agent-watch.sh:8234` — callers: `scripts/herd/retirement.sh:367`, `scripts/herd/retirement.sh:483`, `scripts/herd/retirement.sh:500`, `scripts/herd/retirement.sh:865`, `scripts/herd/sweep.sh:356`, `scripts/herd/sweep.sh:598`
+- `_stale_base_autofix_enabled` — def `scripts/herd/agent-watch.sh:9831` — callers: —
+- `_stale_dup_gate_step` — def `scripts/herd/agent-watch.sh:10550` — callers: —
 - `_stale_dup_merged_refs` — def `scripts/herd/stale-dup-gate.sh:102` — callers: —
 - `_stale_dup_shipped_by` — def `scripts/herd/stale-dup-gate.sh:133` — callers: —
 - `_stale_dup_this_ref` — def `scripts/herd/stale-dup-gate.sh:88` — callers: —
-- `_stale_has_live_builder` — def `scripts/herd/agent-watch.sh:10137` — callers: —
-- `_stale_needs_you_row` — def `scripts/herd/agent-watch.sh:10149` — callers: —
-- `_stale_resolve_tab_ids` — def `scripts/herd/agent-watch.sh:8522` — callers: `scripts/herd/sweep.sh:451`
-- `_stall_quiet_secs` — def `scripts/herd/agent-watch.sh:11307` — callers: —
-- `_startup_reap_sweep` — def `scripts/herd/agent-watch.sh:8134` — callers: —
-- `_starvation_row` — def `scripts/herd/agent-watch.sh:4287` — callers: —
-- `_stat_birth` — def `scripts/herd/agent-watch.sh:11298`, `scripts/herd/agent-watch.sh:11302` — callers: —
+- `_stale_has_live_builder` — def `scripts/herd/agent-watch.sh:10273` — callers: —
+- `_stale_needs_you_row` — def `scripts/herd/agent-watch.sh:10285` — callers: —
+- `_stale_resolve_tab_ids` — def `scripts/herd/agent-watch.sh:8658` — callers: `scripts/herd/sweep.sh:451`
+- `_stall_quiet_secs` — def `scripts/herd/agent-watch.sh:11443` — callers: —
+- `_startup_reap_sweep` — def `scripts/herd/agent-watch.sh:8270` — callers: —
+- `_starvation_row` — def `scripts/herd/agent-watch.sh:4292` — callers: —
+- `_stat_birth` — def `scripts/herd/agent-watch.sh:11434`, `scripts/herd/agent-watch.sh:11438` — callers: —
 - `_state_upsert` — def `scripts/herd/oss-triage.sh:92` — callers: —
 - `_status_backlog_counts` — def `scripts/herd/status.sh:139` — callers: —
 - `_status_classify_builder` — def `scripts/herd/status.sh:61` — callers: —
@@ -1031,11 +1036,11 @@ this scan cannot see).
 - `_steps_worktree_sha` — def `scripts/herd/steps.sh:177` — callers: —
 - `_stop_project_watcher` — def `bin/herd:5985` — callers: —
 - `_stop_reap_main_health` — def `bin/herd:5945` — callers: —
-- `_strip_ansi` — def `scripts/herd/agent-watch.sh:7238` — callers: —
-- `_suite_inflight_key` — def `scripts/herd/agent-watch.sh:9480` — callers: —
+- `_strip_ansi` — def `scripts/herd/agent-watch.sh:7243` — callers: —
+- `_suite_inflight_key` — def `scripts/herd/agent-watch.sh:9616` — callers: —
 - `_surface` — def `scripts/herd/backlog-reconcile.sh:83` — callers: —
-- `_sweep_auto_record` — def `scripts/herd/agent-watch.sh:14417` — callers: —
-- `_sweep_auto_should_act` — def `scripts/herd/agent-watch.sh:14408` — callers: —
+- `_sweep_auto_record` — def `scripts/herd/agent-watch.sh:14553` — callers: —
+- `_sweep_auto_should_act` — def `scripts/herd/agent-watch.sh:14544` — callers: —
 - `_sweep_await_dead` — def `scripts/herd/sweep.sh:966` — callers: —
 - `_sweep_classify_dirt` — def `scripts/herd/sweep.sh:195` — callers: `scripts/herd/retirement.sh:593`, `scripts/herd/work-units/git-pr.sh:196`
 - `_sweep_die` — def `scripts/herd/backlog-reconcile-sweep.sh:52` — callers: —
@@ -1043,19 +1048,19 @@ this scan cannot see).
 - `_sweep_emit_defer` — def `scripts/herd/sweep.sh:415` — callers: —
 - `_sweep_emit_flag` — def `scripts/herd/sweep.sh:403` — callers: —
 - `_sweep_emit_reap` — def `scripts/herd/sweep.sh:392` — callers: —
-- `_sweep_fmt_age` — def `scripts/herd/agent-watch.sh:14423` — callers: —
-- `_sweep_gate_corpses` — def `scripts/herd/agent-watch.sh:13816` — callers: `scripts/herd/sweep.sh:542`
+- `_sweep_fmt_age` — def `scripts/herd/agent-watch.sh:14559` — callers: —
+- `_sweep_gate_corpses` — def `scripts/herd/agent-watch.sh:13952` — callers: `scripts/herd/sweep.sh:542`
 - `_sweep_is_scratch` — def `scripts/herd/sweep.sh:233` — callers: —
-- `_sweep_journal_audit` — def `scripts/herd/agent-watch.sh:9052` — callers: —
-- `_sweep_lifecycle` — def `scripts/herd/agent-watch.sh:9075` — callers: —
+- `_sweep_journal_audit` — def `scripts/herd/agent-watch.sh:9188` — callers: —
+- `_sweep_lifecycle` — def `scripts/herd/agent-watch.sh:9211` — callers: —
 - `_sweep_live_marker_pids` — def `scripts/herd/sweep.sh:720` — callers: —
 - `_sweep_live_marker_sessions` — def `scripts/herd/sweep.sh:753` — callers: —
-- `_sweep_merged_prs` — def `scripts/herd/agent-watch.sh:9019` — callers: —
+- `_sweep_merged_prs` — def `scripts/herd/agent-watch.sh:9155` — callers: —
 - `_sweep_once_guard_file_pr` — def `scripts/herd/sweep.sh:637` — callers: —
 - `_sweep_once_guard_parse` — def `scripts/herd/sweep.sh:611` — callers: —
 - `_sweep_once_guard_pr_state` — def `scripts/herd/sweep.sh:590` — callers: —
 - `_sweep_once_guard_scan_due` — def `scripts/herd/sweep.sh:574` — callers: —
-- `_sweep_orphan_tabs` — def `scripts/herd/agent-watch.sh:8364` — callers: `scripts/herd/sweep.sh:459`
+- `_sweep_orphan_tabs` — def `scripts/herd/agent-watch.sh:8500` — callers: `scripts/herd/sweep.sh:459`
 - `_sweep_owns_path` — def `scripts/herd/sweep.sh:770` — callers: —
 - `_sweep_pgid_of` — def `scripts/herd/sweep.sh:883` — callers: —
 - `_sweep_proc_cwd` — def `scripts/herd/sweep.sh:702` — callers: —
@@ -1068,22 +1073,23 @@ this scan cannot see).
 - `_sweep_relink_request` — def `scripts/herd/sweep.sh:1176` — callers: —
 - `_sweep_relink_scan_due` — def `scripts/herd/sweep.sh:1193` — callers: —
 - `_sweep_reset_counters` — def `scripts/herd/sweep.sh:157` — callers: —
-- `_sweep_reviewer_registry` — def `scripts/herd/agent-watch.sh:3217` — callers: —
+- `_sweep_reviewer_registry` — def `scripts/herd/agent-watch.sh:3222` — callers: —
 - `_sweep_say` — def `scripts/herd/sweep.sh:163` — callers: —
 - `_sweep_sess_of` — def `scripts/herd/sweep.sh:730` — callers: —
 - `_sweep_spare_pgids` — def `scripts/herd/sweep.sh:898` — callers: —
-- `_sweep_stale_resolve_tabs` — def `scripts/herd/agent-watch.sh:8611` — callers: `scripts/herd/sweep.sh:460`
+- `_sweep_stale_resolve_tabs` — def `scripts/herd/agent-watch.sh:8747` — callers: `scripts/herd/sweep.sh:460`
 - `_sweep_stamp_tally` — def `scripts/herd/sweep.sh:1347` — callers: —
-- `_sweep_tally_invalidated` — def `scripts/herd/agent-watch.sh:14356` — callers: —
+- `_sweep_tally_invalidated` — def `scripts/herd/agent-watch.sh:14492` — callers: —
 - `_sweep_term_one` — def `scripts/herd/sweep.sh:928` — callers: —
-- `_sweep_tracker_state` — def `scripts/herd/agent-watch.sh:8637` — callers: —
-- `_sweep_trigger_tick` — def `scripts/herd/agent-watch.sh:14367` — callers: —
+- `_sweep_tracker_state` — def `scripts/herd/agent-watch.sh:8773` — callers: —
+- `_sweep_trigger_tick` — def `scripts/herd/agent-watch.sh:14503` — callers: —
 - `_sweep_unique_commits` — def `scripts/herd/sweep.sh:273` — callers: `scripts/herd/retirement.sh:613`
 - `_sweep_watcher_has_gate_child` — def `scripts/herd/sweep.sh:840` — callers: —
 - `_sweep_worktree_rows` — def `scripts/herd/sweep.sh:169` — callers: `scripts/herd/retirement.sh:960`
+- `_sysctl_timeval_epoch` — def `scripts/herd/agent-watch.sh:7429` — callers: —
 - `_teardown_reviewer` — def `scripts/herd/herd-review.sh:242` — callers: —
 - `_term_cols` — def `scripts/herd/backlog-view.sh:81` — callers: —
-- `_text_is_limit_banner` — def `scripts/herd/agent-watch.sh:10815` — callers: —
+- `_text_is_limit_banner` — def `scripts/herd/agent-watch.sh:10951` — callers: —
 - `_theme_active` — def `bin/herd:7893` — callers: —
 - `_theme_builtins_dir` — def `bin/herd:7883` — callers: —
 - `_theme_dir_ok` — def `bin/herd:7888` — callers: —
@@ -1092,11 +1098,11 @@ this scan cannot see).
 - `_theme_set` — def `bin/herd:7966` — callers: —
 - `_theme_swatch` — def `bin/herd:7935` — callers: —
 - `_theme_user_dir` — def `bin/herd:7884` — callers: —
-- `_tick_render_reconcile` — def `scripts/herd/agent-watch.sh:14811` — callers: —
-- `_tracker_heal_row` — def `scripts/herd/agent-watch.sh:883` — callers: —
-- `_transcript_growing` — def `scripts/herd/agent-watch.sh:11380` — callers: —
-- `_transcript_last_assistant_text` — def `scripts/herd/agent-watch.sh:10724` — callers: —
-- `_transcript_obs` — def `scripts/herd/agent-watch.sh:11350` — callers: —
+- `_tick_render_reconcile` — def `scripts/herd/agent-watch.sh:14947` — callers: —
+- `_tracker_heal_row` — def `scripts/herd/agent-watch.sh:888` — callers: —
+- `_transcript_growing` — def `scripts/herd/agent-watch.sh:11516` — callers: —
+- `_transcript_last_assistant_text` — def `scripts/herd/agent-watch.sh:10860` — callers: —
+- `_transcript_obs` — def `scripts/herd/agent-watch.sh:11486` — callers: —
 - `_triggers_interval` — def `scripts/herd/triggers.sh:96` — callers: —
 - `_triggers_last_file` — def `scripts/herd/triggers.sh:163` — callers: —
 - `_triggers_now` — def `scripts/herd/triggers.sh:164` — callers: —
@@ -1105,7 +1111,7 @@ this scan cannot see).
 - `_triggers_snapshot_file` — def `scripts/herd/triggers.sh:162` — callers: —
 - `_triggers_spawn` — def `scripts/herd/triggers.sh:185` — callers: —
 - `_triggers_trim` — def `scripts/herd/triggers.sh:80` — callers: —
-- `_try_clean_limit_menu_select` — def `scripts/herd/agent-watch.sh:10997` — callers: —
+- `_try_clean_limit_menu_select` — def `scripts/herd/agent-watch.sh:11133` — callers: —
 - `_tsweep_backend_supported` — def `scripts/herd/tracker-state-sweep.sh:123` — callers: —
 - `_tsweep_die` — def `scripts/herd/tracker-state-sweep.sh:92` — callers: —
 - `_tsweep_gh_evidence` — def `scripts/herd/tracker-state-sweep.sh:243` — callers: —
@@ -1118,94 +1124,95 @@ this scan cannot see).
 - `_tsweep_unresolved_bump` — def `scripts/herd/tracker-state-sweep.sh:263` — callers: —
 - `_tsweep_unresolved_clear` — def `scripts/herd/tracker-state-sweep.sh:275` — callers: —
 - `_tsweep_unresolved_count` — def `scripts/herd/tracker-state-sweep.sh:257` — callers: —
-- `_ungated_pr_classify` — def `scripts/herd/agent-watch.sh:1924` — callers: —
-- `_ungated_pr_row` — def `scripts/herd/agent-watch.sh:1934` — callers: —
-- `_ungated_prs_scan` — def `scripts/herd/agent-watch.sh:1957` — callers: —
+- `_ungated_pr_classify` — def `scripts/herd/agent-watch.sh:1929` — callers: —
+- `_ungated_pr_row` — def `scripts/herd/agent-watch.sh:1939` — callers: —
+- `_ungated_prs_scan` — def `scripts/herd/agent-watch.sh:1962` — callers: —
 - `_untrack_rendered_skill` — def `bin/herd:350` — callers: —
 - `_usage` — def `scripts/herd/changelog.sh:43`, `scripts/herd/oss-triage.sh:42` — callers: —
-- `_wait_agent_working` — def `scripts/herd/agent-watch.sh:9447` — callers: —
+- `_wait_agent_working` — def `scripts/herd/agent-watch.sh:9583` — callers: —
+- `_wake_probe_epoch` — def `scripts/herd/agent-watch.sh:7448` — callers: —
 - `_warn` — def `scripts/herd/changelog.sh:41`, `scripts/herd/governance-hook.sh:59`, `scripts/herd/oss-triage.sh:40` — callers: —
-- `_watch_gate_inflight` — def `scripts/herd/agent-watch.sh:6025` — callers: —
-- `_watcher_holder_argv` — def `scripts/herd/agent-watch.sh:14488` — callers: —
-- `_watcher_lock_cleanup` — def `scripts/herd/agent-watch.sh:14678` — callers: —
-- `_watcher_lock_flock_holder` — def `scripts/herd/agent-watch.sh:14498` — callers: —
+- `_watch_gate_inflight` — def `scripts/herd/agent-watch.sh:6030` — callers: —
+- `_watcher_holder_argv` — def `scripts/herd/agent-watch.sh:14624` — callers: —
+- `_watcher_lock_cleanup` — def `scripts/herd/agent-watch.sh:14814` — callers: —
+- `_watcher_lock_flock_holder` — def `scripts/herd/agent-watch.sh:14634` — callers: —
 - `_watcher_lock_holder_msg` — def `bin/herd:5786` — callers: —
 - `_watcher_lock_pid_if_live` — def `bin/herd:5885` — callers: —
-- `_watcher_owner_login` — def `scripts/herd/agent-watch.sh:14088` — callers: `scripts/herd/resolver-claim.sh:62`
+- `_watcher_owner_login` — def `scripts/herd/agent-watch.sh:14224` — callers: `scripts/herd/resolver-claim.sh:62`
 - `_watcher_proc_start_ticks` — def `bin/herd:5780` — callers: —
 - `_watcher_restart_verify` — def `bin/herd:5819` — callers: —
-- `_watcher_scope` — def `scripts/herd/agent-watch.sh:14060` — callers: —
-- `_watcher_singleton_refuse` — def `scripts/herd/agent-watch.sh:14527` — callers: —
-- `_watcher_singleton_refuse_msg` — def `scripts/herd/agent-watch.sh:14517` — callers: —
-- `_watcher_team_mode` — def `scripts/herd/agent-watch.sh:14071` — callers: —
+- `_watcher_scope` — def `scripts/herd/agent-watch.sh:14196` — callers: —
+- `_watcher_singleton_refuse` — def `scripts/herd/agent-watch.sh:14663` — callers: —
+- `_watcher_singleton_refuse_msg` — def `scripts/herd/agent-watch.sh:14653` — callers: —
+- `_watcher_team_mode` — def `scripts/herd/agent-watch.sh:14207` — callers: —
 - `_watcher_term_verified` — def `bin/herd:5908` — callers: —
 - `_watcher_tick_fields` — def `scripts/herd/work-units/git-pr.sh:373` — callers: —
-- `_watcher_view_active` — def `scripts/herd/agent-watch.sh:13945` — callers: —
-- `_watcher_view_fields` — def `scripts/herd/agent-watch.sh:13959` — callers: `scripts/herd/work-units/git-pr.sh:374`
-- `_watcher_view_filter` — def `scripts/herd/agent-watch.sh:13979` — callers: `scripts/herd/work-units/git-pr.sh:403`
-- `_watcher_view_lens` — def `scripts/herd/agent-watch.sh:13941` — callers: —
-- `_watcher_view_warn_once` — def `scripts/herd/agent-watch.sh:13969` — callers: —
-- `_wedge_autowake_on` — def `scripts/herd/agent-watch.sh:12103` — callers: —
-- `_wedge_commits_ahead` — def `scripts/herd/agent-watch.sh:12081` — callers: —
-- `_wedge_dirty` — def `scripts/herd/agent-watch.sh:12087` — callers: —
-- `_wedge_grace_secs` — def `scripts/herd/agent-watch.sh:12004` — callers: —
-- `_wedge_upsert` — def `scripts/herd/agent-watch.sh:12032` — callers: —
-- `_wedge_wake_prompt` — def `scripts/herd/agent-watch.sh:12112` — callers: —
-- `_worktree_born` — def `scripts/herd/agent-watch.sh:11339` — callers: —
-- `_worktree_has_work` — def `scripts/herd/agent-watch.sh:11750` — callers: —
-- `_worktree_newest_edit` — def `scripts/herd/agent-watch.sh:11318` — callers: —
+- `_watcher_view_active` — def `scripts/herd/agent-watch.sh:14081` — callers: —
+- `_watcher_view_fields` — def `scripts/herd/agent-watch.sh:14095` — callers: `scripts/herd/work-units/git-pr.sh:374`
+- `_watcher_view_filter` — def `scripts/herd/agent-watch.sh:14115` — callers: `scripts/herd/work-units/git-pr.sh:403`
+- `_watcher_view_lens` — def `scripts/herd/agent-watch.sh:14077` — callers: —
+- `_watcher_view_warn_once` — def `scripts/herd/agent-watch.sh:14105` — callers: —
+- `_wedge_autowake_on` — def `scripts/herd/agent-watch.sh:12239` — callers: —
+- `_wedge_commits_ahead` — def `scripts/herd/agent-watch.sh:12217` — callers: —
+- `_wedge_dirty` — def `scripts/herd/agent-watch.sh:12223` — callers: —
+- `_wedge_grace_secs` — def `scripts/herd/agent-watch.sh:12140` — callers: —
+- `_wedge_upsert` — def `scripts/herd/agent-watch.sh:12168` — callers: —
+- `_wedge_wake_prompt` — def `scripts/herd/agent-watch.sh:12248` — callers: —
+- `_worktree_born` — def `scripts/herd/agent-watch.sh:11475` — callers: —
+- `_worktree_has_work` — def `scripts/herd/agent-watch.sh:11886` — callers: —
+- `_worktree_newest_edit` — def `scripts/herd/agent-watch.sh:11454` — callers: —
 - `_wrv_block` — def `bin/herd:5822` — callers: —
 - `_wrv_is_worker` — def `bin/herd:5836` — callers: —
 - `_wx_exempt` — def `scripts/herd/watcher-exempt.sh:248` — callers: —
 - `_wx_trees` — def `scripts/herd/watcher-exempt.sh:94` — callers: —
-- `_xseat_foreign_block` — def `scripts/herd/agent-watch.sh:3996` — callers: —
-- `_xseat_journal_degraded` — def `scripts/herd/agent-watch.sh:4071` — callers: —
-- `_xseat_journal_honored` — def `scripts/herd/agent-watch.sh:4079` — callers: —
-- `_xseat_note_once` — def `scripts/herd/agent-watch.sh:4010` — callers: —
+- `_xseat_foreign_block` — def `scripts/herd/agent-watch.sh:4001` — callers: —
+- `_xseat_journal_degraded` — def `scripts/herd/agent-watch.sh:4076` — callers: —
+- `_xseat_journal_honored` — def `scripts/herd/agent-watch.sh:4084` — callers: —
+- `_xseat_note_once` — def `scripts/herd/agent-watch.sh:4015` — callers: —
 - `agent_update_binary` — def `scripts/herd/agent-update.sh:52` — callers: —
 - `agent_update_dequarantine` — def `scripts/herd/agent-update.sh:93` — callers: —
 - `agent_update_installer` — def `scripts/herd/agent-update.sh:63` — callers: —
 - `agent_update_run` — def `scripts/herd/agent-update.sh:118` — callers: `bin/herd:7168`
 - `already_merged` — def `scripts/herd/work-units/git-pr.sh:76` — callers: —
-- `approval_awaiting_noted` — def `scripts/herd/agent-watch.sh:4167` — callers: —
-- `approval_is_approved` — def `scripts/herd/agent-watch.sh:4173` — callers: —
+- `approval_awaiting_noted` — def `scripts/herd/agent-watch.sh:4172` — callers: —
+- `approval_is_approved` — def `scripts/herd/agent-watch.sh:4178` — callers: —
 - `approval_recorded` — def `scripts/herd/approvals.sh:74` — callers: —
 - `approval_state` — def `scripts/herd/approvals.sh:50` — callers: `scripts/herd/journal-audit.sh:635`
 - `ask` — def `bin/herd:151` — callers: —
-- `base` — def `scripts/herd/codemap.sh:75`, `scripts/herd/codemap.sh:289` — callers: `bin/herd:2016`, `bin/herd:2019`, `bin/herd:2020`, `bin/herd:3089`, `bin/herd:3090`, `bin/herd:3091`, `scripts/herd/agent-watch.sh:3222`, `scripts/herd/agent-watch.sh:3247`, `scripts/herd/agent-watch.sh:3248`, `scripts/herd/agent-watch.sh:3256`, `scripts/herd/agent-watch.sh:10593`, `scripts/herd/agent-watch.sh:10796`, `scripts/herd/agent-watch.sh:13364`, `scripts/herd/agent-watch.sh:13367`, `scripts/herd/agent-watch.sh:13375`, `scripts/herd/agent-watch.sh:13376`, `scripts/herd/agent-watch.sh:13384`, `scripts/herd/agent-watch.sh:13385`, `scripts/herd/agent-watch.sh:13826`, `scripts/herd/agent-watch.sh:13852`, `scripts/herd/backends/jira.sh:486`, `scripts/herd/backends/jira.sh:491`, `scripts/herd/backends/jira.sh:508`, `scripts/herd/backends/jira.sh:526`, `scripts/herd/backlog-reconcile-sweep.sh:257`, `scripts/herd/backlog-reconcile.sh:137`, `scripts/herd/backlog-reconcile.sh:139`, `scripts/herd/ci-repair.sh:123`, `scripts/herd/cost.sh:340`, `scripts/herd/cost.sh:341`, `scripts/herd/create-retry.sh:170`, `scripts/herd/create-retry.sh:230`, `scripts/herd/create-retry.sh:233`, `scripts/herd/driver.sh:1412`, `scripts/herd/driver.sh:1424`, `scripts/herd/governance-drift-sweep.sh:93`, `scripts/herd/governance-drift-sweep.sh:109`, `scripts/herd/herd-feature.sh:349`, `scripts/herd/herd-feature.sh:351`, `scripts/herd/herd-feature.sh:352`, `scripts/herd/herd-resolve.sh:178`, `scripts/herd/herd-resolve.sh:180`, `scripts/herd/herd-resolve.sh:181`, `scripts/herd/journal-emission-lint.sh:101`, `scripts/herd/journal-emission-lint.sh:103`, `scripts/herd/journal.sh:185`, `scripts/herd/journal.sh:190`, `scripts/herd/journal.sh:194`, `scripts/herd/journal.sh:199`, `scripts/herd/push-gate.sh:137`, `scripts/herd/push-gate.sh:152`, `scripts/herd/push-gate.sh:250`, `scripts/herd/retirement.sh:806`, `scripts/herd/retirement.sh:817`, `scripts/herd/retirement.sh:818`, `scripts/herd/retirement.sh:819`, `scripts/herd/scribe-step.sh:132`, `scripts/herd/stale-dup-gate.sh:204`, `scripts/herd/sweep.sh:475`, `scripts/herd/sweep.sh:478`, `scripts/herd/sweep.sh:482`, `scripts/herd/sweep.sh:500`, `scripts/herd/sweep.sh:503`, `scripts/herd/sweep.sh:508`, `scripts/herd/sweep.sh:613`, `scripts/herd/theme.sh:92`
-- `budget_daily_exceeded` — def `scripts/herd/cost.sh:378` — callers: `scripts/herd/agent-watch.sh:15763`, `scripts/herd/herd-feature.sh:66`, `scripts/herd/herd-quick.sh:75`
-- `build_blocked` — def `scripts/herd/agent-watch.sh:864` — callers: —
-- `build_builder_notes` — def `scripts/herd/agent-watch.sh:1801` — callers: —
-- `build_celebrate` — def `scripts/herd/agent-watch.sh:1403` — callers: —
-- `build_checkout_cleanliness` — def `scripts/herd/agent-watch.sh:1152` — callers: —
-- `build_engine_note` — def `scripts/herd/agent-watch.sh:964` — callers: —
-- `build_engine_seat_note` — def `scripts/herd/agent-watch.sh:981` — callers: —
-- `build_header` — def `scripts/herd/agent-watch.sh:721` — callers: —
-- `build_health_headroom_note` — def `scripts/herd/agent-watch.sh:12978` — callers: —
-- `build_landed` — def `scripts/herd/agent-watch.sh:783` — callers: —
-- `build_main_freshness` — def `scripts/herd/agent-watch.sh:1081` — callers: —
-- `build_main_health` — def `scripts/herd/agent-watch.sh:1044` — callers: —
-- `build_main_health_contam` — def `scripts/herd/agent-watch.sh:1193` — callers: —
-- `build_operator_inbox` — def `scripts/herd/agent-watch.sh:1654` — callers: —
-- `build_orphan_prs` — def `scripts/herd/agent-watch.sh:1901` — callers: —
-- `build_pasture` — def `scripts/herd/agent-watch.sh:1421` — callers: —
-- `build_phase_anomalies` — def `scripts/herd/agent-watch.sh:7399` — callers: —
-- `build_reconcile_pending` — def `scripts/herd/agent-watch.sh:835` — callers: —
-- `build_retiring` — def `scripts/herd/agent-watch.sh:1329` — callers: —
-- `build_spawn_holds` — def `scripts/herd/agent-watch.sh:929` — callers: —
-- `build_sweep_note` — def `scripts/herd/agent-watch.sh:14441` — callers: —
-- `build_tracker_drift` — def `scripts/herd/agent-watch.sh:907` — callers: —
-- `build_ungated_prs` — def `scripts/herd/agent-watch.sh:2009` — callers: —
-- `build_watcher_singleton` — def `scripts/herd/agent-watch.sh:1131` — callers: —
+- `base` — def `scripts/herd/codemap.sh:75`, `scripts/herd/codemap.sh:289` — callers: `bin/herd:2016`, `bin/herd:2019`, `bin/herd:2020`, `bin/herd:3089`, `bin/herd:3090`, `bin/herd:3091`, `scripts/herd/agent-watch.sh:3227`, `scripts/herd/agent-watch.sh:3252`, `scripts/herd/agent-watch.sh:3253`, `scripts/herd/agent-watch.sh:3261`, `scripts/herd/agent-watch.sh:10729`, `scripts/herd/agent-watch.sh:10932`, `scripts/herd/agent-watch.sh:13500`, `scripts/herd/agent-watch.sh:13503`, `scripts/herd/agent-watch.sh:13511`, `scripts/herd/agent-watch.sh:13512`, `scripts/herd/agent-watch.sh:13520`, `scripts/herd/agent-watch.sh:13521`, `scripts/herd/agent-watch.sh:13962`, `scripts/herd/agent-watch.sh:13988`, `scripts/herd/backends/jira.sh:486`, `scripts/herd/backends/jira.sh:491`, `scripts/herd/backends/jira.sh:508`, `scripts/herd/backends/jira.sh:526`, `scripts/herd/backlog-reconcile-sweep.sh:257`, `scripts/herd/backlog-reconcile.sh:137`, `scripts/herd/backlog-reconcile.sh:139`, `scripts/herd/ci-repair.sh:123`, `scripts/herd/cost.sh:340`, `scripts/herd/cost.sh:341`, `scripts/herd/create-retry.sh:170`, `scripts/herd/create-retry.sh:230`, `scripts/herd/create-retry.sh:233`, `scripts/herd/driver.sh:1412`, `scripts/herd/driver.sh:1424`, `scripts/herd/governance-drift-sweep.sh:93`, `scripts/herd/governance-drift-sweep.sh:109`, `scripts/herd/herd-feature.sh:349`, `scripts/herd/herd-feature.sh:351`, `scripts/herd/herd-feature.sh:352`, `scripts/herd/herd-resolve.sh:178`, `scripts/herd/herd-resolve.sh:180`, `scripts/herd/herd-resolve.sh:181`, `scripts/herd/journal-emission-lint.sh:101`, `scripts/herd/journal-emission-lint.sh:103`, `scripts/herd/journal.sh:185`, `scripts/herd/journal.sh:190`, `scripts/herd/journal.sh:194`, `scripts/herd/journal.sh:199`, `scripts/herd/push-gate.sh:137`, `scripts/herd/push-gate.sh:152`, `scripts/herd/push-gate.sh:250`, `scripts/herd/retirement.sh:806`, `scripts/herd/retirement.sh:817`, `scripts/herd/retirement.sh:818`, `scripts/herd/retirement.sh:819`, `scripts/herd/scribe-step.sh:132`, `scripts/herd/stale-dup-gate.sh:204`, `scripts/herd/sweep.sh:475`, `scripts/herd/sweep.sh:478`, `scripts/herd/sweep.sh:482`, `scripts/herd/sweep.sh:500`, `scripts/herd/sweep.sh:503`, `scripts/herd/sweep.sh:508`, `scripts/herd/sweep.sh:613`, `scripts/herd/theme.sh:92`
+- `budget_daily_exceeded` — def `scripts/herd/cost.sh:378` — callers: `scripts/herd/agent-watch.sh:15899`, `scripts/herd/herd-feature.sh:66`, `scripts/herd/herd-quick.sh:75`
+- `build_blocked` — def `scripts/herd/agent-watch.sh:869` — callers: —
+- `build_builder_notes` — def `scripts/herd/agent-watch.sh:1806` — callers: —
+- `build_celebrate` — def `scripts/herd/agent-watch.sh:1408` — callers: —
+- `build_checkout_cleanliness` — def `scripts/herd/agent-watch.sh:1157` — callers: —
+- `build_engine_note` — def `scripts/herd/agent-watch.sh:969` — callers: —
+- `build_engine_seat_note` — def `scripts/herd/agent-watch.sh:986` — callers: —
+- `build_header` — def `scripts/herd/agent-watch.sh:726` — callers: —
+- `build_health_headroom_note` — def `scripts/herd/agent-watch.sh:13114` — callers: —
+- `build_landed` — def `scripts/herd/agent-watch.sh:788` — callers: —
+- `build_main_freshness` — def `scripts/herd/agent-watch.sh:1086` — callers: —
+- `build_main_health` — def `scripts/herd/agent-watch.sh:1049` — callers: —
+- `build_main_health_contam` — def `scripts/herd/agent-watch.sh:1198` — callers: —
+- `build_operator_inbox` — def `scripts/herd/agent-watch.sh:1659` — callers: —
+- `build_orphan_prs` — def `scripts/herd/agent-watch.sh:1906` — callers: —
+- `build_pasture` — def `scripts/herd/agent-watch.sh:1426` — callers: —
+- `build_phase_anomalies` — def `scripts/herd/agent-watch.sh:7404` — callers: —
+- `build_reconcile_pending` — def `scripts/herd/agent-watch.sh:840` — callers: —
+- `build_retiring` — def `scripts/herd/agent-watch.sh:1334` — callers: —
+- `build_spawn_holds` — def `scripts/herd/agent-watch.sh:934` — callers: —
+- `build_sweep_note` — def `scripts/herd/agent-watch.sh:14577` — callers: —
+- `build_tracker_drift` — def `scripts/herd/agent-watch.sh:912` — callers: —
+- `build_ungated_prs` — def `scripts/herd/agent-watch.sh:2014` — callers: —
+- `build_watcher_singleton` — def `scripts/herd/agent-watch.sh:1136` — callers: —
 - `ci_autorepair_enabled` — def `scripts/herd/ci-repair.sh:53` — callers: —
 - `ci_repair_branch_behind` — def `scripts/herd/ci-repair.sh:73` — callers: —
 - `ci_repair_eligible` — def `scripts/herd/ci-repair.sh:113` — callers: —
 - `ci_repair_gates_passed` — def `scripts/herd/ci-repair.sh:92` — callers: —
-- `clear_dead` — def `scripts/herd/agent-watch.sh:11508` — callers: `scripts/herd/retirement.sh:702`
-- `clear_limit` — def `scripts/herd/agent-watch.sh:10867` — callers: `scripts/herd/retirement.sh:703`
-- `clear_respawn` — def `scripts/herd/agent-watch.sh:11533` — callers: —
-- `clear_sendkeys` — def `scripts/herd/agent-watch.sh:10926` — callers: `scripts/herd/retirement.sh:704`
-- `clear_wedge` — def `scripts/herd/agent-watch.sh:12043` — callers: —
+- `clear_dead` — def `scripts/herd/agent-watch.sh:11644` — callers: `scripts/herd/retirement.sh:702`
+- `clear_limit` — def `scripts/herd/agent-watch.sh:11003` — callers: `scripts/herd/retirement.sh:703`
+- `clear_respawn` — def `scripts/herd/agent-watch.sh:11669` — callers: —
+- `clear_sendkeys` — def `scripts/herd/agent-watch.sh:11062` — callers: `scripts/herd/retirement.sh:704`
+- `clear_wedge` — def `scripts/herd/agent-watch.sh:12179` — callers: —
 - `cmd_advise` — def `bin/herd:1959` — callers: —
 - `cmd_agent_update` — def `bin/herd:7157` — callers: —
 - `cmd_approve` — def `bin/herd:7437` — callers: —
@@ -1267,7 +1274,7 @@ this scan cannot see).
 - `cmd_watcher_resurrect` — def `bin/herd:6743` — callers: —
 - `cmd_why` — def `bin/herd:7292` — callers: —
 - `cost_day_total` — def `scripts/herd/cost.sh:328` — callers: —
-- `cost_emit_merge` — def `scripts/herd/cost.sh:393` — callers: `scripts/herd/agent-watch.sh:8986`, `scripts/herd/work-units/git-pr.sh:309`
+- `cost_emit_merge` — def `scripts/herd/cost.sh:393` — callers: `scripts/herd/agent-watch.sh:9122`, `scripts/herd/work-units/git-pr.sh:309`
 - `cost_report_dir` — def `scripts/herd/cost.sh:293` — callers: —
 - `cost_report_full` — def `scripts/herd/cost.sh:305` — callers: `bin/herd:7475`
 - `create_retry_class` — def `scripts/herd/create-retry.sh:103` — callers: `scripts/herd/scribe-step.sh:194`
@@ -1283,15 +1290,15 @@ this scan cannot see).
 - `create_retry_resolve` — def `scripts/herd/create-retry.sh:350` — callers: `scripts/herd/scribe-step.sh:202`, `scripts/herd/scribe-step.sh:226`
 - `create_retry_revive` — def `scripts/herd/create-retry.sh:456` — callers: —
 - `create_retry_rows` — def `scripts/herd/create-retry.sh:485` — callers: `scripts/herd/sweep.sh:1222`
-- `dead_first_seen` — def `scripts/herd/agent-watch.sh:11484` — callers: —
-- `dead_notified` — def `scripts/herd/agent-watch.sh:11490` — callers: —
+- `dead_first_seen` — def `scripts/herd/agent-watch.sh:11620` — callers: —
+- `dead_notified` — def `scripts/herd/agent-watch.sh:11626` — callers: —
 - `detect_github` — def `bin/herd:730` — callers: —
 - `die` — def `bin/herd:150` — callers: `scripts/herd/agent-watch.sh:272`, `scripts/herd/fleet.sh:172`, `scripts/herd/fleet.sh:177`, `scripts/herd/fleet.sh:179`, `scripts/herd/fleet.sh:182`, `scripts/herd/fleet.sh:185`, `scripts/herd/fleet.sh:188`, `scripts/herd/fleet.sh:190`, `scripts/herd/fleet.sh:194`, `scripts/herd/fleet.sh:200`, `scripts/herd/fleet.sh:204`, `scripts/herd/fleet.sh:207`, `scripts/herd/fleet.sh:208`, `scripts/herd/fleet.sh:217`, `scripts/herd/fleet.sh:238`, `scripts/herd/fleet.sh:239`, `scripts/herd/fleet.sh:257`, `scripts/herd/fleet.sh:264`, `scripts/herd/fleet.sh:357`, `scripts/herd/fleet.sh:364`, `scripts/herd/fleet.sh:371`, `scripts/herd/fleet.sh:373`, `scripts/herd/fleet.sh:377`, `scripts/herd/fleet.sh:382`, `scripts/herd/fleet.sh:383`, `scripts/herd/fleet.sh:385`, `scripts/herd/fleet.sh:420`, `scripts/herd/fleet.sh:423`, `scripts/herd/fleet.sh:431`, `scripts/herd/fleet.sh:442`, `scripts/herd/fleet.sh:597`, `scripts/herd/fleet.sh:658`, `scripts/herd/fleet.sh:990`, `scripts/herd/fleet.sh:1072`, `scripts/herd/fleet.sh:1073`, `scripts/herd/fleet.sh:1075`, `scripts/herd/fleet.sh:1082`, `scripts/herd/fleet.sh:1326`, `scripts/herd/fleet.sh:1327`, `scripts/herd/fleet.sh:1341`, `scripts/herd/fleet.sh:1641`, `scripts/herd/fleet.sh:1721`, `scripts/herd/fleet.sh:1818`, `scripts/herd/fleet.sh:1821`, `scripts/herd/fleet.sh:1879`, `scripts/herd/fleet.sh:1892`, `scripts/herd/fleet.sh:1893`, `scripts/herd/fleet.sh:1896`, `scripts/herd/fleet.sh:1932`, `scripts/herd/fleet.sh:1935`, `scripts/herd/fleet.sh:1940`, `scripts/herd/fleet.sh:1944`, `scripts/herd/fleet.sh:1958`
 - `do_merge` — def `scripts/herd/work-units/git-pr.sh:202` — callers: `scripts/herd/work-unit.sh:167`
-- `emit` — def `scripts/herd/codemap.sh:391`, `scripts/herd/codemap.sh:410`, `scripts/herd/codemap.sh:432`, `scripts/herd/codemap.sh:450`, `scripts/herd/codemap.sh:485` — callers: `scripts/herd/agent-watch.sh:8195`, `scripts/herd/agent-watch.sh:8198`, `scripts/herd/cost.sh:247`, `scripts/herd/cost.sh:273`, `scripts/herd/handoff.sh:214`, `scripts/herd/handoff.sh:253`, `scripts/herd/handoff.sh:260`, `scripts/herd/sweep.sh:181`, `scripts/herd/sweep.sh:186`
+- `emit` — def `scripts/herd/codemap.sh:391`, `scripts/herd/codemap.sh:410`, `scripts/herd/codemap.sh:432`, `scripts/herd/codemap.sh:450`, `scripts/herd/codemap.sh:485` — callers: `scripts/herd/agent-watch.sh:8331`, `scripts/herd/agent-watch.sh:8334`, `scripts/herd/cost.sh:247`, `scripts/herd/cost.sh:273`, `scripts/herd/handoff.sh:214`, `scripts/herd/handoff.sh:253`, `scripts/herd/handoff.sh:260`, `scripts/herd/sweep.sh:181`, `scripts/herd/sweep.sh:186`
 - `emit_infra_fail` — def `scripts/herd/herd-review.sh:479` — callers: —
-- `epoch_to_hhmm` — def `scripts/herd/agent-watch.sh:735`, `scripts/herd/backlog-view.sh:148`, `scripts/herd/backlog-view.sh:151`, `scripts/herd/herd-approve.sh:61` — callers: —
-- `file_mtime` — def `scripts/herd/agent-watch.sh:11296`, `scripts/herd/agent-watch.sh:11300`, `scripts/herd/backlog-view.sh:147`, `scripts/herd/backlog-view.sh:150`, `scripts/herd/task-spec-view.sh:69`, `scripts/herd/task-spec-view.sh:71` — callers: —
+- `epoch_to_hhmm` — def `scripts/herd/agent-watch.sh:740`, `scripts/herd/backlog-view.sh:148`, `scripts/herd/backlog-view.sh:151`, `scripts/herd/herd-approve.sh:61` — callers: —
+- `file_mtime` — def `scripts/herd/agent-watch.sh:11432`, `scripts/herd/agent-watch.sh:11436`, `scripts/herd/backlog-view.sh:147`, `scripts/herd/backlog-view.sh:150`, `scripts/herd/task-spec-view.sh:69`, `scripts/herd/task-spec-view.sh:71` — callers: —
 - `fleet_digest` — def `scripts/herd/fleet.sh:1322` — callers: `bin/herd:7809`
 - `fleet_discover` — def `scripts/herd/fleet.sh:644` — callers: `bin/herd:7805`
 - `fleet_governance` — def `scripts/herd/fleet.sh:1702` — callers: `bin/herd:7811`
@@ -1313,36 +1320,36 @@ this scan cannot see).
 - `handoff_has` — def `scripts/herd/handoff.sh:77` — callers: —
 - `handoff_render` — def `scripts/herd/handoff.sh:134` — callers: —
 - `handoff_upsert_body` — def `scripts/herd/handoff.sh:154` — callers: —
-- `herd_agent_name_sanitize` — def `scripts/herd/driver.sh:1039` — callers: `scripts/herd/agent-watch.sh:4970`, `scripts/herd/agent-watch.sh:5053`, `scripts/herd/herd-resolve.sh:203`, `scripts/herd/herd-review.sh:760`
-- `herd_agents_conventions` — def `scripts/herd/herd-config.sh:1372` — callers: `scripts/herd/driver.sh:293`
+- `herd_agent_name_sanitize` — def `scripts/herd/driver.sh:1039` — callers: `scripts/herd/agent-watch.sh:4975`, `scripts/herd/agent-watch.sh:5058`, `scripts/herd/herd-resolve.sh:203`, `scripts/herd/herd-review.sh:760`
+- `herd_agents_conventions` — def `scripts/herd/herd-config.sh:1373` — callers: `scripts/herd/driver.sh:293`
 - `herd_bats_early_reap` — def `scripts/herd/bats-fd3-guard.sh:46` — callers: —
-- `herd_branch_parse` — def `scripts/herd/herd-config.sh:1735` — callers: `scripts/herd/agent-watch.sh:8896`, `scripts/herd/retirement.sh:396`, `scripts/herd/retirement.sh:732`
-- `herd_branch_render` — def `scripts/herd/herd-config.sh:1720` — callers: `scripts/herd/agent-watch.sh:15602`, `scripts/herd/new-feature.sh:19`
-- `herd_branch_slug` — def `scripts/herd/herd-config.sh:1769` — callers: `scripts/herd/agent-watch.sh:2144`, `scripts/herd/agent-watch.sh:2221`
+- `herd_branch_parse` — def `scripts/herd/herd-config.sh:1736` — callers: `scripts/herd/agent-watch.sh:9032`, `scripts/herd/retirement.sh:396`, `scripts/herd/retirement.sh:732`
+- `herd_branch_render` — def `scripts/herd/herd-config.sh:1721` — callers: `scripts/herd/agent-watch.sh:15738`, `scripts/herd/new-feature.sh:19`
+- `herd_branch_slug` — def `scripts/herd/herd-config.sh:1770` — callers: `scripts/herd/agent-watch.sh:2149`, `scripts/herd/agent-watch.sh:2226`
 - `herd_burst` — def `scripts/herd/burst.sh:63` — callers: `scripts/herd/herd-review.sh:520`, `scripts/herd/herd-review.sh:903`
 - `herd_burst_bound` — def `scripts/herd/burst.sh:46` — callers: `scripts/herd/herd-review.sh:165`, `scripts/herd/herd-review.sh:199`, `scripts/herd/research.sh:166`
 - `herd_burst_enabled` — def `scripts/herd/burst.sh:31` — callers: —
 - `herd_caps_sync_lint` — def `scripts/herd/caps-sync-lint.sh:27`, `scripts/herd/healthcheck.sh:100` — callers: —
 - `herd_claim_or_abort` — def `scripts/herd/herd-claim.sh:141` — callers: —
-- `herd_claim_release` — def `scripts/herd/herd-claim.sh:258` — callers: `scripts/herd/agent-watch.sh:11639`
-- `herd_claim_release_mode` — def `scripts/herd/herd-claim.sh:213` — callers: `scripts/herd/agent-watch.sh:11611`
-- `herd_close_pane_verified` — def `scripts/herd/driver.sh:673` — callers: `scripts/herd/agent-watch.sh:5204`, `scripts/herd/agent-watch.sh:11823`, `scripts/herd/herd-review.sh:252`, `scripts/herd/herd-review.sh:798`
+- `herd_claim_release` — def `scripts/herd/herd-claim.sh:258` — callers: `scripts/herd/agent-watch.sh:11775`
+- `herd_claim_release_mode` — def `scripts/herd/herd-claim.sh:213` — callers: `scripts/herd/agent-watch.sh:11747`
+- `herd_close_pane_verified` — def `scripts/herd/driver.sh:673` — callers: `scripts/herd/agent-watch.sh:5209`, `scripts/herd/agent-watch.sh:11959`, `scripts/herd/herd-review.sh:252`, `scripts/herd/herd-review.sh:798`
 - `herd_config_viability_doctor_section` — def `scripts/herd/config-viability.sh:434` — callers: `scripts/herd/herd-preflight.sh:682`
 - `herd_config_viability_note` — def `scripts/herd/config-viability.sh:376` — callers: —
 - `herd_config_viability_probe` — def `scripts/herd/config-viability.sh:307` — callers: `bin/herd:2947`
 - `herd_console_acked` — def `scripts/herd/console-section.sh:74` — callers: —
-- `herd_console_classify_builder_note` — def `scripts/herd/console-section.sh:65` — callers: `bin/herd:2088`, `scripts/herd/agent-watch.sh:1805`, `scripts/herd/status.sh:193`
+- `herd_console_classify_builder_note` — def `scripts/herd/console-section.sh:65` — callers: `bin/herd:2088`, `scripts/herd/agent-watch.sh:1810`, `scripts/herd/status.sh:193`
 - `herd_console_classify_tracker_heal` — def `scripts/herd/console-section.sh:51` — callers: —
-- `herd_console_guard` — def `scripts/herd/herd-config.sh:962` — callers: `scripts/herd/agent-watch.sh:15531`, `scripts/herd/backlog-view.sh:39`, `scripts/herd/coordinator.sh:32`
+- `herd_console_guard` — def `scripts/herd/herd-config.sh:963` — callers: `scripts/herd/agent-watch.sh:15667`, `scripts/herd/backlog-view.sh:39`, `scripts/herd/coordinator.sh:32`
 - `herd_console_row_visible` — def `scripts/herd/console-section.sh:38` — callers: —
-- `herd_console_section` — def `scripts/herd/console-section.sh:108` — callers: `scripts/herd/agent-watch.sh:1804`, `scripts/herd/agent-watch.sh:1906`, `scripts/herd/agent-watch.sh:2013`, `scripts/herd/agent-watch.sh:7402`
-- `herd_console_section_tracker` — def `scripts/herd/console-section.sh:175` — callers: `scripts/herd/agent-watch.sh:910`
-- `herd_console_trim` — def `scripts/herd/console-section.sh:189` — callers: `bin/herd:2199`, `scripts/herd/agent-watch.sh:1778`, `scripts/herd/agent-watch.sh:1779`, `scripts/herd/agent-watch.sh:7438`, `scripts/herd/tracker-state-sweep.sh:320`
+- `herd_console_section` — def `scripts/herd/console-section.sh:108` — callers: `scripts/herd/agent-watch.sh:1809`, `scripts/herd/agent-watch.sh:1911`, `scripts/herd/agent-watch.sh:2018`, `scripts/herd/agent-watch.sh:7407`
+- `herd_console_section_tracker` — def `scripts/herd/console-section.sh:175` — callers: `scripts/herd/agent-watch.sh:915`
+- `herd_console_trim` — def `scripts/herd/console-section.sh:189` — callers: `bin/herd:2199`, `scripts/herd/agent-watch.sh:1783`, `scripts/herd/agent-watch.sh:1784`, `scripts/herd/agent-watch.sh:7565`, `scripts/herd/tracker-state-sweep.sh:320`
 - `herd_console_visible_lines` — def `scripts/herd/console-section.sh:84` — callers: `bin/herd:2087`, `scripts/herd/status.sh:192`
 - `herd_console_visible_lines_tracker` — def `scripts/herd/console-section.sh:127` — callers: —
 - `herd_context_guard` — def `scripts/herd/context-guard.sh:125` — callers: `bin/herd:8260`
 - `herd_context_pane_guard` — def `scripts/herd/context-guard.sh:227` — callers: —
-- `herd_context_provision_preamble` — def `scripts/herd/herd-config.sh:1346` — callers: `scripts/herd/herd-feature.sh:268`, `scripts/herd/herd-quick.sh:275`
+- `herd_context_provision_preamble` — def `scripts/herd/herd-config.sh:1347` — callers: `scripts/herd/herd-feature.sh:268`, `scripts/herd/herd-quick.sh:275`
 - `herd_derived_paths` — def `scripts/herd/derived-files.sh:44` — callers: `scripts/herd/sweep.sh:199`
 - `herd_doc_drift_lint` — def `scripts/herd/doc-drift-lint.sh:177`, `scripts/herd/healthcheck.sh:111` — callers: —
 - `herd_doc_drift_report` — def `scripts/herd/doc-drift-lint.sh:46` — callers: —
@@ -1353,15 +1360,15 @@ this scan cannot see).
 - `herd_drainer_live_status` — def `scripts/herd/drainer-liveness.sh:81` — callers: `scripts/herd/lifecycle.sh:211`, `scripts/herd/research.sh:115`, `scripts/herd/scribe.sh:98`
 - `herd_drainer_should_reclaim` — def `scripts/herd/drainer-liveness.sh:123` — callers: —
 - `herd_driver_agent_herdr_kind` — def `scripts/herd/driver.sh:1012` — callers: —
-- `herd_driver_agent_limit_pattern` — def `scripts/herd/driver.sh:1572` — callers: `scripts/herd/agent-watch.sh:10817`
-- `herd_driver_agent_list_json` — def `scripts/herd/driver.sh:442` — callers: `scripts/herd/agent-watch.sh:5447`, `scripts/herd/agent-watch.sh:14892`, `scripts/herd/agent-watch.sh:15954`, `scripts/herd/research.sh:96`, `scripts/herd/retirement.sh:197`, `scripts/herd/retirement.sh:225`, `scripts/herd/scribe.sh:79`, `scripts/herd/status.sh:389`, `scripts/herd/sweep.sh:434`
-- `herd_driver_agent_liveness` — def `scripts/herd/driver.sh:733` — callers: `scripts/herd/agent-watch.sh:4991`, `scripts/herd/agent-watch.sh:9439`, `scripts/herd/drainer-liveness.sh:108`, `scripts/herd/lifecycle.sh:213`, `scripts/herd/status.sh:451`
-- `herd_driver_agent_pane_id` — def `scripts/herd/driver.sh:852` — callers: `scripts/herd/agent-watch.sh:5201`, `scripts/herd/agent-watch.sh:11822`, `scripts/herd/herd-feature.sh:324`, `scripts/herd/herd-quick.sh:331`, `scripts/herd/herd-resolve.sh:147`
+- `herd_driver_agent_limit_pattern` — def `scripts/herd/driver.sh:1572` — callers: `scripts/herd/agent-watch.sh:10953`
+- `herd_driver_agent_list_json` — def `scripts/herd/driver.sh:442` — callers: `scripts/herd/agent-watch.sh:5452`, `scripts/herd/agent-watch.sh:15028`, `scripts/herd/agent-watch.sh:16090`, `scripts/herd/research.sh:96`, `scripts/herd/retirement.sh:197`, `scripts/herd/retirement.sh:225`, `scripts/herd/scribe.sh:79`, `scripts/herd/status.sh:389`, `scripts/herd/sweep.sh:434`
+- `herd_driver_agent_liveness` — def `scripts/herd/driver.sh:733` — callers: `scripts/herd/agent-watch.sh:4996`, `scripts/herd/agent-watch.sh:9575`, `scripts/herd/drainer-liveness.sh:108`, `scripts/herd/lifecycle.sh:213`, `scripts/herd/status.sh:451`
+- `herd_driver_agent_pane_id` — def `scripts/herd/driver.sh:852` — callers: `scripts/herd/agent-watch.sh:5206`, `scripts/herd/agent-watch.sh:11958`, `scripts/herd/herd-feature.sh:324`, `scripts/herd/herd-quick.sh:331`, `scripts/herd/herd-resolve.sh:147`
 - `herd_driver_agent_process_signature` — def `scripts/herd/driver.sh:149` — callers: `scripts/herd/layout-reconcile.sh:108`
-- `herd_driver_agent_resume_cmd` — def `scripts/herd/driver.sh:1532` — callers: `scripts/herd/agent-watch.sh:10702`
+- `herd_driver_agent_resume_cmd` — def `scripts/herd/driver.sh:1532` — callers: `scripts/herd/agent-watch.sh:10838`
 - `herd_driver_agent_runtime` — def `scripts/herd/driver.sh:130` — callers: `bin/herd:6476`, `scripts/herd/config-viability.sh:271`, `scripts/herd/herd-preflight.sh:568`, `scripts/herd/herd-review.sh:418`
 - `herd_driver_agent_runtime_native` — def `scripts/herd/driver.sh:361` — callers: —
-- `herd_driver_agent_spawn_argv` — def `scripts/herd/driver.sh:279` — callers: `scripts/herd/agent-watch.sh:11909`
+- `herd_driver_agent_spawn_argv` — def `scripts/herd/driver.sh:279` — callers: `scripts/herd/agent-watch.sh:12045`
 - `herd_driver_agent_value` — def `scripts/herd/driver.sh:103` — callers: `scripts/herd/agent-update.sh:52`, `scripts/herd/agent-update.sh:131`, `scripts/herd/agent-update.sh:132`, `scripts/herd/agent-update.sh:133`, `scripts/herd/config-viability.sh:264`
 - `herd_driver_close_pane` — def `scripts/herd/driver.sh:552` — callers: —
 - `herd_driver_create_tab` — def `scripts/herd/driver.sh:898` — callers: —
@@ -1370,33 +1377,33 @@ this scan cannot see).
 - `herd_driver_herdr_attach_agent` — def `scripts/herd/driver.sh:1077` — callers: —
 - `herd_driver_herdr_spawn_shape` — def `scripts/herd/driver.sh:973` — callers: `scripts/herd/config-viability.sh:291`
 - `herd_driver_known` — def `scripts/herd/driver.sh:75` — callers: `bin/herd:2708`
-- `herd_driver_lane_permission_flags` — def `scripts/herd/driver.sh:345` — callers: `scripts/herd/agent-watch.sh:10701`, `scripts/herd/herd-feature.sh:118`, `scripts/herd/herd-quick.sh:126`
+- `herd_driver_lane_permission_flags` — def `scripts/herd/driver.sh:345` — callers: `scripts/herd/agent-watch.sh:10837`, `scripts/herd/herd-feature.sh:118`, `scripts/herd/herd-quick.sh:126`
 - `herd_driver_launch_agent` — def `scripts/herd/driver.sh:1331` — callers: `bin/herd:6635`, `scripts/herd/coordinator.sh:109`, `scripts/herd/fleet.sh:1955`, `scripts/herd/herd-feature.sh:311`, `scripts/herd/herd-quick.sh:318`, `scripts/herd/herd-review.sh:806`, `scripts/herd/research.sh:188`, `scripts/herd/scribe.sh:210`
-- `herd_driver_name` — def `scripts/herd/driver.sh:26` — callers: `scripts/herd/agent-update.sh:129`, `scripts/herd/agent-watch.sh:11002`, `scripts/herd/agent-watch.sh:11812`, `scripts/herd/agent-watch.sh:11890`, `scripts/herd/herd-feature.sh:45`, `scripts/herd/herd-preflight.sh:567`, `scripts/herd/herd-quick.sh:54`, `scripts/herd/herd-review.sh:149`
-- `herd_driver_notify` — def `scripts/herd/driver.sh:410` — callers: `scripts/herd/agent-watch.sh:1613`, `scripts/herd/agent-watch.sh:1632`, `scripts/herd/agent-watch.sh:1769`, `scripts/herd/agent-watch.sh:4554`, `scripts/herd/agent-watch.sh:7225`, `scripts/herd/agent-watch.sh:7653`, `scripts/herd/agent-watch.sh:9291`, `scripts/herd/agent-watch.sh:9588`, `scripts/herd/agent-watch.sh:9593`, `scripts/herd/agent-watch.sh:9787`, `scripts/herd/agent-watch.sh:9803`, `scripts/herd/agent-watch.sh:10020`, `scripts/herd/agent-watch.sh:10038`, `scripts/herd/agent-watch.sh:10274`, `scripts/herd/agent-watch.sh:10292`, `scripts/herd/agent-watch.sh:10438`, `scripts/herd/agent-watch.sh:10445`, `scripts/herd/agent-watch.sh:10542`, `scripts/herd/agent-watch.sh:10559`, `scripts/herd/agent-watch.sh:11263`, `scripts/herd/agent-watch.sh:11268`, `scripts/herd/agent-watch.sh:11696`, `scripts/herd/agent-watch.sh:11699`, `scripts/herd/agent-watch.sh:11950`, `scripts/herd/agent-watch.sh:11954`, `scripts/herd/agent-watch.sh:11959`, `scripts/herd/agent-watch.sh:11963`, `scripts/herd/agent-watch.sh:12149`, `scripts/herd/agent-watch.sh:12198`, `scripts/herd/agent-watch.sh:12634`, `scripts/herd/agent-watch.sh:12639`, `scripts/herd/agent-watch.sh:12647`, `scripts/herd/agent-watch.sh:12774`, `scripts/herd/agent-watch.sh:12780`, `scripts/herd/agent-watch.sh:12788`, `scripts/herd/agent-watch.sh:14755`, `scripts/herd/agent-watch.sh:14766`, `scripts/herd/agent-watch.sh:14783`, `scripts/herd/agent-watch.sh:14804`, `scripts/herd/dep-watcher.sh:263`, `scripts/herd/research-step.sh:84`, `scripts/herd/scribe-step.sh:156`, `scripts/herd/steps.sh:542`
+- `herd_driver_name` — def `scripts/herd/driver.sh:26` — callers: `scripts/herd/agent-update.sh:129`, `scripts/herd/agent-watch.sh:11138`, `scripts/herd/agent-watch.sh:11948`, `scripts/herd/agent-watch.sh:12026`, `scripts/herd/herd-feature.sh:45`, `scripts/herd/herd-preflight.sh:567`, `scripts/herd/herd-quick.sh:54`, `scripts/herd/herd-review.sh:149`
+- `herd_driver_notify` — def `scripts/herd/driver.sh:410` — callers: `scripts/herd/agent-watch.sh:1618`, `scripts/herd/agent-watch.sh:1637`, `scripts/herd/agent-watch.sh:1774`, `scripts/herd/agent-watch.sh:4559`, `scripts/herd/agent-watch.sh:7230`, `scripts/herd/agent-watch.sh:7789`, `scripts/herd/agent-watch.sh:9427`, `scripts/herd/agent-watch.sh:9724`, `scripts/herd/agent-watch.sh:9729`, `scripts/herd/agent-watch.sh:9923`, `scripts/herd/agent-watch.sh:9939`, `scripts/herd/agent-watch.sh:10156`, `scripts/herd/agent-watch.sh:10174`, `scripts/herd/agent-watch.sh:10410`, `scripts/herd/agent-watch.sh:10428`, `scripts/herd/agent-watch.sh:10574`, `scripts/herd/agent-watch.sh:10581`, `scripts/herd/agent-watch.sh:10678`, `scripts/herd/agent-watch.sh:10695`, `scripts/herd/agent-watch.sh:11399`, `scripts/herd/agent-watch.sh:11404`, `scripts/herd/agent-watch.sh:11832`, `scripts/herd/agent-watch.sh:11835`, `scripts/herd/agent-watch.sh:12086`, `scripts/herd/agent-watch.sh:12090`, `scripts/herd/agent-watch.sh:12095`, `scripts/herd/agent-watch.sh:12099`, `scripts/herd/agent-watch.sh:12285`, `scripts/herd/agent-watch.sh:12334`, `scripts/herd/agent-watch.sh:12770`, `scripts/herd/agent-watch.sh:12775`, `scripts/herd/agent-watch.sh:12783`, `scripts/herd/agent-watch.sh:12910`, `scripts/herd/agent-watch.sh:12916`, `scripts/herd/agent-watch.sh:12924`, `scripts/herd/agent-watch.sh:14891`, `scripts/herd/agent-watch.sh:14902`, `scripts/herd/agent-watch.sh:14919`, `scripts/herd/agent-watch.sh:14940`, `scripts/herd/dep-watcher.sh:263`, `scripts/herd/research-step.sh:84`, `scripts/herd/scribe-step.sh:156`, `scripts/herd/steps.sh:542`
 - `herd_driver_oneshot_exec` — def `scripts/herd/driver.sh:1471` — callers: `scripts/herd/herd-advise.sh:118`
 - `herd_driver_oneshot_exec_as` — def `scripts/herd/driver.sh:1493` — callers: `scripts/herd/herd-review.sh:428`, `scripts/herd/herd-review.sh:530`, `scripts/herd/herd-review.sh:925`
-- `herd_driver_pane_alive` — def `scripts/herd/driver.sh:702` — callers: `scripts/herd/agent-watch.sh:3174`, `scripts/herd/agent-watch.sh:3192`, `scripts/herd/agent-watch.sh:4786`, `scripts/herd/agent-watch.sh:4894`
+- `herd_driver_pane_alive` — def `scripts/herd/driver.sh:702` — callers: `scripts/herd/agent-watch.sh:3179`, `scripts/herd/agent-watch.sh:3197`, `scripts/herd/agent-watch.sh:4791`, `scripts/herd/agent-watch.sh:4899`
 - `herd_driver_pane_id_from_agent_start` — def `scripts/herd/driver.sh:875` — callers: `scripts/herd/herd-feature.sh:323`, `scripts/herd/herd-quick.sh:330`
 - `herd_driver_pane_identity` — def `scripts/herd/driver.sh:593` — callers: —
 - `herd_driver_pane_rename` — def `scripts/herd/driver.sh:837` — callers: `scripts/herd/coordinator.sh:96`, `scripts/herd/coordinator.sh:130`, `scripts/herd/herd-feature.sh:325`, `scripts/herd/herd-feature.sh:383`, `scripts/herd/herd-feature.sh:386`, `scripts/herd/herd-quick.sh:332`, `scripts/herd/herd-quick.sh:354`, `scripts/herd/herd-quick.sh:357`, `scripts/herd/herd-resolve.sh:148`
-- `herd_driver_read_pane` — def `scripts/herd/driver.sh:490` — callers: `scripts/herd/agent-watch.sh:10946`, `scripts/herd/agent-watch.sh:10966`, `scripts/herd/agent-watch.sh:10983`
+- `herd_driver_read_pane` — def `scripts/herd/driver.sh:490` — callers: `scripts/herd/agent-watch.sh:11082`, `scripts/herd/agent-watch.sh:11102`, `scripts/herd/agent-watch.sh:11119`
 - `herd_driver_report_agent` — def `scripts/herd/driver.sh:378` — callers: `scripts/herd/herd-feature.sh:331`, `scripts/herd/herd-quick.sh:338`
-- `herd_driver_send_keys` — def `scripts/herd/driver.sh:818` — callers: `scripts/herd/agent-watch.sh:11019`
-- `herd_driver_send_text` — def `scripts/herd/driver.sh:511` — callers: `scripts/herd/agent-watch.sh:9647`, `scripts/herd/agent-watch.sh:9651`, `scripts/herd/agent-watch.sh:10075`, `scripts/herd/agent-watch.sh:10079`, `scripts/herd/agent-watch.sh:10341`, `scripts/herd/agent-watch.sh:10345`, `scripts/herd/agent-watch.sh:10601`, `scripts/herd/agent-watch.sh:10605`, `scripts/herd/agent-watch.sh:12139`, `scripts/herd/agent-watch.sh:12525`, `scripts/herd/herd-feature.sh:384`, `scripts/herd/herd-quick.sh:355`
-- `herd_driver_start_agent` — def `scripts/herd/driver.sh:1226` — callers: `scripts/herd/agent-watch.sh:11891`
+- `herd_driver_send_keys` — def `scripts/herd/driver.sh:818` — callers: `scripts/herd/agent-watch.sh:11155`
+- `herd_driver_send_text` — def `scripts/herd/driver.sh:511` — callers: `scripts/herd/agent-watch.sh:9783`, `scripts/herd/agent-watch.sh:9787`, `scripts/herd/agent-watch.sh:10211`, `scripts/herd/agent-watch.sh:10215`, `scripts/herd/agent-watch.sh:10477`, `scripts/herd/agent-watch.sh:10481`, `scripts/herd/agent-watch.sh:10737`, `scripts/herd/agent-watch.sh:10741`, `scripts/herd/agent-watch.sh:12275`, `scripts/herd/agent-watch.sh:12661`, `scripts/herd/herd-feature.sh:384`, `scripts/herd/herd-quick.sh:355`
+- `herd_driver_start_agent` — def `scripts/herd/driver.sh:1226` — callers: `scripts/herd/agent-watch.sh:12027`
 - `herd_driver_switch_model` — def `scripts/herd/driver.sh:1583` — callers: —
 - `herd_driver_wsl_interop_guard` — def `scripts/herd/driver.sh:1200` — callers: `scripts/herd/herd-preflight.sh:67`
-- `herd_engine_autoupdate_mode` — def `scripts/herd/engine-version.sh:81` — callers: `scripts/herd/agent-watch.sh:966`
-- `herd_engine_autoupdate_tick` — def `scripts/herd/engine-version.sh:239` — callers: `scripts/herd/agent-watch.sh:15493`
+- `herd_engine_autoupdate_mode` — def `scripts/herd/engine-version.sh:81` — callers: `scripts/herd/agent-watch.sh:971`
+- `herd_engine_autoupdate_tick` — def `scripts/herd/engine-version.sh:239` — callers: `scripts/herd/agent-watch.sh:15629`
 - `herd_engine_doctor_row` — def `scripts/herd/engine-version.sh:133` — callers: `scripts/herd/herd-preflight.sh:673`
 - `herd_engine_dualwrite_active` — def `scripts/herd/engine-seat.sh:241` — callers: —
 - `herd_engine_guard` — def `scripts/herd/engine-version.sh:99` — callers: `bin/herd:4759`, `scripts/herd/herd-claim.sh:149`, `scripts/herd/herd-preflight.sh:59`, `scripts/herd/scribe-step.sh:106`
 - `herd_engine_impl` — def `scripts/herd/engine-version.sh:284` — callers: —
-- `herd_engine_level` — def `scripts/herd/engine-version.sh:70` — callers: `bin/herd:1710`, `scripts/herd/agent-watch.sh:970`, `scripts/herd/engine-seat.sh:127`, `scripts/herd/engine-seat.sh:186`
+- `herd_engine_level` — def `scripts/herd/engine-version.sh:70` — callers: `bin/herd:1710`, `scripts/herd/agent-watch.sh:975`, `scripts/herd/engine-seat.sh:127`, `scripts/herd/engine-seat.sh:186`
 - `herd_engine_live_tick` — def `scripts/herd/engine-version.sh:326` — callers: —
 - `herd_engine_migration_guard` — def `scripts/herd/engine-seat.sh:276` — callers: —
-- `herd_engine_min` — def `scripts/herd/engine-version.sh:74` — callers: `scripts/herd/agent-watch.sh:970`
+- `herd_engine_min` — def `scripts/herd/engine-version.sh:74` — callers: `scripts/herd/agent-watch.sh:975`
 - `herd_engine_min_stamp` — def `scripts/herd/engine-version.sh:172` — callers: `bin/herd:1708`
 - `herd_engine_quiesce_ok` — def `scripts/herd/engine-seat.sh:255` — callers: —
 - `herd_engine_seat_hold` — def `scripts/herd/engine-seat.sh:225` — callers: —
@@ -1406,9 +1413,9 @@ this scan cannot see).
 - `herd_engine_seat_registry` — def `scripts/herd/engine-seat.sh:85` — callers: —
 - `herd_engine_seat_stamp` — def `scripts/herd/engine-seat.sh:123` — callers: —
 - `herd_engine_shadow_tick` — def `scripts/herd/engine-version.sh:308` — callers: —
-- `herd_engine_stale` — def `scripts/herd/engine-version.sh:77` — callers: `scripts/herd/agent-watch.sh:968`
+- `herd_engine_stale` — def `scripts/herd/engine-version.sh:77` — callers: `scripts/herd/agent-watch.sh:973`
 - `herd_engine_warn_if_stale` — def `scripts/herd/engine-version.sh:122` — callers: `bin/herd:4450`
-- `herd_enum` — def `scripts/herd/herd-config.sh:1664` — callers: —
+- `herd_enum` — def `scripts/herd/herd-config.sh:1665` — callers: —
 - `herd_env_export_lint` — def `scripts/herd/env-export-lint.sh:36`, `scripts/herd/healthcheck.sh:166` — callers: —
 - `herd_gate_coverage_advisory_note` — def `scripts/herd/gate-coverage-lint.sh:107` — callers: —
 - `herd_gate_coverage_check` — def `scripts/herd/gate-coverage-lint.sh:47` — callers: —
@@ -1425,15 +1432,15 @@ this scan cannot see).
 - `herd_model_escalate_target` — def `scripts/herd/driver.sh:210` — callers: `scripts/herd/herd-feature.sh:98`, `scripts/herd/herd-quick.sh:108`
 - `herd_model_for_spawn` — def `scripts/herd/driver.sh:188` — callers: `scripts/herd/herd-feature.sh:112`, `scripts/herd/herd-quick.sh:120`, `scripts/herd/herd-review.sh:411`
 - `herd_model_preflight_accessible` — def `scripts/herd/driver.sh:227` — callers: —
-- `herd_model_resolve` — def `scripts/herd/driver.sh:163` — callers: `bin/herd:2933`, `scripts/herd/agent-watch.sh:11906`, `scripts/herd/config-viability.sh:259`, `scripts/herd/herd-review.sh:152`
-- `herd_numeric` — def `scripts/herd/herd-config.sh:1693` — callers: `scripts/herd/agent-watch.sh:678`, `scripts/herd/agent-watch.sh:679`, `scripts/herd/agent-watch.sh:680`, `scripts/herd/agent-watch.sh:15782`, `scripts/herd/agent-watch.sh:15783`, `scripts/herd/herd-spawn-gate.sh:138`, `scripts/herd/herd-spawn-gate.sh:139`
+- `herd_model_resolve` — def `scripts/herd/driver.sh:163` — callers: `bin/herd:2933`, `scripts/herd/agent-watch.sh:12042`, `scripts/herd/config-viability.sh:259`, `scripts/herd/herd-review.sh:152`
+- `herd_numeric` — def `scripts/herd/herd-config.sh:1694` — callers: `scripts/herd/agent-watch.sh:683`, `scripts/herd/agent-watch.sh:684`, `scripts/herd/agent-watch.sh:685`, `scripts/herd/agent-watch.sh:15918`, `scripts/herd/agent-watch.sh:15919`, `scripts/herd/herd-spawn-gate.sh:138`, `scripts/herd/herd-spawn-gate.sh:139`
 - `herd_pane_launch` — def `scripts/herd/driver.sh:536` — callers: `scripts/herd/coordinator.sh:91`, `scripts/herd/coordinator.sh:126`
 - `herd_pipe_safety_check` — def `scripts/herd/pipe-safety-lint.sh:76` — callers: —
 - `herd_pipe_safety_lint` — def `scripts/herd/healthcheck.sh:133`, `scripts/herd/pipe-safety-lint.sh:142` — callers: —
-- `herd_pr_ref_from_body` — def `scripts/herd/agent-watch.sh:5639` — callers: `scripts/herd/work-units/git-pr.sh:148`
+- `herd_pr_ref_from_body` — def `scripts/herd/agent-watch.sh:5644` — callers: `scripts/herd/work-units/git-pr.sh:148`
 - `herd_preflight` — def `scripts/herd/herd-preflight.sh:51` — callers: `scripts/herd/coordinator.sh:37`, `scripts/herd/new-feature.sh:13`
-- `herd_pretrust_worktree` — def `scripts/herd/herd-config.sh:1132` — callers: `scripts/herd/new-feature.sh:73`
-- `herd_resolve_workspace_id` — def `scripts/herd/herd-config.sh:999` — callers: `scripts/herd/agent-watch.sh:4869`, `scripts/herd/agent-watch.sh:8226`, `scripts/herd/agent-watch.sh:11852`, `scripts/herd/agent-watch.sh:11894`, `scripts/herd/driver.sh:1262`, `scripts/herd/driver.sh:1401`, `scripts/herd/herd-feature.sh:119`, `scripts/herd/herd-quick.sh:127`, `scripts/herd/herd-resolve.sh:49`, `scripts/herd/herd-review.sh:159`, `scripts/herd/research.sh:51`, `scripts/herd/retirement.sh:173`, `scripts/herd/scribe.sh:41`
+- `herd_pretrust_worktree` — def `scripts/herd/herd-config.sh:1133` — callers: `scripts/herd/new-feature.sh:73`
+- `herd_resolve_workspace_id` — def `scripts/herd/herd-config.sh:1000` — callers: `scripts/herd/agent-watch.sh:4874`, `scripts/herd/agent-watch.sh:8362`, `scripts/herd/agent-watch.sh:11988`, `scripts/herd/agent-watch.sh:12030`, `scripts/herd/driver.sh:1262`, `scripts/herd/driver.sh:1401`, `scripts/herd/herd-feature.sh:119`, `scripts/herd/herd-quick.sh:127`, `scripts/herd/herd-resolve.sh:49`, `scripts/herd/herd-review.sh:159`, `scripts/herd/research.sh:51`, `scripts/herd/retirement.sh:173`, `scripts/herd/scribe.sh:41`
 - `herd_review_merge_verdicts` — def `scripts/herd/review-panel.sh:117` — callers: `scripts/herd/herd-review.sh:363`
 - `herd_review_panel_policy` — def `scripts/herd/review-panel.sh:77` — callers: `scripts/herd/herd-review.sh:185`
 - `herd_review_panel_policy_is_typo` — def `scripts/herd/review-panel.sh:86` — callers: —
@@ -1443,30 +1450,30 @@ this scan cannot see).
 - `herd_review_panel_verdict_line` — def `scripts/herd/review-panel.sh:97` — callers: `scripts/herd/herd-review.sh:433`
 - `herd_spawn_gate_emit_defer` — def `scripts/herd/herd-spawn-gate.sh:154` — callers: `scripts/herd/herd-feature.sh:86`, `scripts/herd/herd-quick.sh:95`
 - `herd_spawn_gate_saturated` — def `scripts/herd/herd-spawn-gate.sh:135` — callers: —
-- `herd_strip_derived` — def `scripts/herd/derived-files.sh:63` — callers: `scripts/herd/agent-watch.sh:6235`, `scripts/herd/agent-watch.sh:6564`, `scripts/herd/agent-watch.sh:8179`, `scripts/herd/agent-watch.sh:8929`, `scripts/herd/stale-dup-gate.sh:172`
+- `herd_strip_derived` — def `scripts/herd/derived-files.sh:63` — callers: `scripts/herd/agent-watch.sh:6240`, `scripts/herd/agent-watch.sh:6569`, `scripts/herd/agent-watch.sh:8315`, `scripts/herd/agent-watch.sh:9065`, `scripts/herd/stale-dup-gate.sh:172`
 - `herd_suite_curated_tests` — def `scripts/herd/suite-shard.sh:36` — callers: —
 - `herd_suite_shard_hash` — def `scripts/herd/suite-shard.sh:59` — callers: —
 - `herd_suite_shard_of` — def `scripts/herd/suite-shard.sh:65` — callers: —
 - `herd_suite_tests_for_shard` — def `scripts/herd/suite-shard.sh:74` — callers: —
-- `herd_teardown_slug` — def `scripts/herd/herd-config.sh:1030` — callers: `scripts/herd/agent-watch.sh:6878`, `scripts/herd/retirement.sh:695`
+- `herd_teardown_slug` — def `scripts/herd/herd-config.sh:1031` — callers: `scripts/herd/agent-watch.sh:6883`, `scripts/herd/retirement.sh:695`
 - `herd_test_cap_for` — def `scripts/herd/test-cap-ledger.sh:37` — callers: —
 - `herd_test_cap_ledger_check` — def `scripts/herd/test-cap-ledger.sh:63` — callers: —
 - `herd_test_cap_ledger_lint` — def `scripts/herd/healthcheck.sh:177`, `scripts/herd/test-cap-ledger.sh:111` — callers: —
 - `herd_theme_glow_style` — def `scripts/herd/theme.sh:102` — callers: `bin/herd:1925`, `scripts/herd/backlog-view.sh:47`, `scripts/herd/task-spec-view.sh:35`
 - `herd_theme_load_cli` — def `scripts/herd/theme.sh:119` — callers: `bin/herd:145`, `bin/herd:4445`, `bin/herd:7298`, `bin/herd:7467`, `bin/herd:7680`, `scripts/herd/herd-approve.sh:48`
-- `herd_theme_load_console` — def `scripts/herd/theme.sh:106` — callers: `bin/herd:7951`, `scripts/herd/agent-watch.sh:596`
-- `herd_tracked_spawn_or_abort` — def `scripts/herd/herd-config.sh:1400` — callers: —
-- `herd_write_mcp_servers` — def `scripts/herd/herd-config.sh:1455` — callers: `scripts/herd/new-feature.sh:87`
-- `herd_write_ratelimit_hook` — def `scripts/herd/herd-config.sh:1224` — callers: `scripts/herd/coordinator.sh:106`, `scripts/herd/new-feature.sh:79`
-- `herd_write_task_spec` — def `scripts/herd/herd-config.sh:1584` — callers: `scripts/herd/herd-feature.sh:291`, `scripts/herd/herd-quick.sh:299`
+- `herd_theme_load_console` — def `scripts/herd/theme.sh:106` — callers: `bin/herd:7951`, `scripts/herd/agent-watch.sh:601`
+- `herd_tracked_spawn_or_abort` — def `scripts/herd/herd-config.sh:1401` — callers: —
+- `herd_write_mcp_servers` — def `scripts/herd/herd-config.sh:1456` — callers: `scripts/herd/new-feature.sh:87`
+- `herd_write_ratelimit_hook` — def `scripts/herd/herd-config.sh:1225` — callers: `scripts/herd/coordinator.sh:106`, `scripts/herd/new-feature.sh:79`
+- `herd_write_task_spec` — def `scripts/herd/herd-config.sh:1585` — callers: `scripts/herd/herd-feature.sh:291`, `scripts/herd/herd-quick.sh:299`
 - `herd_wsl_interop_fix_hint` — def `scripts/herd/driver.sh:1190` — callers: `scripts/herd/herd-preflight.sh:577`, `scripts/herd/herd-preflight.sh:591`
-- `human_verify_has` — def `scripts/herd/human-verify.sh:72` — callers: `scripts/herd/agent-watch.sh:4680`, `scripts/herd/journal-audit.sh:629`
-- `human_verify_steps` — def `scripts/herd/human-verify.sh:33` — callers: `scripts/herd/agent-watch.sh:4686`, `scripts/herd/herd-approve.sh:80`
-- `hv_informed_noted` — def `scripts/herd/agent-watch.sh:4198` — callers: —
-- `ident` — def `scripts/herd/codemap.sh:484` — callers: `scripts/herd/agent-watch.sh:9405`, `scripts/herd/agent-watch.sh:9424`, `scripts/herd/agent-watch.sh:10666`, `scripts/herd/backends/linear.sh:237`, `scripts/herd/backends/linear.sh:1189`, `scripts/herd/backends/linear.sh:1193`, `scripts/herd/backends/linear.sh:1247`, `scripts/herd/backends/linear.sh:1261`, `scripts/herd/backlog-reconcile-sweep.sh:211`, `scripts/herd/backlog-reconcile-sweep.sh:214`, `scripts/herd/backlog-reconcile-sweep.sh:217`, `scripts/herd/backlog-view.sh:368`, `scripts/herd/backlog-view.sh:375`, `scripts/herd/backlog-view.sh:402`, `scripts/herd/driver.sh:681`, `scripts/herd/retirement.sh:234`
+- `human_verify_has` — def `scripts/herd/human-verify.sh:72` — callers: `scripts/herd/agent-watch.sh:4685`, `scripts/herd/journal-audit.sh:629`
+- `human_verify_steps` — def `scripts/herd/human-verify.sh:33` — callers: `scripts/herd/agent-watch.sh:4691`, `scripts/herd/herd-approve.sh:80`
+- `hv_informed_noted` — def `scripts/herd/agent-watch.sh:4203` — callers: —
+- `ident` — def `scripts/herd/codemap.sh:484` — callers: `scripts/herd/agent-watch.sh:9541`, `scripts/herd/agent-watch.sh:9560`, `scripts/herd/agent-watch.sh:10802`, `scripts/herd/backends/linear.sh:237`, `scripts/herd/backends/linear.sh:1189`, `scripts/herd/backends/linear.sh:1193`, `scripts/herd/backends/linear.sh:1247`, `scripts/herd/backends/linear.sh:1261`, `scripts/herd/backlog-reconcile-sweep.sh:211`, `scripts/herd/backlog-reconcile-sweep.sh:214`, `scripts/herd/backlog-reconcile-sweep.sh:217`, `scripts/herd/backlog-view.sh:368`, `scripts/herd/backlog-view.sh:375`, `scripts/herd/backlog-view.sh:402`, `scripts/herd/driver.sh:681`, `scripts/herd/retirement.sh:234`
 - `incoming_block` — def `scripts/herd/backlog-view.sh:268` — callers: —
 - `is_secret` — def `bin/herd:2763` — callers: —
-- `journal_append` — def `scripts/herd/journal.sh:239` — callers: `bin/herd:4508`, `bin/herd:4514`, `bin/herd:4518`, `bin/herd:4932`, `bin/herd:5828`, `bin/herd:5966`, `bin/herd:5970`, `bin/herd:6030`, `bin/herd:6032`, `bin/herd:6077`, `bin/herd:6080`, `bin/herd:6546`, `bin/herd:6547`, `bin/herd:6548`, `bin/herd:6549`, `bin/herd:6550`, `scripts/herd/agent-watch.sh:308`, `scripts/herd/agent-watch.sh:621`, `scripts/herd/agent-watch.sh:640`, `scripts/herd/agent-watch.sh:669`, `scripts/herd/agent-watch.sh:2063`, `scripts/herd/agent-watch.sh:2119`, `scripts/herd/agent-watch.sh:2123`, `scripts/herd/agent-watch.sh:2158`, `scripts/herd/agent-watch.sh:2183`, `scripts/herd/agent-watch.sh:2212`, `scripts/herd/agent-watch.sh:2234`, `scripts/herd/agent-watch.sh:2236`, `scripts/herd/agent-watch.sh:2238`, `scripts/herd/agent-watch.sh:2451`, `scripts/herd/agent-watch.sh:2580`, `scripts/herd/agent-watch.sh:2599`, `scripts/herd/agent-watch.sh:2602`, `scripts/herd/agent-watch.sh:2702`, `scripts/herd/agent-watch.sh:3205`, `scripts/herd/agent-watch.sh:3358`, `scripts/herd/agent-watch.sh:3364`, `scripts/herd/agent-watch.sh:3377`, `scripts/herd/agent-watch.sh:3408`, `scripts/herd/agent-watch.sh:3446`, `scripts/herd/agent-watch.sh:3522`, `scripts/herd/agent-watch.sh:3529`, `scripts/herd/agent-watch.sh:3544`, `scripts/herd/agent-watch.sh:3659`, `scripts/herd/agent-watch.sh:3675`, `scripts/herd/agent-watch.sh:3794`, `scripts/herd/agent-watch.sh:3817`, `scripts/herd/agent-watch.sh:3889`, `scripts/herd/agent-watch.sh:3903`, `scripts/herd/agent-watch.sh:4073`, `scripts/herd/agent-watch.sh:4081`, `scripts/herd/agent-watch.sh:4276`, `scripts/herd/agent-watch.sh:4278`, `scripts/herd/agent-watch.sh:4399`, `scripts/herd/agent-watch.sh:4553`, `scripts/herd/agent-watch.sh:4559`, `scripts/herd/agent-watch.sh:4642`, `scripts/herd/agent-watch.sh:4791`, `scripts/herd/agent-watch.sh:4880`, `scripts/herd/agent-watch.sh:4896`, `scripts/herd/agent-watch.sh:5192`, `scripts/herd/agent-watch.sh:5205`, `scripts/herd/agent-watch.sh:5256`, `scripts/herd/agent-watch.sh:5366`, `scripts/herd/agent-watch.sh:5377`, `scripts/herd/agent-watch.sh:5422`, `scripts/herd/agent-watch.sh:5453`, `scripts/herd/agent-watch.sh:5455`, `scripts/herd/agent-watch.sh:5760`, `scripts/herd/agent-watch.sh:5818`, `scripts/herd/agent-watch.sh:5820`, `scripts/herd/agent-watch.sh:5917`, `scripts/herd/agent-watch.sh:5919`, `scripts/herd/agent-watch.sh:6123`, `scripts/herd/agent-watch.sh:6144`, `scripts/herd/agent-watch.sh:6206`, `scripts/herd/agent-watch.sh:6221`, `scripts/herd/agent-watch.sh:6367`, `scripts/herd/agent-watch.sh:6488`, `scripts/herd/agent-watch.sh:6510`, `scripts/herd/agent-watch.sh:6518`, `scripts/herd/agent-watch.sh:6616`, `scripts/herd/agent-watch.sh:6672`, `scripts/herd/agent-watch.sh:6730`, `scripts/herd/agent-watch.sh:6747`, `scripts/herd/agent-watch.sh:6877`, `scripts/herd/agent-watch.sh:7094`, `scripts/herd/agent-watch.sh:7205`, `scripts/herd/agent-watch.sh:7219`, `scripts/herd/agent-watch.sh:7223`, `scripts/herd/agent-watch.sh:7435`, `scripts/herd/agent-watch.sh:7446`, `scripts/herd/agent-watch.sh:7448`, `scripts/herd/agent-watch.sh:7450`, `scripts/herd/agent-watch.sh:7544`, `scripts/herd/agent-watch.sh:7551`, `scripts/herd/agent-watch.sh:7557`, `scripts/herd/agent-watch.sh:7559`, `scripts/herd/agent-watch.sh:7567`, `scripts/herd/agent-watch.sh:7600`, `scripts/herd/agent-watch.sh:7615`, `scripts/herd/agent-watch.sh:7617`, `scripts/herd/agent-watch.sh:7651`, `scripts/herd/agent-watch.sh:7699`, `scripts/herd/agent-watch.sh:7732`, `scripts/herd/agent-watch.sh:7742`, `scripts/herd/agent-watch.sh:7823`, `scripts/herd/agent-watch.sh:7842`, `scripts/herd/agent-watch.sh:8018`, `scripts/herd/agent-watch.sh:8052`, `scripts/herd/agent-watch.sh:8074`, `scripts/herd/agent-watch.sh:8078`, `scripts/herd/agent-watch.sh:8080`, `scripts/herd/agent-watch.sh:8082`, `scripts/herd/agent-watch.sh:8180`, `scripts/herd/agent-watch.sh:8200`, `scripts/herd/agent-watch.sh:8384`, `scripts/herd/agent-watch.sh:8490`, `scripts/herd/agent-watch.sh:8622`, `scripts/herd/agent-watch.sh:8933`, `scripts/herd/agent-watch.sh:8979`, `scripts/herd/agent-watch.sh:8996`, `scripts/herd/agent-watch.sh:9010`, `scripts/herd/agent-watch.sh:9239`, `scripts/herd/agent-watch.sh:9289`, `scripts/herd/agent-watch.sh:9505`, `scripts/herd/agent-watch.sh:9539`, `scripts/herd/agent-watch.sh:9586`, `scripts/herd/agent-watch.sh:9591`, `scripts/herd/agent-watch.sh:9629`, `scripts/herd/agent-watch.sh:9667`, `scripts/herd/agent-watch.sh:9744`, `scripts/herd/agent-watch.sh:9785`, `scripts/herd/agent-watch.sh:9801`, `scripts/herd/agent-watch.sh:9824`, `scripts/herd/agent-watch.sh:9837`, `scripts/herd/agent-watch.sh:9872`, `scripts/herd/agent-watch.sh:9886`, `scripts/herd/agent-watch.sh:9978`, `scripts/herd/agent-watch.sh:9991`, `scripts/herd/agent-watch.sh:10018`, `scripts/herd/agent-watch.sh:10036`, `scripts/herd/agent-watch.sh:10059`, `scripts/herd/agent-watch.sh:10094`, `scripts/herd/agent-watch.sh:10200`, `scripts/herd/agent-watch.sh:10272`, `scripts/herd/agent-watch.sh:10290`, `scripts/herd/agent-watch.sh:10314`, `scripts/herd/agent-watch.sh:10326`, `scripts/herd/agent-watch.sh:10366`, `scripts/herd/agent-watch.sh:10380`, `scripts/herd/agent-watch.sh:10430`, `scripts/herd/agent-watch.sh:10510`, `scripts/herd/agent-watch.sh:10540`, `scripts/herd/agent-watch.sh:10557`, `scripts/herd/agent-watch.sh:10577`, `scripts/herd/agent-watch.sh:10620`, `scripts/herd/agent-watch.sh:10694`, `scripts/herd/agent-watch.sh:11016`, `scripts/herd/agent-watch.sh:11024`, `scripts/herd/agent-watch.sh:11030`, `scripts/herd/agent-watch.sh:11058`, `scripts/herd/agent-watch.sh:11059`, `scripts/herd/agent-watch.sh:11097`, `scripts/herd/agent-watch.sh:11109`, `scripts/herd/agent-watch.sh:11111`, `scripts/herd/agent-watch.sh:11117`, `scripts/herd/agent-watch.sh:11190`, `scripts/herd/agent-watch.sh:11215`, `scripts/herd/agent-watch.sh:11216`, `scripts/herd/agent-watch.sh:11225`, `scripts/herd/agent-watch.sh:11249`, `scripts/herd/agent-watch.sh:11252`, `scripts/herd/agent-watch.sh:11259`, `scripts/herd/agent-watch.sh:11261`, `scripts/herd/agent-watch.sh:11267`, `scripts/herd/agent-watch.sh:11556`, `scripts/herd/agent-watch.sh:11622`, `scripts/herd/agent-watch.sh:11630`, `scripts/herd/agent-watch.sh:11688`, `scripts/herd/agent-watch.sh:11813`, `scripts/herd/agent-watch.sh:11837`, `scripts/herd/agent-watch.sh:11880`, `scripts/herd/agent-watch.sh:11926`, `scripts/herd/agent-watch.sh:11949`, `scripts/herd/agent-watch.sh:11953`, `scripts/herd/agent-watch.sh:11958`, `scripts/herd/agent-watch.sh:11962`, `scripts/herd/agent-watch.sh:12134`, `scripts/herd/agent-watch.sh:12138`, `scripts/herd/agent-watch.sh:12142`, `scripts/herd/agent-watch.sh:12190`, `scripts/herd/agent-watch.sh:12487`, `scripts/herd/agent-watch.sh:12489`, `scripts/herd/agent-watch.sh:12491`, `scripts/herd/agent-watch.sh:12493`, `scripts/herd/agent-watch.sh:12520`, `scripts/herd/agent-watch.sh:12524`, `scripts/herd/agent-watch.sh:12528`, `scripts/herd/agent-watch.sh:12614`, `scripts/herd/agent-watch.sh:12617`, `scripts/herd/agent-watch.sh:12638`, `scripts/herd/agent-watch.sh:12646`, `scripts/herd/agent-watch.sh:12758`, `scripts/herd/agent-watch.sh:12762`, `scripts/herd/agent-watch.sh:12773`, `scripts/herd/agent-watch.sh:12779`, `scripts/herd/agent-watch.sh:12787`, `scripts/herd/agent-watch.sh:12970`, `scripts/herd/agent-watch.sh:13269`, `scripts/herd/agent-watch.sh:13370`, `scripts/herd/agent-watch.sh:13416`, `scripts/herd/agent-watch.sh:13418`, `scripts/herd/agent-watch.sh:13494`, `scripts/herd/agent-watch.sh:13496`, `scripts/herd/agent-watch.sh:13649`, `scripts/herd/agent-watch.sh:13661`, `scripts/herd/agent-watch.sh:13663`, `scripts/herd/agent-watch.sh:13683`, `scripts/herd/agent-watch.sh:13690`, `scripts/herd/agent-watch.sh:13695`, `scripts/herd/agent-watch.sh:13723`, `scripts/herd/agent-watch.sh:13766`, `scripts/herd/agent-watch.sh:13840`, `scripts/herd/agent-watch.sh:13845`, `scripts/herd/agent-watch.sh:13877`, `scripts/herd/agent-watch.sh:13907`, `scripts/herd/agent-watch.sh:13911`, `scripts/herd/agent-watch.sh:14130`, `scripts/herd/agent-watch.sh:14533`, `scripts/herd/agent-watch.sh:14627`, `scripts/herd/agent-watch.sh:14754`, `scripts/herd/agent-watch.sh:14765`, `scripts/herd/agent-watch.sh:14782`, `scripts/herd/agent-watch.sh:14793`, `scripts/herd/agent-watch.sh:14803`, `scripts/herd/agent-watch.sh:15621`, `scripts/herd/agent-watch.sh:15717`, `scripts/herd/agent-watch.sh:15719`, `scripts/herd/agent-watch.sh:15725`, `scripts/herd/agent-watch.sh:15727`, `scripts/herd/agent-watch.sh:15732`, `scripts/herd/agent-watch.sh:15734`, `scripts/herd/agent-watch.sh:15765`, `scripts/herd/agent-watch.sh:15772`, `scripts/herd/agent-watch.sh:15815`, `scripts/herd/agent-watch.sh:15822`, `scripts/herd/agent-watch.sh:15847`, `scripts/herd/backends/file.sh:53`, `scripts/herd/backends/file.sh:56`, `scripts/herd/backends/file.sh:190`, `scripts/herd/backends/github.sh:40`, `scripts/herd/backends/github.sh:43`, `scripts/herd/backends/jira.sh:74`, `scripts/herd/backends/jira.sh:77`, `scripts/herd/backends/linear.sh:72`, `scripts/herd/backends/linear.sh:75`, `scripts/herd/backlog-reconcile-sweep.sh:334`, `scripts/herd/config-viability.sh:380`, `scripts/herd/context-guard.sh:118`, `scripts/herd/cost.sh:424`, `scripts/herd/create-retry.sh:185`, `scripts/herd/create-retry.sh:321`, `scripts/herd/create-retry.sh:324`, `scripts/herd/create-retry.sh:361`, `scripts/herd/create-retry.sh:434`, `scripts/herd/create-retry.sh:439`, `scripts/herd/create-retry.sh:474`, `scripts/herd/driver.sh:654`, `scripts/herd/driver.sh:1298`, `scripts/herd/engine-seat.sh:175`, `scripts/herd/engine-seat.sh:280`, `scripts/herd/engine-seat.sh:287`, `scripts/herd/engine-version.sh:92`, `scripts/herd/fleet.sh:330`, `scripts/herd/governance-drift-sweep.sh:140`, `scripts/herd/healthcheck.sh:253`, `scripts/herd/herd-approve.sh:299`, `scripts/herd/herd-claim.sh:176`, `scripts/herd/herd-claim.sh:182`, `scripts/herd/herd-claim.sh:188`, `scripts/herd/herd-claim.sh:267`, `scripts/herd/herd-claim.sh:275`, `scripts/herd/herd-claim.sh:279`, `scripts/herd/herd-claim.sh:284`, `scripts/herd/herd-config.sh:1413`, `scripts/herd/herd-feature.sh:70`, `scripts/herd/herd-feature.sh:73`, `scripts/herd/herd-feature.sh:125`, `scripts/herd/herd-feature.sh:315`, `scripts/herd/herd-quick.sh:79`, `scripts/herd/herd-quick.sh:82`, `scripts/herd/herd-quick.sh:133`, `scripts/herd/herd-quick.sh:322`, `scripts/herd/herd-resolve.sh:108`, `scripts/herd/herd-resolve.sh:131`, `scripts/herd/herd-review.sh:192`, `scripts/herd/herd-review.sh:266`, `scripts/herd/herd-review.sh:413`, `scripts/herd/herd-review.sh:422`, `scripts/herd/herd-review.sh:439`, `scripts/herd/herd-review.sh:481`, `scripts/herd/herd-review.sh:594`, `scripts/herd/herd-review.sh:638`, `scripts/herd/herd-review.sh:877`, `scripts/herd/herd-review.sh:913`, `scripts/herd/journal-audit.sh:691`, `scripts/herd/journal-emission-lint.sh:134`, `scripts/herd/journal-emission-lint.sh:135`, `scripts/herd/journal-emission-lint.sh:136`, `scripts/herd/journal-emission-lint.sh:137`, `scripts/herd/lifecycle.sh:247`, `scripts/herd/lifecycle.sh:270`, `scripts/herd/lifecycle.sh:394`, `scripts/herd/push-gate.sh:185`, `scripts/herd/push-gate.sh:203`, `scripts/herd/push-gate.sh:273`, `scripts/herd/push-gate.sh:278`, `scripts/herd/push-gate.sh:284`, `scripts/herd/research.sh:118`, `scripts/herd/research.sh:124`, `scripts/herd/research.sh:181`, `scripts/herd/research.sh:199`, `scripts/herd/resolver-claim.sh:185`, `scripts/herd/resolver-claim.sh:190`, `scripts/herd/resolver-claim.sh:194`, `scripts/herd/resolver-claim.sh:220`, `scripts/herd/retirement.sh:917`, `scripts/herd/retirement.sh:969`, `scripts/herd/retirement.sh:1057`, `scripts/herd/retirement.sh:1091`, `scripts/herd/scribe-step.sh:139`, `scripts/herd/scribe-step.sh:355`, `scripts/herd/scribe-step.sh:360`, `scripts/herd/scribe-step.sh:373`, `scripts/herd/scribe.sh:101`, `scripts/herd/scribe.sh:107`, `scripts/herd/scribe.sh:203`, `scripts/herd/scribe.sh:221`, `scripts/herd/steps.sh:342`, `scripts/herd/steps.sh:357`, `scripts/herd/steps.sh:412`, `scripts/herd/steps.sh:519`, `scripts/herd/steps.sh:528`, `scripts/herd/steps.sh:534`, `scripts/herd/steps.sh:538`, `scripts/herd/steps.sh:541`, `scripts/herd/steps.sh:546`, `scripts/herd/sweep.sh:407`, `scripts/herd/sweep.sh:419`, `scripts/herd/sweep.sh:690`, `scripts/herd/sweep.sh:932`, `scripts/herd/sweep.sh:944`, `scripts/herd/sweep.sh:948`, `scripts/herd/sweep.sh:1011`, `scripts/herd/sweep.sh:1247`, `scripts/herd/sweep.sh:1253`, `scripts/herd/sweep.sh:1326`, `scripts/herd/sweep.sh:1367`, `scripts/herd/sweep.sh:1394`, `scripts/herd/sweep.sh:1427`, `scripts/herd/tracker-state-sweep.sh:290`, `scripts/herd/tracker-state-sweep.sh:382`, `scripts/herd/tracker-state-sweep.sh:388`, `scripts/herd/triggers.sh:220`, `scripts/herd/triggers.sh:245`, `scripts/herd/triggers.sh:261`, `scripts/herd/triggers.sh:264`, `scripts/herd/triggers.sh:267`, `scripts/herd/watcher-resurrect.sh:80`, `scripts/herd/watcher-resurrect.sh:93`, `scripts/herd/watcher-resurrect.sh:99`, `scripts/herd/work-units/git-pr.sh:174`, `scripts/herd/work-units/git-pr.sh:178`, `scripts/herd/work-units/git-pr.sh:180`, `scripts/herd/work-units/git-pr.sh:212`, `scripts/herd/work-units/git-pr.sh:226`, `scripts/herd/work-units/git-pr.sh:227`, `scripts/herd/work-units/git-pr.sh:266`, `scripts/herd/work-units/git-pr.sh:268`, `scripts/herd/work-units/git-pr.sh:290`, `scripts/herd/work-units/git-pr.sh:335`, `scripts/herd/work-units/git-pr.sh:357`
+- `journal_append` — def `scripts/herd/journal.sh:239` — callers: `bin/herd:4508`, `bin/herd:4514`, `bin/herd:4518`, `bin/herd:4932`, `bin/herd:5828`, `bin/herd:5966`, `bin/herd:5970`, `bin/herd:6030`, `bin/herd:6032`, `bin/herd:6077`, `bin/herd:6080`, `bin/herd:6546`, `bin/herd:6547`, `bin/herd:6548`, `bin/herd:6549`, `bin/herd:6550`, `scripts/herd/agent-watch.sh:308`, `scripts/herd/agent-watch.sh:626`, `scripts/herd/agent-watch.sh:645`, `scripts/herd/agent-watch.sh:674`, `scripts/herd/agent-watch.sh:2068`, `scripts/herd/agent-watch.sh:2124`, `scripts/herd/agent-watch.sh:2128`, `scripts/herd/agent-watch.sh:2163`, `scripts/herd/agent-watch.sh:2188`, `scripts/herd/agent-watch.sh:2217`, `scripts/herd/agent-watch.sh:2239`, `scripts/herd/agent-watch.sh:2241`, `scripts/herd/agent-watch.sh:2243`, `scripts/herd/agent-watch.sh:2456`, `scripts/herd/agent-watch.sh:2585`, `scripts/herd/agent-watch.sh:2604`, `scripts/herd/agent-watch.sh:2607`, `scripts/herd/agent-watch.sh:2707`, `scripts/herd/agent-watch.sh:3210`, `scripts/herd/agent-watch.sh:3363`, `scripts/herd/agent-watch.sh:3369`, `scripts/herd/agent-watch.sh:3382`, `scripts/herd/agent-watch.sh:3413`, `scripts/herd/agent-watch.sh:3451`, `scripts/herd/agent-watch.sh:3527`, `scripts/herd/agent-watch.sh:3534`, `scripts/herd/agent-watch.sh:3549`, `scripts/herd/agent-watch.sh:3664`, `scripts/herd/agent-watch.sh:3680`, `scripts/herd/agent-watch.sh:3799`, `scripts/herd/agent-watch.sh:3822`, `scripts/herd/agent-watch.sh:3894`, `scripts/herd/agent-watch.sh:3908`, `scripts/herd/agent-watch.sh:4078`, `scripts/herd/agent-watch.sh:4086`, `scripts/herd/agent-watch.sh:4281`, `scripts/herd/agent-watch.sh:4283`, `scripts/herd/agent-watch.sh:4404`, `scripts/herd/agent-watch.sh:4558`, `scripts/herd/agent-watch.sh:4564`, `scripts/herd/agent-watch.sh:4647`, `scripts/herd/agent-watch.sh:4796`, `scripts/herd/agent-watch.sh:4885`, `scripts/herd/agent-watch.sh:4901`, `scripts/herd/agent-watch.sh:5197`, `scripts/herd/agent-watch.sh:5210`, `scripts/herd/agent-watch.sh:5261`, `scripts/herd/agent-watch.sh:5371`, `scripts/herd/agent-watch.sh:5382`, `scripts/herd/agent-watch.sh:5427`, `scripts/herd/agent-watch.sh:5458`, `scripts/herd/agent-watch.sh:5460`, `scripts/herd/agent-watch.sh:5765`, `scripts/herd/agent-watch.sh:5823`, `scripts/herd/agent-watch.sh:5825`, `scripts/herd/agent-watch.sh:5922`, `scripts/herd/agent-watch.sh:5924`, `scripts/herd/agent-watch.sh:6128`, `scripts/herd/agent-watch.sh:6149`, `scripts/herd/agent-watch.sh:6211`, `scripts/herd/agent-watch.sh:6226`, `scripts/herd/agent-watch.sh:6372`, `scripts/herd/agent-watch.sh:6493`, `scripts/herd/agent-watch.sh:6515`, `scripts/herd/agent-watch.sh:6523`, `scripts/herd/agent-watch.sh:6621`, `scripts/herd/agent-watch.sh:6677`, `scripts/herd/agent-watch.sh:6735`, `scripts/herd/agent-watch.sh:6752`, `scripts/herd/agent-watch.sh:6882`, `scripts/herd/agent-watch.sh:7099`, `scripts/herd/agent-watch.sh:7210`, `scripts/herd/agent-watch.sh:7224`, `scripts/herd/agent-watch.sh:7228`, `scripts/herd/agent-watch.sh:7562`, `scripts/herd/agent-watch.sh:7570`, `scripts/herd/agent-watch.sh:7582`, `scripts/herd/agent-watch.sh:7584`, `scripts/herd/agent-watch.sh:7586`, `scripts/herd/agent-watch.sh:7680`, `scripts/herd/agent-watch.sh:7687`, `scripts/herd/agent-watch.sh:7693`, `scripts/herd/agent-watch.sh:7695`, `scripts/herd/agent-watch.sh:7703`, `scripts/herd/agent-watch.sh:7736`, `scripts/herd/agent-watch.sh:7751`, `scripts/herd/agent-watch.sh:7753`, `scripts/herd/agent-watch.sh:7787`, `scripts/herd/agent-watch.sh:7835`, `scripts/herd/agent-watch.sh:7868`, `scripts/herd/agent-watch.sh:7878`, `scripts/herd/agent-watch.sh:7959`, `scripts/herd/agent-watch.sh:7978`, `scripts/herd/agent-watch.sh:8154`, `scripts/herd/agent-watch.sh:8188`, `scripts/herd/agent-watch.sh:8210`, `scripts/herd/agent-watch.sh:8214`, `scripts/herd/agent-watch.sh:8216`, `scripts/herd/agent-watch.sh:8218`, `scripts/herd/agent-watch.sh:8316`, `scripts/herd/agent-watch.sh:8336`, `scripts/herd/agent-watch.sh:8520`, `scripts/herd/agent-watch.sh:8626`, `scripts/herd/agent-watch.sh:8758`, `scripts/herd/agent-watch.sh:9069`, `scripts/herd/agent-watch.sh:9115`, `scripts/herd/agent-watch.sh:9132`, `scripts/herd/agent-watch.sh:9146`, `scripts/herd/agent-watch.sh:9375`, `scripts/herd/agent-watch.sh:9425`, `scripts/herd/agent-watch.sh:9641`, `scripts/herd/agent-watch.sh:9675`, `scripts/herd/agent-watch.sh:9722`, `scripts/herd/agent-watch.sh:9727`, `scripts/herd/agent-watch.sh:9765`, `scripts/herd/agent-watch.sh:9803`, `scripts/herd/agent-watch.sh:9880`, `scripts/herd/agent-watch.sh:9921`, `scripts/herd/agent-watch.sh:9937`, `scripts/herd/agent-watch.sh:9960`, `scripts/herd/agent-watch.sh:9973`, `scripts/herd/agent-watch.sh:10008`, `scripts/herd/agent-watch.sh:10022`, `scripts/herd/agent-watch.sh:10114`, `scripts/herd/agent-watch.sh:10127`, `scripts/herd/agent-watch.sh:10154`, `scripts/herd/agent-watch.sh:10172`, `scripts/herd/agent-watch.sh:10195`, `scripts/herd/agent-watch.sh:10230`, `scripts/herd/agent-watch.sh:10336`, `scripts/herd/agent-watch.sh:10408`, `scripts/herd/agent-watch.sh:10426`, `scripts/herd/agent-watch.sh:10450`, `scripts/herd/agent-watch.sh:10462`, `scripts/herd/agent-watch.sh:10502`, `scripts/herd/agent-watch.sh:10516`, `scripts/herd/agent-watch.sh:10566`, `scripts/herd/agent-watch.sh:10646`, `scripts/herd/agent-watch.sh:10676`, `scripts/herd/agent-watch.sh:10693`, `scripts/herd/agent-watch.sh:10713`, `scripts/herd/agent-watch.sh:10756`, `scripts/herd/agent-watch.sh:10830`, `scripts/herd/agent-watch.sh:11152`, `scripts/herd/agent-watch.sh:11160`, `scripts/herd/agent-watch.sh:11166`, `scripts/herd/agent-watch.sh:11194`, `scripts/herd/agent-watch.sh:11195`, `scripts/herd/agent-watch.sh:11233`, `scripts/herd/agent-watch.sh:11245`, `scripts/herd/agent-watch.sh:11247`, `scripts/herd/agent-watch.sh:11253`, `scripts/herd/agent-watch.sh:11326`, `scripts/herd/agent-watch.sh:11351`, `scripts/herd/agent-watch.sh:11352`, `scripts/herd/agent-watch.sh:11361`, `scripts/herd/agent-watch.sh:11385`, `scripts/herd/agent-watch.sh:11388`, `scripts/herd/agent-watch.sh:11395`, `scripts/herd/agent-watch.sh:11397`, `scripts/herd/agent-watch.sh:11403`, `scripts/herd/agent-watch.sh:11692`, `scripts/herd/agent-watch.sh:11758`, `scripts/herd/agent-watch.sh:11766`, `scripts/herd/agent-watch.sh:11824`, `scripts/herd/agent-watch.sh:11949`, `scripts/herd/agent-watch.sh:11973`, `scripts/herd/agent-watch.sh:12016`, `scripts/herd/agent-watch.sh:12062`, `scripts/herd/agent-watch.sh:12085`, `scripts/herd/agent-watch.sh:12089`, `scripts/herd/agent-watch.sh:12094`, `scripts/herd/agent-watch.sh:12098`, `scripts/herd/agent-watch.sh:12270`, `scripts/herd/agent-watch.sh:12274`, `scripts/herd/agent-watch.sh:12278`, `scripts/herd/agent-watch.sh:12326`, `scripts/herd/agent-watch.sh:12623`, `scripts/herd/agent-watch.sh:12625`, `scripts/herd/agent-watch.sh:12627`, `scripts/herd/agent-watch.sh:12629`, `scripts/herd/agent-watch.sh:12656`, `scripts/herd/agent-watch.sh:12660`, `scripts/herd/agent-watch.sh:12664`, `scripts/herd/agent-watch.sh:12750`, `scripts/herd/agent-watch.sh:12753`, `scripts/herd/agent-watch.sh:12774`, `scripts/herd/agent-watch.sh:12782`, `scripts/herd/agent-watch.sh:12894`, `scripts/herd/agent-watch.sh:12898`, `scripts/herd/agent-watch.sh:12909`, `scripts/herd/agent-watch.sh:12915`, `scripts/herd/agent-watch.sh:12923`, `scripts/herd/agent-watch.sh:13106`, `scripts/herd/agent-watch.sh:13405`, `scripts/herd/agent-watch.sh:13506`, `scripts/herd/agent-watch.sh:13552`, `scripts/herd/agent-watch.sh:13554`, `scripts/herd/agent-watch.sh:13630`, `scripts/herd/agent-watch.sh:13632`, `scripts/herd/agent-watch.sh:13785`, `scripts/herd/agent-watch.sh:13797`, `scripts/herd/agent-watch.sh:13799`, `scripts/herd/agent-watch.sh:13819`, `scripts/herd/agent-watch.sh:13826`, `scripts/herd/agent-watch.sh:13831`, `scripts/herd/agent-watch.sh:13859`, `scripts/herd/agent-watch.sh:13902`, `scripts/herd/agent-watch.sh:13976`, `scripts/herd/agent-watch.sh:13981`, `scripts/herd/agent-watch.sh:14013`, `scripts/herd/agent-watch.sh:14043`, `scripts/herd/agent-watch.sh:14047`, `scripts/herd/agent-watch.sh:14266`, `scripts/herd/agent-watch.sh:14669`, `scripts/herd/agent-watch.sh:14763`, `scripts/herd/agent-watch.sh:14890`, `scripts/herd/agent-watch.sh:14901`, `scripts/herd/agent-watch.sh:14918`, `scripts/herd/agent-watch.sh:14929`, `scripts/herd/agent-watch.sh:14939`, `scripts/herd/agent-watch.sh:15757`, `scripts/herd/agent-watch.sh:15853`, `scripts/herd/agent-watch.sh:15855`, `scripts/herd/agent-watch.sh:15861`, `scripts/herd/agent-watch.sh:15863`, `scripts/herd/agent-watch.sh:15868`, `scripts/herd/agent-watch.sh:15870`, `scripts/herd/agent-watch.sh:15901`, `scripts/herd/agent-watch.sh:15908`, `scripts/herd/agent-watch.sh:15951`, `scripts/herd/agent-watch.sh:15958`, `scripts/herd/agent-watch.sh:15983`, `scripts/herd/backends/file.sh:53`, `scripts/herd/backends/file.sh:56`, `scripts/herd/backends/file.sh:190`, `scripts/herd/backends/github.sh:40`, `scripts/herd/backends/github.sh:43`, `scripts/herd/backends/jira.sh:74`, `scripts/herd/backends/jira.sh:77`, `scripts/herd/backends/linear.sh:72`, `scripts/herd/backends/linear.sh:75`, `scripts/herd/backlog-reconcile-sweep.sh:334`, `scripts/herd/config-viability.sh:380`, `scripts/herd/context-guard.sh:118`, `scripts/herd/cost.sh:424`, `scripts/herd/create-retry.sh:185`, `scripts/herd/create-retry.sh:321`, `scripts/herd/create-retry.sh:324`, `scripts/herd/create-retry.sh:361`, `scripts/herd/create-retry.sh:434`, `scripts/herd/create-retry.sh:439`, `scripts/herd/create-retry.sh:474`, `scripts/herd/driver.sh:654`, `scripts/herd/driver.sh:1298`, `scripts/herd/engine-seat.sh:175`, `scripts/herd/engine-seat.sh:280`, `scripts/herd/engine-seat.sh:287`, `scripts/herd/engine-version.sh:92`, `scripts/herd/fleet.sh:330`, `scripts/herd/governance-drift-sweep.sh:140`, `scripts/herd/healthcheck.sh:253`, `scripts/herd/herd-approve.sh:299`, `scripts/herd/herd-claim.sh:176`, `scripts/herd/herd-claim.sh:182`, `scripts/herd/herd-claim.sh:188`, `scripts/herd/herd-claim.sh:267`, `scripts/herd/herd-claim.sh:275`, `scripts/herd/herd-claim.sh:279`, `scripts/herd/herd-claim.sh:284`, `scripts/herd/herd-config.sh:1414`, `scripts/herd/herd-feature.sh:70`, `scripts/herd/herd-feature.sh:73`, `scripts/herd/herd-feature.sh:125`, `scripts/herd/herd-feature.sh:315`, `scripts/herd/herd-quick.sh:79`, `scripts/herd/herd-quick.sh:82`, `scripts/herd/herd-quick.sh:133`, `scripts/herd/herd-quick.sh:322`, `scripts/herd/herd-resolve.sh:108`, `scripts/herd/herd-resolve.sh:131`, `scripts/herd/herd-review.sh:192`, `scripts/herd/herd-review.sh:266`, `scripts/herd/herd-review.sh:413`, `scripts/herd/herd-review.sh:422`, `scripts/herd/herd-review.sh:439`, `scripts/herd/herd-review.sh:481`, `scripts/herd/herd-review.sh:594`, `scripts/herd/herd-review.sh:638`, `scripts/herd/herd-review.sh:877`, `scripts/herd/herd-review.sh:913`, `scripts/herd/journal-audit.sh:691`, `scripts/herd/journal-emission-lint.sh:134`, `scripts/herd/journal-emission-lint.sh:135`, `scripts/herd/journal-emission-lint.sh:136`, `scripts/herd/journal-emission-lint.sh:137`, `scripts/herd/lifecycle.sh:247`, `scripts/herd/lifecycle.sh:270`, `scripts/herd/lifecycle.sh:394`, `scripts/herd/push-gate.sh:185`, `scripts/herd/push-gate.sh:203`, `scripts/herd/push-gate.sh:273`, `scripts/herd/push-gate.sh:278`, `scripts/herd/push-gate.sh:284`, `scripts/herd/research.sh:118`, `scripts/herd/research.sh:124`, `scripts/herd/research.sh:181`, `scripts/herd/research.sh:199`, `scripts/herd/resolver-claim.sh:185`, `scripts/herd/resolver-claim.sh:190`, `scripts/herd/resolver-claim.sh:194`, `scripts/herd/resolver-claim.sh:220`, `scripts/herd/retirement.sh:917`, `scripts/herd/retirement.sh:969`, `scripts/herd/retirement.sh:1057`, `scripts/herd/retirement.sh:1091`, `scripts/herd/scribe-step.sh:139`, `scripts/herd/scribe-step.sh:355`, `scripts/herd/scribe-step.sh:360`, `scripts/herd/scribe-step.sh:373`, `scripts/herd/scribe.sh:101`, `scripts/herd/scribe.sh:107`, `scripts/herd/scribe.sh:203`, `scripts/herd/scribe.sh:221`, `scripts/herd/steps.sh:342`, `scripts/herd/steps.sh:357`, `scripts/herd/steps.sh:412`, `scripts/herd/steps.sh:519`, `scripts/herd/steps.sh:528`, `scripts/herd/steps.sh:534`, `scripts/herd/steps.sh:538`, `scripts/herd/steps.sh:541`, `scripts/herd/steps.sh:546`, `scripts/herd/sweep.sh:407`, `scripts/herd/sweep.sh:419`, `scripts/herd/sweep.sh:690`, `scripts/herd/sweep.sh:932`, `scripts/herd/sweep.sh:944`, `scripts/herd/sweep.sh:948`, `scripts/herd/sweep.sh:1011`, `scripts/herd/sweep.sh:1247`, `scripts/herd/sweep.sh:1253`, `scripts/herd/sweep.sh:1326`, `scripts/herd/sweep.sh:1367`, `scripts/herd/sweep.sh:1394`, `scripts/herd/sweep.sh:1427`, `scripts/herd/tracker-state-sweep.sh:290`, `scripts/herd/tracker-state-sweep.sh:382`, `scripts/herd/tracker-state-sweep.sh:388`, `scripts/herd/triggers.sh:220`, `scripts/herd/triggers.sh:245`, `scripts/herd/triggers.sh:261`, `scripts/herd/triggers.sh:264`, `scripts/herd/triggers.sh:267`, `scripts/herd/watcher-resurrect.sh:80`, `scripts/herd/watcher-resurrect.sh:93`, `scripts/herd/watcher-resurrect.sh:99`, `scripts/herd/work-units/git-pr.sh:174`, `scripts/herd/work-units/git-pr.sh:178`, `scripts/herd/work-units/git-pr.sh:180`, `scripts/herd/work-units/git-pr.sh:212`, `scripts/herd/work-units/git-pr.sh:226`, `scripts/herd/work-units/git-pr.sh:227`, `scripts/herd/work-units/git-pr.sh:266`, `scripts/herd/work-units/git-pr.sh:268`, `scripts/herd/work-units/git-pr.sh:290`, `scripts/herd/work-units/git-pr.sh:335`, `scripts/herd/work-units/git-pr.sh:357`
 - `journal_unit_ref` — def `scripts/herd/journal.sh:143` — callers: `scripts/herd/work-unit.sh:196`
 - `keyof` — def `bin/herd:2752` — callers: —
 - `layout_fold_stray_tabs` — def `scripts/herd/layout-reconcile.sh:276` — callers: `bin/herd:6279`, `scripts/herd/coordinator.sh:61`
@@ -1476,36 +1483,36 @@ this scan cannot see).
 - `layout_write_registry` — def `scripts/herd/layout-reconcile.sh:204` — callers: `bin/herd:6488`, `bin/herd:6649`, `scripts/herd/coordinator.sh:140`
 - `lifecycle_deadline` — def `scripts/herd/lifecycle.sh:154` — callers: —
 - `lifecycle_dir` — def `scripts/herd/lifecycle.sh:126` — callers: —
-- `lifecycle_enabled` — def `scripts/herd/lifecycle.sh:117` — callers: `scripts/herd/agent-watch.sh:3007`, `scripts/herd/agent-watch.sh:3015`
+- `lifecycle_enabled` — def `scripts/herd/lifecycle.sh:117` — callers: `scripts/herd/agent-watch.sh:3012`, `scripts/herd/agent-watch.sh:3020`
 - `lifecycle_records` — def `scripts/herd/lifecycle.sh:277` — callers: —
-- `lifecycle_retire` — def `scripts/herd/lifecycle.sh:257` — callers: `scripts/herd/agent-watch.sh:3018`, `scripts/herd/agent-watch.sh:3188`, `scripts/herd/agent-watch.sh:8089`, `scripts/herd/agent-watch.sh:13705`, `scripts/herd/agent-watch.sh:13722`, `scripts/herd/research-step.sh:92`, `scripts/herd/research.sh:119`, `scripts/herd/scribe-step.sh:578`, `scripts/herd/scribe.sh:102`
+- `lifecycle_retire` — def `scripts/herd/lifecycle.sh:257` — callers: `scripts/herd/agent-watch.sh:3023`, `scripts/herd/agent-watch.sh:3193`, `scripts/herd/agent-watch.sh:8225`, `scripts/herd/agent-watch.sh:13841`, `scripts/herd/agent-watch.sh:13858`, `scripts/herd/research-step.sh:92`, `scripts/herd/research.sh:119`, `scripts/herd/scribe-step.sh:578`, `scripts/herd/scribe.sh:102`
 - `lifecycle_route` — def `scripts/herd/lifecycle.sh:166` — callers: —
-- `lifecycle_spawn` — def `scripts/herd/lifecycle.sh:225` — callers: `scripts/herd/agent-watch.sh:3010`, `scripts/herd/agent-watch.sh:3452`, `scripts/herd/agent-watch.sh:7827`, `scripts/herd/agent-watch.sh:13769`, `scripts/herd/research.sh:195`, `scripts/herd/scribe.sh:217`
-- `lifecycle_sweep` — def `scripts/herd/lifecycle.sh:366` — callers: `scripts/herd/agent-watch.sh:9079`
-- `limit_state` — def `scripts/herd/agent-watch.sh:10850` — callers: —
-- `limit_target_epoch` — def `scripts/herd/agent-watch.sh:10855` — callers: —
+- `lifecycle_spawn` — def `scripts/herd/lifecycle.sh:225` — callers: `scripts/herd/agent-watch.sh:3015`, `scripts/herd/agent-watch.sh:3457`, `scripts/herd/agent-watch.sh:7963`, `scripts/herd/agent-watch.sh:13905`, `scripts/herd/research.sh:195`, `scripts/herd/scribe.sh:217`
+- `lifecycle_sweep` — def `scripts/herd/lifecycle.sh:366` — callers: `scripts/herd/agent-watch.sh:9215`
+- `limit_state` — def `scripts/herd/agent-watch.sh:10986` — callers: —
+- `limit_target_epoch` — def `scripts/herd/agent-watch.sh:10991` — callers: —
 - `link_or_die` — def `scripts/herd/new-feature.sh:31` — callers: —
 - `list_to_md` — def `scripts/herd/backlog-view.sh:435` — callers: —
-- `main` — def `scripts/herd/changelog.sh:486`, `scripts/herd/codemap.sh:614`, `scripts/herd/symbol-index.sh:160` — callers: `bin/herd:6600`, `scripts/herd/agent-watch.sh:1116`, `scripts/herd/agent-watch.sh:8235`, `scripts/herd/fleet.sh:1680`
-- `main_health_tick` — def `scripts/herd/agent-watch.sh:7838` — callers: `scripts/herd/work-units/git-pr.sh:328`
-- `newest` — def `scripts/herd/app-monitor.sh:45` — callers: `bin/herd:8038`, `scripts/herd/agent-watch.sh:10732`, `scripts/herd/agent-watch.sh:11330`, `scripts/herd/agent-watch.sh:11359`, `scripts/herd/status.sh:197`, `scripts/herd/status.sh:676`
+- `main` — def `scripts/herd/changelog.sh:486`, `scripts/herd/codemap.sh:614`, `scripts/herd/symbol-index.sh:160` — callers: `bin/herd:6600`, `scripts/herd/agent-watch.sh:1121`, `scripts/herd/agent-watch.sh:8371`, `scripts/herd/fleet.sh:1680`
+- `main_health_tick` — def `scripts/herd/agent-watch.sh:7974` — callers: `scripts/herd/work-units/git-pr.sh:328`
+- `newest` — def `scripts/herd/app-monitor.sh:45` — callers: `bin/herd:8038`, `scripts/herd/agent-watch.sh:10868`, `scripts/herd/agent-watch.sh:11466`, `scripts/herd/agent-watch.sh:11495`, `scripts/herd/status.sh:197`, `scripts/herd/status.sh:676`
 - `now_hhmm` — def `scripts/herd/backlog-view.sh:153` — callers: —
-- `observe_noted` — def `scripts/herd/agent-watch.sh:4184` — callers: —
-- `ok` — def `bin/herd:148` — callers: `scripts/herd/agent-watch.sh:13029`, `scripts/herd/agent-watch.sh:13065`, `scripts/herd/agent-watch.sh:14773`, `scripts/herd/backends/jira.sh:328`, `scripts/herd/backends/jira.sh:430`, `scripts/herd/backends/jira.sh:713`, `scripts/herd/backends/linear.sh:236`, `scripts/herd/backends/linear.sh:423`, `scripts/herd/backends/linear.sh:545`, `scripts/herd/backends/linear.sh:1087`, `scripts/herd/bats-fd3-guard.sh:57`, `scripts/herd/fleet.sh:218`, `scripts/herd/fleet.sh:265`, `scripts/herd/fleet.sh:297`, `scripts/herd/fleet.sh:335`, `scripts/herd/fleet.sh:444`, `scripts/herd/fleet.sh:1909`, `scripts/herd/fleet.sh:1960`, `scripts/herd/journal-audit.sh:232`, `scripts/herd/journal-audit.sh:237`, `scripts/herd/journal-audit.sh:240`, `scripts/herd/journal-audit.sh:270`, `scripts/herd/journal-audit.sh:280`, `scripts/herd/journal-audit.sh:286`, `scripts/herd/journal-audit.sh:302`, `scripts/herd/journal-audit.sh:312`, `scripts/herd/journal-audit.sh:329`, `scripts/herd/journal-audit.sh:380`, `scripts/herd/journal-audit.sh:386`, `scripts/herd/journal-audit.sh:404`
-- `override_exists` — def `scripts/herd/agent-watch.sh:4161` — callers: —
+- `observe_noted` — def `scripts/herd/agent-watch.sh:4189` — callers: —
+- `ok` — def `bin/herd:148` — callers: `scripts/herd/agent-watch.sh:13165`, `scripts/herd/agent-watch.sh:13201`, `scripts/herd/agent-watch.sh:14909`, `scripts/herd/backends/jira.sh:328`, `scripts/herd/backends/jira.sh:430`, `scripts/herd/backends/jira.sh:713`, `scripts/herd/backends/linear.sh:236`, `scripts/herd/backends/linear.sh:423`, `scripts/herd/backends/linear.sh:545`, `scripts/herd/backends/linear.sh:1087`, `scripts/herd/bats-fd3-guard.sh:57`, `scripts/herd/fleet.sh:218`, `scripts/herd/fleet.sh:265`, `scripts/herd/fleet.sh:297`, `scripts/herd/fleet.sh:335`, `scripts/herd/fleet.sh:444`, `scripts/herd/fleet.sh:1909`, `scripts/herd/fleet.sh:1960`, `scripts/herd/journal-audit.sh:232`, `scripts/herd/journal-audit.sh:237`, `scripts/herd/journal-audit.sh:240`, `scripts/herd/journal-audit.sh:270`, `scripts/herd/journal-audit.sh:280`, `scripts/herd/journal-audit.sh:286`, `scripts/herd/journal-audit.sh:302`, `scripts/herd/journal-audit.sh:312`, `scripts/herd/journal-audit.sh:329`, `scripts/herd/journal-audit.sh:380`, `scripts/herd/journal-audit.sh:386`, `scripts/herd/journal-audit.sh:404`
+- `override_exists` — def `scripts/herd/agent-watch.sh:4166` — callers: —
 - `pin_matches` — def `scripts/herd/herd-approve.sh:243` — callers: —
 - `poll_wait` — def `scripts/herd/backlog-view.sh:199` — callers: —
-- `post_gate_status` — def `scripts/herd/agent-watch.sh:3878` — callers: —
-- `pr_human_verify_held` — def `scripts/herd/agent-watch.sh:4676` — callers: —
-- `pr_human_verify_steps` — def `scripts/herd/agent-watch.sh:4685` — callers: —
+- `post_gate_status` — def `scripts/herd/agent-watch.sh:3883` — callers: —
+- `pr_human_verify_held` — def `scripts/herd/agent-watch.sh:4681` — callers: —
+- `pr_human_verify_steps` — def `scripts/herd/agent-watch.sh:4690` — callers: —
 - `pr_merged` — def `scripts/herd/herd-approve.sh:68` — callers: —
-- `print` — def `bin/herd:4207`, `scripts/herd/backends/jira.sh:542`, `scripts/herd/backends/jira.sh:546`, `scripts/herd/backends/jira.sh:548`, `scripts/herd/backends/linear.sh:705`, `scripts/herd/backends/linear.sh:709`, `scripts/herd/backends/linear.sh:711`, `scripts/herd/fleet.sh:957` — callers: `scripts/herd/agent-watch.sh:1463`, `scripts/herd/agent-watch.sh:1568`, `scripts/herd/agent-watch.sh:1581`, `scripts/herd/agent-watch.sh:1753`, `scripts/herd/agent-watch.sh:1754`, `scripts/herd/agent-watch.sh:1886`, `scripts/herd/agent-watch.sh:1994`, `scripts/herd/agent-watch.sh:2086`, `scripts/herd/agent-watch.sh:2209`, `scripts/herd/agent-watch.sh:2402`, `scripts/herd/agent-watch.sh:2423`, `scripts/herd/agent-watch.sh:2433`, `scripts/herd/agent-watch.sh:2439`, `scripts/herd/agent-watch.sh:2458`, `scripts/herd/agent-watch.sh:2469`, `scripts/herd/agent-watch.sh:2506`, `scripts/herd/agent-watch.sh:3156`, `scripts/herd/agent-watch.sh:4259`, `scripts/herd/agent-watch.sh:4873`, `scripts/herd/agent-watch.sh:5062`, `scripts/herd/agent-watch.sh:5189`, `scripts/herd/agent-watch.sh:6272`, `scripts/herd/agent-watch.sh:6333`, `scripts/herd/agent-watch.sh:6334`, `scripts/herd/agent-watch.sh:6467`, `scripts/herd/agent-watch.sh:6468`, `scripts/herd/agent-watch.sh:8140`, `scripts/herd/agent-watch.sh:8164`, `scripts/herd/agent-watch.sh:8191`, `scripts/herd/agent-watch.sh:8240`, `scripts/herd/agent-watch.sh:8350`, `scripts/herd/agent-watch.sh:8542`, `scripts/herd/agent-watch.sh:8585`, `scripts/herd/agent-watch.sh:8598`, `scripts/herd/agent-watch.sh:8878`, `scripts/herd/agent-watch.sh:9168`, `scripts/herd/agent-watch.sh:9184`, `scripts/herd/agent-watch.sh:9194`, `scripts/herd/agent-watch.sh:9407`, `scripts/herd/agent-watch.sh:9426`, `scripts/herd/agent-watch.sh:10668`, `scripts/herd/agent-watch.sh:10852`, `scripts/herd/agent-watch.sh:10857`, `scripts/herd/agent-watch.sh:10916`, `scripts/herd/agent-watch.sh:11386`, `scripts/herd/agent-watch.sh:11486`, `scripts/herd/agent-watch.sh:11492`, `scripts/herd/agent-watch.sh:11859`, `scripts/herd/agent-watch.sh:11898`, `scripts/herd/agent-watch.sh:12014`, `scripts/herd/agent-watch.sh:12019`, `scripts/herd/agent-watch.sh:14013`, `scripts/herd/agent-watch.sh:14044`, `scripts/herd/agent-watch.sh:14310`, `scripts/herd/agent-watch.sh:14512`, `scripts/herd/agent-watch.sh:15610`, `scripts/herd/approvals.sh:65`, `scripts/herd/approvals.sh:66`, `scripts/herd/approvals.sh:67`, `scripts/herd/backends/changelog.sh:27`, `scripts/herd/backends/changelog.sh:28`, `scripts/herd/backends/changelog.sh:72`, `scripts/herd/backends/changelog.sh:86`, `scripts/herd/backends/file.sh:381`, `scripts/herd/backends/file.sh:386`, `scripts/herd/backends/file.sh:388`, `scripts/herd/backends/file.sh:390`, `scripts/herd/backends/file.sh:398`, `scripts/herd/backends/file.sh:510`, `scripts/herd/backends/file.sh:513`, `scripts/herd/backends/file.sh:516`, `scripts/herd/backends/file.sh:519`, `scripts/herd/backends/file.sh:525`, `scripts/herd/backends/file.sh:672`, `scripts/herd/backends/github.sh:72`, `scripts/herd/backends/github.sh:86`, `scripts/herd/backends/github.sh:96`, `scripts/herd/backends/github.sh:212`, `scripts/herd/backends/github.sh:285`, `scripts/herd/backends/github.sh:304`, `scripts/herd/backends/github.sh:339`, `scripts/herd/backends/github.sh:371`, `scripts/herd/backends/github.sh:378`, `scripts/herd/backends/github.sh:394`, `scripts/herd/backends/github.sh:448`, `scripts/herd/backends/github.sh:495`, `scripts/herd/backlog-reconcile-sweep.sh:261`, `scripts/herd/backlog-reconcile-sweep.sh:264`, `scripts/herd/backlog-reconcile-sweep.sh:268`, `scripts/herd/backlog-reconcile-sweep.sh:269`, `scripts/herd/backlog-reconcile-sweep.sh:270`, `scripts/herd/backlog-reconcile-sweep.sh:273`, `scripts/herd/backlog-reconcile-sweep.sh:274`, `scripts/herd/backlog-reconcile-sweep.sh:275`, `scripts/herd/backlog-reconcile-sweep.sh:277`, `scripts/herd/backlog-reconcile-sweep.sh:280`, `scripts/herd/changelog.sh:127`, `scripts/herd/changelog.sh:225`, `scripts/herd/changelog.sh:264`, `scripts/herd/changelog.sh:269`, `scripts/herd/changelog.sh:272`, `scripts/herd/changelog.sh:449`, `scripts/herd/codemap.sh:104`, `scripts/herd/codemap.sh:122`, `scripts/herd/codemap.sh:144`, `scripts/herd/codemap.sh:239`, `scripts/herd/codemap.sh:240`, `scripts/herd/codemap.sh:349`, `scripts/herd/codemap.sh:374`, `scripts/herd/codemap.sh:391`, `scripts/herd/codemap.sh:408`, `scripts/herd/codemap.sh:417`, `scripts/herd/codemap.sh:432`, `scripts/herd/codemap.sh:448`, `scripts/herd/codemap.sh:450`, `scripts/herd/codemap.sh:470`, `scripts/herd/codemap.sh:472`, `scripts/herd/codemap.sh:485`, `scripts/herd/codemap.sh:549`, `scripts/herd/codemap.sh:600`, `scripts/herd/codemap.sh:602`, `scripts/herd/config-viability.sh:80`, `scripts/herd/config-viability.sh:90`, `scripts/herd/config-viability.sh:128`, `scripts/herd/config-viability.sh:143`, `scripts/herd/config-viability.sh:165`, `scripts/herd/coordinator.sh:50`, `scripts/herd/coordinator.sh:63`, `scripts/herd/coordinator.sh:70`, `scripts/herd/coordinator.sh:81`, `scripts/herd/coordinator.sh:113`, `scripts/herd/coordinator.sh:124`, `scripts/herd/cost.sh:232`, `scripts/herd/cost.sh:369`, `scripts/herd/create-retry.sh:74`, `scripts/herd/create-retry.sh:198`, `scripts/herd/dep-watcher.sh:74`, `scripts/herd/dep-watcher.sh:80`, `scripts/herd/dep-watcher.sh:94`, `scripts/herd/doc-drift-lint.sh:79`, `scripts/herd/doc-drift-lint.sh:108`, `scripts/herd/doc-drift-lint.sh:157`, `scripts/herd/doc-drift-lint.sh:162`, `scripts/herd/doc-drift-lint.sh:167`, `scripts/herd/doc-drift-lint.sh:169`, `scripts/herd/drainer-liveness.sh:97`, `scripts/herd/driver.sh:482`, `scripts/herd/driver.sh:608`, `scripts/herd/driver.sh:762`, `scripts/herd/driver.sh:778`, `scripts/herd/driver.sh:802`, `scripts/herd/driver.sh:804`, `scripts/herd/driver.sh:807`, `scripts/herd/driver.sh:811`, `scripts/herd/driver.sh:865`, `scripts/herd/driver.sh:1063`, `scripts/herd/driver.sh:1095`, `scripts/herd/driver.sh:1267`, `scripts/herd/driver.sh:1427`, `scripts/herd/env-export-lint.sh:54`, `scripts/herd/env-export-lint.sh:56`, `scripts/herd/governance.sh:60`, `scripts/herd/handoff.sh:71`, `scripts/herd/handoff.sh:110`, `scripts/herd/handoff.sh:175`, `scripts/herd/healthcheck.sh:417`, `scripts/herd/healthcheck.sh:418`, `scripts/herd/herd-approve.sh:113`, `scripts/herd/herd-approve.sh:205`, `scripts/herd/herd-approve.sh:309`, `scripts/herd/herd-approve.sh:348`, `scripts/herd/herd-approve.sh:350`, `scripts/herd/herd-approve.sh:352`, `scripts/herd/herd-approve.sh:361`, `scripts/herd/herd-approve.sh:369`, `scripts/herd/herd-config.sh:52`, `scripts/herd/herd-config.sh:91`, `scripts/herd/herd-config.sh:1013`, `scripts/herd/herd-config.sh:1058`, `scripts/herd/herd-config.sh:1075`, `scripts/herd/herd-config.sh:1086`, `scripts/herd/herd-feature.sh:160`, `scripts/herd/herd-feature.sh:355`, `scripts/herd/herd-preflight.sh:105`, `scripts/herd/herd-preflight.sh:107`, `scripts/herd/herd-preflight.sh:145`, `scripts/herd/herd-preflight.sh:157`, `scripts/herd/herd-preflight.sh:272`, `scripts/herd/herd-quick.sh:167`, `scripts/herd/herd-resolve.sh:93`, `scripts/herd/herd-resolve.sh:116`, `scripts/herd/herd-resolve.sh:184`, `scripts/herd/herd-review.sh:342`, `scripts/herd/herd-review.sh:722`, `scripts/herd/herd-review.sh:767`, `scripts/herd/herd-review.sh:782`, `scripts/herd/herd-review.sh:813`, `scripts/herd/herd-review.sh:846`, `scripts/herd/herd-spawn-gate.sh:91`, `scripts/herd/herd-spawn-gate.sh:128`, `scripts/herd/hermetic-env-scrub.sh:61`, `scripts/herd/human-verify.sh:66`, `scripts/herd/journal-audit.sh:462`, `scripts/herd/journal-audit.sh:607`, `scripts/herd/journal-emission-lint.sh:308`, `scripts/herd/journal-emission-lint.sh:310`, `scripts/herd/journal-emission-lint.sh:314`, `scripts/herd/journal-emission-lint.sh:317`, `scripts/herd/layout-reconcile.sh:72`, `scripts/herd/layout-reconcile.sh:191`, `scripts/herd/layout-reconcile.sh:192`, `scripts/herd/layout-reconcile.sh:193`, `scripts/herd/layout-reconcile.sh:194`, `scripts/herd/layout-reconcile.sh:195`, `scripts/herd/lifecycle.sh:196`, `scripts/herd/oss-triage.sh:98`, `scripts/herd/oss-triage.sh:187`, `scripts/herd/oss-triage.sh:227`, `scripts/herd/oss-triage.sh:277`, `scripts/herd/oss-triage.sh:278`, `scripts/herd/push-gate.sh:109`, `scripts/herd/research.sh:177`, `scripts/herd/resolver-claim.sh:99`, `scripts/herd/resolver-claim.sh:100`, `scripts/herd/resolver-claim.sh:101`, `scripts/herd/resolver-claim.sh:102`, `scripts/herd/resolver-claim.sh:103`, `scripts/herd/resolver-claim.sh:104`, `scripts/herd/retirement.sh:183`, `scripts/herd/retirement.sh:407`, `scripts/herd/retirement.sh:831`, `scripts/herd/scribe.sh:199`, `scripts/herd/stale-dup-gate.sh:126`, `scripts/herd/status.sh:112`, `scripts/herd/status.sh:122`, `scripts/herd/status.sh:228`, `scripts/herd/status.sh:427`, `scripts/herd/status.sh:484`, `scripts/herd/status.sh:486`, `scripts/herd/steps.sh:275`, `scripts/herd/steps.sh:302`, `scripts/herd/sweep.sh:177`, `scripts/herd/sweep.sh:886`, `scripts/herd/sweep.sh:1069`, `scripts/herd/symbol-index.sh:54`, `scripts/herd/symbol-index.sh:57`, `scripts/herd/symbol-index.sh:88`, `scripts/herd/symbol-index.sh:147`, `scripts/herd/tracker-state-sweep.sh:175`, `scripts/herd/tracker-state-sweep.sh:260`, `scripts/herd/tracker-state-sweep.sh:269`, `scripts/herd/tracker-state-sweep.sh:277`
+- `print` — def `bin/herd:4207`, `scripts/herd/backends/jira.sh:542`, `scripts/herd/backends/jira.sh:546`, `scripts/herd/backends/jira.sh:548`, `scripts/herd/backends/linear.sh:705`, `scripts/herd/backends/linear.sh:709`, `scripts/herd/backends/linear.sh:711`, `scripts/herd/fleet.sh:957` — callers: `scripts/herd/agent-watch.sh:1468`, `scripts/herd/agent-watch.sh:1573`, `scripts/herd/agent-watch.sh:1586`, `scripts/herd/agent-watch.sh:1758`, `scripts/herd/agent-watch.sh:1759`, `scripts/herd/agent-watch.sh:1891`, `scripts/herd/agent-watch.sh:1999`, `scripts/herd/agent-watch.sh:2091`, `scripts/herd/agent-watch.sh:2214`, `scripts/herd/agent-watch.sh:2407`, `scripts/herd/agent-watch.sh:2428`, `scripts/herd/agent-watch.sh:2438`, `scripts/herd/agent-watch.sh:2444`, `scripts/herd/agent-watch.sh:2463`, `scripts/herd/agent-watch.sh:2474`, `scripts/herd/agent-watch.sh:2511`, `scripts/herd/agent-watch.sh:3161`, `scripts/herd/agent-watch.sh:4264`, `scripts/herd/agent-watch.sh:4878`, `scripts/herd/agent-watch.sh:5067`, `scripts/herd/agent-watch.sh:5194`, `scripts/herd/agent-watch.sh:6277`, `scripts/herd/agent-watch.sh:6338`, `scripts/herd/agent-watch.sh:6339`, `scripts/herd/agent-watch.sh:6472`, `scripts/herd/agent-watch.sh:6473`, `scripts/herd/agent-watch.sh:8276`, `scripts/herd/agent-watch.sh:8300`, `scripts/herd/agent-watch.sh:8327`, `scripts/herd/agent-watch.sh:8376`, `scripts/herd/agent-watch.sh:8486`, `scripts/herd/agent-watch.sh:8678`, `scripts/herd/agent-watch.sh:8721`, `scripts/herd/agent-watch.sh:8734`, `scripts/herd/agent-watch.sh:9014`, `scripts/herd/agent-watch.sh:9304`, `scripts/herd/agent-watch.sh:9320`, `scripts/herd/agent-watch.sh:9330`, `scripts/herd/agent-watch.sh:9543`, `scripts/herd/agent-watch.sh:9562`, `scripts/herd/agent-watch.sh:10804`, `scripts/herd/agent-watch.sh:10988`, `scripts/herd/agent-watch.sh:10993`, `scripts/herd/agent-watch.sh:11052`, `scripts/herd/agent-watch.sh:11522`, `scripts/herd/agent-watch.sh:11622`, `scripts/herd/agent-watch.sh:11628`, `scripts/herd/agent-watch.sh:11995`, `scripts/herd/agent-watch.sh:12034`, `scripts/herd/agent-watch.sh:12150`, `scripts/herd/agent-watch.sh:12155`, `scripts/herd/agent-watch.sh:14149`, `scripts/herd/agent-watch.sh:14180`, `scripts/herd/agent-watch.sh:14446`, `scripts/herd/agent-watch.sh:14648`, `scripts/herd/agent-watch.sh:15746`, `scripts/herd/approvals.sh:65`, `scripts/herd/approvals.sh:66`, `scripts/herd/approvals.sh:67`, `scripts/herd/backends/changelog.sh:27`, `scripts/herd/backends/changelog.sh:28`, `scripts/herd/backends/changelog.sh:72`, `scripts/herd/backends/changelog.sh:86`, `scripts/herd/backends/file.sh:381`, `scripts/herd/backends/file.sh:386`, `scripts/herd/backends/file.sh:388`, `scripts/herd/backends/file.sh:390`, `scripts/herd/backends/file.sh:398`, `scripts/herd/backends/file.sh:510`, `scripts/herd/backends/file.sh:513`, `scripts/herd/backends/file.sh:516`, `scripts/herd/backends/file.sh:519`, `scripts/herd/backends/file.sh:525`, `scripts/herd/backends/file.sh:672`, `scripts/herd/backends/github.sh:72`, `scripts/herd/backends/github.sh:86`, `scripts/herd/backends/github.sh:96`, `scripts/herd/backends/github.sh:212`, `scripts/herd/backends/github.sh:285`, `scripts/herd/backends/github.sh:304`, `scripts/herd/backends/github.sh:339`, `scripts/herd/backends/github.sh:371`, `scripts/herd/backends/github.sh:378`, `scripts/herd/backends/github.sh:394`, `scripts/herd/backends/github.sh:448`, `scripts/herd/backends/github.sh:495`, `scripts/herd/backlog-reconcile-sweep.sh:261`, `scripts/herd/backlog-reconcile-sweep.sh:264`, `scripts/herd/backlog-reconcile-sweep.sh:268`, `scripts/herd/backlog-reconcile-sweep.sh:269`, `scripts/herd/backlog-reconcile-sweep.sh:270`, `scripts/herd/backlog-reconcile-sweep.sh:273`, `scripts/herd/backlog-reconcile-sweep.sh:274`, `scripts/herd/backlog-reconcile-sweep.sh:275`, `scripts/herd/backlog-reconcile-sweep.sh:277`, `scripts/herd/backlog-reconcile-sweep.sh:280`, `scripts/herd/changelog.sh:127`, `scripts/herd/changelog.sh:225`, `scripts/herd/changelog.sh:264`, `scripts/herd/changelog.sh:269`, `scripts/herd/changelog.sh:272`, `scripts/herd/changelog.sh:449`, `scripts/herd/codemap.sh:104`, `scripts/herd/codemap.sh:122`, `scripts/herd/codemap.sh:144`, `scripts/herd/codemap.sh:239`, `scripts/herd/codemap.sh:240`, `scripts/herd/codemap.sh:349`, `scripts/herd/codemap.sh:374`, `scripts/herd/codemap.sh:391`, `scripts/herd/codemap.sh:408`, `scripts/herd/codemap.sh:417`, `scripts/herd/codemap.sh:432`, `scripts/herd/codemap.sh:448`, `scripts/herd/codemap.sh:450`, `scripts/herd/codemap.sh:470`, `scripts/herd/codemap.sh:472`, `scripts/herd/codemap.sh:485`, `scripts/herd/codemap.sh:549`, `scripts/herd/codemap.sh:600`, `scripts/herd/codemap.sh:602`, `scripts/herd/config-viability.sh:80`, `scripts/herd/config-viability.sh:90`, `scripts/herd/config-viability.sh:128`, `scripts/herd/config-viability.sh:143`, `scripts/herd/config-viability.sh:165`, `scripts/herd/coordinator.sh:50`, `scripts/herd/coordinator.sh:63`, `scripts/herd/coordinator.sh:70`, `scripts/herd/coordinator.sh:81`, `scripts/herd/coordinator.sh:113`, `scripts/herd/coordinator.sh:124`, `scripts/herd/cost.sh:232`, `scripts/herd/cost.sh:369`, `scripts/herd/create-retry.sh:74`, `scripts/herd/create-retry.sh:198`, `scripts/herd/dep-watcher.sh:74`, `scripts/herd/dep-watcher.sh:80`, `scripts/herd/dep-watcher.sh:94`, `scripts/herd/doc-drift-lint.sh:79`, `scripts/herd/doc-drift-lint.sh:108`, `scripts/herd/doc-drift-lint.sh:157`, `scripts/herd/doc-drift-lint.sh:162`, `scripts/herd/doc-drift-lint.sh:167`, `scripts/herd/doc-drift-lint.sh:169`, `scripts/herd/drainer-liveness.sh:97`, `scripts/herd/driver.sh:482`, `scripts/herd/driver.sh:608`, `scripts/herd/driver.sh:762`, `scripts/herd/driver.sh:778`, `scripts/herd/driver.sh:802`, `scripts/herd/driver.sh:804`, `scripts/herd/driver.sh:807`, `scripts/herd/driver.sh:811`, `scripts/herd/driver.sh:865`, `scripts/herd/driver.sh:1063`, `scripts/herd/driver.sh:1095`, `scripts/herd/driver.sh:1267`, `scripts/herd/driver.sh:1427`, `scripts/herd/env-export-lint.sh:54`, `scripts/herd/env-export-lint.sh:56`, `scripts/herd/governance.sh:60`, `scripts/herd/handoff.sh:71`, `scripts/herd/handoff.sh:110`, `scripts/herd/handoff.sh:175`, `scripts/herd/healthcheck.sh:417`, `scripts/herd/healthcheck.sh:418`, `scripts/herd/herd-approve.sh:113`, `scripts/herd/herd-approve.sh:205`, `scripts/herd/herd-approve.sh:309`, `scripts/herd/herd-approve.sh:348`, `scripts/herd/herd-approve.sh:350`, `scripts/herd/herd-approve.sh:352`, `scripts/herd/herd-approve.sh:361`, `scripts/herd/herd-approve.sh:369`, `scripts/herd/herd-config.sh:52`, `scripts/herd/herd-config.sh:91`, `scripts/herd/herd-config.sh:1014`, `scripts/herd/herd-config.sh:1059`, `scripts/herd/herd-config.sh:1076`, `scripts/herd/herd-config.sh:1087`, `scripts/herd/herd-feature.sh:160`, `scripts/herd/herd-feature.sh:355`, `scripts/herd/herd-preflight.sh:105`, `scripts/herd/herd-preflight.sh:107`, `scripts/herd/herd-preflight.sh:145`, `scripts/herd/herd-preflight.sh:157`, `scripts/herd/herd-preflight.sh:272`, `scripts/herd/herd-quick.sh:167`, `scripts/herd/herd-resolve.sh:93`, `scripts/herd/herd-resolve.sh:116`, `scripts/herd/herd-resolve.sh:184`, `scripts/herd/herd-review.sh:342`, `scripts/herd/herd-review.sh:722`, `scripts/herd/herd-review.sh:767`, `scripts/herd/herd-review.sh:782`, `scripts/herd/herd-review.sh:813`, `scripts/herd/herd-review.sh:846`, `scripts/herd/herd-spawn-gate.sh:91`, `scripts/herd/herd-spawn-gate.sh:128`, `scripts/herd/hermetic-env-scrub.sh:61`, `scripts/herd/human-verify.sh:66`, `scripts/herd/journal-audit.sh:462`, `scripts/herd/journal-audit.sh:607`, `scripts/herd/journal-emission-lint.sh:308`, `scripts/herd/journal-emission-lint.sh:310`, `scripts/herd/journal-emission-lint.sh:314`, `scripts/herd/journal-emission-lint.sh:317`, `scripts/herd/layout-reconcile.sh:72`, `scripts/herd/layout-reconcile.sh:191`, `scripts/herd/layout-reconcile.sh:192`, `scripts/herd/layout-reconcile.sh:193`, `scripts/herd/layout-reconcile.sh:194`, `scripts/herd/layout-reconcile.sh:195`, `scripts/herd/lifecycle.sh:196`, `scripts/herd/oss-triage.sh:98`, `scripts/herd/oss-triage.sh:187`, `scripts/herd/oss-triage.sh:227`, `scripts/herd/oss-triage.sh:277`, `scripts/herd/oss-triage.sh:278`, `scripts/herd/push-gate.sh:109`, `scripts/herd/research.sh:177`, `scripts/herd/resolver-claim.sh:99`, `scripts/herd/resolver-claim.sh:100`, `scripts/herd/resolver-claim.sh:101`, `scripts/herd/resolver-claim.sh:102`, `scripts/herd/resolver-claim.sh:103`, `scripts/herd/resolver-claim.sh:104`, `scripts/herd/retirement.sh:183`, `scripts/herd/retirement.sh:407`, `scripts/herd/retirement.sh:831`, `scripts/herd/scribe.sh:199`, `scripts/herd/stale-dup-gate.sh:126`, `scripts/herd/status.sh:112`, `scripts/herd/status.sh:122`, `scripts/herd/status.sh:228`, `scripts/herd/status.sh:427`, `scripts/herd/status.sh:484`, `scripts/herd/status.sh:486`, `scripts/herd/steps.sh:275`, `scripts/herd/steps.sh:302`, `scripts/herd/sweep.sh:177`, `scripts/herd/sweep.sh:886`, `scripts/herd/sweep.sh:1069`, `scripts/herd/symbol-index.sh:54`, `scripts/herd/symbol-index.sh:57`, `scripts/herd/symbol-index.sh:88`, `scripts/herd/symbol-index.sh:147`, `scripts/herd/tracker-state-sweep.sh:175`, `scripts/herd/tracker-state-sweep.sh:260`, `scripts/herd/tracker-state-sweep.sh:269`, `scripts/herd/tracker-state-sweep.sh:277`
 - `print_human_verify_steps` — def `scripts/herd/herd-approve.sh:78` — callers: —
-- `purge_pr_aging` — def `scripts/herd/agent-watch.sh:4597` — callers: `scripts/herd/work-units/git-pr.sh:305`
-- `purge_pr_approvals` — def `scripts/herd/agent-watch.sh:4412` — callers: `scripts/herd/retirement.sh:705`, `scripts/herd/work-units/git-pr.sh:299`
-- `purge_pr_ci_checks` — def `scripts/herd/agent-watch.sh:4462` — callers: `scripts/herd/retirement.sh:705`, `scripts/herd/work-units/git-pr.sh:302`
+- `purge_pr_aging` — def `scripts/herd/agent-watch.sh:4602` — callers: `scripts/herd/work-units/git-pr.sh:305`
+- `purge_pr_approvals` — def `scripts/herd/agent-watch.sh:4417` — callers: `scripts/herd/retirement.sh:705`, `scripts/herd/work-units/git-pr.sh:299`
+- `purge_pr_ci_checks` — def `scripts/herd/agent-watch.sh:4467` — callers: `scripts/herd/retirement.sh:705`, `scripts/herd/work-units/git-pr.sh:302`
 - `push_gate_approve` — def `scripts/herd/push-gate.sh:195` — callers: `scripts/herd/herd-approve.sh:259`
-- `push_gate_awaiting_sha` — def `scripts/herd/push-gate.sh:94` — callers: `scripts/herd/agent-watch.sh:14983`, `scripts/herd/herd-approve.sh:257`, `scripts/herd/herd-approve.sh:258`
+- `push_gate_awaiting_sha` — def `scripts/herd/push-gate.sh:94` — callers: `scripts/herd/agent-watch.sh:15119`, `scripts/herd/herd-approve.sh:257`, `scripts/herd/herd-approve.sh:258`
 - `push_gate_body_file` — def `scripts/herd/push-gate.sh:60` — callers: —
 - `push_gate_detail_file` — def `scripts/herd/push-gate.sh:59` — callers: —
 - `push_gate_hold` — def `scripts/herd/push-gate.sh:129` — callers: —
@@ -1515,66 +1522,66 @@ this scan cannot see).
 - `push_gate_mode` — def `scripts/herd/push-gate.sh:46` — callers: —
 - `push_gate_resume` — def `scripts/herd/push-gate.sh:234` — callers: `scripts/herd/herd-approve.sh:262`
 - `reconcile_backlog` — def `scripts/herd/work-units/git-pr.sh:162` — callers: `scripts/herd/work-unit.sh:176`
-- `reconcile_checkout_cleanliness` — def `scripts/herd/agent-watch.sh:6620` — callers: —
-- `reconcile_enqueued` — def `scripts/herd/agent-watch.sh:5587` — callers: `scripts/herd/work-units/git-pr.sh:164`
-- `reconcile_main_freshness` — def `scripts/herd/agent-watch.sh:6432` — callers: —
-- `reconcile_main_health` — def `scripts/herd/agent-watch.sh:8003` — callers: —
-- `reconcile_map_freshness` — def `scripts/herd/agent-watch.sh:6795` — callers: —
-- `reconcile_watcher_singleton` — def `scripts/herd/agent-watch.sh:6709` — callers: —
-- `record_approval_awaiting` — def `scripts/herd/agent-watch.sh:4179` — callers: —
-- `record_dead_notified` — def `scripts/herd/agent-watch.sh:11506` — callers: —
-- `record_dead_seen` — def `scripts/herd/agent-watch.sh:11504` — callers: —
-- `record_health_result` — def `scripts/herd/agent-watch.sh:13343` — callers: —
-- `record_healthcheck` — def `scripts/herd/agent-watch.sh:13488` — callers: —
-- `record_hv_informed` — def `scripts/herd/agent-watch.sh:4204` — callers: —
-- `record_limit` — def `scripts/herd/agent-watch.sh:10860` — callers: —
-- `record_observe_noted` — def `scripts/herd/agent-watch.sh:4190` — callers: —
-- `record_reconcile` — def `scripts/herd/agent-watch.sh:5593` — callers: `scripts/herd/work-units/git-pr.sh:165`
-- `record_refix` — def `scripts/herd/agent-watch.sh:9221` — callers: —
-- `record_resolve_attempt` — def `scripts/herd/agent-watch.sh:2444` — callers: —
-- `record_resolve_escalated` — def `scripts/herd/agent-watch.sh:2449` — callers: —
-- `record_respawn` — def `scripts/herd/agent-watch.sh:11745` — callers: —
-- `record_review` — def `scripts/herd/agent-watch.sh:2595` — callers: —
-- `record_review_retry` — def `scripts/herd/agent-watch.sh:3160` — callers: —
-- `record_sendkeys` — def `scripts/herd/agent-watch.sh:10919` — callers: —
-- `record_stale_dup_held` — def `scripts/herd/agent-watch.sh:4217` — callers: —
-- `record_wedge_seen` — def `scripts/herd/agent-watch.sh:12039` — callers: —
-- `record_wedge_state` — def `scripts/herd/agent-watch.sh:12041` — callers: —
-- `refix_attempted` — def `scripts/herd/agent-watch.sh:9157` — callers: —
-- `refix_rail_cap` — def `scripts/herd/agent-watch.sh:9147` — callers: —
-- `refix_rail_count` — def `scripts/herd/agent-watch.sh:9178` — callers: —
-- `refix_rail_reset` — def `scripts/herd/agent-watch.sh:9230` — callers: —
-- `refix_round_count` — def `scripts/herd/agent-watch.sh:9173` — callers: —
-- `refix_round_count_kind` — def `scripts/herd/agent-watch.sh:9191` — callers: —
-- `refix_total_cap` — def `scripts/herd/agent-watch.sh:9150` — callers: —
-- `refix_total_count` — def `scripts/herd/agent-watch.sh:9166` — callers: —
-- `refresh_codemap` — def `scripts/herd/agent-watch.sh:5812` — callers: `scripts/herd/work-units/git-pr.sh:320`
-- `refresh_symbol_index` — def `scripts/herd/agent-watch.sh:5913` — callers: `scripts/herd/work-units/git-pr.sh:323`
-- `render` — def `scripts/herd/agent-watch.sh:2244` — callers: `bin/herd:1751`, `bin/herd:3041`, `bin/herd:3529`, `bin/herd:3877`, `bin/herd:8266`, `scripts/herd/codemap.sh:100`, `scripts/herd/handoff.sh:210`, `scripts/herd/handoff.sh:252`, `scripts/herd/herd-feature.sh:280`, `scripts/herd/herd-quick.sh:288`
+- `reconcile_checkout_cleanliness` — def `scripts/herd/agent-watch.sh:6625` — callers: —
+- `reconcile_enqueued` — def `scripts/herd/agent-watch.sh:5592` — callers: `scripts/herd/work-units/git-pr.sh:164`
+- `reconcile_main_freshness` — def `scripts/herd/agent-watch.sh:6437` — callers: —
+- `reconcile_main_health` — def `scripts/herd/agent-watch.sh:8139` — callers: —
+- `reconcile_map_freshness` — def `scripts/herd/agent-watch.sh:6800` — callers: —
+- `reconcile_watcher_singleton` — def `scripts/herd/agent-watch.sh:6714` — callers: —
+- `record_approval_awaiting` — def `scripts/herd/agent-watch.sh:4184` — callers: —
+- `record_dead_notified` — def `scripts/herd/agent-watch.sh:11642` — callers: —
+- `record_dead_seen` — def `scripts/herd/agent-watch.sh:11640` — callers: —
+- `record_health_result` — def `scripts/herd/agent-watch.sh:13479` — callers: —
+- `record_healthcheck` — def `scripts/herd/agent-watch.sh:13624` — callers: —
+- `record_hv_informed` — def `scripts/herd/agent-watch.sh:4209` — callers: —
+- `record_limit` — def `scripts/herd/agent-watch.sh:10996` — callers: —
+- `record_observe_noted` — def `scripts/herd/agent-watch.sh:4195` — callers: —
+- `record_reconcile` — def `scripts/herd/agent-watch.sh:5598` — callers: `scripts/herd/work-units/git-pr.sh:165`
+- `record_refix` — def `scripts/herd/agent-watch.sh:9357` — callers: —
+- `record_resolve_attempt` — def `scripts/herd/agent-watch.sh:2449` — callers: —
+- `record_resolve_escalated` — def `scripts/herd/agent-watch.sh:2454` — callers: —
+- `record_respawn` — def `scripts/herd/agent-watch.sh:11881` — callers: —
+- `record_review` — def `scripts/herd/agent-watch.sh:2600` — callers: —
+- `record_review_retry` — def `scripts/herd/agent-watch.sh:3165` — callers: —
+- `record_sendkeys` — def `scripts/herd/agent-watch.sh:11055` — callers: —
+- `record_stale_dup_held` — def `scripts/herd/agent-watch.sh:4222` — callers: —
+- `record_wedge_seen` — def `scripts/herd/agent-watch.sh:12175` — callers: —
+- `record_wedge_state` — def `scripts/herd/agent-watch.sh:12177` — callers: —
+- `refix_attempted` — def `scripts/herd/agent-watch.sh:9293` — callers: —
+- `refix_rail_cap` — def `scripts/herd/agent-watch.sh:9283` — callers: —
+- `refix_rail_count` — def `scripts/herd/agent-watch.sh:9314` — callers: —
+- `refix_rail_reset` — def `scripts/herd/agent-watch.sh:9366` — callers: —
+- `refix_round_count` — def `scripts/herd/agent-watch.sh:9309` — callers: —
+- `refix_round_count_kind` — def `scripts/herd/agent-watch.sh:9327` — callers: —
+- `refix_total_cap` — def `scripts/herd/agent-watch.sh:9286` — callers: —
+- `refix_total_count` — def `scripts/herd/agent-watch.sh:9302` — callers: —
+- `refresh_codemap` — def `scripts/herd/agent-watch.sh:5817` — callers: `scripts/herd/work-units/git-pr.sh:320`
+- `refresh_symbol_index` — def `scripts/herd/agent-watch.sh:5918` — callers: `scripts/herd/work-units/git-pr.sh:323`
+- `render` — def `scripts/herd/agent-watch.sh:2249` — callers: `bin/herd:1751`, `bin/herd:3041`, `bin/herd:3529`, `bin/herd:3877`, `bin/herd:8266`, `scripts/herd/codemap.sh:100`, `scripts/herd/handoff.sh:210`, `scripts/herd/handoff.sh:252`, `scripts/herd/herd-feature.sh:280`, `scripts/herd/herd-quick.sh:288`
 - `render_backend_frame` — def `scripts/herd/backlog-view.sh:475` — callers: —
 - `render_fleet_skill` — def `scripts/herd/fleet.sh:1816` — callers: —
 - `render_skill` — def `bin/herd:366` — callers: —
 - `render_width` — def `scripts/herd/backlog-view.sh:97` — callers: —
-- `resolver_attempted` — def `scripts/herd/agent-watch.sh:2385` — callers: —
-- `resolver_dispatch_count` — def `scripts/herd/agent-watch.sh:2400` — callers: —
-- `resolver_dispatched_sha` — def `scripts/herd/agent-watch.sh:2406` — callers: —
-- `resolver_escalated_sha` — def `scripts/herd/agent-watch.sh:2413` — callers: —
-- `resolver_ever_attempted` — def `scripts/herd/agent-watch.sh:2393` — callers: —
-- `resolver_last_dispatch_epoch` — def `scripts/herd/agent-watch.sh:2421` — callers: —
-- `resolver_last_dispatch_epoch_slug` — def `scripts/herd/agent-watch.sh:2431` — callers: —
-- `resolver_last_sha` — def `scripts/herd/agent-watch.sh:2437` — callers: —
-- `respawn_recorded` — def `scripts/herd/agent-watch.sh:11739` — callers: —
-- `restale_count` — def `scripts/herd/agent-watch.sh:4257` — callers: —
-- `restale_counted` — def `scripts/herd/agent-watch.sh:4250` — callers: —
+- `resolver_attempted` — def `scripts/herd/agent-watch.sh:2390` — callers: —
+- `resolver_dispatch_count` — def `scripts/herd/agent-watch.sh:2405` — callers: —
+- `resolver_dispatched_sha` — def `scripts/herd/agent-watch.sh:2411` — callers: —
+- `resolver_escalated_sha` — def `scripts/herd/agent-watch.sh:2418` — callers: —
+- `resolver_ever_attempted` — def `scripts/herd/agent-watch.sh:2398` — callers: —
+- `resolver_last_dispatch_epoch` — def `scripts/herd/agent-watch.sh:2426` — callers: —
+- `resolver_last_dispatch_epoch_slug` — def `scripts/herd/agent-watch.sh:2436` — callers: —
+- `resolver_last_sha` — def `scripts/herd/agent-watch.sh:2442` — callers: —
+- `respawn_recorded` — def `scripts/herd/agent-watch.sh:11875` — callers: —
+- `restale_count` — def `scripts/herd/agent-watch.sh:4262` — callers: —
+- `restale_counted` — def `scripts/herd/agent-watch.sh:4255` — callers: —
 - `restore_tty` — def `scripts/herd/backlog-view.sh:127`, `scripts/herd/task-spec-view.sh:47` — callers: —
 - `retire_classify` — def `scripts/herd/retirement.sh:569` — callers: —
 - `retire_converge` — def `scripts/herd/retirement.sh:688` — callers: —
 - `retire_leftovers` — def `scripts/herd/retirement.sh:335` — callers: —
-- `retirement_tick` — def `scripts/herd/retirement.sh:934` — callers: `scripts/herd/agent-watch.sh:14901`
-- `reverse_file` — def `scripts/herd/agent-watch.sh:737` — callers: —
+- `retirement_tick` — def `scripts/herd/retirement.sh:934` — callers: `scripts/herd/agent-watch.sh:15037`
+- `reverse_file` — def `scripts/herd/agent-watch.sh:742` — callers: —
 - `review_block_reason` — def `scripts/herd/herd-approve.sh:107` — callers: —
-- `review_verdict` — def `scripts/herd/agent-watch.sh:2456` — callers: —
-- `review_verdict_source` — def `scripts/herd/agent-watch.sh:2467` — callers: —
+- `review_verdict` — def `scripts/herd/agent-watch.sh:2461` — callers: —
+- `review_verdict_source` — def `scripts/herd/agent-watch.sh:2472` — callers: —
 - `rich_to_md` — def `scripts/herd/backlog-view.sh:327` — callers: —
 - `run_attribution_lint` — def `scripts/herd/healthcheck.sh:654` — callers: —
 - `run_backend_mode` — def `scripts/herd/backlog-view.sh:512` — callers: —
@@ -1588,15 +1595,15 @@ this scan cannot see).
 - `scanq` — def `scripts/herd/codemap.sh:489` — callers: —
 - `scout_repo` — def `bin/herd:608` — callers: —
 - `seg1` — def `scripts/herd/codemap.sh:390` — callers: —
-- `sendkeys_state` — def `scripts/herd/agent-watch.sh:10914` — callers: —
+- `sendkeys_state` — def `scripts/herd/agent-watch.sh:11050` — callers: —
 - `shape_md` — def `scripts/herd/backlog-view.sh:417` — callers: —
 - `share_exposes_secrets` — def `scripts/herd/new-feature.sh:50` — callers: —
-- `spawn_resolver` — def `scripts/herd/agent-watch.sh:5253` — callers: `scripts/herd/journal-emission-lint.sh:75`
+- `spawn_resolver` — def `scripts/herd/agent-watch.sh:5258` — callers: `scripts/herd/journal-emission-lint.sh:75`
 - `stale_dup_base_overlap` — def `scripts/herd/stale-dup-gate.sh:156` — callers: —
 - `stale_dup_check` — def `scripts/herd/stale-dup-gate.sh:180` — callers: —
 - `stale_dup_enabled` — def `scripts/herd/stale-dup-gate.sh:59` — callers: —
 - `stale_dup_extract_ref` — def `scripts/herd/stale-dup-gate.sh:70` — callers: —
-- `stale_dup_held_noted` — def `scripts/herd/agent-watch.sh:4211` — callers: —
+- `stale_dup_held_noted` — def `scripts/herd/agent-watch.sh:4216` — callers: —
 - `steps_builder_rule` — def `scripts/herd/steps.sh:151` — callers: `scripts/herd/herd-feature.sh:244`, `scripts/herd/herd-quick.sh:251`
 - `steps_enabled` — def `scripts/herd/steps.sh:75` — callers: —
 - `steps_file` — def `scripts/herd/steps.sh:67` — callers: —
@@ -1608,19 +1615,19 @@ this scan cannot see).
 - `steps_hold_is_released` — def `scripts/herd/steps.sh:236` — callers: —
 - `steps_hold_ledger` — def `scripts/herd/steps.sh:169` — callers: —
 - `steps_hold_list` — def `scripts/herd/steps.sh:298` — callers: `scripts/herd/herd-approve.sh:188`
-- `steps_hold_purge` — def `scripts/herd/steps.sh:268` — callers: `scripts/herd/agent-watch.sh:6869`
+- `steps_hold_purge` — def `scripts/herd/steps.sh:268` — callers: `scripts/herd/agent-watch.sh:6874`
 - `steps_hold_release` — def `scripts/herd/steps.sh:368` — callers: `scripts/herd/herd-approve.sh:274`
 - `steps_list` — def `scripts/herd/steps.sh:119` — callers: —
 - `steps_run_at` — def `scripts/herd/steps.sh:471` — callers: `scripts/herd/work-units/git-pr.sh:223`, `scripts/herd/work-units/git-pr.sh:334`
 - `steps_step_memoized` — def `scripts/herd/steps.sh:249` — callers: —
 - `steps_validate` — def `scripts/herd/steps.sh:95` — callers: —
 - `stripws` — def `bin/herd:2751` — callers: —
-- `sweep_advice_line` — def `scripts/herd/sweep.sh:1301` — callers: `scripts/herd/agent-watch.sh:14446`
-- `sweep_auto_mode` — def `scripts/herd/sweep.sh:1261` — callers: `scripts/herd/agent-watch.sh:14369`, `scripts/herd/agent-watch.sh:14444`
+- `sweep_advice_line` — def `scripts/herd/sweep.sh:1301` — callers: `scripts/herd/agent-watch.sh:14582`
+- `sweep_auto_mode` — def `scripts/herd/sweep.sh:1261` — callers: `scripts/herd/agent-watch.sh:14505`, `scripts/herd/agent-watch.sh:14580`
 - `sweep_cheap_tab_count` — def `scripts/herd/sweep.sh:1274` — callers: —
 - `sweep_dead_marker_keys` — def `scripts/herd/sweep.sh:471` — callers: —
 - `sweep_dead_once_guard_prs` — def `scripts/herd/sweep.sh:649` — callers: —
-- `sweep_journal_advice_once` — def `scripts/herd/sweep.sh:1316` — callers: `scripts/herd/agent-watch.sh:14381`
+- `sweep_journal_advice_once` — def `scripts/herd/sweep.sh:1316` — callers: `scripts/herd/agent-watch.sh:14517`
 - `sweep_leg_links` — def `scripts/herd/sweep.sh:1204` — callers: —
 - `sweep_leg_markers` — def `scripts/herd/sweep.sh:528` — callers: —
 - `sweep_leg_once_guards` — def `scripts/herd/sweep.sh:678` — callers: —
@@ -1630,10 +1637,10 @@ this scan cannot see).
 - `sweep_main` — def `scripts/herd/sweep.sh:1376` — callers: —
 - `sweep_once_guard_files` — def `scripts/herd/sweep.sh:624` — callers: —
 - `sweep_orphan_procs` — def `scripts/herd/sweep.sh:795` — callers: —
-- `sweep_run_safe_legs` — def `scripts/herd/sweep.sh:1353` — callers: `scripts/herd/agent-watch.sh:14388`
-- `sweep_scan_counts` — def `scripts/herd/sweep.sh:1290` — callers: `scripts/herd/agent-watch.sh:14380`, `scripts/herd/agent-watch.sh:14399`
+- `sweep_run_safe_legs` — def `scripts/herd/sweep.sh:1353` — callers: `scripts/herd/agent-watch.sh:14524`
+- `sweep_scan_counts` — def `scripts/herd/sweep.sh:1290` — callers: `scripts/herd/agent-watch.sh:14516`, `scripts/herd/agent-watch.sh:14535`
 - `sweep_stray_watchers` — def `scripts/herd/sweep.sh:868` — callers: —
-- `sweep_swept_total` — def `scripts/herd/sweep.sh:1340` — callers: `scripts/herd/agent-watch.sh:14394`
+- `sweep_swept_total` — def `scripts/herd/sweep.sh:1340` — callers: `scripts/herd/agent-watch.sh:14530`
 - `sweep_timedout_marker_keys` — def `scripts/herd/sweep.sh:496` — callers: —
 - `triggers_due` — def `scripts/herd/triggers.sh:169` — callers: —
 - `triggers_enabled` — def `scripts/herd/triggers.sh:73` — callers: —
@@ -1645,13 +1652,13 @@ this scan cannot see).
 - `triggers_tick` — def `scripts/herd/triggers.sh:275` — callers: —
 - `triggers_validate` — def `scripts/herd/triggers.sh:122` — callers: —
 - `trim` — def `scripts/herd/codemap.sh:290` — callers: —
-- `usage` — def `bin/herd:7988` — callers: `scripts/herd/agent-watch.sh:10818`, `scripts/herd/agent-watch.sh:10822`, `scripts/herd/backlog-reconcile-sweep.sh:64`, `scripts/herd/changelog.sh:45`, `scripts/herd/driver.sh:1576`, `scripts/herd/fleet.sh:145`, `scripts/herd/fleet.sh:581`, `scripts/herd/fleet.sh:1330`, `scripts/herd/fleet.sh:1624`, `scripts/herd/fleet.sh:1707`, `scripts/herd/fleet.sh:1731`, `scripts/herd/fleet.sh:1863`, `scripts/herd/governance-drift-sweep.sh:52`, `scripts/herd/healthcheck.sh:75`, `scripts/herd/herd-approve.sh:233`, `scripts/herd/oss-triage.sh:44`, `scripts/herd/tracker-state-sweep.sh:102`
+- `usage` — def `bin/herd:7988` — callers: `scripts/herd/agent-watch.sh:10954`, `scripts/herd/agent-watch.sh:10958`, `scripts/herd/backlog-reconcile-sweep.sh:64`, `scripts/herd/changelog.sh:45`, `scripts/herd/driver.sh:1576`, `scripts/herd/fleet.sh:145`, `scripts/herd/fleet.sh:581`, `scripts/herd/fleet.sh:1330`, `scripts/herd/fleet.sh:1624`, `scripts/herd/fleet.sh:1707`, `scripts/herd/fleet.sh:1731`, `scripts/herd/fleet.sh:1863`, `scripts/herd/governance-drift-sweep.sh:52`, `scripts/herd/healthcheck.sh:75`, `scripts/herd/herd-approve.sh:233`, `scripts/herd/oss-triage.sh:44`, `scripts/herd/tracker-state-sweep.sh:102`
 - `valof` — def `bin/herd:2757` — callers: —
-- `warn` — def `bin/herd:149` — callers: `scripts/herd/agent-watch.sh:1383`, `scripts/herd/fleet.sh:226`, `scripts/herd/fleet.sh:279`, `scripts/herd/fleet.sh:281`, `scripts/herd/fleet.sh:287`, `scripts/herd/fleet.sh:299`, `scripts/herd/fleet.sh:302`, `scripts/herd/fleet.sh:305`, `scripts/herd/fleet.sh:394`, `scripts/herd/fleet.sh:666`, `scripts/herd/fleet.sh:667`, `scripts/herd/fleet.sh:1776`, `scripts/herd/herd-claim.sh:216`, `scripts/herd/herd-preflight.sh:506`, `scripts/herd/herd-preflight.sh:509`, `scripts/herd/herd-preflight.sh:533`, `scripts/herd/herd-preflight.sh:537`, `scripts/herd/herd-preflight.sh:548`, `scripts/herd/herd-preflight.sh:554`, `scripts/herd/herd-preflight.sh:578`, `scripts/herd/herd-preflight.sh:592`, `scripts/herd/herd-preflight.sh:613`, `scripts/herd/herd-preflight.sh:616`, `scripts/herd/status.sh:726`, `scripts/herd/steps.sh:109`, `scripts/herd/steps.sh:131`
-- `watcher_canonical_pid` — def `scripts/herd/watcher-exempt.sh:115` — callers: `scripts/herd/agent-watch.sh:13267`
+- `warn` — def `bin/herd:149` — callers: `scripts/herd/agent-watch.sh:1388`, `scripts/herd/fleet.sh:226`, `scripts/herd/fleet.sh:279`, `scripts/herd/fleet.sh:281`, `scripts/herd/fleet.sh:287`, `scripts/herd/fleet.sh:299`, `scripts/herd/fleet.sh:302`, `scripts/herd/fleet.sh:305`, `scripts/herd/fleet.sh:394`, `scripts/herd/fleet.sh:666`, `scripts/herd/fleet.sh:667`, `scripts/herd/fleet.sh:1776`, `scripts/herd/herd-claim.sh:216`, `scripts/herd/herd-preflight.sh:506`, `scripts/herd/herd-preflight.sh:509`, `scripts/herd/herd-preflight.sh:533`, `scripts/herd/herd-preflight.sh:537`, `scripts/herd/herd-preflight.sh:548`, `scripts/herd/herd-preflight.sh:554`, `scripts/herd/herd-preflight.sh:578`, `scripts/herd/herd-preflight.sh:592`, `scripts/herd/herd-preflight.sh:613`, `scripts/herd/herd-preflight.sh:616`, `scripts/herd/status.sh:726`, `scripts/herd/steps.sh:109`, `scripts/herd/steps.sh:131`
+- `watcher_canonical_pid` — def `scripts/herd/watcher-exempt.sh:115` — callers: `scripts/herd/agent-watch.sh:13403`
 - `watcher_handoff_active` — def `scripts/herd/watcher-exempt.sh:204` — callers: `scripts/herd/status.sh:280`, `scripts/herd/status.sh:371`
-- `watcher_handoff_begin` — def `scripts/herd/watcher-exempt.sh:180` — callers: `scripts/herd/agent-watch.sh:6168`
-- `watcher_handoff_clear` — def `scripts/herd/watcher-exempt.sh:188` — callers: `bin/herd:6094`, `scripts/herd/agent-watch.sh:6205`, `scripts/herd/agent-watch.sh:15572`
+- `watcher_handoff_begin` — def `scripts/herd/watcher-exempt.sh:180` — callers: `scripts/herd/agent-watch.sh:6173`
+- `watcher_handoff_clear` — def `scripts/herd/watcher-exempt.sh:188` — callers: `bin/herd:6094`, `scripts/herd/agent-watch.sh:6210`, `scripts/herd/agent-watch.sh:15708`
 - `watcher_handoff_file` — def `scripts/herd/watcher-exempt.sh:171` — callers: —
 - `watcher_handoff_pid` — def `scripts/herd/watcher-exempt.sh:195` — callers: —
 - `watcher_has_gate_child` — def `scripts/herd/watcher-exempt.sh:227` — callers: `scripts/herd/sweep.sh:840`
@@ -1659,22 +1666,22 @@ this scan cannot see).
 - `watcher_lock_pid` — def `scripts/herd/watcher-exempt.sh:107` — callers: `scripts/herd/sweep.sh:871`
 - `watcher_marker_pids` — def `scripts/herd/watcher-exempt.sh:125` — callers: `scripts/herd/sweep.sh:720`
 - `watcher_marker_sessions` — def `scripts/herd/watcher-exempt.sh:149` — callers: `scripts/herd/sweep.sh:754`
-- `watcher_pid_exempt` — def `scripts/herd/watcher-exempt.sh:257` — callers: `bin/herd:5839`, `scripts/herd/agent-watch.sh:14619`
+- `watcher_pid_exempt` — def `scripts/herd/watcher-exempt.sh:257` — callers: `bin/herd:5839`, `scripts/herd/agent-watch.sh:14755`
 - `watcher_ps_table` — def `scripts/herd/watcher-exempt.sh:99` — callers: `scripts/herd/sweep.sh:701`
 - `watcher_resurrect_enabled` — def `scripts/herd/watcher-resurrect.sh:52` — callers: —
 - `watcher_resurrect_herd_bin` — def `scripts/herd/watcher-resurrect.sh:59` — callers: —
 - `watcher_resurrect_probe` — def `scripts/herd/watcher-resurrect.sh:68` — callers: —
-- `watcher_singleton_verdict` — def `scripts/herd/watcher-exempt.sh:336` — callers: `scripts/herd/agent-watch.sh:6714`, `scripts/herd/herd-config.sh:783`, `scripts/herd/herd-config.sh:785`, `scripts/herd/watcher-resurrect.sh:73`
-- `wedge_first_seen` — def `scripts/herd/agent-watch.sh:12012` — callers: —
-- `wedge_notified` — def `scripts/herd/agent-watch.sh:12023` — callers: —
-- `wedge_state_of` — def `scripts/herd/agent-watch.sh:12017` — callers: —
-- `wedge_woken` — def `scripts/herd/agent-watch.sh:12028` — callers: —
+- `watcher_singleton_verdict` — def `scripts/herd/watcher-exempt.sh:336` — callers: `scripts/herd/agent-watch.sh:6719`, `scripts/herd/herd-config.sh:784`, `scripts/herd/herd-config.sh:786`, `scripts/herd/watcher-resurrect.sh:73`
+- `wedge_first_seen` — def `scripts/herd/agent-watch.sh:12148` — callers: —
+- `wedge_notified` — def `scripts/herd/agent-watch.sh:12159` — callers: —
+- `wedge_state_of` — def `scripts/herd/agent-watch.sh:12153` — callers: —
+- `wedge_woken` — def `scripts/herd/agent-watch.sh:12164` — callers: —
 - `wunit_apply` — def `scripts/herd/work-unit.sh:166` — callers: —
 - `wunit_gate` — def `scripts/herd/work-unit.sh:148` — callers: —
 - `wunit_inspect` — def `scripts/herd/work-unit.sh:131` — callers: —
 - `wunit_list_open` — def `scripts/herd/work-unit.sh:123` — callers: —
 - `wunit_open` — def `scripts/herd/work-unit.sh:114` — callers: —
-- `wunit_reconcile` — def `scripts/herd/work-unit.sh:175` — callers: `scripts/herd/agent-watch.sh:8991`
+- `wunit_reconcile` — def `scripts/herd/work-unit.sh:175` — callers: `scripts/herd/agent-watch.sh:9127`
 - `wunit_ref` — def `scripts/herd/work-unit.sh:195` — callers: —
 - `wunit_resolve_adapter` — def `scripts/herd/work-unit.sh:92` — callers: —
-- `wunit_teardown` — def `scripts/herd/work-unit.sh:183` — callers: `scripts/herd/agent-watch.sh:8184`, `scripts/herd/agent-watch.sh:8993`
+- `wunit_teardown` — def `scripts/herd/work-unit.sh:183` — callers: `scripts/herd/agent-watch.sh:8320`, `scripts/herd/agent-watch.sh:9129`
