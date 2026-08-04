@@ -154,7 +154,10 @@ _report_and_cleanup() {
   printf '%s · %s\n' "$sum" "$short" > "$RECEIPT"
   printf '[%s] %s · %s\n' "$(date '+%H:%M')" "$sum" "$short" >> "$INBOX"
   herd_driver_notify "✍️ Backlog scribed" "$sum" done
-  rm -f "$mine"
+  # HERD-514: belt-and-suspenders — _backend_add_item already consumes+removes its own snapshot on the
+  # file-backend commit path; this catches every OTHER terminal path (skip, add-item, update-state,
+  # amend, the #139 stale-drainer reroute) so a claim's snapshot never outlives its claim.
+  rm -f "$mine" "${mine}.snapshot"
   echo "$out $short"
 }
 
@@ -413,6 +416,13 @@ case "$cmd" in
       done < <(ls -1 "$Q"/*.req 2>/dev/null | sort)
       if [ -n "$claimed" ]; then
         ( cd "$REPO" && git pull --ff-only --quiet "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null ) || true
+        # HERD-514 (GH #627): snapshot the repo's dirty state HERE — right after the claim/pull, before
+        # the scribe agent touches anything — so the file backend's _backend_add_item can later stage
+        # only THIS request's own edit surface instead of sweeping every pre-existing dirty/untracked
+        # path into the commit. Defined only by backends/file.sh (other backends don't edit arbitrary
+        # files), so this is a no-op — and the snapshot stays absent, which the backend already treats
+        # as a fail-soft fallback to today's behavior — under every other SCRIBE_BACKEND.
+        ( cd "$REPO" && command -v _backend_snapshot_dirty >/dev/null 2>&1 && _backend_snapshot_dirty "$claimed" ) || true
         # Emit the ACTIVE backend (SCRIBE_BACKEND was sourced fresh THIS invocation, so it reflects
         # any mid-session flip) so the drainer applies each request via the backend live at DRAIN
         # time — not whatever was set when the drainer was spawned (issue #139).
