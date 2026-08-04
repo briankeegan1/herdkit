@@ -559,47 +559,70 @@ _On every invocation, read live state to surface what is configured:_
     # option here (subshell-scoped) so these replacements stay LITERAL on every bash. Guarded so it is a
     # harmless no-op on bash < 5.2 where the option does not exist.
     shopt -u patsub_replacement 2>/dev/null || true
-    local line _dk
-    while IFS= read -r line || [ -n "$line" ]; do
-      # HERD-216: {{OPERATING_POSTURE}} is either a multi-line section or empty. When empty (human
-      # autonomy default) drop the token line entirely so the rendered skill stays byte-identical —
-      # a bare `printf` of an empty substitution would inject a spurious blank line.
-      if [ "$line" = '{{OPERATING_POSTURE}}' ]; then
-        [ -n "$OPERATING_POSTURE" ] && printf '%s\n' "$OPERATING_POSTURE"
-        continue
-      fi
-      # Driver tokens FIRST, so a driver value that itself contains a {{TOKEN}} (e.g. {{SCRIPTS_DIR}})
-      # is resolved by the passes below. Only keys the driver defined are substituted; a token whose
-      # capability the driver omits survives to the completeness lint.
-      for _dk in $_dvars; do
-        line="${line//\{\{$_dk\}\}/${!_dk}}"
-      done
-      line="${line//\{\{WORKSPACE_NAME\}\}/$WORKSPACE_NAME}"
-      line="${line//\{\{PROJECT_ROOT\}\}/$PROJECT_ROOT}"
-      line="${line//\{\{DEFAULT_BRANCH\}\}/$DEFAULT_BRANCH}"
-      line="${line//\{\{BACKLOG_FILE\}\}/$BACKLOG_FILE}"
-      line="${line//\{\{SCRIPTS_DIR\}\}/$SCRIPTS_DIR}"
-      line="${line//\{\{DENY_PATHS\}\}/$DENY_PATHS}"
-      line="${line//\{\{HERD_REPO\}\}/$HERD_REPO}"
-      line="${line//\{\{COORDINATOR_CMD\}\}/$COORDINATOR_CMD}"
-      line="${line//\{\{COORDINATOR_AUTONOMY_NOTE\}\}/$COORDINATOR_AUTONOMY_NOTE}"
-      line="${line//\{\{CAPABILITIES\}\}/$CAPABILITIES}"
-      printf '%s\n' "$line"
-    done < "$TEMPLATES_DIR/coordinator.md.tmpl" > "$out"
 
-    # Completeness lint: no {{TOKEN}} may survive — a driver missing a tokenized capability, or an
-    # unknown config token, must fail LOUDLY here rather than emit a broken skill (mirrors the
-    # hermetic "no leftover {{tokens}}" render check).
-    if grep -qE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' "$out"; then
-      local _left; _left="$(grep -oE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' "$out" | sort -u | tr '\n' ' ')"
-      die "coordinator render left unsubstituted token(s): ${_left}— driver '$HERD_DRIVER' or .herd/config is missing a binding for them"
-    fi
+    # _rs_emit <tmpl> <out> <label> — ONE token-substitution pass, shared by every skill this render
+    # machinery emits (HERD-515: the coordinator skill AND the /autopilot standing-watch skill), so
+    # their token wiring can never drift apart — a token bound for one is bound for both. Reads the
+    # already-computed values from render_skill's scope (dynamic scoping) and ends with the
+    # completeness lint on its own output.
+    _rs_emit() {
+      local _tmpl="$1" _out="$2" _label="$3"
+      local line _dk
+      while IFS= read -r line || [ -n "$line" ]; do
+        # HERD-216: {{OPERATING_POSTURE}} is either a multi-line section or empty. When empty (human
+        # autonomy default) drop the token line entirely so the rendered skill stays byte-identical —
+        # a bare `printf` of an empty substitution would inject a spurious blank line.
+        if [ "$line" = '{{OPERATING_POSTURE}}' ]; then
+          [ -n "$OPERATING_POSTURE" ] && printf '%s\n' "$OPERATING_POSTURE"
+          continue
+        fi
+        # Driver tokens FIRST, so a driver value that itself contains a {{TOKEN}} (e.g. {{SCRIPTS_DIR}})
+        # is resolved by the passes below. Only keys the driver defined are substituted; a token whose
+        # capability the driver omits survives to the completeness lint.
+        for _dk in $_dvars; do
+          line="${line//\{\{$_dk\}\}/${!_dk}}"
+        done
+        line="${line//\{\{WORKSPACE_NAME\}\}/$WORKSPACE_NAME}"
+        line="${line//\{\{PROJECT_ROOT\}\}/$PROJECT_ROOT}"
+        line="${line//\{\{DEFAULT_BRANCH\}\}/$DEFAULT_BRANCH}"
+        line="${line//\{\{BACKLOG_FILE\}\}/$BACKLOG_FILE}"
+        line="${line//\{\{SCRIPTS_DIR\}\}/$SCRIPTS_DIR}"
+        line="${line//\{\{DENY_PATHS\}\}/$DENY_PATHS}"
+        line="${line//\{\{HERD_REPO\}\}/$HERD_REPO}"
+        line="${line//\{\{COORDINATOR_CMD\}\}/$COORDINATOR_CMD}"
+        line="${line//\{\{COORDINATOR_AUTONOMY_NOTE\}\}/$COORDINATOR_AUTONOMY_NOTE}"
+        line="${line//\{\{CAPABILITIES\}\}/$CAPABILITIES}"
+        printf '%s\n' "$line"
+      done < "$_tmpl" > "$_out"
+
+      # Completeness lint: no {{TOKEN}} may survive — a driver missing a tokenized capability, or an
+      # unknown config token, must fail LOUDLY here rather than emit a broken skill (mirrors the
+      # hermetic "no leftover {{tokens}}" render check).
+      if grep -qE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' "$_out"; then
+        local _left; _left="$(grep -oE '\{\{[A-Za-z_][A-Za-z0-9_]*\}\}' "$_out" | sort -u | tr '\n' ' ')"
+        die "$_label render left unsubstituted token(s): ${_left}— driver '$HERD_DRIVER' or .herd/config is missing a binding for them"
+      fi
+    }
+
+    _rs_emit "$TEMPLATES_DIR/coordinator.md.tmpl" "$out" "coordinator"
     # HERD-214: the render is a PER-MACHINE artifact — gitignored, never committed, regenerated by
     # whichever of init/update/reload/render/`config set` runs next (all of them recreate it when the
     # file is absent). Consumers share the TEMPLATE, not the render. Ensuring the ignore here means
     # every render path self-heals the contract; it is a no-op once the line exists. The narration goes
     # to stderr because this function's STDOUT is the rendered file's path.
     _ensure_gitignored "$root" ".claude/commands/$name.md" >&2
+
+    # HERD-515: the /autopilot STANDING WATCH-AND-DRAIN skill renders from the SAME machinery, the
+    # SAME tokens and the SAME per-machine contract as the coordinator skill above — one render path,
+    # two entry points, so a token wired for one seat can never be missing from the other. Its name is
+    # FIXED (`autopilot`, no new config key); it cites the coordinator skill's drain-mode section as
+    # authoritative rather than forking it. FAIL-SOFT: a tree whose templates dir predates the
+    # template simply renders no autopilot skill — never an error, never a red.
+    local ap_tmpl="$TEMPLATES_DIR/autopilot.md.tmpl"
+    if [ -f "$ap_tmpl" ]; then
+      _rs_emit "$ap_tmpl" "$out_dir/autopilot.md" "autopilot"
+      _ensure_gitignored "$root" ".claude/commands/autopilot.md" >&2
+    fi
     printf '%s' "$out"
   )
 }
