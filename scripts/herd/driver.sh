@@ -1591,6 +1591,119 @@ herd_driver_switch_model() {
   return 0
 }
 
+# ── post-spawn wake verification (HERD-516 / issue #632) ───────────────────────────────────────────
+# herd_driver_start_agent / herd_driver_launch_agent compose the kickoff as argv and return 0 as soon
+# as the spawn CALL succeeds — nothing downstream ever checks the agent actually PICKED UP that argv
+# prompt. A swallowed kickoff (the pointer sits unexecuted, or unsubmitted, in the fresh pane) is a
+# SILENT stall: the builder never transitions to "working" and nothing else notices for as long as
+# nobody looks (real incident: money-bets 2026-08-04, ~40 minutes lost, recovered only by a manual
+# send-keys Enter). This mirrors the watcher's own auto-refix wake-check (_wait_agent_working /
+# _handle_block_verdict in agent-watch.sh) at spawn time instead of at re-task time.
+
+# _herd_spawn_agent_status <slug> — agent_status word for <slug> out of herd_driver_agent_list_json's
+# roster (identity match on `name` OR `agent`, the same tolerance every other roster reader in this
+# file uses). Empty when not found / unparseable — never aborts the caller.
+_herd_spawn_agent_status() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || return 0
+  herd_driver_agent_list_json 2>/dev/null | SLUG="$slug" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  for a in (json.load(sys.stdin).get("result") or {}).get("agents") or []:
+    if (a.get("name") or a.get("agent") or "") == slug:
+      print(a.get("agent_status", ""), end=""); break
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
+# _herd_spawn_wait_working <slug> <window-s> — poll until <slug>'s agent_status is "working" or the
+# window expires, on the SAME backed-off cadence the watcher's refix wake-check uses (_wait_agent_working,
+# agent-watch.sh): an immediate check, then 1s, 2s, 3s… capped at 5s between checks. Returns 0 iff it
+# woke within the window.
+_herd_spawn_wait_working() {
+  local slug="$1" window="$2" deadline int=1
+  deadline=$(( $(date +%s) + window ))
+  [ "$(_herd_spawn_agent_status "$slug")" = "working" ] && return 0
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    sleep "$int"
+    [ "$(_herd_spawn_agent_status "$slug")" = "working" ] && return 0
+    [ "$int" -lt 5 ] && int=$((int + 1))
+  done
+  return 1
+}
+
+# herd_spawn_wake_verify <slug> <pane> <pointer> — verify a freshly-spawned builder actually woke up.
+# Poll window ~20s (the same ~15-30s backed-off shape as HERD_REFIX_WAIT_TIMEOUT); on a still-idle
+# agent, retry the submit ONCE: first a bare Enter to the agent pane (the kickoff prompt may simply be
+# sitting unsubmitted in the TUI buffer), re-poll; if STILL idle, re-send the pointer prompt itself via
+# the driver send-text surface (type + Enter, HERD-186), re-poll. On final failure, print a LOUD
+# warning with the manual recovery one-liner and return — the builder is left running for the
+# watcher's dead/wedge rails to catch if it is truly stuck; this helper NEVER kills it.
+#
+# Gated on the non-headless driver: _herd_headless_start_agent execs the runtime argv directly via
+# nohup (synchronous, no pane) — there is no race to verify there, so a headless spawn returns
+# immediately with no journal noise. Kill switch: HERD_SPAWN_WAKE_VERIFY=off skips verification
+# entirely (documented in docs/driver-abstraction.md) — an always-on correctness fix needs no config
+# key, so this is a bare env read, never a herd-config.sh `:=` default.
+#
+# FAIL-SOFT everywhere: an empty slug/pane, a missing herdr, or an unparseable roster degrades to a
+# silent skip — a driver that cannot report agent status never blocks or fails the spawn, it only
+# observes it. Concretely: if the roster does not carry THIS identity AT ALL on the very first look —
+# right after a synchronous, already-successful spawn call — this driver cannot report agent status for
+# it (a minimal/degraded roster reader, not a genuinely idle builder), so verification skips ENTIRELY
+# rather than grinding through three full retry windows against a status this driver will never
+# produce. A real herdr roster reflects a freshly-started agent immediately (its own `agent start` RPC
+# only returns success once the agent is registered), so this never masks a genuine stall — it only
+# recognizes "unobservable" for what it is.
+#
+# Journals spawn_wake_result every time verification actually runs: slug, woke(0|1),
+# retried(none|enter|prompt) — none/enter/prompt names the LAST wake attempt made before the final
+# poll (none = woke on the very first poll, no retry needed). Nothing is journaled on the "unobservable"
+# skip above — there is no wake attempt to record.
+herd_spawn_wake_verify() {
+  local slug="${1:-}" pane="${2:-}" pointer="${3:-}"
+  [ "${HERD_SPAWN_WAKE_VERIFY:-on}" != "off" ] || return 0
+  _herd_driver_is_headless && return 0
+  [ -n "$slug" ] && [ -n "$pane" ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  [ -n "$(_herd_spawn_agent_status "$slug")" ] || return 0
+
+  # 20s default sits in the ~15-30s window this mirrors from HERD_REFIX_WAIT_TIMEOUT's shape. Not a
+  # declared config key (no capabilities.tsv row, no herd-config.sh `:=` default) — HERD_SPAWN_WAKE_WINDOW
+  # is a bare TEST SEAM only, the same class as HERD_JOURNAL_NOW / JOURNAL_MAX_BYTES / HERD_WSL_PROC_VERSION_FILE,
+  # so a hermetic test can shrink the poll window without a real 20s sleep per case.
+  local window="${HERD_SPAWN_WAKE_WINDOW:-20}"
+  case "$window" in ''|*[!0-9]*) window=20 ;; esac
+
+  if _herd_spawn_wait_working "$slug" "$window"; then
+    command -v journal_append >/dev/null 2>&1 && journal_append spawn_wake_result slug "$slug" woke 1 retried none
+    return 0
+  fi
+  herd_driver_send_keys "$pane" Enter
+  if _herd_spawn_wait_working "$slug" "$window"; then
+    command -v journal_append >/dev/null 2>&1 && journal_append spawn_wake_result slug "$slug" woke 1 retried enter
+    return 0
+  fi
+  if [ -n "$pointer" ]; then
+    herd_driver_send_text "$pane" "$pointer"
+    if _herd_spawn_wait_working "$slug" "$window"; then
+      command -v journal_append >/dev/null 2>&1 && journal_append spawn_wake_result slug "$slug" woke 1 retried prompt
+      return 0
+    fi
+  fi
+  command -v journal_append >/dev/null 2>&1 && journal_append spawn_wake_result slug "$slug" woke 0 \
+    retried "$([ -n "$pointer" ] && printf prompt || printf enter)"
+  {
+    printf '⚠️  herd: builder "%s" never picked up its kickoff prompt after spawn (pane %s).\n' "$slug" "$pane"
+    printf '   This can silently stall the builder for tens of minutes (issue #632). Manual recovery:\n'
+    printf '     herdr pane send-keys %s Enter\n' "$pane"
+    printf '   The builder is left running — the watcher'"'"'s dead/wedge rails still catch a genuinely stuck agent.\n'
+  } >&2
+  return 0
+}
+
 # ── CLI entrypoint ───────────────────────────────────────────────────────────────────────────────
 # Only runs when EXECUTED (not sourced): `bash driver.sh <cap> …`. Sources herd-config.sh for
 # WORKTREES_DIR, then dispatches to the capability. This is what the rendered headless coordinator
@@ -1623,7 +1736,8 @@ _herd_driver_cli() {
     agent-value) herd_driver_agent_value "$@"; echo ;;   # <KEY> [default] → the active driver's DRIVER_AGENT_* value
     resolve-model)   herd_model_resolve "$@"   || return 1; echo ;;   # "<driver>\t<model>" (loud-fails on unknown driver)
     model-for-spawn) herd_model_for_spawn "$@" || return 1; echo ;;   # just the bare model to pass to --model
-    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|resume-cmd <prompt> [flags] [driver]|limit-pattern [driver]|process-signature [driver]|switch-model <pane> <model>|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>}\n' >&2; return 2 ;;
+    spawn-wake-verify) herd_spawn_wake_verify "$@" ;;   # <slug> <pane> <pointer> → HERD-516 post-spawn wake check
+    *) printf 'usage: driver.sh {list-agents|read-pane <slug>|send-text <slug> <text>|send-keys <slug> <keys…>|close-pane <pane>|close-verified <pane> <expected-kind>|pane-identity <pane>|pane-rename <pane> <label>|report-agent <slug> <pane> [state]|agent-pane <slug>|pane-alive <pane>|agent-liveness <slug> [pane]|create-tab <slug>|oneshot-exec <prompt> <model> [arg…]|resume-cmd <prompt> [flags] [driver]|limit-pattern [driver]|process-signature [driver]|switch-model <pane> <model>|agent-runtime|focus <slug>|notify <title> <body> [sound]|name|agent-value <KEY> [default]|resolve-model <ref>|model-for-spawn <ref>|spawn-wake-verify <slug> <pane> <pointer>}\n' >&2; return 2 ;;
   esac
 }
 

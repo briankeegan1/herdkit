@@ -638,3 +638,34 @@ driver-aware (P2) and the refuse message never named a binary.
 Proof: `tests/test-layout-reconcile.sh` (classification for a claude pane / a codex pane / a bare shell,
 via a synthetic `DRIVER_AGENT_PROCESS_SIGNATURE` binding) and `tests/test-codex-driver.sh` (the codex
 driver binds its own signature, zero-secret, non-empty).
+
+## HERD-516 / issue #632: post-spawn wake verification
+
+`herd_driver_start_agent` / `herd_driver_launch_agent` (the P2 spawn seam above) compose the kickoff
+prompt as argv and return 0 the moment the spawn CALL succeeds — nothing downstream ever confirms the
+agent actually PICKED UP that prompt. A swallowed kickoff (typed into a pane that was not yet ready, or
+left sitting unsubmitted in the fresh TUI buffer) is a silent stall: the builder never transitions to
+`working` and nothing else notices until a human happens to look. Real incident: a money-bets builder
+sat idle ~40 minutes on 2026-08-04, recovered only by a manual `herdr pane send-keys … Enter`.
+
+`herd_spawn_wake_verify <slug> <pane> <pointer>` (`scripts/herd/driver.sh`) closes the gap by mirroring
+the watcher's own auto-refix wake-check (`_wait_agent_working` / `_handle_block_verdict`,
+`agent-watch.sh`) at spawn time: poll the driver's agent roster on a backed-off cadence (~20s window,
+the same shape as `HERD_REFIX_WAIT_TIMEOUT`) for `agent_status` to flip to `working`; if it is still
+idle, retry ONCE with a bare Enter to the agent pane (the prompt may simply be unsubmitted); if still
+idle, retry once more by re-sending the pointer prompt itself via the `DRIVER_SEND_TEXT` seam
+(`herd_driver_send_text` — type + Enter, HERD-186). A final failure prints a loud warning with the
+manual recovery one-liner and returns — the builder is left running for the watcher's dead/wedge rails
+to catch if it is genuinely stuck; this helper never kills anything. Every run that actually polls
+journals `spawn_wake_result` (`slug`, `woke`, `retried`).
+
+Called from both `herd-feature.sh` and `herd-quick.sh` immediately after their (non-headless) spawn
+step. **Gated on the non-headless driver**: `_herd_headless_start_agent` execs the runtime argv directly
+via `nohup` — synchronous, no pane — so there is no race to verify there, and a headless spawn skips
+verification entirely with no journal noise.
+
+**Kill switch:** `HERD_SPAWN_WAKE_VERIFY=off` skips verification entirely. This is an always-on
+correctness fix, not a new config key — the switch is a bare env read in `herd_spawn_wake_verify`
+itself (no `templates/capabilities.tsv` row, no `herd-config.sh` `:=` default), the same class of
+escape hatch as e.g. `HERD_SKIP_PREFLIGHT`. Leave it unset (the default, effectively "on") unless a
+driver's roster read is known to be unreliable enough that the retries would just add noise.

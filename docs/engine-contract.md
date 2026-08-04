@@ -302,6 +302,7 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `stale_dup_hold` | pr, sha, slug, kind, reason | `agent-watch.sh:7896` |
 | `refix_bounce` | pr, sha, slug, round, agent_status_before, rule, location | `agent-watch.sh:7321` |
 | `refix_wake_result` | pr, sha, slug, round, agent_status_before, agent_status_after, woke, escalated | `agent-watch.sh:7359` |
+| `spawn_wake_result` | slug, woke, retried(none\|enter\|prompt) | `driver.sh:herd_spawn_wake_verify` (HERD-516/#632 — the same wake-check shape as `refix_wake_result`, run once at spawn time instead of at re-task time) |
 | `refix_escalated_no_wake` | pr, sha, slug, kind, reason(no-live-builder), agent_status | port `live_runtime.py:LiveTick._bounce_and_wake` (HERD-370 — an unwoken bounce escalates to needs-you immediately, in the same tick, instead of holding silently) |
 | `hold_applied` | pr, sha, slug, kind(approve\|human-verify) [, human_verify_policy] | port `live_runtime.py:LiveTick._walk` (HERD-442 — the bash anchor `agent-watch.sh:12287` died with the action pass at `ede7d45`) |
 | `hold_released` | pr, sha, slug, kind(approve\|human-verify), reason(approved) | port `live_runtime.py:LiveTick._walk` (HERD-442 — restored; consumed by `herd why` and the fleet inbox/digest) |
