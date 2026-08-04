@@ -337,6 +337,10 @@ else
   if [ -n "$_AGENT_PANE" ] && ! herd_driver_agent_runtime_native "$_DRIVER_RUNTIME"; then
     herd_driver_report_agent "$SLUG" "$_AGENT_PANE" working
   fi
+  # HERD-516 / issue #632: verify the freshly-spawned builder actually picked up its kickoff prompt
+  # instead of silently stalling at an unexecuted argv. Fail-soft, never blocks the lane — see
+  # herd_spawn_wake_verify (driver.sh) for the retry/journal/kill-switch contract.
+  herd_spawn_wake_verify "$SLUG" "$_AGENT_PANE" "$POINTER"
 fi
 
 # 3b. Task-spec viewer in the tab's OTHERWISE-IDLE root pane (TASK_PANE_VIEW, default on). The quick
