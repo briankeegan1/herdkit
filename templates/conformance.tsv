@@ -484,3 +484,4 @@ RESOLVE_CLAIM	sim	tests/test-sandbox-multiseat.sh
 RESOLVE_CLAIM_TTL	unit	tests/test-resolver-claim.sh
 ANOMALY_BASELINES	unit	tests/test-phase-anomaly-baselines.sh
 ANOMALY_BASELINES	unit	tests/test_store.py
+ANOMALY_FILE_COOLDOWN_SECS	unit	tests/test-phase-anomaly-suspend-skip.sh

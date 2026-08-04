@@ -540,6 +540,11 @@ BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # render() adds nothing (byte-identical console).
 ANOMALY_LEDGER="$TREES/.agent-watch-phase-anomalies"
 ANOMALY_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
+# HERD-512: per-PHASE last-filing stamp — "<prefix><phase>" holds the epoch at which that phase last
+# actually ENQUEUED an anomaly item, so ANOMALY_FILE_COOLDOWN_SECS can collapse a burst of repeat
+# filings for the SAME phase into one. Written ONLY on a real enqueue (never on dedup/skip), and only
+# while ANOMALY_BASELINES is on, so off stays byte-inert (no such file is ever created).
+ANOMALY_FILE_STAMP_PREFIX="$TREES/.agent-watch-phase-anomaly-filed-"
 # Orphan-PR advisory surface (HERD-330). The watcher gates work it DISCOVERS via git worktrees; an
 # open PR with no live builder worktree in this workspace (a collaborator PR, a main-checkout PR, a
 # PR whose worktree was reaped) is therefore never adopted — it sits ungated and, today, invisible.
@@ -7404,6 +7409,115 @@ build_phase_anomalies() {
   return 0
 }
 
+# ── HERD-512(a): SUSPEND-AWARE SKIP ────────────────────────────────────────────────────────────────
+# Every one of HERD-496's 5 measurement points times WALL CLOCK, so a laptop that suspended (or
+# dark-woke) mid-interval reads as a phase that "took" the whole sleep. Diagnosed 2026-08-04 from the
+# journal: 4 bogus anomaly filings overnight (134s/189s/181s/2049s tick cadences against a p95 of
+# 35-173s) and — worse — the sleep-inflated samples went into the ROLLING BASELINE, dragging the
+# tick_cadence median from 32s to 129s, which then desensitizes the rail against a real stall. The fix
+# is at the ONE shared chokepoint below, BEFORE the store write, so a sleep-spanning interval is not
+# merely un-filed but never SAMPLED.
+#
+# Fail-soft and deliberately narrow: darwin-only (the only platform with this probe), and a missing,
+# unreadable, or unparseable sysctl behaves EXACTLY as today (observe normally) rather than skipping —
+# a blind probe must never silence the rail.
+
+# _sysctl_timeval_epoch <raw> — parse a `sysctl -n` struct-timeval value ("{ sec = 1785818873, usec =
+# 568344 } Tue Aug  4 00:47:53 2026") down to its whole-second epoch. Also accepts a bare integer (a
+# future/other sysctl shape). Empty + rc 1 on anything else — the caller then treats the probe as
+# unavailable.
+_sysctl_timeval_epoch() {
+  local _ste_raw="${1:-}" _ste_sec
+  case "$_ste_raw" in
+    *"sec = "*) _ste_sec="${_ste_raw#*sec = }"; _ste_sec="${_ste_sec%%,*}" ;;
+    *)          _ste_sec="$_ste_raw" ;;
+  esac
+  _ste_sec="${_ste_sec%% *}"
+  case "$_ste_sec" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$_ste_sec"
+}
+
+# _wake_probe_epoch — the epoch of this machine's most recent SUSPEND/WAKE boundary, or empty + rc 1
+# when there is no such probe to read. On darwin that is the LATER of `kern.waketime` (last wake) and
+# `kern.sleeptime` (last sleep) — taking the later of the two means a dark-wake window whose sleep edge
+# lands inside a measured interval counts too, not only the wake edge. Non-darwin returns rc 1
+# unconditionally, so every other platform is byte-identical to before HERD-512.
+#
+# This is also the TEST SEAM: tests/test-phase-anomaly-suspend-skip.sh overrides this one function to
+# place a fake boundary inside vs outside a measured interval, without needing a machine that sleeps.
+_wake_probe_epoch() {
+  local _wpe_key _wpe_raw _wpe_epoch _wpe_best=0
+  [ "$(uname -s 2>/dev/null)" = "Darwin" ] || return 1
+  command -v sysctl >/dev/null 2>&1 || return 1
+  for _wpe_key in kern.waketime kern.sleeptime; do
+    _wpe_raw="$(sysctl -n "$_wpe_key" 2>/dev/null)" || continue
+    _wpe_epoch="$(_sysctl_timeval_epoch "$_wpe_raw")" || continue
+    if [ "$_wpe_epoch" -gt "$_wpe_best" ]; then _wpe_best="$_wpe_epoch"; fi
+  done
+  if [ "$_wpe_best" -le 0 ]; then return 1; fi
+  printf '%s' "$_wpe_best"
+}
+
+# _interval_spans_wake <start-epoch> <end-epoch> — true iff the machine's most recent suspend/wake
+# boundary falls INSIDE [start, end], i.e. the interval a caller just measured with wall clock has a
+# sleep window in it and its duration is therefore not real elapsed WORK. False (rc 1) whenever the
+# probe is unavailable/unparseable or the bounds are not sane integers — fail-soft toward "no wake",
+# which is exactly today's behavior.
+_interval_spans_wake() {
+  local _isw_start="${1:-}" _isw_end="${2:-}" _isw_wake
+  case "$_isw_start" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_isw_end"   in ''|*[!0-9]*) return 1 ;; esac
+  _isw_wake="$(_wake_probe_epoch)" || return 1
+  [ -n "$_isw_wake" ] || return 1
+  [ "$_isw_wake" -ge "$_isw_start" ] || return 1
+  [ "$_isw_wake" -le "$_isw_end" ] || return 1
+  return 0
+}
+
+# ── HERD-512(b): PER-PHASE FILING COOLDOWN ─────────────────────────────────────────────────────────
+# The honest-identity dedup (phase+seconds+p95) only collapses an IDENTICAL re-reading; a phase that is
+# genuinely degraded for a while files a FRESH item every tick it reads differently — which is how one
+# bad night produced 4 separate tracker items for the same story. ANOMALY_FILE_COOLDOWN_SECS bounds
+# that: within the window the anomaly is still JOURNALED and still PAINTED on the console ledger (the
+# operator loses no visibility), only the tracker filing is withheld, journaled result=cooldown.
+
+# _anomaly_file_cooldown_secs — the configured ANOMALY_FILE_COOLDOWN_SECS in seconds. 0 = off (today's
+# behavior: every above-threshold reading may file). A non-numeric value falls soft to the DOCUMENTED
+# default rather than to 0 — a typo must not silently restore the filing storm this key exists to stop.
+_anomaly_file_cooldown_secs() {
+  local _afcs_v="${ANOMALY_FILE_COOLDOWN_SECS:-1800}"
+  case "$_afcs_v" in ''|*[!0-9]*) printf 1800 ;; *) printf '%s' "$_afcs_v" ;; esac
+}
+
+# _anomaly_file_stamp_path <phase-key> — the per-phase last-filing stamp file. The phase key is
+# sanitized to [A-Za-z0-9_-] so a caller can never escape $TREES with a crafted key.
+_anomaly_file_stamp_path() {
+  local _afsp_phase; _afsp_phase="$(printf '%s' "${1:-}" | tr -c 'A-Za-z0-9_-' '_')"
+  printf '%s%s' "$ANOMALY_FILE_STAMP_PREFIX" "$_afsp_phase"
+}
+
+# _anomaly_file_in_cooldown <phase-key> — true iff this phase FILED less than
+# _anomaly_file_cooldown_secs ago. Fail-soft toward "not in cooldown" (file it) on a 0/off window, a
+# missing or unreadable stamp, or a stamp that is not an epoch — the rail stays loud when in doubt.
+_anomaly_file_in_cooldown() {
+  local _afic_win _afic_stamp _afic_last _afic_now
+  _afic_win="$(_anomaly_file_cooldown_secs)"
+  [ "$_afic_win" -gt 0 ] || return 1
+  _afic_stamp="$(_anomaly_file_stamp_path "${1:-}")"
+  [ -f "$_afic_stamp" ] || return 1
+  _afic_last="$(cat "$_afic_stamp" 2>/dev/null)" || return 1
+  case "$_afic_last" in ''|*[!0-9]*) return 1 ;; esac
+  _afic_now="$(_now_epoch)"
+  [ "$_afic_now" -ge "$_afic_last" ] || return 1     # clock went backwards — never hold on that
+  [ $(( _afic_now - _afic_last )) -lt "$_afic_win" ]
+}
+
+# _anomaly_file_stamp <phase-key> — record that this phase just ENQUEUED an item, arming the cooldown.
+# Never fatal: an unwritable $TREES simply leaves the cooldown disarmed (today's behavior).
+_anomaly_file_stamp() {
+  printf '%s\n' "$(_now_epoch)" > "$(_anomaly_file_stamp_path "${1:-}")" 2>/dev/null || true
+}
+
 # _phase_anomaly_observe <phase-key> <human-label> <duration-secs> — the ONE shared call every one of
 # HERD-496's 5 measurement points calls once it knows how long its own instance just took. Ship-
 # dormant: returns immediately (no store touch, no journal, no row) unless ANOMALY_BASELINES is on.
@@ -7416,11 +7530,24 @@ build_phase_anomalies() {
 # _main_health_scribe, HERD-371) — an HONEST identity of phase+THIS measurement+the baseline it beat,
 # so a re-observed IDENTICAL reading dedups (journaled result=dedup) while a worse or different
 # reading of the same phase files fresh. Fully fail-soft; always returns 0.
+#
+# HERD-512 adds two guards here, both at this ONE chokepoint so all 5 measurement points inherit them:
+#   (a) an interval a machine SUSPEND/WAKE boundary falls inside is dropped whole — before the store
+#       write — so sleep neither files nor pollutes the baseline (_interval_spans_wake);
+#   (b) a repeat filing for the SAME phase inside ANOMALY_FILE_COOLDOWN_SECS still journals and still
+#       paints its row, but withholds the tracker filing (journaled result=cooldown).
 _phase_anomaly_observe() {
   local _pa_phase="$1" _pa_label="$2" _pa_secs="$3"
-  local _pa_stats _pa_median _pa_p95 _pa_n _pa_threshold _pa_id _pa_mark_rc
+  local _pa_stats _pa_median _pa_p95 _pa_n _pa_threshold _pa_id _pa_mark_rc _pa_now
   _anomaly_baselines_enabled || return 0
   case "$_pa_secs" in ''|*[!0-9]*) return 0 ;; esac
+  # HERD-512(a): a measured interval that a machine suspend/wake boundary falls inside is wall clock,
+  # not work — drop it ENTIRELY (no baseline sample, so the sleep never pollutes the rolling median;
+  # no journal line; no filing). Fail-soft: no probe ⇒ observe exactly as before.
+  _pa_now="$(_now_epoch)"
+  if [ "$_pa_now" -ge "$_pa_secs" ]; then
+    if _interval_spans_wake "$(( _pa_now - _pa_secs ))" "$_pa_now"; then return 0; fi
+  fi
   _pa_stats="$(_phase_duration_observe "$_pa_phase" "$_pa_secs")" || return 0
   IFS=$'\t' read -r _pa_median _pa_p95 _pa_n <<EOF
 $_pa_stats
@@ -7437,12 +7564,21 @@ EOF
   printf '%s\t%s\t%s\t%s\n' "$(_now_epoch)" "$_pa_label" "$_pa_secs" "$_pa_p95" >> "$ANOMALY_LEDGER" 2>/dev/null || true
   herd_console_trim "$ANOMALY_LEDGER" "$ANOMALY_LEDGER_MAX"
 
+  # HERD-512(b): the row and the journal line above are already painted — only the TRACKER filing is
+  # rate-limited, so a phase that stays degraded tells the story once instead of once per tick.
+  if _anomaly_file_in_cooldown "$_pa_phase"; then
+    journal_append phase_anomaly_filed phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" \
+      result cooldown window "$(_anomaly_file_cooldown_secs)"
+    return 0
+  fi
+
   _pa_id="anomaly:${_pa_phase}:${_pa_secs}:${_pa_p95}"
   _main_health_fix_mark "$_pa_id" "0" ""; _pa_mark_rc=$?
   case "$_pa_mark_rc" in
     0)
       _main_health_scribe "ANOMALY: ${_pa_label} took $(_fmt_age "$_pa_secs") — p95 $(_fmt_age "$_pa_p95")
 A ${_pa_label} run just took $(_fmt_age "$_pa_secs"), past its learned p95 baseline of $(_fmt_age "$_pa_p95") (median $(_fmt_age "${_pa_median:-0}") over ${_pa_n} samples). Look for a stuck dependency, a resource-contention window, or a genuine regression."
+      _anomaly_file_stamp "$_pa_phase"
       journal_append phase_anomaly_filed phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" result enqueued ;;
     3)
       journal_append phase_anomaly_filed phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" result dedup ;;
