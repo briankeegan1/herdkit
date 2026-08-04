@@ -111,6 +111,7 @@ Role summarized from each file's top-of-file comment.
 ### Templates (`templates/`)
 
 - `archetypes.tsv` — templates/archetypes.tsv — the CANONICAL PROJECT ARCHETYPES (HERD-409): the committed,
+- `autopilot.md.tmpl` — (render template — no header comment)
 - `capabilities.tsv` — (tab-separated manifest — no header comment)
 - `capability-class.tsv` — (tab-separated manifest — no header comment)
 - `config.example` — .herd/config — read by the herd engine; one per consuming project.
