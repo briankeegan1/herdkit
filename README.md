@@ -143,6 +143,11 @@ herd backend switch <file|github|linear|jira|changelog> [--migrate]
 which preflights credentials before changing anything, flips `SCRIBE_BACKEND` through the validated
 config path, and — with `--migrate` — replays the old backend's open items into the new one.
 
+> **Running the fleet against Jira?**
+> [`docs/jira-guide.md`](docs/jira-guide.md) is the end-to-end walkthrough — credentials and
+> project scoping, the issue → builder → PR → Done lifecycle against a Jira project, and the
+> adapter's current limits.
+
 If your Linear workspace hosts more than one team's issues under the same API key, set
 `LINEAR_TEAM_ID` (`herd config set LINEAR_TEAM_ID <id>`, or alongside the API key in
 `.herd/secrets`) to scope `herd backlog` and new-issue creation to just this project's team; unset
