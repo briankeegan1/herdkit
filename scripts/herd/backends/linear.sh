@@ -427,6 +427,97 @@ print("1" if (((d.get("data") or {}).get("issueUpdate") or {}).get("success")) e
     [ "$ok" = "1" ]
 }
 
+# _linear_read_issue_state_type <issue-id> — HERD-552 (GH #682): read the issue's OWN CURRENT
+# workflow-state type straight from Linear via a direct `issue(id:)` lookup — deliberately a DIFFERENT
+# shape from the issues(filter:) resolve path used to FIND the issue in the first place, so this call
+# exists solely to OBSERVE a write's actual effect, never a cached/stale node the resolve query handed
+# back. Prints the state type (e.g. "completed", "started") or empty on any transport/parse failure —
+# empty means "could not confirm either way", never "definitely not terminal" (see
+# _linear_transition_and_verify, which treats the two very differently).
+_linear_read_issue_state_type() {
+    local id="$1" resp
+    resp="$(_linear_gql 'query R($id: String!) { issue(id: $id) { state { type } } }' \
+      "$(ID="$id" python3 -c 'import os, json
+print(json.dumps({"id": os.environ["ID"]}))')" 2>/dev/null)" || { printf ''; return 0; }
+    printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+issue = (d.get("data") or {}).get("issue") or {}
+state = issue.get("state") or {}
+print(state.get("type") or "")' 2>/dev/null
+}
+
+# _linear_transition_and_verify <issue-id> <state-id> <want-type> — HERD-552/GH #682: fire the
+# transition, then VERIFY it actually landed by reading the issue back. emberglen-godot saw
+# issueUpdate report success:true on an in-progress→done move while the issue stayed In Progress — a
+# mutation ack is necessary but not sufficient. Sets _LINEAR_TRANSITION_OBSERVED to the readback's
+# actual type. Returns 0 when the mutation is confirmed AND EITHER the readback matches <want-type> OR
+# the readback itself could not be read (empty — fail-soft: an unreadable SECONDARY read is never
+# evidence of a silent no-op, so it never turns a confirmed write into a failure). Returns 1 when the
+# mutation itself was never confirmed (_LINEAR_TRANSITION_OBSERVED left empty — the pre-existing
+# NOCHANGE path, unchanged) or when the readback POSITIVELY resolves to a different type (the HERD-552
+# signal — a real, observed contradiction, not a missing read).
+_linear_transition_and_verify() {
+    local id="$1" state_id="$2" want_type="$3" observed
+    _LINEAR_TRANSITION_OBSERVED=""
+    _linear_issue_update_state_verified "$id" "$state_id" || return 1
+    observed="$(_linear_read_issue_state_type "$id")"
+    _LINEAR_TRANSITION_OBSERVED="$observed"
+    [ -z "$observed" ] || [ "$observed" = "$want_type" ]
+}
+
+# _linear_resolve_explicit_state_id <ref> <name> — HERD-552 retry path: resolve a workflow-state id by
+# its OWN literal name (a server-side `name: { eq: }` filter), bypassing the type-filtered/
+# name-preferred BATCH pick (_pick_state) the first attempt resolved through. Suspected root cause of
+# the GH #682 silent no-op (diagnosed against the emberglen-godot repro — EMG-126/162/165, all claimed
+# then merged before the miss): the type-filtered pick hands back whichever id the team's
+# states(filter: type:) list returns for that type, which behaves like an ALIAS of the real target for
+# an issue still sitting in a STARTED state — issueUpdate accepts it (success:true) without applying
+# it. A state resolved by its own exact name is the unambiguous, explicit target. Empty when <name> is
+# empty (no preferred name for this type — nothing explicit to retry through) or nothing resolves.
+_linear_resolve_explicit_state_id() {
+    local ref="$1" name="$2" fields resp
+    [ -n "$name" ] || { printf ''; return 0; }
+    fields="id identifier title team { states(filter: { name: { eq: \"$name\" } }) { nodes { id name } } }"
+    resp="$(_linear_resolve_ref "$ref" "$fields" "")"
+    printf '%s' "$resp" | python3 -c 'import sys, json
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
+if len(nodes) != 1:
+    print("")
+else:
+    states = (((nodes[0].get("team") or {}).get("states") or {}).get("nodes")) or []
+    print(states[0].get("id") or "" if states else "")' 2>/dev/null
+}
+
+# _linear_transition_state <ref> <issue-id> <state-id> <want-type> <pref-name> <want-word> — the FULL
+# HERD-552 write: transition + verify, and on a success-reported-but-non-terminal readback, journal
+# reconcile_transition_failed LOUDLY (ref, pr, observed state) and retry EXACTLY ONCE via the explicit
+# workflow-state id (_linear_resolve_explicit_state_id) rather than the named/type-filtered batch pick
+# the first attempt used. Returns 0 only on an eventually-CONFIRMED terminal state (first attempt or
+# the retry); 1 otherwise. A plain mutation failure (observed stays empty) never journals or retries —
+# that pre-existing NOCHANGE path (a real transport/API failure) is unchanged. Leaving this NOCHANGE is
+# not the end of the story: the caller's own fuzzy-scribe fallback and — for the merge-reconcile leg —
+# tracker-state-sweep.sh's periodic backstop both re-issue this same call on a later pass until the
+# item reads back terminal (bounded per-pass self-heal).
+_linear_transition_state() {
+    local ref="$1" issue_id="$2" state_id="$3" want_type="$4" pref="$5" want="$6" observed retry_id
+    if _linear_transition_and_verify "$issue_id" "$state_id" "$want_type"; then
+        return 0
+    fi
+    observed="$_LINEAR_TRANSITION_OBSERVED"
+    [ -n "$observed" ] || return 1
+    echo "linear backend: issueUpdate for '$ref' → '$want' reported success but the issue reads back '$observed' (expected '$want_type') — retrying once via the explicit workflow-state id" >&2
+    if command -v journal_append >/dev/null 2>&1; then
+        journal_append reconcile_transition_failed ref "$ref" pr "${HERD_TW_PR:-}" observed "$observed"
+    fi
+    [ -n "$pref" ] || return 1
+    retry_id="$(_linear_resolve_explicit_state_id "$ref" "$pref")"
+    [ -n "$retry_id" ] || return 1
+    _linear_transition_and_verify "$issue_id" "$retry_id" "$want_type"
+}
+
 _backend_update_state() {
     # $1 = item ref (Linear identifier e.g. HERD-22, a leading '#' tolerated — or a title phrase when
     # no identifier is present); $2 = target state (done|in-progress|canceled + synonyms).
@@ -472,14 +563,18 @@ EOF
         _BACKEND_RESULT="NOCHANGE"
         return 0
     fi
-    # Transition the issue — reporting DONE only when the issueUpdate is CONFIRMED (success:true). A
-    # transiently-failed mutation returns NOCHANGE so agent-watch's _reconcile_via_ref does NOT journal
-    # resolution=explicit-ref and skip the fuzzy-scribe fallback that would retry — the exact failure
-    # behind PR #187/HERD-67 staying In Progress after merge (2026-07-07).
-    if _linear_issue_update_state_verified "$issue_id" "$state_id"; then
+    # Transition the issue — reporting DONE only when the write is CONFIRMED, which since HERD-552 (GH
+    # #682) means BOTH the issueUpdate ack (success:true) AND a readback of the issue's own state (a
+    # confirmed-but-non-terminal readback retries once via an explicit-name state id before giving up;
+    # see _linear_transition_state). A transiently-failed mutation, or a retry that still doesn't stick,
+    # returns NOCHANGE so agent-watch's _reconcile_via_ref does NOT journal resolution=explicit-ref and
+    # skips straight to the fuzzy-scribe fallback that would retry — the exact failure behind
+    # PR #187/HERD-67 staying In Progress after merge (2026-07-07), now closed further by HERD-552's
+    # readback for the started→done no-op that same fix did not catch.
+    if _linear_transition_state "$ref" "$issue_id" "$state_id" "$stype" "$pref" "$want"; then
         _BACKEND_RESULT="DONE"
     else
-        echo "linear backend: issueUpdate for '$ref' → '$want' was not confirmed (success≠true) — state left unresolved for retry (skipping, not filing)" >&2
+        echo "linear backend: issueUpdate for '$ref' → '$want' was not confirmed — state left unresolved for retry (skipping, not filing)" >&2
         _BACKEND_RESULT="NOCHANGE"
     fi
     # HERD-85: journal the write we just attempted (result = the verified outcome) so attribution is a

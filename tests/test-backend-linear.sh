@@ -651,4 +651,113 @@ grep -q "local exec failed under load" <<<"$err9" || fail "local exec failure me
 [ -s "$CURLLOG" ] && fail "a local payload-build failure must never reach curl — that would blame Linear for our own fork pressure"
 pass
 
+# ── HERD-552 / GH #682: verify-after-write + retry-once-via-explicit-id ────────────────────────────
+# emberglen-godot saw issueUpdate report success:true on an in-progress→done transition (EMG-126/162/
+# 165, all claimed then merged) while the issue's OWN state never actually moved off 'started' — a
+# silent no-op only a post-write READBACK exposes. These stubs simulate exactly that: the first
+# (type-filtered/name-preferred) pick resolves a DECOY stateId that issueUpdate accepts but never
+# actually applies; a readback taken right after still shows 'started'. Each stub is bespoke (not the
+# shared `run()` harness) because the readback response must vary BY CALL, which the harness's static
+# case dispatch cannot express.
+
+# 10a. no-op on attempt 1 → journaled LOUDLY once with the observed state, retried ONCE via a state id
+#      resolved by its own literal name (never the type-filtered pick) → that retry sticks → DONE.
+: > "$GQLLOG"; : > "$JLOG"
+IUCOUNT="$T/iucount"; RBCOUNT="$T/rbcount"; : > "$IUCOUNT"; : > "$RBCOUNT"
+noop_then_heal="$(
+  cd "$T" && . "$BACKEND"
+  journal_append() { printf '%s\n' "$*" >> "$JLOG"; }
+  _linear_gql() {
+    printf 'QUERY<<%s>>VARS<<%s>>\n' "$1" "${2:-}" >> "$GQLLOG"
+    case "$1" in
+      (*issueUpdate*)
+        echo x >> "$IUCOUNT"
+        echo '{"data":{"issueUpdate":{"success":true}}}' ;;
+      (*'name: { eq: "Done" }'*)
+        echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","title":"t","team":{"states":{"nodes":[{"id":"state_explicit","name":"Done"}]}}}]}}}' ;;
+      (*"states(filter"*)
+        echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","title":"t","team":{"states":{"nodes":[{"id":"state_decoy","name":"Done","position":1}]}}}]}}}' ;;
+      (*"issue(id:"*)
+        echo x >> "$RBCOUNT"
+        if [ "$(wc -l < "$RBCOUNT" | tr -d ' ')" = "1" ]; then
+          echo '{"data":{"issue":{"state":{"type":"started"}}}}'
+        else
+          echo '{"data":{"issue":{"state":{"type":"completed"}}}}'
+        fi ;;
+      (*) echo '{"data":{}}' ;;
+    esac
+  }
+  _BACKEND_RESULT=""
+  HERD_COMPONENT=reconcile HERD_TW_PR=99 _backend_update_state ENG-7 done
+  printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+)"
+grep -q "RESULT=DONE" <<< "$noop_then_heal" || fail "HERD-552: no-op-then-heal did not eventually report DONE ($noop_then_heal)"
+grep -q "state_decoy" "$GQLLOG" || fail "HERD-552: attempt 1 did not use the type-filtered/decoy state id"
+grep -q "state_explicit" "$GQLLOG" || fail "HERD-552: retry did not use the explicit-name state id"
+grep -q 'name: { eq: "Done" }' "$GQLLOG" || fail "HERD-552: retry did not resolve via a literal-name states filter"
+[ "$(wc -l < "$IUCOUNT" | tr -d ' ')" = "2" ] || fail "HERD-552: expected exactly 2 issueUpdate calls (attempt + one retry), got $(cat "$IUCOUNT" | wc -l)"
+[ "$(grep -c '^reconcile_transition_failed ' "$JLOG")" = "1" ] || fail "HERD-552: expected exactly one reconcile_transition_failed journal event ($(cat "$JLOG"))"
+rtf="$(grep '^reconcile_transition_failed ' "$JLOG")"
+grep -q "ref ENG-7" <<< "$rtf" || fail "reconcile_transition_failed missing 'ref ENG-7' ($rtf)"
+grep -q "pr 99" <<< "$rtf" || fail "reconcile_transition_failed missing 'pr 99' ($rtf)"
+grep -q "observed started" <<< "$rtf" || fail "reconcile_transition_failed missing the observed (non-terminal) state ($rtf)"
+pass
+
+# 10b. no-op on attempt 1 AND the retry — bounded per-pass: exactly one retry attempt (never a loop),
+#      exactly one journal event (the retry's own failure is not separately journaled), NOCHANGE so
+#      the caller's fuzzy-scribe fallback / the periodic tracker-state-sweep can pick it up later.
+: > "$GQLLOG"; : > "$JLOG"; : > "$IUCOUNT"
+still_stuck="$(
+  cd "$T" && . "$BACKEND"
+  journal_append() { printf '%s\n' "$*" >> "$JLOG"; }
+  _linear_gql() {
+    printf 'QUERY<<%s>>VARS<<%s>>\n' "$1" "${2:-}" >> "$GQLLOG"
+    case "$1" in
+      (*issueUpdate*)
+        echo x >> "$IUCOUNT"
+        echo '{"data":{"issueUpdate":{"success":true}}}' ;;
+      (*'name: { eq: "Done" }'*)
+        echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","title":"t","team":{"states":{"nodes":[{"id":"state_explicit","name":"Done"}]}}}]}}}' ;;
+      (*"states(filter"*)
+        echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","title":"t","team":{"states":{"nodes":[{"id":"state_decoy","name":"Done","position":1}]}}}]}}}' ;;
+      (*"issue(id:"*) echo '{"data":{"issue":{"state":{"type":"started"}}}}' ;;   # ALWAYS non-terminal
+      (*) echo '{"data":{}}' ;;
+    esac
+  }
+  _BACKEND_RESULT=""
+  HERD_COMPONENT=reconcile HERD_TW_PR=100 _backend_update_state ENG-7 done
+  printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+)"
+grep -q "RESULT=NOCHANGE" <<< "$still_stuck" || fail "HERD-552: a readback that never confirms should stay NOCHANGE, not falsely report DONE ($still_stuck)"
+[ "$(wc -l < "$IUCOUNT" | tr -d ' ')" = "2" ] || fail "HERD-552: a persistently-stuck ref must retry EXACTLY once, not loop ($(cat "$IUCOUNT" | wc -l) issueUpdate calls)"
+[ "$(grep -c '^reconcile_transition_failed ' "$JLOG")" = "1" ] || fail "HERD-552: a failed retry must not journal a SECOND reconcile_transition_failed event ($(cat "$JLOG"))"
+pass
+
+# 10c. HAPPY PATH stays unchanged: a readback that confirms the terminal type on the FIRST attempt
+#      needs no retry at all — one issueUpdate, no reconcile_transition_failed journal, DONE.
+: > "$GQLLOG"; : > "$JLOG"; : > "$IUCOUNT"
+happy="$(
+  cd "$T" && . "$BACKEND"
+  journal_append() { printf '%s\n' "$*" >> "$JLOG"; }
+  _linear_gql() {
+    printf 'QUERY<<%s>>VARS<<%s>>\n' "$1" "${2:-}" >> "$GQLLOG"
+    case "$1" in
+      (*issueUpdate*)
+        echo x >> "$IUCOUNT"
+        echo '{"data":{"issueUpdate":{"success":true}}}' ;;
+      (*"states(filter"*)
+        echo '{"data":{"issues":{"nodes":[{"id":"iss_7","identifier":"ENG-7","title":"t","team":{"states":{"nodes":[{"id":"state_done","name":"Done","position":1}]}}}]}}}' ;;
+      (*"issue(id:"*) echo '{"data":{"issue":{"state":{"type":"completed"}}}}' ;;
+      (*) echo '{"data":{}}' ;;
+    esac
+  }
+  _BACKEND_RESULT=""
+  _backend_update_state ENG-7 done
+  printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}"
+)"
+grep -q "RESULT=DONE" <<< "$happy" || fail "HERD-552: a confirmed-terminal readback on attempt 1 should still report DONE ($happy)"
+[ "$(wc -l < "$IUCOUNT" | tr -d ' ')" = "1" ] || fail "HERD-552: a clean transition must NOT retry ($(cat "$IUCOUNT" | wc -l) issueUpdate calls)"
+grep -q "^reconcile_transition_failed " "$JLOG" && fail "HERD-552: a clean transition must not journal reconcile_transition_failed ($(cat "$JLOG"))"
+pass
+
 echo "ALL PASS ($PASS checks)"
