@@ -789,7 +789,10 @@ RC=0
 # health workers pass HERD_HEALTH_PROVENANCE=watcher, so a watcher run can never be mistaken for the
 # builder-local evidence that justifies trusting it (trust always traces back to a real heavy suite).
 # Best-effort and silent: writing a record can never change this script's verdict or exit status.
-if [ "$MODE" = "heavy" ] && [ -z "$ONELINE" ]; then
+# $HEALTHCHECK_CMD must be non-empty too: with no project health command, run_heavy DELEGATES to
+# run_light (see run_heavy's first line), so MODE=heavy would otherwise stamp a heavy record on a run
+# that was only the syntax/lint gate. Record what actually ran, never what was asked for.
+if [ "$MODE" = "heavy" ] && [ -z "$ONELINE" ] && [ -n "$HEALTHCHECK_CMD" ]; then
   _hc_prov_outcome="CLEAN"
   if [ "$RC" -eq 1 ]; then
     _hc_prov_outcome="CODEERROR"

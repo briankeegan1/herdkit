@@ -248,6 +248,13 @@ env HERD_CONFIG_FILE="$T/no-such-config" HEALTHCHECK_CMD="$STUB" HEALTHCHECK_HEA
     HEALTH_TRUST_BUILDER=on bash "$HC" "$WT" --light >/dev/null 2>&1
 [ -z "$(find "$TREES" -name '.health-provenance-*' 2>/dev/null)" ] \
   || fail "(11) the LIGHT profile must never author a provenance record"
+# --heavy with NO project health command DELEGATES to the light gate — it must not stamp a heavy
+# record on a run that was only the syntax/lint pass.
+env HERD_CONFIG_FILE="$T/no-such-config" HEALTHCHECK_CMD="" HEALTHCHECK_HEAVY_GLOB="" \
+    DEFAULT_BRANCH="no-such-ref-for-tests" BASELINE_AWARE_GATE=off WORKTREES_DIR="$TREES" \
+    HEALTH_TRUST_BUILDER=on bash "$HC" "$WT" --heavy >/dev/null 2>&1
+[ -z "$(find "$TREES" -name '.health-provenance-*' 2>/dev/null)" ] \
+  || fail "(11) --heavy with no HEALTHCHECK_CMD (which delegates to light) must author no record"
 ok "(11) healthcheck.sh authors an honest heavy record (sha/profile/outcome/duration/provenance/tree_state); --oneline and --light author none"
 
 # ── (12) BYTE-IDENTICAL when off ───────────────────────────────────────────────────────────────────
