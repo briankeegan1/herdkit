@@ -199,6 +199,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # byte-inert until CLAIM_RELEASE is opted in.
 # shellcheck source=/dev/null
 . "$HERE/herd-claim.sh"
+# GATE_SCALE (HERD-542) — sourced for its builder-count primitive, _sg_count_inflight_builders (git
+# worktrees under WORKTREES_DIR). Reused AS-IS so the watcher's fleet-size input can never diverge
+# from the lane-side spawn advisory's own count. Sourcing DEFINES functions only (its own entry point,
+# herd_spawn_gate_saturated, is never called from here); safe to source in lib mode.
+# shellcheck source=/dev/null
+. "$HERE/herd-spawn-gate.sh"
 # SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531) — the shared provenance-record library, sourced for its
 # READ half (herd_health_trust_check), which the health dispatch below consults before running a full
 # suite. Sourcing DEFINES functions only; byte-inert until HEALTH_TRUST_BUILDER is opted in.
@@ -756,14 +762,84 @@ if [ "${AGENT_WATCH_LIB:-}" != "1" ]; then
   esac
 fi
 
+# ── GATE_SCALE (HERD-542) — auto-scale review/health concurrency with the LIVE fleet size ────────
+# Internal ratio + ceiling-fallback constants — NOT config keys. GATE_SCALE is the single lever this
+# feature adds; the formula's ratio and the unreadable-cores fallback are implementation details of
+# that one lever, not separate knobs. One review/health slot per 2 live builders (ceil(builders/2));
+# a box whose core count cannot be read gets a conservative ceiling of 4.
+_GATE_SCALE_RATIO_DEN=2
+_GATE_SCALE_CORES_FALLBACK=4
+
+# _gate_scale_enabled — true iff GATE_SCALE resolves to "on". Unknown/empty → off (fail-safe), so a
+# typo can never silently arm scaling.
+_gate_scale_enabled() { [ "${GATE_SCALE:-off}" = "on" ]; }
+
+# _gate_scale_cores — logical core count for the scaling ceiling. GATE_SCALE_CORES_OVERRIDE is an
+# internal TEST SEAM (never a capabilities.tsv key, never read by production) so hermetic tests get a
+# deterministic ceiling without depending on the box that happens to run them. Production path: nproc
+# (Linux), else sysctl -n hw.ncpu (macOS); unreadable/non-numeric → the built-in fallback.
+_gate_scale_cores() {
+  local n="${GATE_SCALE_CORES_OVERRIDE:-}"
+  if [ -z "$n" ]; then n="$(command -v nproc >/dev/null 2>&1 && nproc 2>/dev/null || true)"; fi
+  if [ -z "$n" ]; then n="$(command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu 2>/dev/null || true)"; fi
+  case "$n" in ''|*[!0-9]*) printf '%s' "$_GATE_SCALE_CORES_FALLBACK" ;; *) printf '%s' "$n" ;; esac
+}
+
+# _gate_scale_builders — live builder count, via herd-spawn-gate.sh's OWN source (git worktrees under
+# WORKTREES_DIR — _sg_count_inflight_builders). Reused, never reimplemented, so this can never diverge
+# from the lane-side spawn advisory's own count. Unreadable git/worktree state → 0 (fail-soft: a bogus
+# 0 only ever pulls the scaled value DOWN toward the floor, never up past a fabricated ceiling).
+_gate_scale_builders() {
+  type _sg_count_inflight_builders >/dev/null 2>&1 || { printf '0'; return 0; }
+  _sg_count_inflight_builders 2>/dev/null || printf '0'
+}
+
+# _gate_scale_derive <configured-floor> — echo the EFFECTIVE cap under GATE_SCALE=on:
+# clamp(floor, ceil(builders / _GATE_SCALE_RATIO_DEN), cores-derived ceiling). floor is NEVER lowered
+# — an explicit operator value stays the minimum even on a box whose core ceiling is smaller than it.
+_gate_scale_derive() {
+  local floor="$1" builders ceiling scaled
+  case "$floor" in ''|*[!0-9]*) printf '%s' "$floor"; return 0 ;; esac
+  builders="$(_gate_scale_builders)"
+  case "$builders" in ''|*[!0-9]*) builders=0 ;; esac
+  ceiling="$(_gate_scale_cores)"
+  scaled=$(( (builders + _GATE_SCALE_RATIO_DEN - 1) / _GATE_SCALE_RATIO_DEN ))   # ceil(builders/den)
+  [ "$scaled" -gt "$ceiling" ] && scaled="$ceiling"
+  [ "$scaled" -lt "$floor" ] && scaled="$floor"
+  printf '%s' "$scaled"
+}
+
+_GATE_SCALE_LAST_SIG=""
+# _gate_scale_journal_once <review> <health> <builders> — journal `gate_scale` only when this triple
+# CHANGES from the last journaled value (module-level, per process) — a steady fleet never spams the
+# journal on every ~4s tick.
+_gate_scale_journal_once() {
+  local sig="r=$1 h=$2 b=$3"
+  [ "$sig" = "$_GATE_SCALE_LAST_SIG" ] && return 0
+  _GATE_SCALE_LAST_SIG="$sig"
+  journal_append gate_scale review "$1" health "$2" builders "$3"
+}
+
 # ── HERD-159: live numeric / cosmetic resolvers (gate keys fail strict; cosmetic fail soft) ─────
 # herd_numeric / herd_enum live in herd-config.sh. These thin wrappers keep every call site on a
 # SAFE integer (or a known on/off token) while still honoring a mid-process export — hermetic tests
 # set HEALTH_CONCURRENCY / CODEMAP_AUTOREFRESH AFTER sourcing this file. Warnings fire once per key
 # via _herd_val_warn_once so a tick loop never spams stderr.
-_review_conc()  { herd_numeric REVIEW_CONCURRENCY 2 || true; }
+# GATE_SCALE=off (the ship default) is a strict pass-through to herd_numeric — byte-identical to
+# before this key existed. GATE_SCALE=on runs the configured value through _gate_scale_derive as a
+# FLOOR (never lowered). Feeds BOTH the console (via build_gate_scale_note) and the LIVE Python engine
+# core (herd_engine_live_tick passes these same two values as an explicit env override per tick).
+_review_conc()  {
+  local _rc_floor; _rc_floor="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+  _gate_scale_enabled || { printf '%s' "$_rc_floor"; return 0; }
+  _gate_scale_derive "$_rc_floor"
+}
 _spawn_ahead()  { herd_numeric SPAWN_AHEAD 1 || true; }
-_health_conc()  { herd_numeric HEALTH_CONCURRENCY 1 || true; }
+_health_conc()  {
+  local _hc_floor; _hc_floor="$(herd_numeric HEALTH_CONCURRENCY 1)" || true
+  _gate_scale_enabled || { printf '%s' "$_hc_floor"; return 0; }
+  _gate_scale_derive "$_hc_floor"
+}
 # CODEMAP_AUTOREFRESH is cosmetic (post-merge map refresh, never a gate). Unrecognized values fail
 # soft toward ACTIVE (default true) so a typo never freezes the maps.
 _codemap_auto() {
@@ -3020,6 +3096,12 @@ render() {
   # so the console is byte-identical to before when the margin is not crossed or the lever is dormant.
   if [ -n "${HEALTH_HEADROOM_NOTE:-}" ]; then
     frame="${frame}  ${C_DIM}health headroom${C_RESET}"$'\n'"${HEALTH_HEADROOM_NOTE}"$'\n'
+  fi
+  # GATE SCALE (HERD-542) — the derived review/health caps when GATE_SCALE=on has scaled a value past
+  # its configured floor. Empty whenever GATE_SCALE=off (default) or scaling never moved a value, so
+  # the console is byte-identical to before when the lever is dormant or inert this tick.
+  if [ -n "${GATE_SCALE_NOTE:-}" ]; then
+    frame="${frame}  ${C_DIM}gate scale${C_RESET}"$'\n'"${GATE_SCALE_NOTE}"$'\n'
   fi
   # OPERATOR INBOX (HERD-184) — cross-seat comments needing the coordinator, just above the in-flight
   # rows (needs-you-adjacent). Empty unless OPERATOR_INBOX is on AND a comment has been surfaced, so
@@ -5619,9 +5701,10 @@ _effective_health_pane() {
 _health_pane_registry_file() { printf '%s' "$TREES/.health-pane-registry-$1-$2"; }
 
 # _spawn_health_pane <pr#> <slug> <sha> <worktree-dir> — stand up the disposable `health·<slug>` view
-# pane for an in-flight suite, ONCE. Called from the render pass while a suite is genuinely in flight
-# (a live inflight marker), so it rides the same signal leg (b)'s row does — and works identically
-# whether the bash gate or the Python engine is running the suite. Self-gating + idempotent + fail-soft:
+# pane for an in-flight suite, ONCE. A PRIMITIVE: the only caller is the per-tick reconcile below, which
+# decides from the OBSERVED inflight marker — never from a dispatch event — so it rides the same signal
+# leg (b)'s row does and works identically whether the bash gate or the Python engine ran the suite.
+# Self-gating + idempotent + fail-soft:
 #   • HEALTH_PANE off / dry-run / headless (no panes) / herdr absent → returns 0 having done NOTHING.
 #   • a registry row already present for this (pr,sha) → returns 0 (one pane per suite).
 # The pane runs `tail -F` of the sha-scoped health log the worker streams into (leg b's TEE), stamped
@@ -5673,14 +5756,74 @@ _retire_health_pane() {
   rm -f "$_rhp_reg" 2>/dev/null || true
 }
 
-# _reconcile_health_panes — retire every disposable health pane whose suite has ENDED, EVERY tick,
-# whoever ran (or killed) the suite. Byte-quiet on a seat with no health-pane rows — the overwhelming
-# common case, and the whole of the HEALTH_PANE=off default (spawn never wrote a row). A pane is kept
-# ONLY while its (pr,sha) inflight marker is still pid-live; the instant the suite finishes, is
-# collected, or its worker dies, the marker stops being live and the pane is retired. Dry-run-inert.
+# _health_pane_slug_dir <pr#> — echo "<slug>\t<dir>" for the builder worktree THIS TICK'S DISCOVERY PASS
+# matched to <pr#>, or return 1 when no worktree row claims it. The source is $FEATS — the very records
+# every console row is rendered from (`git worktree list` ⋈ the PR JSON, see _discover_feature_worktrees),
+# so a pane's identity is derived from OBSERVED state and never from whoever dispatched the suite. Unset
+# $FEATS (lib-mode callers, a sim harness) is an EMPTY index, not an error: returns 1, byte-quiet.
+_health_pane_slug_dir() {
+  local _hps_pr="${1:-}" _hps_rec _hps_dir _hps_slug _hps_branch _hps_prnum _hps_rest
+  [ -n "$_hps_pr" ] || return 1
+  for _hps_rec in ${FEATS[@]+"${FEATS[@]}"}; do
+    IFS=$'\037' read -r _hps_dir _hps_slug _hps_branch _hps_prnum _hps_rest <<EOF
+$_hps_rec
+EOF
+    [ "${_hps_prnum:-}" = "$_hps_pr" ] || continue
+    [ -n "${_hps_slug:-}" ] && [ -n "${_hps_dir:-}" ] || continue
+    printf '%s\t%s' "$_hps_slug" "$_hps_dir"
+    return 0
+  done
+  return 1
+}
+
+# _reconcile_health_panes — THE per-tick RECONCILED INVARIANT for the disposable health panes (HERD-554):
+# "one `health·<slug>` pane per OBSERVED in-flight suite, and none for a suite that has ended", asserted
+# fresh EVERY bash render tick against the marker files themselves — never as a side-effect of a dispatch
+# event (multi-seat rule 1). Both directions, in one pass:
+#
+#   live suite, no pane   → stand one up streaming its sha-scoped log (via the _spawn_health_pane
+#                           primitive above);
+#   pane, suite ended     → retire it through the existing guarded-close path.
+#
+# The CREATE half is what makes this ENGINE-AGNOSTIC. It used to hang off the bash render pass's
+# automerge-candidate branch (agent-watch.sh's `_gate_health_inflight && _spawn_health_pane` hook), which
+# is only ever reached for a CLEAN candidate this seat is about to merge — so under ENGINE_IMPL=python,
+# where pysrc/herd/live_runtime.py dispatches the suite and the PR sits BLOCKED-but-unblessed (or held)
+# while it runs, HEALTH_PANE=on was silently inert: no pane ever appeared. Keying off `.health-inflight-*`
+# instead means ANY writer of that marker — the bash gate, the Python engine, a second seat — gets a pane
+# by construction, and the two halves can never disagree about which suite is live because they read the
+# same file (_health_pid_live, the same predicate the console's running row uses).
+#
+# Contracts held: HEALTH_PANE=off (the ship default) is a HARD no-op — the create half is skipped whole,
+# spawn never wrote a row, so the retire half walks an empty glob. Dry-run, headless, and herdr-absent
+# are inert through the primitives. Byte-quiet on a seat with no live suites and no rows — the
+# overwhelming common case. Idempotent: a registry row already present for a (pr,sha) is left alone.
 _reconcile_health_panes() {
   [ -z "${DRYRUN:-}" ] || return 0
-  local _rcp_f _rcp_base _rcp_rest _rcp_pr _rcp_sha _rcp_inf
+  local _rcp_f _rcp_base _rcp_rest _rcp_pr _rcp_sha _rcp_inf _rcp_id _rcp_slug _rcp_dir
+
+  # (a) CREATE — gated on the lever FIRST so `off` costs not even a glob walk.
+  if [ "$(_effective_health_pane)" = on ]; then
+    for _rcp_f in "$TREES"/.health-inflight-*; do
+      [ -e "$_rcp_f" ] || continue
+      _rcp_base="${_rcp_f##*/}"; _rcp_rest="${_rcp_base#.health-inflight-}"
+      _rcp_pr="${_rcp_rest%-*}"; _rcp_sha="${_rcp_rest##*-}"
+      # PR-keyed suites ONLY. The `main-<sha>` MAIN_HEALTH_TICK rail has no builder worktree and no
+      # slug, so it gets no `health·<slug>` pane — same as before this half existed.
+      case "$_rcp_pr" in ''|*[!0-9]*) continue ;; esac
+      [ -n "$_rcp_sha" ] || continue
+      [ -f "$(_health_pane_registry_file "$_rcp_pr" "$_rcp_sha")" ] && continue
+      # A dead / recycled-pid / expired marker is NOT a live suite (HERD-451 identity, not existence):
+      # never stand a pane up over a corpse.
+      _health_pid_live "$_rcp_f" || continue
+      _rcp_id="$(_health_pane_slug_dir "$_rcp_pr")" || continue
+      IFS=$'\t' read -r _rcp_slug _rcp_dir <<< "$_rcp_id"
+      _spawn_health_pane "$_rcp_pr" "$_rcp_slug" "$_rcp_sha" "$_rcp_dir"
+    done
+  fi
+
+  # (b) RETIRE — a pane is kept ONLY while its (pr,sha) inflight marker is still pid-live; the instant
+  # the suite finishes, is collected, or its worker dies, the marker stops being live and it is retired.
   for _rcp_f in "$TREES"/.health-pane-registry-*; do
     [ -e "$_rcp_f" ] || continue
     _rcp_base="${_rcp_f##*/}"; _rcp_rest="${_rcp_base#.health-pane-registry-}"
@@ -14275,6 +14418,27 @@ build_health_headroom_note() {
   fi
 }
 
+# build_gate_scale_note — GATE_SCALE (HERD-542) console row + once-per-change journal line. Derives
+# the effective review/health caps EXACTLY as _review_conc / _health_conc do (same floor + same
+# _gate_scale_derive), so the row on screen is provably the values the gate itself is using this tick
+# — never a separately-computed display number that could drift from the real one. Journals
+# `gate_scale review=N health=M builders=K` only when that triple changes. Renders a "scaled" row only
+# when scaling actually raised a value past its configured floor. Empty (byte-identical console, no
+# journal call) whenever GATE_SCALE=off — the ship default.
+build_gate_scale_note() {
+  GATE_SCALE_NOTE=""
+  _gate_scale_enabled || return 0
+  local _gsn_floor_r _gsn_floor_h _gsn_eff_r _gsn_eff_h _gsn_builders
+  _gsn_floor_r="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+  _gsn_floor_h="$(herd_numeric HEALTH_CONCURRENCY 1)" || true
+  _gsn_eff_r="$(_gate_scale_derive "$_gsn_floor_r")"
+  _gsn_eff_h="$(_gate_scale_derive "$_gsn_floor_h")"
+  _gsn_builders="$(_gate_scale_builders)"
+  _gate_scale_journal_once "$_gsn_eff_r" "$_gsn_eff_h" "$_gsn_builders"
+  { [ "$_gsn_eff_r" = "$_gsn_floor_r" ] && [ "$_gsn_eff_h" = "$_gsn_floor_h" ]; } && return 0
+  GATE_SCALE_NOTE="    ${C_DIM}review=${_gsn_eff_r} health=${_gsn_eff_h} · scaled${C_RESET} ${C_DIM}(builders=${_gsn_builders}, floor review=${_gsn_floor_r} health=${_gsn_floor_h})${C_RESET}"$'\n'
+}
+
 # _health_fail_detail <log> — the ONE line that best names why this suite failed. Every caller used to
 # fall back to `sed -n 1p` when the log carried no TAP 'not ok', which quotes healthcheck.sh's own
 # CLASSIFIER BANNER ("❌ CODE ERROR") — true, but content-free: it names no test, no file, no reason
@@ -14367,7 +14531,13 @@ _health_progress() {
 # Pure read of the tailable log the health worker (bash or the Python engine) streams into; no state
 # mutation, so the render half can call it every tick.
 _health_inflight_note() {
-  local _hin_log="$1" _hin_prog _hin_src
+  local _hin_log="$1" _hin_prog _hin_src _hin_es
+  # HERD-546: an env-suspect marker (written by _health_worker before its solo re-run) takes
+  # precedence over the ordinary TAP/byte-count liveness clause — the operator sees WHY a run that
+  # already failed once is still in flight, not just that it is. Empty (byte-inert) whenever
+  # ENV_SUSPECT_TIMEOUT never fired for this run.
+  _hin_es="$(_health_env_suspect_marker "$_hin_log")"
+  if [ -n "$_hin_es" ]; then printf '%s' "$_hin_es"; return 0; fi
   _hin_prog="$(_health_progress "$_hin_log")"
   if [ -n "$_hin_prog" ]; then printf '%s' "$_hin_prog"; return 0; fi
   _hin_src="$(_health_progress_source "$_hin_log")"
@@ -14398,9 +14568,9 @@ _health_running_row() {
 # resolve), but on an operator's console it reads as a stop. The reviewer leg was invisible on BOTH
 # gate branches, so a ~4-minute adversarial review rendered as a frozen placeholder.
 
-# _gate_health_inflight <pr#> <sha> — true iff a health worker is live for this exact (pr,sha). The one
-# predicate behind both the running row and the HERD-313 health-pane spawn, so the pane can never be
-# stood up for a suite the row does not show (or vice versa).
+# _gate_health_inflight <pr#> <sha> — true iff a health worker is live for this exact (pr,sha). Shares
+# its liveness predicate (_health_pid_live over the sha-scoped marker) with the HERD-554 health-pane
+# reconcile, so a pane can never be stood up for a suite the console row does not show (or vice versa).
 _gate_health_inflight() {
   [ -n "${2:-}" ] || return 1
   _health_pid_live "$(_health_inflight_file "${1}-${2}")"
@@ -14786,6 +14956,105 @@ EOF
   printf '^(%s)$' "$_hbf_alt"
 }
 
+# ── ENV-SUSPECT TIMEOUT CLASSIFICATION (HERD-546, HERD-539 leg 3) ──────────────────────────────────
+# A per-test TIMEOUT is a routine box-load symptom (a slow/contended runner tipping a marginal test
+# past its cap — the exact shape .herd/healthcheck.project.sh's own HERD-462 single-target tolerance
+# was written for), not a code bug. Before this, ANY run-1 failure — timeout included — rendered as a
+# bare "health-check · running" row while its solo retry (HERD-498's existing retry-before-red, below,
+# UNCHANGED) played out silently, so an operator watching the console had no way to tell "this might
+# just be load" from "this is a real red pending confirmation". ENV_SUSPECT_TIMEOUT=on (default off,
+# ship-dormant) makes that distinction visible: when run 1's failure is a per-test timeout AND this
+# box looks contended right now (loadavg1m >= HEALTH_LOAD_THRESHOLD, OR another HERD-529 local-suite
+# slot is live), the running row reads 'env-suspect · timeout under load · solo re-run queued' and the
+# shared red-ledger (HERD-539/PR #670's established <key>\t<class>\t<first-seen>\t<last-verified>\t
+# <why> row shape) gets a durable note. The retry-before-red VERDICT LOGIC below is not touched by any
+# of this: a solo pass still clears (FLAKY), a solo fail still reds (CODEERROR) — this only changes
+# what a still-pending retry renders and what gets journaled while it is in flight. off (default) →
+# byte-inert: no marker line, no ledger note, no journal event, the running row is unchanged.
+_env_suspect_enabled() {
+  case "$(printf '%s' "${ENV_SUSPECT_TIMEOUT:-off}" | tr '[:upper:]' '[:lower:]')" in
+    on|true|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _health_timeout_detail <text> — the matched line/fragment if <text> names a per-test TIMEOUT, empty
+# otherwise. Recognizes both TIMEOUT conventions the engine already produces/reads elsewhere: bats'
+# own TAP "# timeout after Ns" suffix (.herd/healthcheck.project.sh's _hk_bats_timeout_only,
+# BATS_TEST_TIMEOUT-driven) and scripts/ci/run-suite.sh's per-test-cap-ledger (HERD-478) "(TIMEOUT
+# after Ns)" suffix (what _main_health_ci_log_identity's "✗ <test>" lines carry) — so this reads true
+# regardless of which runner produced the failing detail.
+_health_timeout_detail() {
+  grep -m1 -E '# timeout after [0-9]+s|\(TIMEOUT after [0-9]+s\)' <<< "${1:-}" 2>/dev/null
+}
+
+# _health_loadavg_1m — the 1-minute load average, cross-platform (Linux /proc/loadavg; macOS/BSD
+# `sysctl -n vm.loadavg`), or empty when neither source is readable — callers treat empty as "unknown,
+# don't judge on it" (fail-soft), never as zero. HERD_FAKE_LOADAVG is a TEST SEAM (mirrors
+# HERD_FAKE_NOW/HERD_PID_STARTTIME_CMD) so a hermetic fixture can pin a value without the real box.
+_health_loadavg_1m() {
+  [ -n "${HERD_FAKE_LOADAVG:-}" ] && { printf '%s' "$HERD_FAKE_LOADAVG"; return 0; }
+  if [ -r /proc/loadavg ]; then
+    awk '{print $1}' /proc/loadavg 2>/dev/null
+    return 0
+  fi
+  if command -v sysctl >/dev/null 2>&1; then
+    sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}'
+    return 0
+  fi
+  return 0
+}
+
+# _health_sibling_suites_live — count of OTHER live cross-worktree local-suite slots right now
+# (HERD-529's `.local-suite-slot-*` pool under $TREES, the SAME pool healthcheck.sh's own
+# LOCAL_SUITE_CONCURRENCY acquire path writes into) — a heavy suite this box is ALSO running
+# concurrently with the one that just timed out. A lightweight pid-liveness read (kill -0), not the
+# full recycling-safe pid+start-time match healthcheck.sh's own _lss_marker_live uses for its
+# slot-GRANT decision — this is a display/classification heuristic, never a grant, so a rare
+# false-positive from a just-recycled pid only costs a mislabeled render, never a wrong gate outcome.
+_health_sibling_suites_live() {
+  local _hsl_n=0 _hsl_f _hsl_pid
+  { [ -n "${TREES:-}" ] && [ -d "$TREES" ]; } || { printf '0'; return 0; }
+  for _hsl_f in "$TREES"/.local-suite-slot-*; do
+    [ -e "$_hsl_f" ] || continue
+    case "$_hsl_f" in *.lock) continue ;; esac
+    _hsl_pid="$(sed -n '1p' "$_hsl_f" 2>/dev/null)"
+    case "$_hsl_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$_hsl_pid" 2>/dev/null && _hsl_n=$((_hsl_n + 1))
+  done
+  printf '%s' "$_hsl_n"
+}
+
+# _health_load_high — true iff ENV_SUSPECT_TIMEOUT is on AND this box looks contended right now:
+# loadavg1m at/over HEALTH_LOAD_THRESHOLD (default 4), OR another HERD-529 local-suite slot is live.
+# Ship-dormant: always false while ENV_SUSPECT_TIMEOUT=off (default), so a timeout classifies exactly
+# as any other code error whenever this lever is untouched.
+_health_load_high() {
+  _env_suspect_enabled || return 1
+  local _hlh_load _hlh_threshold _hlh_siblings
+  _hlh_threshold="$(herd_numeric HEALTH_LOAD_THRESHOLD 4)"
+  case "$_hlh_threshold" in ''|*[!0-9]*) _hlh_threshold=4 ;; esac
+  _hlh_load="$(_health_loadavg_1m)"
+  case "$_hlh_load" in
+    ''|*[!0-9.]*) : ;;
+    *) awk -v l="$_hlh_load" -v t="$_hlh_threshold" 'BEGIN{exit !(l+0>=t+0)}' </dev/null && return 0 ;;
+  esac
+  _hlh_siblings="$(_health_sibling_suites_live)"
+  case "$_hlh_siblings" in ''|*[!0-9]*) _hlh_siblings=0 ;; esac
+  [ "$_hlh_siblings" -ge 1 ]
+}
+
+# _health_env_suspect_marker <log> — the fixed render fragment _health_worker appends to the live log
+# the moment it classifies run 1 as env-suspect, or empty when no such marker line is present. Read
+# back by _health_inflight_note so the "health-check · running" row can show it while the solo retry
+# (queued right after this marker is written) is still in flight.
+_HEALTH_ENV_SUSPECT_TEXT="env-suspect · timeout under load · solo re-run queued"
+_health_env_suspect_marker() {
+  [ -s "${1:-}" ] || return 0
+  grep -qm1 -F "[env-suspect] $_HEALTH_ENV_SUSPECT_TEXT" "$1" 2>/dev/null || return 0
+  printf '%s' "$_HEALTH_ENV_SUSPECT_TEXT"
+}
+
 # record_healthcheck <pr#> <slug> <attempt> <outcome> [failed-identity] — append one attempt to the
 # ledger. When the outcome is a code error, [failed-identity] carries WHICH test/step failed (from
 # _health_fail_identity) and is journaled as failed=<id> so a later FLAKY-collapsed offender is still
@@ -14840,6 +15109,7 @@ record_healthcheck() {
 _health_worker() {
   local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_profile="${4:-}"
   local _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line _hw_filter
+  local _hw_es_key="" _hw_es_timeout=""
   local _hw_args=("$_hw_dir")
   [ -n "$_hw_profile" ] && _hw_args+=("$_hw_profile")
   # BASELINE-AWARE GATE (HERD-190): hand healthcheck.sh the base checkout ($MAIN, the default-branch
@@ -14862,6 +15132,19 @@ _health_worker() {
   else
     _hw_notok="$(_health_fail_detail "$_hw_log")"; [ -n "$_hw_notok" ] || _hw_notok="$_hw_first"
     _hw_id="$(_health_fail_identity "$_hw_notok")"
+    # HERD-546 (HERD-539 leg 3): a per-test TIMEOUT observed while this box is under load is
+    # env-suspect, not a bare code red — note it into the shared red-ledger (PR #670's established
+    # row shape) and mark the live log so the running row below renders the queued solo re-run
+    # honestly, BEFORE that retry runs. The retry-before-red logic immediately below is UNCHANGED
+    # either way — this only changes what a still-pending retry renders and what gets journaled.
+    _hw_es_timeout="$(_health_timeout_detail "$_hw_notok")"
+    if [ -n "$_hw_es_timeout" ] && _health_load_high; then
+      _hw_es_key="env_suspect:$(basename "$_hw_dir")"
+      herd_red_ledger_note "$RED_LEDGER_FILE" "$_hw_es_key" env_suspect \
+        "timeout under load · solo re-run queued — ${_hw_es_timeout}"
+      printf '[env-suspect] %s\n' "$_HEALTH_ENV_SUSPECT_TEXT" >> "$_hw_log" 2>/dev/null || true
+      journal_append health_env_suspect dir "$(basename "$_hw_dir")" detail "$_hw_es_timeout"
+    fi
     # RETRY-BEFORE-RED (solo): re-run once into a sibling log, keeping the LATEST run as the live log.
     # Baseline-aware on the retry too (HERD-190), so an inherited-only failure still collapses to rc 0.
     # HERD-498: when run 1's failure carries a bats TAP identity, target the retry at EXACTLY that
@@ -14882,6 +15165,8 @@ _health_worker() {
     if [ "$_hw_rc2" -eq 0 ]; then
       rm -f "$_hw_log.retry" 2>/dev/null || true                 # transient — the passing retry is the truth
       _hw_line="FLAKY"$'\t'"$_hw_id"
+      # HERD-546: solo pass clears the env-suspect diagnosis too — no-op unless a row was actually noted.
+      [ -n "$_hw_es_key" ] && herd_red_ledger_clear "$RED_LEDGER_FILE" "$_hw_es_key" reverified
     else
       mv "$_hw_log.retry" "$_hw_log" 2>/dev/null || true         # the reproduced failure is the live log
       _hw_detail="$(_health_leak_guard_line "$_hw_log")"
@@ -14892,6 +15177,11 @@ _health_worker() {
       # keep the detail single-line + bounded so the "<verdict>\t<detail>" contract can't be broken.
       _hw_detail="$(printf '%s' "$_hw_detail" | tr '\t\n' '  ')"; _hw_detail="${_hw_detail:0:200}"
       _hw_line="CODEERROR"$'\t'"$_hw_detail"
+      # HERD-546: only a solo-run failure becomes a code red — the ledger note survives, refreshed to
+      # say so, as the diagnostic trail behind the now-ordinary CODEERROR row (byte-identical console:
+      # this is a ledger-only write, never a second row).
+      [ -n "$_hw_es_key" ] && herd_red_ledger_note "$RED_LEDGER_FILE" "$_hw_es_key" env_suspect \
+        "timeout under load · solo re-run also failed — ${_hw_detail}"
     fi
   fi
   printf '%s\n' "$_hw_line" > "$_hw_out.tmp.$$" 2>/dev/null && mv "$_hw_out.tmp.$$" "$_hw_out" 2>/dev/null || true
@@ -16212,6 +16502,7 @@ _tick_render_reconcile() {
   build_watcher_singleton      # HERD-450: the duplicate-watcher / lock-drift row (empty unless violated)
   build_sweep_note
   build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
+  build_gate_scale_note       # HERD-542: derived review/health caps when GATE_SCALE=on has scaled them
 
   # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
   # claim "awaiting task"). On success, apply the configured watcher view (lens + filters). The view
@@ -16541,9 +16832,12 @@ EOF
           # HERD-453: one shared phase row — a live suite, a live reviewer, else today's placeholder.
           DISPLAY[i]="$(_gate_phase_row "$sl" "$pn" "$prnum" "$headsha" \
             "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}")"
-          # HERD-313 leg (a): stand up the disposable health·<slug> WATCH pane (once). Self-gating on
-          # HEALTH_PANE (off default ⇒ no-op), idempotent, fail-soft — never touches the row above.
-          _gate_health_inflight "$prnum" "$headsha" && _spawn_health_pane "$prnum" "$slug" "$headsha" "$dir"
+          # HERD-554: the disposable health·<slug> WATCH pane used to be stood up from HERE, on this one
+          # automerge-candidate branch — which is only ever reached for a CLEAN candidate this seat is
+          # about to merge. Under ENGINE_IMPL=python the suite is dispatched by live_runtime.py while the
+          # PR sits BLOCKED-but-unblessed (the `else` branch below) or held, so HEALTH_PANE=on never
+          # produced a pane at all. The spawn now lives in _reconcile_health_panes, keyed off the OBSERVED
+          # `.health-inflight-*` marker, so every engine gets a pane by construction.
         else
           # BLOCKED-but-unblessed: the gate cycle is what CLEARS this state, so name the phase it is
           # actually in and say what is awaited, rather than shouting GitHub's mergeStateStatus token.
@@ -16755,9 +17049,12 @@ EOF
   # Byte-inert unless RESOLVER_PANE=on (no rows exist to reconcile).
   _reconcile_resolver_panes
 
-  # Health-pane reconcile (HERD-313 leg a): retire the disposable `health·<slug>` view pane of every
-  # suite that has ENDED, whoever ran it (mirrors the resolver-pane reconcile above). Byte-inert unless
-  # HEALTH_PANE=on left rows to reconcile — under the ship default there are none, so this does nothing.
+  # Health-pane reconcile (HERD-313 leg a, made a full invariant in HERD-554): assert BOTH directions of
+  # "one disposable `health·<slug>` view pane per OBSERVED in-flight suite" — stand one up for a live
+  # suite that has none (whichever engine dispatched it), retire the pane of every suite that has ENDED
+  # (whoever ran it). Mirrors the resolver-pane reconcile above, and reads the same `.health-inflight-*`
+  # markers the console's own running row does. Byte-inert unless HEALTH_PANE=on — under the ship default
+  # the create half is skipped whole and no rows exist to retire, so this does nothing.
   _reconcile_health_panes
 
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.

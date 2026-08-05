@@ -3120,24 +3120,60 @@ _config_reload_timeout() {
 # A pure-shell watchdog rather than coreutils `timeout`, because the thing being bounded is a SHELL
 # FUNCTION in this process's own scope, not an executable: re-invoking `herd reload` as a child under
 # `timeout` would fork a second engine process with its own config resolution. On expiry we SIGTERM the
-# reload subshell AND its direct children — the hang is normally in a child (`herdr …`), and bash defers
-# a subshell's SIGTERM until its foreground child returns, so signalling only the subshell would leave
-# both alive. SIGKILL follows for anything that ignored it. Every kill/wait is guarded so the watchdog
-# can never abort this `set -euo pipefail` caller.
+# reload — the hang is normally in a CHILD (`herdr …`), and bash defers a subshell's SIGTERM until its
+# foreground child returns, so signalling only the subshell would leave both alive. SIGKILL follows for
+# anything that ignored it. Every kill/wait is guarded so the watchdog can never abort this
+# `set -euo pipefail` caller.
+#
+# WHAT GETS SIGNALLED — the whole SUBTREE, via its process GROUP (HERD-540). The reap used to be
+# "$pid plus `pgrep -P $pid`", i.e. the subshell and its DIRECT children only, which is one level too
+# shallow: `herdr` is a wrapper whose own child makes the blocking call, so the grandchild outlived
+# the bound as an orphan — and, still holding the `$(herdr workspace list)` command-substitution pipe
+# open, it blocked whatever had captured this command's output for its full lifetime. Live symptom
+# (HERD-538): an intermittent ~1-in-30 120s main-health timeout on test-config-set-watcher-skip.sh,
+# long after the 1s-bounded command itself had returned.
+#
+# So the reload is forked into its OWN PROCESS GROUP and the GROUP is signalled — the idiom
+# agent-watch.sh already uses to bound its health workers (_bg_health_worker / _health_terminate_worker,
+# HERD-283): monitor mode around the single fork makes the backgrounded subshell a process-group leader
+# (pgid == pid), and `set +m` as its first act keeps its whole subtree in that one group instead of
+# letting an inherited -m give some descendant a group of its own. Depth no longer matters — including
+# for the headless-watcher fallback cmd_reload may background just before it wedges, which the shallow
+# reap left running: a reload stopped at its bound must not leave half a control room behind, and the
+# warning the caller prints already tells the operator to re-run `herd reload` by hand.
+#
+# Deliberately NOT copied from _bg_health_worker: the `disown` (this watchdog must still `wait` for
+# cmd_reload's own exit status, and a disowned job is no longer waitable) and the stdio detach
+# (`herd reload` narrates to the operator's terminal — that output is the unchanged part of this
+# surface). The job-control notice bash prints when a backgrounded job is signalled is unchanged too:
+# it is emitted on the pre-HERD-540 single-pid kill exactly the same way.
+#
+# FAIL-SOFT: the isolation is VERIFIED before it is used — the recorded group must be the fork's own
+# (pgid == pid) and must never be this process's group — and if it did not take we fall back to the
+# pre-HERD-540 pid + direct-children sweep rather than risk aiming a group signal at the caller.
 _config_bounded_reload() {
   local secs; secs="$(_config_reload_timeout)"
   local rc=0
   [ "$secs" -eq 0 ] && { cmd_reload || rc=$?; return "$rc"; }
-  cmd_reload &
-  local pid=$! waited=0 kid
+  local had_m=0; case "$-" in *m*) had_m=1 ;; esac
+  set -m
+  { set +m; cmd_reload; } &
+  local pid=$! waited=0 kid pgid selfpg target
+  [ "$had_m" -eq 1 ] || set +m
+  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  selfpg="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d '[:space:]')"
+  target="$pid"
+  { [ -n "$pgid" ] && [ "$pgid" = "$pid" ] && [ "$pgid" != "$selfpg" ]; } && target="-$pgid"
   while kill -0 "$pid" 2>/dev/null; do
     if [ "$waited" -ge "$secs" ]; then
-      kill -TERM "$pid" 2>/dev/null || true
-      while IFS= read -r kid; do
-        [ -n "$kid" ] && kill -TERM "$kid" 2>/dev/null || true
-      done < <(pgrep -P "$pid" 2>/dev/null || true)
+      kill -TERM "$target" 2>/dev/null || true
+      if [ "$target" = "$pid" ]; then
+        while IFS= read -r kid; do
+          [ -n "$kid" ] && kill -TERM "$kid" 2>/dev/null || true
+        done < <(pgrep -P "$pid" 2>/dev/null || true)
+      fi
       sleep 2
-      kill -KILL "$pid" 2>/dev/null || true
+      kill -KILL "$target" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
       return 124
     fi

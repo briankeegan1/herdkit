@@ -374,6 +374,8 @@ RED_LEDGER	unit	tests/test-main-health-invariant.sh
 RED_ROW_RECHECK_MINS	unit	tests/test-ref-unparsed-reverify.sh
 red-ledger.sh	unit	tests/test-red-auto-escalate.sh
 RED_AUTOESCALATE	unit	tests/test-red-auto-escalate.sh
+ENV_SUSPECT_TIMEOUT	unit	tests/test-health-env-suspect.sh
+HEALTH_LOAD_THRESHOLD	unit	tests/test-health-env-suspect.sh
 AGING_PR_TTL	unit	tests/test-aging-pr-alarm.sh
 aging-pr.sh	unit	tests/test-aging-pr-alarm.sh
 MAIN_HEALTH_AUTOFIX	unit	tests/test-main-health-invariant.sh
@@ -510,3 +512,4 @@ RESOLVE_CLAIM_TTL	unit	tests/test-resolver-claim.sh
 ANOMALY_BASELINES	unit	tests/test-phase-anomaly-baselines.sh
 ANOMALY_BASELINES	unit	tests/test_store.py
 ANOMALY_FILE_COOLDOWN_SECS	unit	tests/test-phase-anomaly-suspend-skip.sh
+GATE_SCALE	sim	tests/test-gate-scale.sh

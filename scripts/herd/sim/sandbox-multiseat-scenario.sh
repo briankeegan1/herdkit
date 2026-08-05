@@ -136,6 +136,42 @@ cat > "$BIN/gh" <<'GH'
 # Shared multi-seat stub remote. Seat identity rides HERD_SIM_SEAT (set by each seat runner).
 seat="${HERD_SIM_SEAT:-?}"
 S="${SANDBOX_SHARED:?}"
+# ── -q/--jq filter (HERD-528) ──────────────────────────────────────────────────
+# Reads a JSON doc on stdin, prints the bare filtered value for $1 (a -q/--jq expression). Passes
+# through to the real jq when installed; else a minimal python3 extractor for the handful of
+# expression shapes this stub's own callers actually pass (a one-level '.field' path, and the
+# '[.[] | select(.context=="X")][0].state' list shape _gate_status_blessed uses). Unknown shapes
+# print nothing rather than guessing.
+_jqf() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -r "$1" 2>/dev/null
+    return
+  fi
+  python3 - "$1" <<'PY'
+import json, re, sys
+expr = sys.argv[1]
+data = json.load(sys.stdin)
+m = re.fullmatch(r'\[\.\[\] \| select\(\.context=="([^"]*)"\)\]\[0\]\.state', expr)
+if m:
+    hits = [e for e in data if e.get("context") == m.group(1)]
+    print(hits[0].get("state", "") if hits else "")
+    sys.exit(0)
+m = re.fullmatch(r"\.([A-Za-z_][A-Za-z0-9_]*)", expr)
+if m:
+    v = data.get(m.group(1), "")
+    print(v if isinstance(v, str) else json.dumps(v))
+    sys.exit(0)
+print("")
+PY
+}
+# _gh_argv_flag <argv...> — echoes the value following the first -q or --jq in argv, empty if absent.
+_gh_argv_flag() {
+  local prev=""
+  for a in "$@"; do
+    case "$prev" in -q|--jq) printf '%s' "$a"; return 0 ;; esac
+    prev="$a"
+  done
+}
 # ── pr merge ──────────────────────────────────────────────────────────────────
 if [ "${1:-}" = "pr" ] && [ "${2:-}" = "merge" ]; then
   pr="${3:-?}"
@@ -175,10 +211,12 @@ fi
 # ── pr view ───────────────────────────────────────────────────────────────────
 if [ "${1:-}" = "pr" ] && [ "${2:-}" = "view" ]; then
   pr="${3:-}"
+  jqexpr="$(_gh_argv_flag "$@")"
   # Find the PR row.
   row="$(awk -v p="$pr" -F'\t' '$1==p{print; exit}' "$S/prs.tsv" 2>/dev/null || true)"
   if [ -z "$row" ]; then
-    printf '{"state":"OPEN","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefName":"","headRefOid":"","author":{"login":"?"},"body":"","comments":[]}\n'
+    doc='{"state":"OPEN","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","headRefName":"","headRefOid":"","author":{"login":"?"},"body":"","comments":[]}'
+    if [ -n "$jqexpr" ]; then printf '%s' "$doc" | _jqf "$jqexpr"; else printf '%s\n' "$doc"; fi
     exit 0
   fi
   state="$(printf '%s' "$row" | cut -f2)"
@@ -197,10 +235,11 @@ if [ "${1:-}" = "pr" ] && [ "${2:-}" = "view" ]; then
     END { if (n) printf "\n" }
   ' "$S/comments.log" 2>/dev/null || true)"
   [ -n "$comments_json" ] || comments_json=""
-  printf '{"state":"%s","mergedAt":%s,"mergeable":"%s","mergeStateStatus":"%s","headRefName":"%s","headRefOid":"%s","author":{"login":"%s"},"body":"Refs: HERD-236","comments":[%s]}\n' \
+  doc="$(printf '{"state":"%s","mergedAt":%s,"mergeable":"%s","mergeStateStatus":"%s","headRefName":"%s","headRefOid":"%s","author":{"login":"%s"},"body":"Refs: HERD-236","comments":[%s]}' \
     "$state" \
     "$([ "$state" = "MERGED" ] && echo '"2020-01-01T00:00:00Z"' || echo null)" \
-    "$mergeable" "$mstate" "$branch" "$sha" "$author" "$comments_json"
+    "$mergeable" "$mstate" "$branch" "$sha" "$author" "$comments_json")"
+  if [ -n "$jqexpr" ]; then printf '%s' "$doc" | _jqf "$jqexpr"; else printf '%s\n' "$doc"; fi
   exit 0
 fi
 # ── pr list ───────────────────────────────────────────────────────────────────
@@ -298,17 +337,9 @@ case "$url" in
   */commits/*/statuses)
     # GET statuses for a sha. Path: repos/{owner}/{repo}/commits/<sha>/statuses
     sha="$(printf '%s' "$url" | sed -E 's|.*/commits/([^/]+)/statuses.*|\1|')"
-    # Newest-first JSON array of {state, context, creator.login}
-    printf '['
-    first=1
-    # Print matching rows in reverse (newest last in file → reverse for newest-first)
-    tac "$S/statuses.log" 2>/dev/null | while IFS=$'\t' read -r s state context creator; do
-      [ "$s" = "$sha" ] || continue
-      # shellcheck disable=SC2030
-      :
-    done
-    # Build via awk for portability (tac may be missing).
-    awk -v sha="$sha" -F'\t' '
+    jqexpr="$(_gh_argv_flag "$@")"
+    # Newest-first JSON array of {state, context, creator.login}, built via awk for portability.
+    doc="$(printf '['; awk -v sha="$sha" -F'\t' '
       $1==sha { n++; sha_a[n]=$1; st[n]=$2; ctx[n]=$3; cr[n]=$4 }
       END {
         first=1
@@ -318,8 +349,8 @@ case "$url" in
           printf "{\"state\":\"%s\",\"context\":\"%s\",\"creator\":{\"login\":\"%s\"}}", st[i], ctx[i], cr[i]
         }
       }
-    ' "$S/statuses.log" 2>/dev/null
-    printf ']\n'
+    ' "$S/statuses.log" 2>/dev/null; printf ']')"
+    if [ -n "$jqexpr" ]; then printf '%s' "$doc" | _jqf "$jqexpr"; else printf '%s\n' "$doc"; fi
     exit 0
     ;;
   */commits/*)

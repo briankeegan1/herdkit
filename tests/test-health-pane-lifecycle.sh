@@ -18,6 +18,17 @@
 #   (9) DRY-RUN INERT: a render must never close (or spawn) a pane.
 #  (10) HEADLESS INERT: view-only driver stands up no pane even with the lever on.
 #
+# HERD-554 turned the reconcile into a FULL invariant — one pane per OBSERVED in-flight suite, asserted
+# both ways every tick off the `.health-inflight-<pr>-<sha>` markers instead of a bash dispatch-site
+# hook, so the lever finally works under ENGINE_IMPL=python. Its cases (numbered 10–17 in the body):
+#  (10) PYTHON-STYLE DISPATCH: a marker + live log and NOTHING else gains a pane on the reconcile pass.
+#  (11) IDEMPOTENT ACROSS TICKS: a second tick neither duplicates nor closes the live pane.
+#  (12) ROUND TRIP: the same reconcile retires the pane it created, and never re-creates it after.
+#  (13) LEVER OFF (and a typo value): a live suite + a matching worktree row creates NOTHING.
+#  (14) UNUSABLE MARKERS: a corpse pid, the `main-<sha>` rail, and a PR no worktree claims mint no pane.
+#  (15)/(16) DRY-RUN and HEADLESS are inert on the CREATE half too.
+#  (17) NO DISPATCH-SITE HOOK LEFT: _spawn_health_pane has exactly one call site — the reconcile.
+#
 # Sources agent-watch.sh in lib mode under the DEFAULT herdr-claude driver with a herdr stub whose pane
 # LABELS drive herd_driver_pane_identity (a health pane is a labelled NON-agent pane, unlike a reviewer
 # agent pane), so herd_driver_pane_alive / herd_close_pane_verified exercise the real driver seam.
@@ -231,5 +242,117 @@ ok
 ( export HERD_DRIVER=headless; live_marker 47 shaG; _spawn_health_pane 47 slug-g shaG "$WT" )
 [ ! -f "$(_health_pane_registry_file 47 shaG)" ] || fail "headless stood up a health pane (should be view-only)"
 ok
+
+# ══ HERD-554: the RECONCILED-INVARIANT create half ═════════════════════════════════════════════════
+# _reconcile_health_panes now asserts BOTH directions of "one health·<slug> pane per OBSERVED in-flight
+# suite" every tick, keyed off the `.health-inflight-<pr>-<sha>` markers rather than a dispatch-site
+# hook. That is what makes the lever work under ENGINE_IMPL=python, where live_runtime.py dispatches the
+# suite and the bash render pass's automerge-candidate branch (the old spawn site) is never reached.
+# The pr→(slug,dir) identity comes from $FEATS — the same discovery records the console rows use.
+#
+# feat_rec <dir> <slug> <pr#> <sha> — one \037-separated _discover_feature_worktrees record. The fields
+# past prnum are the ones the reconcile does not read; they are filled in the shipped shape so the
+# fixture stays a faithful stand-in for a real row.
+feat_rec() {
+  printf '%s\037%s\037feat/%s\037%s\037MERGEABLE\037BLOCKED\037working\037%s\037me\037branch\037\0370' \
+    "$1" "$2" "$2" "$3" "$4"
+}
+export HEALTH_PANE=on
+rm -f "$TREES"/.health-pane-registry-* 2>/dev/null || true
+
+# ── (10) PYTHON-STYLE DISPATCH: marker + log ONLY (no bash dispatch event) still gains a pane ──────
+# This is the HERD-554 regression itself. Nothing here calls a spawn hook: the ONLY inputs are the two
+# state files the Python engine writes (_marker_write over .health-inflight-<pr>-<sha>, and the live
+# .health-log-<pr>-<sha> it tees the suite into) plus the observed worktree row. Under the old
+# dispatch-site hook this produced NO pane at all.
+PY_DIR="$T/trees/py-builder"; mkdir -p "$PY_DIR"
+FEATS=("$(feat_rec "$PY_DIR" py-builder 70 shaPY)")
+live_marker 70 shaPY
+printf 'suite line 1\n' > "$(_health_log_file "70-shaPY")"
+: > "$HERDR_LOG"
+_reconcile_health_panes
+REG_PY="$(_health_pane_registry_file 70 shaPY)"
+[ -f "$REG_PY" ] || fail "(10) reconcile did not stand up a pane for a live python-dispatched suite"
+read -r PANE_PY TAB_PY LABEL_PY < "$REG_PY"
+[ "$LABEL_PY" = "health·py-builder" ] || fail "(10) pane must be stamped health·<slug> (got '$LABEL_PY')"
+grep -qxF "$PANE_PY" "$ALIVE_PANES" || fail "(10) the reconciled pane is not alive"
+grep -q "run $PANE_PY tail" "$HERDR_LOG" || fail "(10) the pane must stream the suite log via tail"
+grep -q "$(_health_log_file "70-shaPY")" "$HERDR_LOG" || fail "(10) the pane must tail the sha-scoped health log"
+grep -qF -- "--cwd $PY_DIR" "$HERDR_LOG" || fail "(10) the pane must open in the builder worktree"
+grep -q '"event":"health_pane_spawned"' "$JOURNAL_FILE" || fail "(10) a reconciled spawn must journal health_pane_spawned"
+ok
+
+# ── (11) IDEMPOTENT ACROSS TICKS: a second reconcile makes no second pane, and keeps the live one ──
+before_ctr="$(cat "$PANE_CTR")"
+: > "$CLOSE_LOG"
+_reconcile_health_panes
+[ "$(cat "$PANE_CTR")" = "$before_ctr" ] || fail "(11) a second reconcile tick created a second pane"
+[ ! -s "$CLOSE_LOG" ] || fail "(11) a second reconcile tick closed the still-in-flight pane"
+[ -f "$REG_PY" ] || fail "(11) a second reconcile tick dropped the in-flight row"
+ok
+
+# ── (12) ROUND TRIP: the suite ends → the SAME reconcile retires the pane it created ───────────────
+rm -f "$(_health_inflight_file "70-shaPY")"
+: > "$CLOSE_LOG"
+_reconcile_health_panes
+grep -qxF "$PANE_PY" "$CLOSE_LOG" || fail "(12) the reconciled pane was not retired once its suite ended"
+[ ! -f "$REG_PY" ] || fail "(12) the registry row survived the retire"
+: > "$HERDR_LOG"
+_reconcile_health_panes
+[ ! -s "$HERDR_LOG" ] || fail "(12) a retired suite must not be re-created by the next tick (marker is gone)"
+ok
+
+# ── (13) LEVER OFF: a live suite + a matching worktree row creates NOTHING ─────────────────────────
+OFF_DIR="$T/trees/off-builder"; mkdir -p "$OFF_DIR"
+FEATS=("$(feat_rec "$OFF_DIR" off-builder 71 shaOF)")
+live_marker 71 shaOF
+: > "$HERDR_LOG"
+( export HEALTH_PANE=off; _reconcile_health_panes )
+[ ! -f "$(_health_pane_registry_file 71 shaOF)" ] || fail "(13) lever off created a health-pane row"
+[ ! -s "$HERDR_LOG" ] || fail "(13) lever off called herdr during the reconcile"
+( export HEALTH_PANE=maybe; _reconcile_health_panes )
+[ ! -f "$(_health_pane_registry_file 71 shaOF)" ] || fail "(13) an unrecognized HEALTH_PANE value created a pane"
+ok
+
+# ── (14) DEAD / UNKNOWN / NON-PR markers never mint a pane ─────────────────────────────────────────
+# (a) a corpse marker (its recorded pid is long gone) is not a live suite;
+# (b) the `main-<sha>` MAIN_HEALTH_TICK rail has no worktree and no slug — no health·<slug> pane;
+# (c) a live suite whose PR no worktree row claims is unidentifiable — no pane, no guess.
+DEAD_DIR="$T/trees/dead-builder"; mkdir -p "$DEAD_DIR"
+FEATS=("$(feat_rec "$DEAD_DIR" dead-builder 72 shaDD)")
+_marker_write "$(_health_inflight_file "72-shaDD")" 999999            # (a) pid that cannot be alive
+live_marker main shaMAIN                                              # (b)
+live_marker 73 shaORPH                                                # (c) no FEATS row for pr 73
+: > "$HERDR_LOG"
+_reconcile_health_panes
+[ ! -f "$(_health_pane_registry_file 72 shaDD)" ]   || fail "(14a) a dead marker stood a pane up over a corpse"
+[ ! -f "$(_health_pane_registry_file main shaMAIN)" ] || fail "(14b) the main-health rail got a health·<slug> pane"
+[ ! -f "$(_health_pane_registry_file 73 shaORPH)" ] || fail "(14c) a PR with no observed worktree got a pane"
+[ ! -s "$HERDR_LOG" ] || fail "(14) an unusable marker still called herdr"
+ok
+
+# ── (15) DRY-RUN INERT on the create half too ──────────────────────────────────────────────────────
+DRY_DIR="$T/trees/dry-builder"; mkdir -p "$DRY_DIR"
+FEATS=("$(feat_rec "$DRY_DIR" dry-builder 74 shaDR)")
+live_marker 74 shaDR
+: > "$HERDR_LOG"
+( DRYRUN=1; _reconcile_health_panes )
+[ ! -f "$(_health_pane_registry_file 74 shaDR)" ] || fail "(15) dry-run reconcile created a pane"
+[ ! -s "$HERDR_LOG" ] || fail "(15) dry-run reconcile called herdr"
+ok
+
+# ── (16) HEADLESS INERT on the create half too ────────────────────────────────────────────────────
+: > "$HERDR_LOG"
+( export HERD_DRIVER=headless; _reconcile_health_panes )
+[ ! -f "$(_health_pane_registry_file 74 shaDR)" ] || fail "(16) headless reconcile created a pane"
+ok
+
+# ── (17) NO DISPATCH-SITE HOOK LEFT: the spawn primitive has exactly ONE caller, the reconcile ─────
+# The whole point of HERD-554 is that no engine-specific dispatch path decides whether a pane exists.
+# A second call site would silently re-introduce the bash-only leg this fix removed.
+CALLERS="$(grep -c '^[[:space:]]*[^#]*_spawn_health_pane ' "$WATCH" || true)"
+[ "$CALLERS" = "1" ] || fail "(17) _spawn_health_pane must have exactly ONE call site (the reconcile); found $CALLERS"
+ok
+unset FEATS
 
 echo "ALL PASS ($pass checks)"

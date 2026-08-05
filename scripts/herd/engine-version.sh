@@ -323,16 +323,29 @@ herd_engine_shadow_tick() {
 #
 # The Python side inherits the watcher's dry-run switch (AGENT_WATCH_DRYRUN/DRYRUN): a dry-run watcher
 # drives a dry-run tick that actuates nothing, exactly as the bash dry-run did.
+#
+# GATE_SCALE (HERD-542): the Python engine core reads HEALTH_CONCURRENCY / REVIEW_CONCURRENCY from
+# os.environ (_CORE_ENV_KEYS, live_runtime.py), so passing this ONE tick's already-derived caps as an
+# explicit env override here is the whole integration — no change to live_runtime.py needed. _health_conc
+# / _review_conc (agent-watch.sh) already resolve to the plain configured value when GATE_SCALE=off, so
+# this is a byte-identical re-statement of what the child would have inherited anyway in that case.
+# Guarded by `type` because a handful of hermetic tests source this file WITHOUT agent-watch.sh
+# (tests/test-py-live-runtime.sh): when those two functions are undefined, _gs_health/_gs_review stay
+# empty and the fallback `${HEALTH_CONCURRENCY:-}` / `${REVIEW_CONCURRENCY:-}` re-passes exactly
+# whatever this process already had — again byte-identical to not passing an override at all.
 herd_engine_live_tick() {
   herd_engine_impl >/dev/null 2>&1   # resolve (fires the retired-value warning once if ENGINE_IMPL is stale)
   command -v python3 >/dev/null 2>&1 || return 1
-  local home pyp _tick_stderr _tick_rc
+  local home pyp _tick_stderr _tick_rc _gs_health="" _gs_review=""
   home="${HERDKIT_HOME:-$(cd "$_HERD_ENGINE_DIR/../.." 2>/dev/null && pwd)}"
   pyp="$home/pysrc"
   [ -f "$pyp/herd/live_runtime.py" ] || return 1
   _herd_engine_journal engine_live_dispatched python
   _tick_stderr="$(mktemp 2>/dev/null || printf '%s' "/tmp/herd-tick-err-$$")"
+  type _health_conc >/dev/null 2>&1 && _gs_health="$(_health_conc 2>/dev/null)"
+  type _review_conc >/dev/null 2>&1 && _gs_review="$(_review_conc 2>/dev/null)"
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" WORKTREES_DIR="${WORKTREES_DIR:-}" PROJECT_ROOT="${PROJECT_ROOT:-}" \
+    HEALTH_CONCURRENCY="${_gs_health:-${HEALTH_CONCURRENCY:-}}" REVIEW_CONCURRENCY="${_gs_review:-${REVIEW_CONCURRENCY:-}}" \
     python3 -m herd.live_runtime --tick >/dev/null 2>"$_tick_stderr"
   _tick_rc=$?
   # Capture the last non-empty stderr line so the caller can surface a self-explaining fault reason.
