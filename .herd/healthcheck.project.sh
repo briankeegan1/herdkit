@@ -552,6 +552,63 @@ _hk_suite_workers() {
 }
 _HK_SUITE_WORKERS="$(_hk_suite_workers)"
 
+# ── HERD-532 DIFF-SCOPED SUITE SELECTION ──────────────────────────────────────────────────────────
+# Sharding (HERD-463) splits the SAME ~350 tests across boxes; scoping asks the different question of
+# which of them this diff can actually break. A one-file change to scripts/herd/foo.sh cannot break
+# the 340 tests that never touch it, yet every re-push paid for all of them.
+#
+# HEALTH_SUITE_SCOPE=diff | full (default full, ship-dormant). The mapping rules, the always-run core
+# and — decisively — the FAIL-CLOSED behavior all live in the shared library
+# (scripts/herd/suite-shard.sh's herd_suite_tests_for_diff), so the wrapper and its mutation-prove
+# test (tests/test-suite-scope.sh) can never disagree about what a scoped run drops. Here we only:
+#   • resolve the mode (env first — the test/one-off seam — then this project's committed .herd/config,
+#     the same subshell read _hk_live_sibling_suites above uses for WORKTREES_DIR, because the wrapper
+#     is a CHILD process and herd-config.sh does not export this key);
+#   • compute the worktree's changed paths exactly as scripts/herd/healthcheck.sh does (diff vs the
+#     default branch PLUS untracked files, so a brand-new script is never missed);
+#   • hand the selection to bats via HERD_SUITE_SCOPE_TESTS (honored by tests/discover-tests.bash).
+# BYTE-IDENTICAL when off — and, deliberately, also when ON but the selection comes back as the whole
+# curated set (an unmappable or wide-blast path): the allow-list is left UNSET rather than set to
+# "everything", so the ordinary full run is reached by exactly the same code path as before.
+_hk_scope_mode() {
+  local _hsm_v="${HEALTH_SUITE_SCOPE:-}"
+  if [ -z "$_hsm_v" ] && [ -f .herd/config ]; then
+    _hsm_v="$(. .herd/config 2>/dev/null && printf '%s' "${HEALTH_SUITE_SCOPE:-}")"
+  fi
+  ( HEALTH_SUITE_SCOPE="${_hsm_v:-full}"; herd_suite_scope_mode )
+}
+_hk_scope_changed() {
+  local _hsc_br="origin/main"
+  if [ -f .herd/config ]; then
+    _hsc_br="$(. .herd/config 2>/dev/null && printf '%s' "${DEFAULT_BRANCH:-origin/main}")" \
+      || _hsc_br="origin/main"
+  fi
+  { git diff --name-only "$_hsc_br" 2>/dev/null
+    git ls-files --others --exclude-standard 2>/dev/null; } | sort -u
+}
+_HK_SCOPE_NOTE=""
+if [ -f scripts/herd/suite-shard.sh ]; then
+  # shellcheck source=scripts/herd/suite-shard.sh
+  . scripts/herd/suite-shard.sh
+  if [ "$(_hk_scope_mode)" = "diff" ]; then
+    _hk_scope_paths=()
+    while IFS= read -r _hk_scope_p; do
+      [ -n "$_hk_scope_p" ] && _hk_scope_paths+=("$_hk_scope_p")
+    done <<EOF
+$(_hk_scope_changed)
+EOF
+    if [ "${#_hk_scope_paths[@]}" -gt 0 ]; then
+      _hk_scope_sel="$(herd_suite_tests_for_diff tests "${_hk_scope_paths[@]}")"
+      _hk_scope_all="$(herd_suite_curated_tests tests)"
+      if [ -n "$_hk_scope_sel" ] && [ "$_hk_scope_sel" != "$_hk_scope_all" ]; then
+        HERD_SUITE_SCOPE_TESTS="$(printf '%s' "$_hk_scope_sel" | tr '\n' ' ')"
+        export HERD_SUITE_SCOPE_TESTS
+        _HK_SCOPE_NOTE=" · diff-scoped $(printf '%s\n' "$_hk_scope_sel" | grep -c .)/$(printf '%s\n' "$_hk_scope_all" | grep -c .) tests"
+      fi
+    fi
+  fi
+fi
+
 t_note="tests: none"
 if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   # HANG-PROOF SUITE (HERD-185) + DAEMON-HERMETICITY SANDBOX (HERD-189) + JOURNAL HERMETICITY (HERD-223):
@@ -655,7 +712,7 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
     exit 2
   fi
   if [ "$_hk_bats_rc" -eq 0 ]; then
-    t_note="tests: bats pass$_hk_jobs_note"
+    t_note="tests: bats pass$_hk_jobs_note$_HK_SCOPE_NOTE"
   elif _hk_bats_env_only "$to"; then
     # KNOWN data/env condition (HERD-187): tolerated → exit 2, quoting the REAL failing 'not ok' line.
     _hk_notok="$(_hk_bats_notok_line "$to" "$_HK_ENV_TEST")"
@@ -708,15 +765,32 @@ elif ls tests/test-*.sh >/dev/null 2>&1; then
       JOURNAL_FILE="$_hk_jh_file" HERD_JOURNAL_HERMETIC=1 \
       bash "$t" >/dev/null 2>&1 || : > "$_hk_par_dir/$base.fail"
   }
+  # HERD-532: the bats-absent fallback honors the SAME diff-scoped allow-list bats discovery does —
+  # otherwise this box would silently run a different set of tests than the bats box for one config.
+  # Unset (scope=full, or a fail-closed selection) → the glob is used verbatim, byte-identical.
+  _hk_direct_tests=()
+  for t in tests/test-*.sh; do
+    [ -e "$t" ] || continue
+    if [ -n "${HERD_SUITE_SCOPE_TESTS:-}" ]; then
+      case " ${HERD_SUITE_SCOPE_TESTS} " in *" ${t##*/} "*) : ;; *) continue ;; esac
+    fi
+    _hk_direct_tests+=("$t")
+  done
+  if [ "${#_hk_direct_tests[@]}" -eq 0 ]; then
+    # Never pass an empty selection off as a green suite (the HERD-295 zero-match discipline).
+    echo "tests: diff-scoped selection matched ZERO tests/test-*.sh — refusing to pass an empty suite"
+    rm -rf "$_hk_par_dir"
+    exit 1
+  fi
   if [ "$_HK_SUITE_WORKERS" -gt 1 ] && command -v herd_burst >/dev/null 2>&1; then
-    herd_burst "$_HK_SUITE_WORKERS" _hk_run_one_direct_test tests/test-*.sh
+    herd_burst "$_HK_SUITE_WORKERS" _hk_run_one_direct_test "${_hk_direct_tests[@]}"
   else
-    for t in tests/test-*.sh; do _hk_run_one_direct_test "$t"; done
+    for t in "${_hk_direct_tests[@]}"; do _hk_run_one_direct_test "$t"; done
   fi
   fails="$(find "$_hk_par_dir" -name '*.fail' 2>/dev/null | wc -l | tr -d ' ')"
   rm -rf "$_hk_par_dir"
   _hk_dh_verdict
-  if [ "$fails" -eq 0 ]; then t_note="tests: hermetic suite pass (workers=$_HK_SUITE_WORKERS)"; else
+  if [ "$fails" -eq 0 ]; then t_note="tests: hermetic suite pass (workers=$_HK_SUITE_WORKERS)$_HK_SCOPE_NOTE"; else
     [ -n "$ONELINE" ] && echo "tests: $fails failed" || echo "TESTS FAILED: $fails"
     exit 1
   fi

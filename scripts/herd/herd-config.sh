@@ -687,6 +687,31 @@ fi
 # HEALTH_INFLIGHT_TIMEOUT exactly); the early-reap path is unreachable. Non-numeric → 0 (never
 # activate on a typo). Consumed by agent-watch.sh.
 : "${HEALTH_EARLY_REAP_SECS:="0"}"   # HERD-494: early-reap a dead-at-spawn/wedged worker (seconds); 0 = off
+# HEALTH_TRUST_BUILDER (HERD-531) — SHA-MATCHED TRUST of a builder's own pre-PR heavy suite: on | off
+# (default off, ship-dormant). The health gate is the pipeline's dominant cost (~350 hermetic tests,
+# 20-60 min per suite), and a builder that runs the heavy profile before opening its PR makes the
+# watcher pay for the IDENTICAL suite on the IDENTICAL commit a second time. on → the shared
+# healthcheck entry writes an engine-authored PROVENANCE record (sha, worktree, profile, outcome,
+# duration) into the shared worktree pool, and the watcher's health dispatch, when a candidate's EXACT
+# head sha has a CLEAN heavy record from a CLEAN tree at that same worktree, runs the LIGHT profile as
+# a smoke instead of the full re-run and journals health_trusted provenance=builder-local. EVERY other
+# case — no record, stale sha, non-clean outcome, dirty tree, a record older than the commit, or a
+# record the watcher itself wrote — is a FULL re-run exactly as today (fail-closed). off (default) →
+# byte-identical: no record is written and none is read. An unrecognized value reads as off (a typo can
+# never arm a path that skips the authoritative suite). Consumed by health-trust.sh (sourced by
+# healthcheck.sh + agent-watch.sh).
+: "${HEALTH_TRUST_BUILDER:="off"}"   # HERD-531: trust a sha-matched builder-local heavy run — on | off
+# HEALTH_SUITE_SCOPE (HERD-532) — DIFF-SCOPED test selection for the heavy suite: diff | full (default
+# full, ship-dormant). full → the healthcheck wrapper runs the whole curated set, byte-identical to
+# before. diff → it maps the worktree's changed paths to the tests that can actually cover them, via
+# the gate-coverage pairing convention (tests/test-<name>.sh ↔ scripts/herd/<name>.sh), an optional
+# per-test `# suite-deps:` header, and an always-run core of cross-cutting manifest/lint/hermeticity
+# proofs. FAIL-CLOSED: any changed path that is unmappable or wide-blast (bin/herd, herd-config.sh,
+# agent-watch.sh, either healthcheck wrapper, templates/capabilities.tsv, the selection library, the
+# bats discovery surface) selects the FULL curated set — an unprovable diff runs everything, never
+# nothing. An unrecognized value reads as full. Consumed by suite-shard.sh (herd_suite_scope_mode),
+# read by the project healthcheck wrapper.
+: "${HEALTH_SUITE_SCOPE:="full"}"    # HERD-532: heavy-suite test selection — diff | full
 # GATE_DISPATCH (HERD-73) — serial (default) | parallel. Governs WHEN the watcher's action pass fires
 # the pre-merge review relative to the healthcheck for a (pr,sha). serial → today's EXACT behavior,
 # byte-identical: the review dispatches only AFTER the healthcheck outcome lands, so gate wall-clock is

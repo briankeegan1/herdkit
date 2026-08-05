@@ -32,6 +32,58 @@
 #
 # MUTATION-PROVEN by tests/test-suite-shard.sh: for every shard_count tried, the UNION of shards
 # 1..shard_count reconstructs herd_suite_curated_tests exactly (no drop, no duplicate).
+#
+# ── DIFF-SCOPED SELECTION (HERD-532) ──────────────────────────────────────────────────────────────
+# Sharding splits the SAME work across boxes; scoping asks a different question — which of the ~350
+# curated tests can this diff actually break? A one-file change to scripts/herd/foo.sh cannot break
+# the 340 tests that never touch it, yet the gate runs all of them, every time, on every re-push.
+#
+# herd_suite_scope_mode
+#   The effective HEALTH_SUITE_SCOPE: "diff" or "full" (default full — ship-dormant). Any
+#   unrecognized value reads as FULL: a typo must never silently narrow the authoritative gate.
+#
+# herd_suite_tests_for_diff <tests_dir> <changed-path>...
+#   Prints the curated tests this diff can affect, one per line, LC_ALL=C sorted. THREE rules, in
+#   order — and the third is the one that makes the other two safe:
+#     (1) PAIRING (the gate-coverage convention, HERD-292): a changed scripts/herd/<name>.sh selects
+#         its paired tests/test-<name>.sh. A changed tests/test-<name>.sh selects itself.
+#     (2) DECLARED DEPS: a test may declare cross-file coverage with a
+#             # suite-deps: <path-or-glob> [<path-or-glob>…]
+#         header line. Any changed path matching a token selects that test. This is how a test that
+#         covers a file it is not NAME-paired with (a template, a backend, a sibling script) stays
+#         selected — the escape hatch that keeps rule (1)'s narrowness honest.
+#     (3) FAIL-CLOSED: any changed path that rules (1)+(2) cannot map, and any path on the
+#         WIDE-BLAST list (bin/herd, herd-config.sh, agent-watch.sh, either healthcheck wrapper,
+#         templates/capabilities.tsv, this library, and the bats discovery surface), selects the
+#         ENTIRE curated set. Unmappable never means "select nothing"; it means "select everything".
+#   Plus an ALWAYS-RUN CORE (HERD_SUITE_CORE_TESTS): the cross-cutting manifest/lint/hermeticity
+#   proofs that ANY diff can trip regardless of which file it touched. The core is unioned into
+#   every scoped selection, so scoping can never drop them.
+#
+#   The invariant this must never break: a scoped selection is a SUBSET of the curated set that
+#   still contains every test the rules above map from the diff, and the fail-closed paths return
+#   the curated set EXACTLY. tests/test-suite-scope.sh mutation-proves both halves (same discipline
+#   as the shard membership proof above): a dropped test can never read as green.
+
+# The ALWAYS-RUN CORE: proofs that guard cross-cutting invariants a diff to ANY file can violate —
+# the capability/config manifests, the shared gate lints, the conformance ledger, the suite's own
+# hermeticity guards, and this selection library itself. Space-separated basenames. A name that is
+# not in the curated set (retired/renamed/exempted) is dropped silently HERE — and asserted present
+# by tests/test-suite-scope.sh, so a rename is caught by the proof rather than silently shrinking
+# the core.
+HERD_SUITE_CORE_TESTS="${HERD_SUITE_CORE_TESTS:-test-caps-sync-light.sh test-config-manifest.sh test-conformance.sh test-daemon-hermeticity.sh test-doc-drift.sh test-env-export-lint.sh test-gate-coverage.sh test-git-scope-lint.sh test-hermetic-env-scrub.sh test-journal-hermeticity.sh test-pipe-safety.sh test-suite-shard.sh test-suite-scope.sh test-test-cap-ledger.sh}"
+
+# WIDE-BLAST paths: a change here can plausibly affect ANY test, so it selects the full curated set.
+# Space-separated repo-root-relative paths (matched exactly, after a leading './' is stripped):
+#   • bin/herd, herd-config.sh, agent-watch.sh — the CLI, the config loader every script sources,
+#     and the watcher: effectively global blast radius.
+#   • scripts/herd/healthcheck.sh + .herd/healthcheck.project.sh — the gate wrappers themselves. A
+#     change to how the suite RUNS must be proven by running the whole suite.
+#   • templates/capabilities.tsv — the manifest half of a dozen lints.
+#   • scripts/herd/suite-shard.sh — THIS file. The selector must never scope its own change.
+#   • tests/herd.bats, tests/discover-tests.bash, tests/gate-coverage-exempt.tsv — the discovery
+#     surface that decides what "the suite" even is.
+HERD_SUITE_WIDE_BLAST="${HERD_SUITE_WIDE_BLAST:-bin/herd scripts/herd/herd-config.sh scripts/herd/agent-watch.sh scripts/herd/healthcheck.sh .herd/healthcheck.project.sh templates/capabilities.tsv scripts/herd/suite-shard.sh tests/herd.bats tests/discover-tests.bash tests/gate-coverage-exempt.tsv}"
 
 herd_suite_curated_tests() {
   local _hsc_dir="${1:-}" _hsc_exempt="${2:-}"
@@ -80,4 +132,143 @@ herd_suite_tests_for_shard() {
     _hst_shard="$(herd_suite_shard_of "$_hst_name" "$_hst_count")"
     [ "$_hst_shard" = "$_hst_idx" ] && printf '%s\n' "$_hst_name"
   done
+}
+
+# ── DIFF-SCOPED SELECTION (HERD-532) ──────────────────────────────────────────────────────────────
+
+# herd_suite_scope_mode — the effective HEALTH_SUITE_SCOPE. Prints "diff" only for an exact,
+# case-insensitive "diff"; EVERYTHING else (unset, empty, a typo, a value from a newer engine)
+# prints "full". Fail toward the authoritative full suite: a scope typo must never quietly gate a
+# merge on a subset.
+herd_suite_scope_mode() {
+  case "$(printf '%s' "${HEALTH_SUITE_SCOPE:-full}" | tr '[:upper:]' '[:lower:]')" in
+    diff) printf 'diff' ;;
+    *)    printf 'full' ;;
+  esac
+}
+
+# _herd_suite_deps_table <tests_dir> — emit one "<test-basename>\t<dep-token>" row per token of every
+# test's optional `# suite-deps: <path-or-glob> …` header. Built ONCE per selection call (not once per
+# changed path). Only the FIRST such header line in a file is read, so a doc example further down a
+# test cannot silently widen its own coverage claim. Pathname expansion is disabled around the token
+# split: a dep token like `scripts/herd/backends/*.sh` is a PATTERN to match changed paths against,
+# and must never be glob-expanded against the caller's cwd.
+_herd_suite_deps_table() {
+  local _hdt_dir="${1:-}" _hdt_hits _hdt_row _hdt_base _hdt_line _hdt_tok _hdt_restore=0
+  [ -n "$_hdt_dir" ] && [ -d "$_hdt_dir" ] || return 0
+  # ONE grep across every test file (`-m1` stops after the first match PER FILE, `-H` names it), not a
+  # grep fork per file: the ~400-file tree made the per-file shape a 400-fork, multi-second scan — the
+  # exact cost herd_suite_curated_tests' own bulk-grep note above was written about. Files are named
+  # directly (no `producer | grep`), so there is no EPIPE under a caller's pipefail (HERD-297).
+  _hdt_hits="$(grep -H -m1 -E '^#[[:space:]]*suite-deps:' "$_hdt_dir"/test-*.sh 2>/dev/null)" || return 0
+  [ -n "$_hdt_hits" ] || return 0
+  # Split the declared tokens with pathname expansion DISABLED: a dep token like
+  # `scripts/herd/backends/*.sh` is a PATTERN to match changed paths against, never a glob to expand
+  # against the caller's cwd.
+  case "$-" in *f*) : ;; *) _hdt_restore=1; set -f ;; esac
+  while IFS= read -r _hdt_row; do
+    [ -n "$_hdt_row" ] || continue
+    _hdt_base="${_hdt_row%%:*}"; _hdt_base="${_hdt_base##*/}"
+    _hdt_line="${_hdt_row#*suite-deps:}"
+    for _hdt_tok in $_hdt_line; do
+      [ -n "$_hdt_tok" ] || continue
+      printf '%s\t%s\n' "$_hdt_base" "$_hdt_tok"
+    done
+  done <<EOF
+$_hdt_hits
+EOF
+  [ "$_hdt_restore" -eq 1 ] && set +f
+  return 0
+}
+
+# herd_suite_tests_for_diff <tests_dir> <changed-path>… — the curated tests this diff can affect,
+# one per line, LC_ALL=C sorted-unique. See the header block for the three rules and the always-run
+# core. Returns the FULL curated set (never nothing) whenever it cannot prove a narrower answer:
+# no changed paths given, a wide-blast path, or a path no rule maps.
+herd_suite_tests_for_diff() {
+  local _hsd_dir="${1:-}"
+  [ "$#" -ge 1 ] && shift
+  local _hsd_curated _hsd_sel="" _hsd_deps="" _hsd_p _hsd_base _hsd_name _hsd_out
+  local _hsd_mapped _hsd_t _hsd_tok _hsd_restore=0
+
+  _hsd_curated="$(herd_suite_curated_tests "$_hsd_dir")"
+  [ -n "$_hsd_curated" ] || return 0          # no tests at all → nothing to select (fail-soft)
+  if [ "$#" -eq 0 ]; then printf '%s\n' "$_hsd_curated"; return 0; fi
+
+  # Build the dep table FIRST — it globs "$_hsd_dir"/test-*.sh, so it must run while pathname
+  # expansion is still enabled (it disables expansion only around its own token split).
+  _hsd_deps="$(_herd_suite_deps_table "$_hsd_dir")"
+  # Now disable pathname expansion for the unquoted `for … in $LIST` splits below (the core /
+  # wide-blast lists and the dep tokens are PATTERNS and NAMES, never globs to expand against cwd).
+  case "$-" in *f*) : ;; *) _hsd_restore=1; set -f ;; esac
+
+  for _hsd_p in "$@"; do
+    [ -n "$_hsd_p" ] || continue
+    _hsd_p="${_hsd_p#./}"
+
+    # (3a) WIDE-BLAST: a change here can affect anything → the entire curated set, immediately.
+    for _hsd_t in ${HERD_SUITE_WIDE_BLAST:-}; do
+      if [ "$_hsd_p" = "$_hsd_t" ]; then
+        [ "$_hsd_restore" -eq 1 ] && set +f
+        printf '%s\n' "$_hsd_curated"
+        return 0
+      fi
+    done
+
+    _hsd_mapped=0
+    _hsd_base="${_hsd_p##*/}"
+
+    # (1) PAIRING (the gate-coverage convention, HERD-292).
+    case "$_hsd_p" in
+      tests/test-*.sh)
+        # A changed test selects ITSELF — mapped even when it is exempt or brand-new (the union with
+        # the curated set below drops what the gate would not have run anyway).
+        _hsd_sel="${_hsd_sel}${_hsd_base}"$'\n'; _hsd_mapped=1 ;;
+      scripts/herd/*.sh)
+        case "${_hsd_p#scripts/herd/}" in
+          */*) : ;;                       # backends/ + work-units/ carry no test-<name>.sh convention
+          *)
+            _hsd_name="test-${_hsd_base}"
+            if [ -f "$_hsd_dir/$_hsd_name" ]; then
+              _hsd_sel="${_hsd_sel}${_hsd_name}"$'\n'; _hsd_mapped=1
+            fi ;;
+        esac ;;
+    esac
+
+    # (2) DECLARED DEPS: any test whose `# suite-deps:` header covers this path.
+    while IFS=$'\t' read -r _hsd_t _hsd_tok; do
+      [ -n "$_hsd_t" ] && [ -n "$_hsd_tok" ] || continue
+      # shellcheck disable=SC2254  # $_hsd_tok is deliberately a PATTERN, not a literal
+      case "$_hsd_p" in
+        $_hsd_tok) _hsd_sel="${_hsd_sel}${_hsd_t}"$'\n'; _hsd_mapped=1 ;;
+      esac
+    done <<EOF
+$_hsd_deps
+EOF
+
+    # (3b) UNMAPPABLE: no pairing, no declared dep → fail CLOSED to the entire curated set. This is
+    # what makes a narrow selection safe: "we could not prove which tests cover this" is answered
+    # with everything, never with nothing.
+    if [ "$_hsd_mapped" -eq 0 ]; then
+      [ "$_hsd_restore" -eq 1 ] && set +f
+      printf '%s\n' "$_hsd_curated"
+      return 0
+    fi
+  done
+
+  # ALWAYS-RUN CORE: unioned into every scoped selection, so the cross-cutting manifest/lint/
+  # hermeticity proofs run no matter which file the diff touched.
+  for _hsd_t in ${HERD_SUITE_CORE_TESTS:-}; do
+    [ -n "$_hsd_t" ] || continue
+    _hsd_sel="${_hsd_sel}${_hsd_t}"$'\n'
+  done
+  [ "$_hsd_restore" -eq 1 ] && set +f
+
+  # Intersect with the curated set — a selected name that is exempt, retired or not yet committed is
+  # not part of the gate and must not be emitted — then dedupe + sort for a stable, comparable list.
+  _hsd_out="$(printf '%s\n' "$_hsd_sel" \
+    | grep -Fxf <(printf '%s\n' "$_hsd_curated") 2>/dev/null \
+    | LC_ALL=C sort -u)" || _hsd_out=""
+  [ -n "$_hsd_out" ] && printf '%s\n' "$_hsd_out"
+  return 0
 }
