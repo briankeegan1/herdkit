@@ -15,7 +15,8 @@
 #       → the restart STILL runs and still stops that watcher. The lever is not a blanket off-switch.
 #   (C) A WEDGED pane surface → the restart is stopped at the bound (HERD_CONFIG_RELOAD_TIMEOUT) and
 #       the failure is LOUD but NON-FATAL: rc=0, a warning naming the un-restarted watcher, and the
-#       value still written.
+#       value still written — and (HERD-540) the bound reaps the reload's WHOLE subtree, so not even
+#       a GRANDCHILD of the wedged surface survives it.
 #   (D) A NON-watcher key is untouched by all of this (byte-identical no-op path).
 #
 # Fully hermetic: temp git repos, stub herdr/pgrep on PATH, no network, no real daemon. The only
@@ -26,13 +27,22 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 HERD="$HERE/../bin/herd"
 [ -f "$HERD" ] || { echo "FAIL: missing $HERD" >&2; exit 1; }
 
-T="$(mktemp -d)"; trap 'rm -rf "$T"; _reap_decoys' EXIT
+T="$(mktemp -d)"
+# WEDGE_PIDS — every pid the wedged-herdr stub of leg (C) puts into the process table (its own, and
+# the GRANDCHILD sleeper it forks). Leg (C) asserts none of them outlives the bound; the EXIT trap
+# reaps them regardless so a regression leaks nothing onto the machine running the suite. It lives
+# OUTSIDE $T because the trap removes $T before it reaps.
+WEDGE_PIDS="$(mktemp)"
+trap 'rm -rf "$T"; _reap_decoys; rm -f "$WEDGE_PIDS"' EXIT
 PASS=0
 fail() { echo "FAIL: $1" >&2; exit 1; }
 ok()   { PASS=$((PASS + 1)); echo "PASS: $1"; }
 
 DECOYS=""
-_reap_decoys() { local p; for p in $DECOYS; do kill -9 "$p" 2>/dev/null || true; done; }
+_reap_decoys() {
+  local p
+  for p in $DECOYS $(cat "$WEDGE_PIDS" 2>/dev/null || true); do kill -9 "$p" 2>/dev/null || true; done
+}
 
 # ── stubs on PATH ────────────────────────────────────────────────────────────────────────────────
 BIN="$T/bin"; mkdir -p "$BIN"
@@ -152,16 +162,36 @@ kill -0 "$WPID" 2>/dev/null && fail "(B) the live watcher was not stopped by the
 ok "B2 the restart actually stops the live watcher"
 
 # ══ (C) a WEDGED pane surface → bounded, loud, non-fatal ═══════════════════════════════════════
-# The herdr stub now HANGS, reproducing the wedged socket that caused the original hang. The bound is
-# set to 1s; HERD_RELOAD_SKIP_LAUNCH=fallback keeps the herdr path live while making a real headless
-# watcher spawn impossible even if the bound were broken.
-printf '#!/usr/bin/env bash\nsleep 120\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
+# The herdr stub now HANGS, reproducing the wedged socket that caused the original hang.
+# HERD_RELOAD_SKIP_LAUNCH=fallback keeps the herdr path live while making a real headless watcher
+# spawn impossible even if the bound were broken.
+#
+# THE BOUND MUST OUTLAST THE RELOAD'S OWN RUN-UP (HERD-540). It was 1s, which is SHORTER than the
+# ~2s cmd_reload spends stopping the planted watcher and re-rendering the skill before it ever calls
+# `herdr` — so on most runs the reload was stopped before it reached the wedged surface at all, and
+# this leg silently proved a bound against the watcher-stop instead. That is also what made the leaked
+# orphan a ~1-in-30 flake rather than a certainty: the leak only happened on the runs that DID reach
+# herdr. A bound comfortably past the run-up makes every run exercise the wedge (C4 fails loudly if
+# one ever does not), at the cost of a few seconds of wall clock.
+#
+# HERD-540: the stub hangs in a FORKED GRANDCHILD, not in its own process, which is what the real
+# herdr does (a wrapper whose child makes the blocking socket call) and what the live defect needed:
+# the reload subshell's DIRECT child is this stub, so a reap that TERMs only `pgrep -P <subshell>`
+# leaves the sleeper orphaned — holding the `$(herdr workspace list)` command-substitution pipe open
+# long after the 1s bound returned. Both pids are recorded so C4 can assert neither survives.
+cat > "$BIN/herdr" <<STUB
+#!/usr/bin/env bash
+sleep 120 &
+printf '%s %s\n' "\$\$" "\$!" >> "$WEDGE_PIDS"
+wait
+STUB
+chmod +x "$BIN/herdr"
 W="$T/wedged"; _make_project "$W" "hk519-wedge"
 WPID2="$(_plant_watcher hk519-wedge)"; DECOYS="$DECOYS $WPID2"
 t0=$SECONDS
 OUT="$( cd "$W" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 FAKE_STRAY_PIDS="" \
           HERD_RELOAD_SKIP_LAUNCH=fallback HERD_RELOAD_SIGTERM_POLLS=15 \
-          HERD_CONFIG_RELOAD_TIMEOUT=1 \
+          HERD_CONFIG_RELOAD_TIMEOUT=8 \
           bash "$HERD" config set REVIEW_CONCURRENCY 9 2>&1 )"; RC=$?
 ELAPSED=$((SECONDS - t0))
 printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
@@ -176,6 +206,26 @@ ok "C2 the timeout warns loudly and names the manual follow-up"
 grep -qE '^[[:space:]]*REVIEW_CONCURRENCY="9"' "$W/.herd/config" \
   || fail "(C) the key was lost when the restart timed out"
 ok "C3 the value is written even when the restart is abandoned"
+
+# C4 (HERD-540) — NO DESCENDANT of the abandoned reload survives the bound, at ANY depth. The stub
+# recorded its own pid and its forked sleeper's; a short poll absorbs TERM→exit latency (the reap has
+# already waited out its own SIGKILL grace, so anything still alive here is genuinely leaked). Note
+# that a leak also shows up ABOVE as a blown C1: an orphan holding the `$(herdr workspace list)`
+# command-substitution pipe open keeps THIS test's own `$( … )` capture blocked for the sleeper's full
+# 120s — the exact shape of the intermittent main-health timeout HERD-538's builder hit.
+WEDGE_SEEN="$(tr -s '[:space:]' ' ' < "$WEDGE_PIDS")"
+[ -n "$(printf '%s' "$WEDGE_SEEN" | tr -d ' ')" ] \
+  || fail "(C) the wedged herdr stub never ran — leg C no longer exercises the reap"
+_i=0; LEAKED=""
+while [ "$_i" -lt 25 ]; do
+  LEAKED=""
+  for _p in $WEDGE_SEEN; do kill -0 "$_p" 2>/dev/null && LEAKED="$LEAKED $_p"; done
+  [ -z "$LEAKED" ] && break
+  sleep 0.2; _i=$((_i + 1))
+done
+[ -z "$LEAKED" ] \
+  || fail "(C) the bound leaked descendants past the reload it abandoned:$LEAKED — $(ps -o pid=,ppid=,command= -p "$(printf '%s' "$LEAKED" | sed 's/^ //; s/ /,/g')" 2>/dev/null | tr '\n' ';')"
+ok "C4 the bound reaps the reload's WHOLE subtree — not even a grandchild outlives it (HERD-540)"
 
 # ══ (D) a NON-watcher key is untouched by any of this ══════════════════════════════════════════
 D="$T/plain"; _make_project "$D" "hk519-plain"
