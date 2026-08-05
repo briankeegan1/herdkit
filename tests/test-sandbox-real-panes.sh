@@ -319,16 +319,19 @@ done
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
-# Three tabs and nine panes. Tabs: the control room, the builder, and the disposable `health·<slug>` TAB
-# the HERD-554 reconcile MINTS for an observed in-flight suite (the only leg that creates a tab rather
-# than splitting a pane — _spawn_health_pane calls `herdr tab create`, so its pane counts too). Panes:
-# watcher, backlog, builder, the reviewer split for the reviewer-pane-lifecycle checkpoint, the two
-# resolver splits for the HERD-280 retire/escalate legs, the health split for the HERD-313
-# retire-on-outcome checkpoint, that minted health pane, and the claude-as-root pane for the alive
-# checkpoint. All but the ESCALATE resolver pane are closed again within their own steps — that one
-# stays open BY DESIGN and goes with the workspace at teardown.
-[ "$(sc "$SCR" tabs_created)" -eq 3 ]  || fail "(B) tabs_created should be 3 (got $(sc "$SCR" tabs_created))"
-[ "$(sc "$SCR" panes_created)" -eq 9 ] || fail "(B) panes_created should be 9 (got $(sc "$SCR" panes_created))"
+# Four tabs and eleven panes. Tabs: the control room, the builder, the disposable `health·<slug>` TAB
+# the HERD-554 reconcile MINTS for an observed in-flight suite with NO live builder tab to split into
+# (the create-half checkpoint's fixture never registers one), and the HERD-568 fallback checkpoint's OWN
+# standalone tab (its .herd-tabs row names a tab that no longer exists, so it too must mint a fresh
+# one). Panes: watcher, backlog, builder, the reviewer split for the reviewer-pane-lifecycle checkpoint,
+# the two resolver splits for the HERD-280 retire/escalate legs, the health split for the HERD-313
+# retire-on-outcome checkpoint, that minted health pane, the HERD-568 split-placement checkpoint's pane
+# (split INTO the builder tab — no new tab), the HERD-568 fallback checkpoint's pane (its own new tab,
+# counted above), and the claude-as-root pane for the alive checkpoint. All but the ESCALATE resolver
+# pane are closed again within their own steps — that one stays open BY DESIGN and goes with the
+# workspace at teardown.
+[ "$(sc "$SCR" tabs_created)" -eq 4 ]   || fail "(B) tabs_created should be 4 (got $(sc "$SCR" tabs_created))"
+[ "$(sc "$SCR" panes_created)" -eq 11 ] || fail "(B) panes_created should be 11 (got $(sc "$SCR" panes_created))"
 # The reviewer pane is retired on verdict consumption (HERD-113).
 [ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # The resolver pane retires on a consumed DONE and SURVIVES an ESCALATE (HERD-280).
@@ -342,6 +345,14 @@ done
   || fail "(B) health_pane_created_from_observed_suite not pass"
 [ "$(cp_status "$SCR" health_pane_roundtrip_on_same_reconcile)" = "pass" ] \
   || fail "(B) health_pane_roundtrip_on_same_reconcile not pass"
+# HERD-568: a live builder tab gets the health pane as a SPLIT inside it (tab id equality against the
+# real builder tab), never a fresh standalone tab.
+[ "$(cp_status "$SCR" health_pane_split_in_builder_tab)" = "pass" ] \
+  || fail "(B) health_pane_split_in_builder_tab not pass"
+# HERD-568: a .herd-tabs row naming a tab that no longer exists degrades to the standalone-tab
+# fallback, journaled reason=no-builder-tab.
+[ "$(cp_status "$SCR" health_pane_fallback_reaped_builder_tab)" = "pass" ] \
+  || fail "(B) health_pane_fallback_reaped_builder_tab not pass"
 # CLEAN TEARDOWN: zero leaked tabs, and the fake herdr's state has no workspaces left behind.
 [ "$(sc "$SCR" leaked_tabs)" -eq 0 ] || fail "(B) leaked_tabs must be 0 (got $(sc "$SCR" leaked_tabs))"
 LEFT="$(python3 -c 'import json; print(len(json.load(open("'"$STATE"'"))["workspaces"]))')"

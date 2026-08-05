@@ -5869,6 +5869,51 @@ _effective_health_pane() {
 # reconcile stays in lock-step with the inflight marker.
 _health_pane_registry_file() { printf '%s' "$TREES/.health-pane-registry-$1-$2"; }
 
+# _health_builder_tab <slug> — the tab_id of the BUILDER's own tab for <slug>, or empty when none is
+# found (HERD-568): the health pane's PREFERRED placement is a split INSIDE that tab, never a fresh
+# standalone one. Two sources, in order:
+#   1. $TREES/.herd-tabs — the engine's own tab registry (herd-feature.sh / herd-quick.sh write
+#      "<slug> <tab_id> builder" the moment a builder tab is created). Matched against the RAW slug
+#      first, then the SANITIZED/truncated form (herd_agent_name_sanitize) a foreign/legacy writer
+#      might have used instead — the registry's own writers always use the raw slug today, but a
+#      lookup that only tried raw would silently miss a row from any that didn't.
+#   2. `herdr agent list`, matched on the REGISTERED (sanitized) agent name — the same roster
+#      herd_driver_agent_pane_id reads, here for its tab_id instead of pane_id. Catches a builder
+#      whose .herd-tabs row is missing or stale (e.g. an adopted PR with no lane-written row) as long
+#      as the agent itself is still live.
+# Fail-soft throughout: headless / herdr absent / no match of either kind → empty output, no herdr call
+# beyond the one `agent list` in leg 2.
+_health_builder_tab() {
+  local _hbt_slug="${1:-}"
+  [ -n "$_hbt_slug" ] || return 0
+  local _hbt_reg="$TREES/.herd-tabs" _hbt_lbl _hbt_tab _hbt_role _hbt_rest
+  if [ -f "$_hbt_reg" ]; then
+    while IFS=' ' read -r _hbt_lbl _hbt_tab _hbt_role _hbt_rest; do
+      [ "${_hbt_role:-}" = builder ] && [ "$_hbt_lbl" = "$_hbt_slug" ] || continue
+      [ -n "$_hbt_tab" ] && { printf '%s' "$_hbt_tab"; return 0; }
+    done < "$_hbt_reg"
+    local _hbt_san; _hbt_san="$(herd_agent_name_sanitize "$_hbt_slug")"
+    if [ "$_hbt_san" != "$_hbt_slug" ]; then
+      while IFS=' ' read -r _hbt_lbl _hbt_tab _hbt_role _hbt_rest; do
+        [ "${_hbt_role:-}" = builder ] && [ "$_hbt_lbl" = "$_hbt_san" ] || continue
+        [ -n "$_hbt_tab" ] && { printf '%s' "$_hbt_tab"; return 0; }
+      done < "$_hbt_reg"
+    fi
+  fi
+  _herd_driver_is_headless && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  herdr agent list 2>/dev/null | SLUG="$(herd_agent_name_sanitize "$_hbt_slug")" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  for a in (json.load(sys.stdin).get("result") or {}).get("agents") or []:
+    if a.get("name") == slug:
+      print(a.get("tab_id","") or "", end=""); break
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
 # _spawn_health_pane <pr#> <slug> <sha> <worktree-dir> — stand up the disposable `health·<slug>` view
 # pane for an in-flight suite, ONCE. A PRIMITIVE: the only caller is the per-tick reconcile below, which
 # decides from the OBSERVED inflight marker — never from a dispatch event — so it rides the same signal
@@ -5876,8 +5921,22 @@ _health_pane_registry_file() { printf '%s' "$TREES/.health-pane-registry-$1-$2";
 # Self-gating + idempotent + fail-soft:
 #   • HEALTH_PANE off / dry-run / headless (no panes) / herdr absent → returns 0 having done NOTHING.
 #   • a registry row already present for this (pr,sha) → returns 0 (one pane per suite).
-# The pane runs `tail -F` of the sha-scoped health log the worker streams into (leg b's TEE), stamped
-# with a `health·<slug>` label so the guarded close recognizes it and a neighbour is never mistaken.
+#
+# PLACEMENT (HERD-568): the pane must appear WITH the builder's work, never steal a fresh tab (the
+# defect this fixes — every health_pane_spawned since PR #686 opened a brand-new tab, full fish
+# greeting + fastfetch, cluttering the tab bar). Two modes:
+#   SPLIT (preferred) — when _health_builder_tab finds the builder's own tab still open, split its
+#     ROOT pane (_herd_herdr_tab_root_pane — the task-spec-viewer / app-preview pane, NEVER the agent
+#     pane, which always lives in its OWN split off root) downward. Mirrors the exact placement
+#     herd-review.sh / herd-resolve.sh already use for their in-tab panes: below/beside the task-spec
+#     viewer, never on top of the agent.
+#   TAB (fallback) — the builder's tab is gone (retired/never existed) or the split failed: a
+#     standalone health·<slug> tab, byte-identical to the pre-HERD-568 behavior, journaled with
+#     reason=no-builder-tab so the operator can tell placement degraded from a dispatch event alone.
+# Either way the pane runs health-pane-view.sh (HERD-568 addendum) execed directly as its command — a
+# sidecar-aware tail of the live suite log ending in the final verdict — instead of typing a bare
+# `tail` into the pane's still-greeting shell, stamped with a `health·<slug>` label so the guarded
+# close recognizes it and a neighbour is never mistaken.
 _spawn_health_pane() {
   local _shp_pr="$1" _shp_slug="$2" _shp_sha="$3" _shp_dir="$4"
   [ "$(_effective_health_pane)" = on ] || return 0
@@ -5886,37 +5945,59 @@ _spawn_health_pane() {
   command -v herdr >/dev/null 2>&1 || return 0
   local _shp_reg; _shp_reg="$(_health_pane_registry_file "$_shp_pr" "$_shp_sha")"
   [ -f "$_shp_reg" ] && return 0
-  local _shp_log _shp_ws _shp_created _shp_tab _shp_root
+  local _shp_log _shp_mark _shp_ws _shp_tab="" _shp_root="" _shp_placement="tab"
   _shp_log="$(_health_log_file "${_shp_pr}-${_shp_sha}")"
+  _shp_mark="$(_health_inflight_file "${_shp_pr}-${_shp_sha}")"
   _shp_ws="$(herd_resolve_workspace_id 2>/dev/null || true)"
-  # shellcheck disable=SC2086  # ${_shp_ws:+…} deliberately word-splits into two argv when set
-  _shp_created="$(herdr tab create ${_shp_ws:+--workspace "$_shp_ws"} --cwd "$_shp_dir" --label "health·$_shp_slug" --no-focus 2>/dev/null || true)"
-  read -r _shp_tab _shp_root < <(printf '%s' "$_shp_created" | python3 -c \
-    'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
-  [ -n "${_shp_tab:-}" ] && [ -n "${_shp_root:-}" ] || return 0
+
+  local _shp_builder_tab; _shp_builder_tab="$(_health_builder_tab "$_shp_slug")"
+  if [ -n "$_shp_builder_tab" ]; then
+    local _shp_base; _shp_base="$(_herd_herdr_tab_root_pane "$_shp_builder_tab")"
+    if [ -n "$_shp_base" ]; then
+      local _shp_split
+      _shp_split="$(herdr pane split "$_shp_base" --direction down --cwd "$_shp_dir" --no-focus 2>/dev/null || true)"
+      _shp_root="$(printf '%s' "$_shp_split" | python3 -c \
+        'import sys,json; print((json.load(sys.stdin)["result"]["pane"]["pane_id"]) or "", end="")' 2>/dev/null || true)"
+      [ -n "$_shp_root" ] && { _shp_tab="$_shp_builder_tab"; _shp_placement=split; }
+    fi
+  fi
+
+  if [ "$_shp_placement" != split ]; then
+    local _shp_created
+    # shellcheck disable=SC2086  # ${_shp_ws:+…} deliberately word-splits into two argv when set
+    _shp_created="$(herdr tab create ${_shp_ws:+--workspace "$_shp_ws"} --cwd "$_shp_dir" --label "health·$_shp_slug" --no-focus 2>/dev/null || true)"
+    read -r _shp_tab _shp_root < <(printf '%s' "$_shp_created" | python3 -c \
+      'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
+    [ -n "${_shp_tab:-}" ] && [ -n "${_shp_root:-}" ] || return 0
+    printf '%s %s health\n' "$_shp_slug" "$_shp_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
+    journal_append infra_event component health_pane slug "$_shp_slug" pr "$_shp_pr" sha "$_shp_sha" reason no-builder-tab tab "$_shp_tab"
+  fi
+
   herdr pane rename "$_shp_root" "health·$_shp_slug" >/dev/null 2>&1 || true
-  # `tail -F` (retry+follow) tolerates the log not existing yet or being rotated under it.
-  herdr pane run "$_shp_root" "tail -n +1 -F $_shp_log" >/dev/null 2>&1 || true
-  printf '%s %s health·%s\n' "$_shp_root" "$_shp_tab" "$_shp_slug" > "$_shp_reg" 2>/dev/null || true
-  printf '%s %s health\n' "$_shp_slug" "$_shp_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
-  journal_append health_pane_spawned pr "$_shp_pr" slug "$_shp_slug" sha "$_shp_sha" pane "$_shp_root" tab "$_shp_tab" log_path "$_shp_log"
+  herdr pane run "$_shp_root" "bash $HERE/health-pane-view.sh $_shp_log $_shp_mark" >/dev/null 2>&1 || true
+  printf '%s %s %s health·%s\n' "$_shp_root" "$_shp_tab" "$_shp_placement" "$_shp_slug" > "$_shp_reg" 2>/dev/null || true
+  journal_append health_pane_spawned pr "$_shp_pr" slug "$_shp_slug" sha "$_shp_sha" pane "$_shp_root" tab "$_shp_tab" log_path "$_shp_log" placement "$_shp_placement"
 }
 
 # _retire_health_pane <pr#> <sha> [reason] — close the disposable pane once its suite has ended. Mirrors
 # _retire_resolver_pane: read the registry row and, if it still names a LIVE pane, close it via the
 # HERD-134 guarded close (which REFUSES + journals pane_close_refused if the id was recycled onto a
-# neighbour), journal `health_pane_retired` on a real close, close the now-empty tab, then drop the row
-# unconditionally. FAIL-SOFT + byte-quiet: no row / no pane / already-gone ⇒ no output, no journal.
+# neighbour), journal `health_pane_retired` on a real close, then drop the row unconditionally.
+# TAB is closed too — but ONLY in `tab` placement (the standalone fallback): in `split` placement that
+# id names the BUILDER's own shared tab, and closing it would take the builder down with the health
+# pane (the review/resolve-pane precedent this mirrors, _retire_resolver_pane, draws the exact same
+# line). FAIL-SOFT + byte-quiet: no row / no pane / already-gone ⇒ no output, no journal.
 _retire_health_pane() {
-  local _rhp_pr="$1" _rhp_sha="$2" _rhp_reason="${3:-outcome-landed}" _rhp_reg _rhp_pane _rhp_tab
+  local _rhp_pr="$1" _rhp_sha="$2" _rhp_reason="${3:-outcome-landed}" _rhp_reg _rhp_pane _rhp_tab _rhp_placement
   [ -z "${DRYRUN:-}" ] || return 0
   _rhp_reg="$(_health_pane_registry_file "$_rhp_pr" "$_rhp_sha")"
   [ -f "$_rhp_reg" ] || return 0
-  read -r _rhp_pane _rhp_tab _ < "$_rhp_reg" 2>/dev/null || true
+  read -r _rhp_pane _rhp_tab _rhp_placement _ < "$_rhp_reg" 2>/dev/null || true
   if [ -n "${_rhp_pane:-}" ] && [ "$_rhp_pane" != "-" ] && herd_driver_pane_alive "$_rhp_pane"; then
     if herd_close_pane_verified "$_rhp_pane" "health·"; then
-      journal_append health_pane_retired pr "$_rhp_pr" sha "$_rhp_sha" pane "$_rhp_pane" reason "$_rhp_reason"
-      if [ -n "${_rhp_tab:-}" ] && [ "$_rhp_tab" != "-" ]; then
+      journal_append health_pane_retired pr "$_rhp_pr" sha "$_rhp_sha" pane "$_rhp_pane" \
+        placement "${_rhp_placement:--}" reason "$_rhp_reason"
+      if [ "${_rhp_placement:-}" = "tab" ] && [ -n "${_rhp_tab:-}" ] && [ "$_rhp_tab" != "-" ]; then
         herdr tab close "$_rhp_tab" >/dev/null 2>&1 || true
         _herd_tabs_drop_row "$TREES/.herd-tabs" "$_rhp_tab"
       fi
