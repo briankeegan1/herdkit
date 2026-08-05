@@ -1682,6 +1682,182 @@ run_migrations() {
   rm -f "$backup"
 }
 
+# ── herd adopt: one-command localization of a CLONED herd project (HERD-520 / epic HERD-517) ─────
+# A herd project COMMITS .herd/config, and that baseline carries the AUTHOR's absolute PROJECT_ROOT
+# and WORKTREES_DIR. A collaborator who clones the project therefore inherits paths that do not
+# exist on THIS machine: every lane, the watcher lock, the worktree pool and the journal resolve
+# into someone else's home directory. Until this command the remedy was an undocumented hand
+# sequence — two `herd config set --local` writes, a mkdir, and a gitignore edit — which the
+# 2026-08-05 fleet-room onboarding session proved nobody discovers unaided (see
+# docs/audits/2026-08-05-collaborator-onboarding.md).
+#
+# `herd adopt [path]` IS that sequence: NON-INTERACTIVE, idempotent, and overlay-only.
+#   1. derive PROJECT_ROOT from the target's PHYSICAL path (pwd -P) and WORKTREES_DIR as the
+#      documented sibling pool <PROJECT_ROOT>-trees
+#   2. write BOTH through the VALIDATED machine-scope setter (`cmd_config_set --local`), so they
+#      land in the gitignored .herd/config.local overlay and the COMMITTED baseline is never
+#      touched — the clone stays byte-clean for its author and for the next `git pull`
+#   3. mkdir -p the worktree pool
+#   4. guarantee the overlay is ignored by git in this checkout
+#   5. run the dependency doctor, then print the two next commands
+# Re-running against an already-localized project changes nothing and prints a no-op report.
+
+# _adopt_ensure_ignored <project_root> <pattern> — guarantee <pattern> is ignored by git in THIS
+# checkout WITHOUT dirtying it. Deliberately NOT _ensure_gitignored: that appends to the COMMITTED
+# .gitignore, which leaves a fresh clone dirty the moment adopt runs — the very defect finding (6)
+# of the onboarding audit records against `herd render`. The per-machine overlay is a per-machine
+# concern, so the ignore belongs in the per-checkout exclude file, which git honors identically and
+# no `git status` ever reports.
+#   exit 0 = the pattern was ADDED to .git/info/exclude
+#        2 = already ignored (a committed .gitignore rule, or a previous adopt) — nothing to do
+#        1 = could not be established (no git / unreadable git dir) — caller warns, never dies
+_adopt_ensure_ignored() {
+  local root="$1" pat="$2" gitdir excl
+  command -v git >/dev/null 2>&1 || return 1
+  git -C "$root" rev-parse --git-dir >/dev/null 2>&1 || return 1
+  # Already covered by ANY ignore source (committed .gitignore, a global excludesFile, or the
+  # exclude file we write below) → idempotent no-op. This is what makes a second adopt inert.
+  git -C "$root" check-ignore -q -- "$pat" 2>/dev/null && return 2
+  gitdir="$(git -C "$root" rev-parse --git-dir 2>/dev/null)" || return 1
+  [ -n "$gitdir" ] || return 1
+  case "$gitdir" in /*) ;; *) gitdir="$root/$gitdir" ;; esac
+  excl="$gitdir/info/exclude"
+  mkdir -p "$gitdir/info" 2>/dev/null || return 1
+  { [ -f "$excl" ] && grep -qxF "$pat" "$excl"; } && return 2
+  printf '%s\n' "$pat" >> "$excl" || return 1
+  return 0
+}
+
+# _adopt_set_local <project_root> <KEY> <VALUE> — write one key into the target's .herd/config.local
+# through the SAME validated setter `herd config set --local` uses, so adopt inherits every guard
+# (unknown key, newline/shell-active charset, value shape, secret refusal) instead of hand-editing
+# the overlay. HERD_INIT_DEFER_APPLY=1 is load-bearing, for the same reason init and `governance
+# apply` set it: PROJECT_ROOT and WORKTREES_DIR are `requires=watcher` keys, so the setter's
+# change-awareness would otherwise drive a full `herd reload` — and on a just-cloned project there
+# is no control room to restart, only a herdr socket call with nothing on the other end (finding (2)
+# of the audit: `herd config set` on a watcher key HANGS with no watcher running). The deferral also
+# skips the external-consistency probe, keeping adopt offline-safe. The value simply takes effect on
+# the first `herd render` / `herd reload`, which adopt prints as the next steps.
+_adopt_set_local() {
+  local root="$1" key="$2" val="$3" rc=0
+  ( cd "$root" && export HERD_INIT_DEFER_APPLY=1 && cmd_config_set --local "$key" "$val" ) || rc=$?
+  return "$rc"
+}
+
+cmd_adopt() {
+  local target=""
+  while [ "$#" -gt 0 ]; do
+    case "${1:-}" in
+      --)   shift; break ;;
+      -?*)  die "unknown flag '$1' — usage: herd adopt [path]" ;;
+      *)    break ;;
+    esac
+  done
+  target="${1:-.}"
+  [ "$#" -le 1 ] || die "usage: herd adopt [path] — one target path (default: the current directory)"
+  [ -d "$target" ] || die "no directory at '$target' — usage: herd adopt [path]"
+
+  # PHYSICAL path (pwd -P): every consumer of PROJECT_ROOT compares it against paths git and the
+  # worktree pool report, which are symlink-resolved. A logical path would silently mismatch on a
+  # machine whose home or /tmp is a symlink (macOS /tmp → /private/tmp is the common case).
+  local project_root; project_root="$(cd "$target" && pwd -P)"
+  local cfg="$project_root/.herd/config" local_cfg="$project_root/.herd/config.local"
+  [ -f "$cfg" ] || die "no .herd/config at $project_root — 'herd adopt' localizes a project that ALREADY carries a committed herd config; run 'herd init' to stand one up"
+
+  # A linked git worktree is a checkout of a project that already has a control room; localizing it
+  # would repoint PROJECT_ROOT at the worktree and hijack the operator's watcher lock and pane set
+  # (the HERD-269 blast radius). Adopt is for the CLONE's root, so refuse — loudly, before any write.
+  local gitdir commondir
+  if gitdir="$(git -C "$project_root" rev-parse --git-dir 2>/dev/null)" && [ -n "$gitdir" ]; then
+    commondir="$(git -C "$project_root" rev-parse --git-common-dir 2>/dev/null)" || commondir="$gitdir"
+    [ "$gitdir" = "$commondir" ] \
+      || die "refusing to adopt $project_root — it is a linked git worktree, not a clone root. 'herd adopt' localizes the CLONE (its PROJECT_ROOT is the control room's identity); run it in the main checkout instead"
+  fi
+
+  # The documented pool location: a SIBLING of the project root, never inside it (a worktree pool
+  # under the repo would be swept up by every gate, lint and `git status` the engine runs).
+  local worktrees_dir="${project_root}-trees"
+
+  say "${c_bold}herd adopt${c_rst} — localizing $project_root for this machine"
+  say ""
+
+  # Report what the COMMITTED baseline claims, so the operator sees exactly what is being overridden
+  # and why. A baseline root that happens to equal the local one is the author's own checkout, not a
+  # defect — adopt still writes the overlay so the two can never diverge on a later pull.
+  local base_root; base_root="$(_config_file_value "$cfg" PROJECT_ROOT)"
+  if [ -n "$base_root" ] && [ "$base_root" != "$project_root" ]; then
+    say "  ${c_dim}committed .herd/config names PROJECT_ROOT=$base_root — a path from the project's author, not this machine${c_rst}"
+    say ""
+  fi
+
+  # Idempotency probe BEFORE any write: read the OVERLAY (what actually wins at load time), so a
+  # re-adopt of an already-localized project can report a clean no-op instead of narrating four
+  # writes that changed nothing. cmd_config_set is itself idempotent; this is the human-facing half.
+  local ov_root="" ov_trees=""
+  if [ -f "$local_cfg" ]; then
+    ov_root="$(_config_file_value "$local_cfg" PROJECT_ROOT)"
+    ov_trees="$(_config_file_value "$local_cfg" WORKTREES_DIR)"
+  fi
+  local changes=0
+
+  # 1 + 2. The two localized keys, through the validated machine-scope setter.
+  [ "$ov_root" = "$project_root" ] || changes=$((changes+1))
+  _adopt_set_local "$project_root" PROJECT_ROOT "$project_root" \
+    || die "could not set PROJECT_ROOT (see the refusal above) — nothing else was changed"
+  [ "$ov_trees" = "$worktrees_dir" ] || changes=$((changes+1))
+  _adopt_set_local "$project_root" WORKTREES_DIR "$worktrees_dir" \
+    || die "could not set WORKTREES_DIR (see the refusal above) — PROJECT_ROOT is already localized; re-run 'herd adopt' after fixing the cause"
+
+  # 3. The worktree pool. Every lane spawn assumes it exists; creating it here is what turns the
+  #    localized config into a config the engine can actually run on.
+  if [ -d "$worktrees_dir" ]; then
+    ok "worktree pool already exists → $worktrees_dir"
+  elif mkdir -p "$worktrees_dir" 2>/dev/null; then
+    ok "created worktree pool → $worktrees_dir"
+    changes=$((changes+1))
+  else
+    die "could not create the worktree pool at $worktrees_dir — create it by hand (mkdir -p) and re-run 'herd adopt'"
+  fi
+
+  # 4. The overlay must never reach git. Checkout-local, so the clone stays undirtied (see
+  #    _adopt_ensure_ignored).
+  local ign_rc=0
+  _adopt_ensure_ignored "$project_root" '.herd/config.local' || ign_rc=$?
+  case "$ign_rc" in
+    0) ok "ignored .herd/config.local via .git/info/exclude (checkout-local — the clone stays clean)"
+       changes=$((changes+1)) ;;
+    2) ok ".herd/config.local is already ignored by git" ;;
+    *) warn "could not confirm .herd/config.local is gitignored at $project_root — add it to .gitignore or .git/info/exclude by hand; it holds per-machine paths and must never be committed" ;;
+  esac
+
+  # 5. Dependency doctor. Deliberately LAST and deliberately NOT a precondition: localization needs
+  #    neither `gh auth` nor a live herdr, so a collaborator with a half-set-up environment must
+  #    still be able to localize the clone and then fix the environment. A miss is reported honestly
+  #    (non-zero exit, loud line) rather than silently swallowed — re-running adopt after the fix is
+  #    a clean no-op. HERD_SKIP_DOCTOR=1 bypasses, exactly as it does for `herd init`.
+  # Blank separator only when the doctor will actually print — HERD_SKIP_DOCTOR=1 makes it silent,
+  # and a report that ends in two blank lines reads like something was swallowed.
+  [ "${HERD_SKIP_DOCTOR:-}" = "1" ] || say ""
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/herd-preflight.sh"
+  local doctor_rc=0
+  herd_doctor || doctor_rc=$?
+
+  say ""
+  if [ "$changes" -eq 0 ]; then
+    ok "herd adopt: already localized for this machine — no changes."
+  else
+    ok "herd adopt complete — $changes change(s) applied to the per-machine overlay."
+  fi
+  say "  Next:  cd $project_root"
+  say "         herd render    ${c_dim}# rebuild the per-machine coordinator skill from the localized config${c_rst}"
+  say "         herd reload    ${c_dim}# bring up the control room (watcher + backlog pane)${c_rst}"
+  if [ "$doctor_rc" -ne 0 ]; then
+    say ""
+    die "the dependency doctor found missing/broken required dependencies (above). The localization ABOVE is already applied and durable — fix the deps, then re-run 'herd adopt' (a clean no-op) before launching the control room.  (bypass: HERD_SKIP_DOCTOR=1)"
+  fi
+}
+
 cmd_upgrade() {
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
@@ -8013,6 +8189,17 @@ usage() {
 herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
 
   herd init                           stand up herdkit in the current repo (interview + scout)
+  herd adopt [path]                   localize a CLONED herd project on THIS machine — the one
+                                      command a collaborator runs after 'git clone'. NON-INTERACTIVE
+                                      and idempotent: writes PROJECT_ROOT (the target's physical
+                                      path) + WORKTREES_DIR (<PROJECT_ROOT>-trees) into the
+                                      gitignored .herd/config.local overlay through the validated
+                                      machine-scope setter (the committed baseline, which carries
+                                      the AUTHOR's absolute paths, is never touched), creates the
+                                      worktree pool, guarantees the overlay is git-ignored via
+                                      .git/info/exclude (so the clone stays undirtied), then runs
+                                      the dependency doctor and prints the next steps. Re-running
+                                      on an already-localized project is a no-op report
   herd doctor                         one-pass dependency doctor: check git, gh (+auth), claude,
                                       python3, herdr (+JSON contract) and python3's UTF-8 output;
                                       report every problem at once with per-platform install hints;
@@ -8284,6 +8471,7 @@ command -v herd_context_guard >/dev/null 2>&1 && herd_context_guard "$@"
 
 case "${1:-help}" in
   init)    shift; cmd_init "$@" ;;
+  adopt)   shift; cmd_adopt "$@" ;;
   doctor)  shift; cmd_doctor "$@" ;;
   upgrade) shift; cmd_upgrade "$@" ;;
   render)  shift; cmd_render "$@" ;;
