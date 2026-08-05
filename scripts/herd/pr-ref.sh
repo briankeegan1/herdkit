@@ -61,9 +61,9 @@
 # stdin, or a whole `gh pr list --json number,body` array). Same shape as backends/linear.sh's
 # _LINEAR_PICK_STATE_PY. Exports three names:
 #   pr_ref_from_body(body)      → the ref, or "" (no Refs: line / placeholder / no token)
-#   pr_ref_unparsed_line(body)  → the offending line when the body MENTIONS refs: but yields no ref;
-#                                 "" when a ref parsed, when nothing mentions refs:, or when the
-#                                 mention is an explicit placeholder
+#   pr_ref_unparsed_line(body)  → the offending line when the body DECLARES a ref but yields none;
+#                                 "" when a ref parsed, when no line is declaration-shaped, or when
+#                                 the declaration is an explicit placeholder
 #   pr_ref_declared_none(line)  → True for an explicit placeholder line (used by the two above)
 #
 # The decoration class `[\s#*>-]` is written with `-` LAST so it is a literal, not a range, in both
@@ -74,8 +74,16 @@ _PR_REF_PLACEHOLDER = {"none", "n/a", "na"}
 _PR_REF_TRAILING = ".,;:!)]}*"
 # leading decoration (heading/list/quote/bold) · "refs:" · a closing bold · the token
 _PR_REF_LINE = re.compile(r"^[\s#*>-]*refs:\**\s*(\S+)", re.IGNORECASE)
-# the LOOSE mention: any "refs:" anywhere on the line, however decorated or buried in prose
-_PR_REF_MENTION = re.compile(r"refs:", re.IGNORECASE)
+# DECLARATION-SHAPED, the alarm'"'"'s wider net: `refs:` is the first WORD on the line, whatever sits in
+# front of it, so long as none of it is a word itself. That admits every decoration this parser does
+# NOT yet know — a numbered list (`1. Refs:`), a table cell (`| Refs: |`), an HTML tag
+# (`<b>Refs:</b>`), a bullet glyph — which is exactly the alarm'"'"'s job: to catch the decoration AFTER
+# this one. It excludes a `refs:` buried in PROSE ("see the refs: line") and, importantly, one buried
+# in a one-line JSON blob — a `gh` stub that ignores `-q .body` hands the whole `{"state":…,"body":
+# "Refs: X"}` object over as the body, and treating that as a failed declaration alarms on every
+# merged PR in the sim suite.
+_PR_REF_MENTION = re.compile(
+    r"^[^0-9A-Za-z]*(?:\d+[.)][^0-9A-Za-z]*)?(?:<[A-Za-z/][^>]*>[^0-9A-Za-z]*)*refs:", re.IGNORECASE)
 
 def _pr_ref_decomment(body):
     return re.sub(r"<!--.*?-->", "", body or "", flags=re.DOTALL)
@@ -107,14 +115,14 @@ def pr_ref_from_body(body):
     return ""
 
 def pr_ref_unparsed_line(body, cap=200):
-    """The SILENT-MISS probe. "" when the body has no refs: intent, when a ref parsed, or when the
-    only mention is an explicit placeholder; otherwise the first offending line, whitespace-flattened
+    """The SILENT-MISS probe. "" when no line DECLARES a ref, when a ref parsed, or when the
+    declaration is an explicit placeholder; otherwise the first offending line, whitespace-flattened
     and capped so it is safe to journal and to render on one console row."""
     body = _pr_ref_decomment(body)
     if pr_ref_from_body(body):
         return ""
     for line in body.splitlines():
-        if not _PR_REF_MENTION.search(line):
+        if not _PR_REF_MENTION.match(line):
             continue
         if pr_ref_declared_none(line):
             return ""

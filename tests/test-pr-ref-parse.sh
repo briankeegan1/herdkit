@@ -16,11 +16,14 @@
 #       PURE WIDENING: every previously-matching body still yields the same ref, byte for byte.
 #   (3) NO SHAPE TEST — `Refs: some-title-slug` still parses (the default `file` backend's item ref
 #       IS a slug; the shape question belongs to the backend, never the engine).
-#   (4) THE SILENT-MISS ALARM — a body that MENTIONS `refs:` and yields no ref journals a loud
+#   (4) THE SILENT-MISS ALARM — a body that DECLARES a ref and yields none journals a loud
 #       `reconcile_ref_unparsed` event (pr + the offending line), writes one ledger row, and renders
-#       through the shared bounded-console-section machinery. Once per PR, never twice.
-#   (5) SILENT WHEN HEALTHY — a body with no refs: mention, or with an explicit placeholder, produces
-#       NO event, NO ledger row, and an EMPTY console section (byte-identical console).
+#       through the shared bounded-console-section machinery. Once per PR, never twice. Declaration-
+#       shaped means `refs:` is the first WORD on its line, so a decoration this parser does NOT know
+#       (`1. Refs:`, `| Refs: |`, `<b>Refs:</b>`) alarms rather than vanishing — the alarm's whole job.
+#   (5) SILENT WHEN HEALTHY — a placeholder, a template comment, a `refs:` buried in prose, and a
+#       one-line json blob carrying a `"body":"Refs: X"` field all produce NO event, NO ledger row,
+#       and an EMPTY console section (byte-identical console).
 #   (6) DEGRADED HOST — with python3 shadowed the shell fallback still parses every decorated shape,
 #       and the alarm goes quiet rather than guessing.
 #
@@ -132,19 +135,23 @@ got="$(_ref '## Refs: healthcheck-sha-cache')"
 ok; echo "PASS (4) a title-slug ref still parses — no engine-side shape test"
 
 # ══ (5) THE SILENT-MISS PROBE ════════════════════════════════════════════════════════════════════
-# A refs: mention that yields nothing usable is the shape #637 had. Note what is NOT a miss: a bare
-# word after the colon IS a legitimate ref on the file backend (see (4)), so "garbage" means a line
-# whose colon is followed by nothing this parser can turn into a token — not a value it dislikes.
-while IFS='|' read -r label body; do
-  [ -n "$label" ] || continue
-  got="$(_unparsed "$body")"
-  [ -n "$got" ] || fail "(5) $label: '$body' raised NO alarm — the silent miss is back"
-done <<'CASES'
-empty value|Refs:
-punctuation-only value|Refs: .
-bold label, value on the next line|**Refs:**
-buried in prose|see the refs: line in the template
-CASES
+# A DECLARATION that yields nothing usable is the shape #637 had. Two things are deliberately NOT a
+# miss: a bare word after the colon IS a legitimate ref on the file backend (see (4)), so "garbage"
+# means a colon followed by nothing this parser can turn into a token, not a value it dislikes; and
+# the alarm is declaration-shaped, not any `refs:` anywhere (see (6)).
+#
+# The last three rows are the alarm EARNING ITS KEEP: decorations the PARSER does not handle. Each is
+# a plausible next #637, and each is caught loudly instead of silently — which is the whole point of
+# having an alarm rather than only a wider regex.
+_alarms() {  # <label> <body> — the body must raise the alarm
+  [ -n "$(_unparsed "$2")" ] || fail "(5) $1: '$2' raised NO alarm — the silent miss is back"
+}
+_alarms 'empty value'                            'Refs:'
+_alarms 'punctuation-only value'                 'Refs: .'
+_alarms 'bold label, value on the next line'     '**Refs:**'
+_alarms 'numbered list (parser does not handle)' '1. Refs: HERD-1'
+_alarms 'table cell (parser does not handle)'    '| Refs: HERD-1 |'
+_alarms 'html tag (parser does not handle)'      '<b>Refs:</b> HERD-1'
 # The offending LINE is what gets reported — an operator must see WHY it did not parse.
 got="$(_unparsed 'Refs: .')"
 [ "$got" = "Refs: ." ] || fail "(5) the alarm reported '$got' instead of the offending line"
@@ -155,22 +162,27 @@ got="$(_unparsed "$(printf '  \tRefs:\t \n')")"
 ok; echo "PASS (5) a refs: mention that parses to nothing is reported, with the offending line"
 
 # ══ (6) SILENT WHEN HEALTHY — no false alarms ════════════════════════════════════════════════════
-while IFS='|' read -r label body; do
-  [ -n "$label" ] || continue
-  got="$(_unparsed "$body")"
-  [ -z "$got" ] || fail "(6) $label wrongly alarmed with '$got'"
-done <<'CASES'
-a parsed bare ref|Refs: HERD-522
-a parsed decorated ref|## Refs: EMG-111
-an explicit placeholder|Refs: <ID>
-an explicit none|Refs: none
-a body with no refs: at all|just a body, nothing tracked
-CASES
+# An alarm is worth exactly its precision. These are the shapes that must stay quiet, and the last
+# two are not hypothetical — the heavy gate caught BOTH firing before the probe was narrowed from
+# "any refs: on the line" to "refs: is the first word on the line".
+_quiet() {  # <label> <body> — the body must NOT raise the alarm
+  local got; got="$(_unparsed "$2")"
+  [ -z "$got" ] || fail "(6) $1 wrongly alarmed with '$got'"
+}
+_quiet 'a parsed bare ref'            'Refs: HERD-522'
+_quiet 'a parsed decorated ref'       '## Refs: EMG-111'
+_quiet 'an explicit placeholder'      'Refs: <ID>'
+_quiet 'an explicit none'             'Refs: none'
+_quiet 'a body with no refs: at all'  'just a body, nothing tracked'
+_quiet 'refs: buried in prose'        'the reconcile parses the refs: line at merge time'
+# A `gh` stub that ignores `-q .body` hands the WHOLE json object over as the body — one line, with a
+# `"body":"Refs: X"` field inside it. Read as a failed declaration, that alarmed on every merged PR in
+# the sim suite (and, with the notify that used to fire here, leaked a desktop notification per PR).
+_quiet 'a one-line json blob' '{"state":"MERGED","headRefName":"sim/feat-1","body":"Refs: HERD-236"}'
 # The PR-TEMPLATE comment block is the highest-volume false-alarm risk: EVERY untracked PR in a repo
 # with a classic PULL_REQUEST_TEMPLATE.md carries a commented-out `Refs:` example.
-got="$(_unparsed "$(printf '<!-- Refs: <ID> -->\nno tracker item for this one\n')")"
-[ -z "$got" ] || fail "(6) a PR-template comment raised a false alarm ('$got')"
-ok; echo "PASS (6) no alarm for a parsed ref, a declared placeholder, or a template comment"
+_quiet 'a PR-template comment' "$(printf '<!-- Refs: <ID> -->\nno tracker item for this one\n')"
+ok; echo "PASS (6) quiet for a parsed ref, a placeholder, a template comment, prose, and a json blob"
 
 # ══ (7) DEGRADED HOST — python3 shadowed ═════════════════════════════════════════════════════════
 # python3 is a hard engine dep, but the parser sits on the merge tail and has always degraded to a

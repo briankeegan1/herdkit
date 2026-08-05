@@ -182,8 +182,12 @@ _reconcile_ref_unparsed_alarm() {
   [ -n "${REF_UNPARSED_FILE:-}" ] || return 0
   printf '%s\t%s\t%s\n' "$(date +%s)" "$ru_pr" "$ru_line" >> "$REF_UNPARSED_FILE" 2>/dev/null || true
   command -v herd_console_trim >/dev/null 2>&1 && herd_console_trim "$REF_UNPARSED_FILE" "${CONSOLE_LEDGER_MAX:-20}"
-  command -v herd_driver_notify >/dev/null 2>&1 \
-    && herd_driver_notify "🔗 unlinked merge · PR #${ru_pr}" "a 'refs:' line that parses to nothing: ${ru_line}" default
+  # NO herd_driver_notify. A desktop notification was the obvious "loud", and it is the wrong loud
+  # here: this fires from a post-merge sweep that re-probes every recently-merged PR, so it is a
+  # SURFACE (a standing console row) rather than an EVENT worth interrupting a human for — and, as the
+  # heavy gate proved, notifying from the merge tail leaks a real desktop notification out of every
+  # hermetic test and sim that walks a merged PR (daemon-hermeticity). The journal event plus the loud
+  # console section are the two surfaces the item asked for.
   return 0
 }
 
