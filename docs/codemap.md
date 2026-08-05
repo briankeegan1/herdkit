@@ -348,6 +348,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `STORE_BACKEND` → —
 - `SWEEP_AUTO` → `bin/herd`, `sweep.sh`
 - `TASK_PANE_VIEW` → `herd-feature.sh`, `herd-quick.sh`
+- `TEAM_PRESENCE` → `agent-watch.sh`
 - `TOKEN_MODE` → `bin/herd`
 - `TRACKED_SPAWNS` → `bin/herd`
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
