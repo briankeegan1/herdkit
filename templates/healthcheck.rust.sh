@@ -2,10 +2,12 @@
 # healthcheck.rust.sh (EXAMPLE) — a per-project health command for a Rust (Cargo) project.
 # `herd init` seeds this into .herd/healthcheck.project.sh when scout detects lang=rust; you can also
 # copy it by hand and point HEALTHCHECK_CMD at it. Same contract as templates/healthcheck.project.sh:
-# exit 0 clean, 1 code error, 2 data/env (tolerated).
+# exit 0 clean, 1 code error, 2 data/env (tolerated). The wrapper forwards --heavy as $2 (HERD-551) —
+# see templates/healthcheck.project.sh's header for the full profile/HEAVY-SKIPPED contract.
 set -u
-DIR="${1:?usage: healthcheck.rust.sh <worktree-dir> [--oneline]}"
-ONELINE=""; [ "${2:-}" = "--oneline" ] && ONELINE=1
+DIR="${1:?usage: healthcheck.rust.sh <worktree-dir> [--heavy] [--oneline]}"
+ONELINE=""
+for _hk_arg in "$@"; do [ "$_hk_arg" = "--oneline" ] && ONELINE=1; done
 cd "$DIR" 2>/dev/null || { echo "no such dir: $DIR"; exit 1; }
 
 # 1. cargo check as the hard code gate (type-checks + compiles without producing binaries).

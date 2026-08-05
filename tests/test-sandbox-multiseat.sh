@@ -94,6 +94,31 @@ echo "PASS (d) all $NPRS PRs drained, 0 double-merges"
 [ "$(sc "$SCARD" blessings_posted)" -ge "$NPRS" ] || fail "(e) blessings_posted < prs"
 echo "PASS (e) two TREES dirs + shared remote + blessings present"
 
+# ── (g) STUB SELF-TEST — the shared gh stub honors -q/--jq (HERD-528) ─────────
+# A filtered query (-q/--jq) must return the BARE field; an unfiltered query must return the
+# FULL JSON doc. Exercises the SAME stub binary + shared state the scenario run above already
+# populated (section (a)), so this proves the real code path, not a reimplementation of it.
+GHBIN="$ART/bin/gh"
+[ -x "$GHBIN" ] || fail "(g) stub gh binary missing at $GHBIN"
+PR1="$(awk -F'\t' 'NR==1{print $1}' "$ART/shared/prs.tsv")"
+SHA1="$(awk -F'\t' 'NR==1{print $3}' "$ART/shared/prs.tsv")"
+[ -n "$PR1" ] && [ -n "$SHA1" ] || fail "(g) could not read a PR/sha fixture row from prs.tsv"
+
+FILTERED="$(SANDBOX_SHARED="$ART/shared" HERD_SIM_SEAT=seat-a "$GHBIN" pr view "$PR1" --json state,mergedAt -q .state)"
+[ "$FILTERED" = "MERGED" ] || fail "(g) pr view -q .state should return the bare state 'MERGED', got: $FILTERED"
+UNFILTERED="$(SANDBOX_SHARED="$ART/shared" HERD_SIM_SEAT=seat-a "$GHBIN" pr view "$PR1" --json state,mergedAt)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"]=="MERGED"' "$UNFILTERED" \
+  || fail "(g) unfiltered pr view should return the full JSON doc, got: $UNFILTERED"
+echo "PASS (g.1) pr view: -q .state bare vs. unfiltered full JSON"
+
+STATUSES_FILTERED="$(SANDBOX_SHARED="$ART/shared" HERD_SIM_SEAT=seat-a "$GHBIN" api "repos/{owner}/{repo}/commits/$SHA1/statuses" --jq '[.[] | select(.context=="herd/gates")][0].state')"
+[ "$STATUSES_FILTERED" = "success" ] \
+  || fail "(g) commits/statuses --jq should return the bare state 'success', got: $STATUSES_FILTERED"
+STATUSES_UNFILTERED="$(SANDBOX_SHARED="$ART/shared" HERD_SIM_SEAT=seat-a "$GHBIN" api "repos/{owner}/{repo}/commits/$SHA1/statuses")"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert isinstance(d, list) and d and "context" in d[0]' "$STATUSES_UNFILTERED" \
+  || fail "(g) unfiltered commits/statuses should return the full JSON array, got: $STATUSES_UNFILTERED"
+echo "PASS (g.2) commits/statuses: --jq bare vs. unfiltered full JSON array"
+
 # ── (f) HERMETIC — nothing leaked into the real repo tree ─────────────────────
 NOW_STATUS="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | sort || true)"
 NEW_ENTRIES="$(comm -13 <(printf '%s\n' "$BASELINE_STATUS") <(printf '%s\n' "$NOW_STATUS") | grep -v '^$' || true)"

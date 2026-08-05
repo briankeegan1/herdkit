@@ -19,6 +19,10 @@
 #     the pane process ⇒ 'dead' (pane present, unresponsive); REMOVE the agent pane entirely ⇒ 'missing'
 #     (HERD-135) — the SHIPPED status classifier reads 'agentmissing' (NOT done) for an open-PR builder
 #     with no agent (the #249 false-'done' incident);
+#   • DISPOSABLE HEALTH PANES, both directions (HERD-313 leg a / HERD-554): the shipped per-tick
+#     reconcile MINTS a real `health·<slug>` pane for an OBSERVED in-flight suite — a pid-live inflight
+#     marker + its sha-scoped log and nothing else, the shape pysrc/herd/live_runtime.py leaves behind —
+#     and RETIRES it the instant that suite ends;
 #   • CLEAN TEARDOWN — the disposable workspace is closed and NO tab or pane is leaked afterward
 #     (so the result satisfies the tab-leak-guard).
 #
@@ -773,6 +777,101 @@ except Exception:
       fi
     else
       checkpoint health_pane_retired_on_outcome fail "could not stand up the health split pane (HP_PANE='$HP_PANE')"
+    fi
+  fi
+
+  # ── HEALTH-PANE CREATE (HERD-554): a live suite with NO pane gains one on the reconcile pass ───────
+  # The retire leg above proves half the invariant against a pane the SIM stood up. This proves the other
+  # half — and the actual HERD-554 regression: under ENGINE_IMPL=python the suite is dispatched by
+  # pysrc/herd/live_runtime.py, the bash render pass's automerge-candidate branch (where the old spawn
+  # hook lived) is never reached, and HEALTH_PANE=on produced no pane at all. So the ONLY inputs here are
+  # the two state files the Python engine writes — a pid-live `.health-inflight-<pr>-<sha>` marker and the
+  # sha-scoped `.health-log-<pr>-<sha>` it tees the suite into — plus the observed worktree row ($FEATS).
+  # NOTHING calls a spawn hook. The SHIPPED reconcile (_reconcile_health_panes, agent-watch.sh in lib
+  # mode) then has to mint a REAL herdr tab+pane, pinned into THIS scenario's disposable workspace via
+  # WORKSPACE_NAME (so it can never land in the runner's own control room), stamped `health·<slug>` and
+  # tailing the live log. Killing the suite and re-running the same reconcile must take it away again.
+  if [ -n "$WSID" ]; then
+    step healthpanecreate "health pane is CREATED for an OBSERVED in-flight suite, then retired (engine-agnostic reconcile, real pane)"
+    HC_T="$ART/healthcreatetrees"; mkdir -p "$HC_T/.herd"
+    HC_PR=558; HC_SHA="hcsha558"
+    HC_JOURNAL="$ART/hp-create-journal.jsonl"; : > "$HC_JOURNAL"
+    HC_REG="$HC_T/.health-pane-registry-$HC_PR-$HC_SHA"
+    # A real background sleeper is the suite's holder pid, so _health_pid_live's HERD-451 identity check
+    # (pid alive AND its recorded start-time still matches) passes against a genuine process.
+    sleep 120 </dev/null >/dev/null 2>&1 &
+    HC_HOLDER=$!
+    disown "$HC_HOLDER" 2>/dev/null || true   # no job-control "Terminated" noise when we kill it below
+    printf 'suite: running…\n' > "$HC_T/.health-log-$HC_PR-$HC_SHA"
+    _hc_present() {
+      pane_json "$WSID" | HCP="$1" python3 -c '
+import sys,json,os
+hcp=os.environ["HCP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    p=next((p for p in panes if str(p.get("pane_id",""))==hcp), None)
+    print(("yes\t"+str(p.get("label") or "")) if p else "no\t")
+except Exception:
+    print("err\t")
+' 2>/dev/null
+    }
+    _hc_reconcile() {
+      (
+        export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$HC_T" DEFAULT_BRANCH=main HEALTH_PANE=on \
+               HERD_DISPOSABLE_WORKSPACE=1 WORKSPACE_NAME="$WS_LABEL" JOURNAL_FILE="$HC_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        [ "${1:-}" = "arm" ] && _marker_write "$(_health_inflight_file "$HC_PR-$HC_SHA")" "$HC_HOLDER"
+        # The observed discovery record the console rows are rendered from: this PR lives in this
+        # worktree under this slug. mergeStateStatus BLOCKED on purpose — the exact state a PR under
+        # `require herd/gates` sits in WHILE its suite runs, i.e. the branch the old hook never saw.
+        FEATS=("$REPO"$'\037'"rp-builder"$'\037'"feat/rp-builder"$'\037'"$HC_PR"$'\037'"MERGEABLE"$'\037'"BLOCKED"$'\037'"working"$'\037'"$HC_SHA"$'\037'"me"$'\037'"branch"$'\037'""$'\037'"0")
+        _reconcile_health_panes
+      )
+    }
+    _hc_reconcile arm; HC_RC=$?
+    HC_PANE=""; HC_TAB=""; HC_LABEL=""
+    [ -f "$HC_REG" ] && read -r HC_PANE HC_TAB HC_LABEL < "$HC_REG"
+    [ -n "$HC_PANE" ] && { PANES_CREATED=$((PANES_CREATED+1)); TABS_CREATED=$((TABS_CREATED+1)); }
+    HC_SEEN="no"; HC_SEEN_LABEL=""
+    if [ -n "$HC_PANE" ]; then
+      _i=0
+      while [ "$_i" -lt 25 ]; do
+        IFS=$'\t' read -r HC_SEEN HC_SEEN_LABEL <<< "$(_hc_present "$HC_PANE")"
+        [ "$HC_SEEN" = yes ] && break
+        _i=$((_i+1)); sleep 0.2
+      done
+    fi
+    HC_JRN=no; grep -q '"event":"health_pane_spawned"' "$HC_JOURNAL" 2>/dev/null && HC_JRN=yes
+    if [ "$HC_RC" = 0 ] && [ "$HC_SEEN" = yes ] && [ "$HC_LABEL" = "health·rp-builder" ] \
+       && [ "$HC_SEEN_LABEL" = "health·rp-builder" ] && [ "$HC_JRN" = yes ]; then
+      checkpoint health_pane_created_from_observed_suite pass \
+        "live inflight marker + log alone (python-shaped dispatch, PR BLOCKED) minted real pane $HC_PANE labelled '$HC_SEEN_LABEL'; health_pane_spawned journaled"
+    else
+      checkpoint health_pane_created_from_observed_suite fail \
+        "no pane minted for the observed suite (rc=$HC_RC pane='$HC_PANE' present=$HC_SEEN row_label='$HC_LABEL' live_label='$HC_SEEN_LABEL' journaled=$HC_JRN)"
+    fi
+
+    # Idempotent + round trip: a second tick must not duplicate the pane; once the suite ends (holder
+    # killed, marker collected) the SAME reconcile must take it away.
+    HC_DUP=no
+    _hc_reconcile; [ -f "$HC_REG" ] && { read -r _hc_p2 _ _ < "$HC_REG"; [ "$_hc_p2" != "$HC_PANE" ] && HC_DUP=yes; }
+    kill "$HC_HOLDER" 2>/dev/null || true
+    rm -f "$HC_T/.health-inflight-$HC_PR-$HC_SHA"
+    _hc_reconcile; HC_RC2=$?
+    HC_GONE=no; _i=0
+    while [ "$_i" -lt 25 ]; do
+      case "$(_hc_present "${HC_PANE:-none}")" in no*) HC_GONE=yes; break ;; esac
+      _i=$((_i+1)); sleep 0.2
+    done
+    HC_DROPPED=no; [ ! -f "$HC_REG" ] && HC_DROPPED=yes
+    if [ -n "$HC_PANE" ] && [ "$HC_RC2" = 0 ] && [ "$HC_DUP" = no ] && [ "$HC_GONE" = yes ] && [ "$HC_DROPPED" = yes ]; then
+      checkpoint health_pane_roundtrip_on_same_reconcile pass \
+        "second tick duplicated nothing; suite ended → the same reconcile retired pane $HC_PANE and dropped its row"
+    else
+      checkpoint health_pane_roundtrip_on_same_reconcile fail \
+        "create/retire round trip broke (pane='$HC_PANE' rc2=$HC_RC2 duplicated=$HC_DUP gone=$HC_GONE row_dropped=$HC_DROPPED)"
     fi
   fi
 

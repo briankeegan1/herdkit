@@ -5,11 +5,21 @@
 # so a one-line script tweak isn't forced through the project's full (possibly slow) gate:
 #
 #   • heavy — run the PROJECT health command ($HEALTHCHECK_CMD from .herd/config), invoked as
-#       $HEALTHCHECK_CMD <worktree-dir> [--oneline].  It owns the project-specific notion of
+#       $HEALTHCHECK_CMD <worktree-dir> --heavy [--oneline].  It owns the project-specific notion of
 #       "healthy" (boot a server, run the test suite, shellcheck + bats, …) and MUST exit:
 #         0 = clean (or only a tolerated data/env issue)
 #         1 = a real CODE error
 #         2 = a data/env issue (tolerated — treated as clean, surfaced as a ⚠️)
+#       PROFILE FORWARDING (HERD-551 / GH #674): the resolved profile is passed through as $2 — dir
+#       stays $1 — so a profile-aware project script (one that runs extra/slower probes ONLY under
+#       --heavy) actually sees the request instead of silently defaulting to its own light behavior
+#       while the wrapper reports clean. A script that ignores $2 (like herdkit's own, and the
+#       templates/healthcheck.*.sh examples) is byte-identical either way.
+#       CONTRADICTION HARD-ERROR (HERD-551): if a --heavy run's output contains a line starting with
+#       the literal marker "HEAVY-SKIPPED:" — the documented convention for a project script that
+#       received --heavy but still skipped its heavy probes (missing tool, env cap, a stale default,
+#       …) — healthcheck.sh fails LOUDLY (exit 1) regardless of the script's own exit code. A --heavy
+#       request that silently downgrades must never read as clean.
 #       BASELINE-AWARE (HERD-190): a heavy code error whose failing tests ALL already fail on the base
 #       (origin/main) is INHERITED — surfaced as a tolerated ⚠️, not blocked — so a fix-PR never
 #       deadlocks on a base failure it did not introduce. See the baseline-aware gate section below;
@@ -325,7 +335,10 @@ _baseline_base_set() {
 
   # Run the base suite in FULL mode (TAP), extract + cache its known-failure set. A tolerated data/env
   # (⚠️, rc 2) or clean (rc 0) base simply yields no 'not ok' lines → an empty set (base green).
-  _bl_out="$(bash -c "cd '$_bl_dir' && $HEALTHCHECK_CMD '$_bl_dir'" 2>&1)"
+  # HERD-551: forward --heavy here too — the base run must be the SAME profile as the PR run it is
+  # diffed against, else a profile-aware project script would compare a heavy PR suite's failures
+  # against a light base run's (near-empty) known-failure set and never find anything "inherited".
+  _bl_out="$(bash -c "cd '$_bl_dir' && $HEALTHCHECK_CMD '$_bl_dir' --heavy" 2>&1)"
   _bl_set="$(_baseline_notok_set "$_bl_out")"
   printf '%s\n' "$_bl_set" > "$_bl_cache" 2>/dev/null || true
   git -C "$_bl_src" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true
@@ -518,11 +531,26 @@ run_heavy() {
   # (tee is a transparent passthrough of the same bytes; `pipefail`, scoped to this one subshell via
   # the command substitution, keeps $HEALTHCHECK_CMD's — not tee's — exit code). With the env var
   # unset (every caller except the async worker) the tee target is /dev/null: byte-identical.
+  # HERD-551 / GH #674: forward the resolved profile — dir stays $1, profile is $2 — so a
+  # profile-aware project script actually sees --heavy instead of defaulting to light while this
+  # wrapper reports clean. See the header contract comment above.
   [ -n "${HEALTHCHECK_PROGRESS_LOG:-}" ] && { : > "$HEALTHCHECK_PROGRESS_LOG"; } 2>/dev/null
   if [ -n "$ONELINE" ]; then
-    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
   else
-    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR'" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+  fi
+  # HERD-551 / GH #674 CONTRADICTION HARD-ERROR: a project script invoked with --heavy that still
+  # emits the documented "HEAVY-SKIPPED:" marker is telling us it did NOT run its heavy probes —
+  # trusting its exit code here would be exactly the silent-clean gate-integrity hole GH #674 found
+  # (six heavy probes + visual regression never ran while the gate reported clean). This check runs
+  # BEFORE the baseline-aware downgrade and the normal rc dispatch below, and fires regardless of rc
+  # (0/1/2) — a script that skips heavy work and still exits 0 is the exact failure mode being closed.
+  if grep -q '^HEAVY-SKIPPED:' <<< "$out"; then
+    echo "❌ HEAVY/LIGHT CONTRADICTION: wrapper invoked --heavy but the project health command reports it skipped heavy work (see the HEAVY-SKIPPED: line below) — refusing to report this as clean"
+    printf '%s\n' "$out"
+    command -v journal_append >/dev/null 2>&1 && journal_append heavy_skipped_contradiction result blocked component healthcheck
+    exit 1
   fi
   # BASELINE-AWARE GATE (HERD-190): a CODE error whose failing tests ALL already fail on the base
   # (origin/main) is INHERITED, not introduced by this change — surface it as a tolerated ⚠️ (exit 0)
