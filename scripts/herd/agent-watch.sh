@@ -13705,12 +13705,25 @@ _health_fail_detail() {
 # _health_progress <log> — cheap live progress from a bats/TAP stream: "<done>/<plan>" parsed from the
 # '1..N' plan line + the count of ok/not-ok result lines so far. Empty when the log has no TAP plan (the
 # suite isn't TAP, or hasn't emitted its plan yet) — the running row then shows just elapsed time.
+#
+# HERD-533 leg 3: healthcheck.sh now tees the suite's raw (unbuffered) output into "<log>.progress"
+# AS IT RUNS (HEALTHCHECK_PROGRESS_LOG), while <log> itself still fills in one shot at the very end
+# (the classic, byte-identical-at-rest verdict file the collector's `sed -n '1p'` classifies). Prefer
+# the growing companion when it carries anything — this is the ONLY thing that makes the k/N counter
+# below move DURING a run instead of staying frozen until the suite exits. Fail-soft: no companion
+# (an older worker, or a caller that never set HEALTHCHECK_PROGRESS_LOG) falls straight through to
+# reading <log> itself — today's exact behavior.
+_health_progress_source() {
+  [ -s "${1}.progress" ] && { printf '%s' "${1}.progress"; return 0; }
+  printf '%s' "$1"
+}
 _health_progress() {
-  [ -f "$1" ] || return 0
+  local _hp_src; _hp_src="$(_health_progress_source "$1")"
+  [ -f "$_hp_src" ] || return 0
   local _hp_plan _hp_done
-  _hp_plan="$(grep -m1 -oE '^1\.\.[0-9]+' "$1" 2>/dev/null | grep -oE '[0-9]+$')"
+  _hp_plan="$(grep -m1 -oE '^1\.\.[0-9]+' "$_hp_src" 2>/dev/null | grep -oE '[0-9]+$')"
   [ -n "$_hp_plan" ] || return 0
-  _hp_done="$(grep -cE '^(ok|not ok) ' "$1" 2>/dev/null || printf 0)"
+  _hp_done="$(grep -cE '^(ok|not ok) ' "$_hp_src" 2>/dev/null || printf 0)"
   [ "${_hp_done:-0}" -gt 0 ] 2>/dev/null && printf 'test %s/%s' "$_hp_done" "$_hp_plan"
 }
 
@@ -13724,11 +13737,12 @@ _health_progress() {
 # Pure read of the tailable log the health worker (bash or the Python engine) streams into; no state
 # mutation, so the render half can call it every tick.
 _health_inflight_note() {
-  local _hin_log="$1" _hin_prog
+  local _hin_log="$1" _hin_prog _hin_src
   _hin_prog="$(_health_progress "$_hin_log")"
   if [ -n "$_hin_prog" ]; then printf '%s' "$_hin_prog"; return 0; fi
-  if [ -s "$_hin_log" ]; then
-    printf '%s lines' "$(grep -c '' "$_hin_log" 2>/dev/null || printf 0)"
+  _hin_src="$(_health_progress_source "$_hin_log")"
+  if [ -s "$_hin_src" ]; then
+    printf '%s lines' "$(grep -c '' "$_hin_src" 2>/dev/null || printf 0)"
   else
     printf 'no output yet'
   fi
@@ -13767,10 +13781,19 @@ _gate_health_inflight() {
 #   1. a live HEALTH worker  → the existing shared _health_running_row (unchanged bytes: the same row
 #      the bash gate step and the render half have always agreed on, log-line note and all);
 #   2. a live REVIEWER       → `review · in progress (<age>)`;
-#   3. neither               → <fallback-row> VERBATIM.
+#   3. QUEUED (HERD-533 leg 2) → no live worker for THIS (pr,sha) yet, but another suite already holds
+#      every HEALTH_CONCURRENCY slot → `health-check · queued (n ahead)`, never the bare placeholder a
+#      genuinely-stuck 40-minute wait is indistinguishable from (the live incident this fixes: PR #659
+#      read "running 23m" — no signal ever told the operator it had not actually started). Reads the
+#      SAME engine-agnostic marker files _health_slot_free already uses (bash worker OR the Python
+#      engine's dispatch both write `.health-inflight-*`), so this fires under either engine. n==0 (a
+#      free slot, about to dispatch — typically gone by the very next tick) is deliberately NOT queued:
+#      that transient reads as the pre-existing bare placeholder below, matching today.
+#   4. neither               → <fallback-row> VERBATIM.
 # Both gate branches call this, so "what phase is this PR in" has ONE answer on the console. Reads only
 # marker files the rails already write; side-effect-free; byte-identical to the pre-HERD-453 rows
-# whenever no worker is in flight (the fallback is passed in by the caller unchanged).
+# whenever no worker is in flight AND no slot is contended (the fallback is passed in by the caller
+# unchanged).
 _gate_phase_row() {
   local _gpr_sl="$1" _gpr_pn="$2" _gpr_pr="$3" _gpr_sha="$4" _gpr_fallback="$5" _gpr_inf
   if [ -n "$_gpr_sha" ]; then
@@ -13782,6 +13805,10 @@ _gate_phase_row() {
     _gpr_inf="$(_review_inflight_file "$_gpr_pr" "$_gpr_sha")"
     if [ -f "$_gpr_inf" ] && _review_pid_live "$_gpr_inf"; then
       printf '%s' "    ${C_YELLOW}🔍${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}review · in progress ($(_fmt_age "$(_marker_age_or_mtime "$_gpr_inf")"))${C_RESET}"
+      return 0
+    fi
+    if ! _health_slot_free; then
+      printf '%s' "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}health-check · queued ($(_count_live_healthchecks) ahead)${C_RESET}"
       return 0
     fi
   fi
