@@ -176,6 +176,22 @@ else
   HERD_TEST_CAP_LEDGER_SKIP_REASON="test-cap-ledger.sh not present"
   herd_test_cap_ledger_lint() { return 2; }
 fi
+# SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531): the shared provenance-record library. Sourcing DEFINES
+# functions only and writes nothing; the record itself is written at the very END of this script, and
+# only when HEALTH_TRUST_BUILDER is on. Fail-soft on our own infra (a partially-upgraded engine tree
+# missing it) with a no-op writer, exactly like the lints above. Prefer the tree-under-test's copy
+# when present so a branch that changes the library is exercised by its own version (HERD-309).
+_HERD_LINT_SRC="$HERE/health-trust.sh"
+[ -f "$DIR/scripts/herd/health-trust.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/health-trust.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  # shellcheck source=scripts/herd/health-trust.sh
+  . "$_HERD_LINT_SRC"
+else
+  herd_health_trust_write() { return 0; }
+fi
+# Wall-clock start for the provenance record's duration field. Taken BEFORE the profile runs and
+# after every source, so it measures the run this record describes.
+_HC_T0="$(date +%s 2>/dev/null || echo 0)"
 cd "$DIR" 2>/dev/null || { echo "❌ no such dir: $DIR"; exit 1; }
 PY="$(command -v python3 || true)"
 
@@ -910,6 +926,36 @@ RC=0
 [ "$IG_STATE" = "CODEERROR" ] && RC=1
 [ "$AL_STATE" = "CODEERROR" ] && RC=1
 [ "$CC_STATE" = "CODEERROR" ] && RC=1
+
+# ── provenance record (HERD-531) ──────────────────────────────────────────────────────────────────
+# Record what this run PROVED, so a later run of the identical suite against the identical commit can
+# be skipped instead of paid for twice (see scripts/herd/health-trust.sh for the record's shape and
+# the fail-closed rules that decide whether it is ever honored).
+#
+# Recorded ONLY for a GATING HEAVY run: --oneline is the status pane's summary row (no suite, no gate
+# authority) and the light profile proves nothing about the full suite, so neither may ever author a
+# record a heavy re-run could be skipped on. The outcome recorded is the COMBINED verdict — an
+# interaction/attribution/commit-convention code error is a red this run cannot attest away either.
+# The record is stamped `builder-local` unless the caller declares otherwise: agent-watch.sh's own
+# health workers pass HERD_HEALTH_PROVENANCE=watcher, so a watcher run can never be mistaken for the
+# builder-local evidence that justifies trusting it (trust always traces back to a real heavy suite).
+# Best-effort and silent: writing a record can never change this script's verdict or exit status.
+# $HEALTHCHECK_CMD must be non-empty too: with no project health command, run_heavy DELEGATES to
+# run_light (see run_heavy's first line), so MODE=heavy would otherwise stamp a heavy record on a run
+# that was only the syntax/lint gate. Record what actually ran, never what was asked for.
+if [ "$MODE" = "heavy" ] && [ -z "$ONELINE" ] && [ -n "$HEALTHCHECK_CMD" ]; then
+  _hc_prov_outcome="CLEAN"
+  if [ "$RC" -eq 1 ]; then
+    _hc_prov_outcome="CODEERROR"
+  else
+    case "$MAIN_OUT" in "⚠️"*) _hc_prov_outcome="DATAENV" ;; esac
+  fi
+  _hc_prov_sha="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
+  _hc_prov_now="$(date +%s 2>/dev/null || echo 0)"
+  _hc_prov_dur=$(( _hc_prov_now - _HC_T0 )); [ "$_hc_prov_dur" -ge 0 ] 2>/dev/null || _hc_prov_dur=0
+  herd_health_trust_write "${WORKTREES_DIR:-}" "$_hc_prov_sha" "$DIR" heavy \
+    "$_hc_prov_outcome" "$_hc_prov_dur" "${HERD_HEALTH_PROVENANCE:-builder-local}" || true
+fi
 
 if [ -n "$ONELINE" ]; then
   # Exactly ONE line — the watcher paints healthcheck --oneline as a single status row.

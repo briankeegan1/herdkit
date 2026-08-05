@@ -205,6 +205,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # herd_spawn_gate_saturated, is never called from here); safe to source in lib mode.
 # shellcheck source=/dev/null
 . "$HERE/herd-spawn-gate.sh"
+# SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531) — the shared provenance-record library, sourced for its
+# READ half (herd_health_trust_check), which the health dispatch below consults before running a full
+# suite. Sourcing DEFINES functions only; byte-inert until HEALTH_TRUST_BUILDER is opted in.
+# shellcheck source=scripts/herd/health-trust.sh
+. "$HERE/health-trust.sh"
 
 # ── The gh availability guard (HERD-237) ──────────────────────────────────────────────────────────
 # EVERY `gh` call on the tick path runs through _gh_timeout. Grounding (audit 2026-07-09, G4): the
@@ -7781,6 +7786,12 @@ MAIN_HEALTH_CONTAM_STATE="$TREES/.agent-watch-main-health-contam"  # "<sha>|<rea
 # (mirrors _MAIN_HEALTH_DIED_MAX / _ENGINE_INTERVAL). Byte-inert when MAIN_HEALTH_TICK=off.
 _MAIN_CI_SCAN_INTERVAL=10
 
+# HERD-545: how many NEWER shas may cancel their own CI run, chained back-to-back, before the leg asks
+# for a fresh signal instead of leaving the last conclusive run's verdict standing forever. Inline
+# constant (mirrors _MAIN_HEALTH_DIED_MAX) — a merge burst that cancels fewer than this many runs in a
+# row is not starvation, it is the ordinary superseding-runs behavior every CI provider does on push.
+_MAIN_CI_STARVE_K=3
+
 # A worker that keeps DYING before it can collect must not be re-dispatched forever: after this many
 # consecutive deaths the sha is marked (run-once) and the deaths surface as an infra_event instead of a
 # per-tick suite. Inline constant on purpose — no new config key (mirrors _HEALTH_INFRA_REDISPATCH_MAX).
@@ -7990,9 +8001,13 @@ _main_health_worker() {
     printf '5\tsandbox unavailable: worktree add refused\n' > "$_mw_wtmp" 2>/dev/null && mv "$_mw_wtmp" "$_mw_out" 2>/dev/null || true
     return 0
   fi
-  bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
+  # HERD-531: stamp provenance=watcher on the main-health run too. It executes in a THROWAWAY detached
+  # worktree, so its record could never satisfy the worktree match anyway — but stamping it keeps the
+  # invariant absolute ("only a builder's own pre-PR run authors builder-local evidence") rather than
+  # leaving it to depend on a sandbox path that happens not to collide.
+  HERD_HEALTH_PROVENANCE=watcher bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
   if [ "$_mw_rc" -eq 1 ]; then
-    bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log.retry" 2>&1; _mw_rc=$?
+    HERD_HEALTH_PROVENANCE=watcher bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log.retry" 2>&1; _mw_rc=$?
     mv "$_mw_log.retry" "$_mw_log" 2>/dev/null || true
   fi
   git -C "$MAIN" worktree remove --force "$_mw_dir" >/dev/null 2>&1 || true
@@ -8913,11 +8928,112 @@ for r in runs:                       # gh returns newest-first
 ' "$1"
 }
 
-# _main_health_ci_leg — the per-tick branch-CI probe. Fetches the DEFAULT branch's recent CI runs. On a
-# FAILING conclusion for the CURRENT main HEAD, fires _main_health_set_red once per (sha, conclusion). On
-# a PASSING conclusion, clears the CI identity (HERD-372) — but only when $MAIN_HEALTH_CI_STATE shows a
-# red was actually standing, so a normally-green branch never journals on every scan. Lever-gated (both
-# MAIN_HEALTH_TICK and, HERD-434, MAIN_HEALTH_CI_GATE) + fail-soft; always returns 0.
+# _main_ci_starve_scan — HERD-545: read the SAME `gh run list --json …` array on stdin as
+# _main_ci_classify, but WITHOUT filtering by an expected sha — the main-health CI leg reasons about
+# the whole recent history, not just the current HEAD. GROUNDED 2026-08-05: MAIN RED stood anchored to
+# an OLD sha's CI FAILURE while 17 merges auto-cancelled every newer run — _main_ci_classify's
+# expected-sha filter means the leg only ever asks "does a completed run exist for THIS EXACT sha?",
+# and during a merge burst the answer is "no" for every sha but the very first (every later sha's run
+# gets cancelled before it can complete), so the leg fell fail-soft-silent on every tick after the
+# first and the stale red never had a chance to be superseded OR requalified.
+#
+# Scans newest-first (gh's own order) and reports the FIRST CONCLUSIVE (COMPLETED, non-cancelled) run
+# it finds — pass or fail, whichever sha it belongs to — plus how many DISTINCT shas above it (i.e.
+# strictly newer) never produced a conclusive run of their own (CANCELLED / STALE / unknown — HERD-545
+# part 1: no-signal, never counted as red-sustaining, but counted as STARVATION evidence) and whether
+# ANY run in the window is still non-terminal (IN_PROGRESS / QUEUED — "a run is in progress" for the
+# re-dispatch gate). Emits "<bucket>US<workflow>US<conclusion>US<run-id>US<run-sha>US<n-cancelled>US
+# <in-progress>" — US (0x1f), NOT a tab: <run-id> and <workflow> are routinely EMPTY (no databaseId, no
+# conclusive run at all), and tab is IFS-whitespace — `read` COLLAPSES consecutive tabs instead of
+# preserving the empty field, shifting every later column (the exact hazard $MAIN_HEALTH_STATE's own
+# US-vs-tab comment already warns about). bucket is pass|fail|none (no conclusive run anywhere in the
+# window — deep starvation). NOTHING on bad JSON / not-a-list / empty input. python3 stdlib only.
+_main_ci_starve_scan() {
+  python3 -c '
+import sys, json
+try:
+    runs = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(runs, list):
+    sys.exit(0)
+PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+FAIL = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
+def clean(s):
+    return str(s or "").replace("\x1f", " ").replace("\t", " ").replace("\n", " ").strip()
+in_progress = 0
+cancelled_shas = set()
+bucket, wf, concl, run_id, run_sha = "none", "", "", "", ""
+for r in runs:                       # gh returns newest-first
+    if not isinstance(r, dict):
+        continue
+    sha = clean(r.get("headSha"))
+    if str(r.get("status") or "").upper() != "COMPLETED":
+        in_progress = 1              # still running somewhere in the window — never redispatch onto it
+        continue
+    c = str(r.get("conclusion") or "").upper()
+    if c in PASS or c in FAIL:
+        bucket = "pass" if c in PASS else "fail"
+        wf, concl, run_sha = clean(r.get("workflowName")), c, sha
+        rid = r.get("databaseId")
+        run_id = str(rid) if rid else ""
+        break                        # newest conclusive run wins — everything above it was no-signal
+    if sha:
+        cancelled_shas.add(sha)      # CANCELLED / STALE / unknown terminal conclusion — no-signal
+US = "\x1f"
+sys.stdout.write(US.join([bucket, wf, concl, run_id, run_sha, str(len(cancelled_shas)), str(in_progress)]) + "\n")
+'
+}
+
+# _main_health_ci_redispatch_marker <sha> — run-once-per-sha guard for the HERD-545 fresh-signal
+# request below, in the same $TREES-shared space every other main-health sha marker lives in (all
+# seats share $TREES via the git worktree layout, so this is a cross-seat guard for free).
+_main_health_ci_redispatch_marker() { printf '%s' "$TREES/.main-health-ci-redispatch-$1"; }
+
+# _main_health_ci_redispatch <sha> <workflow-name> — HERD-545 part 2: the last CONCLUSIVE CI run is
+# starving behind a chain of auto-cancelled newer runs (a merge burst supersedes every run before it
+# can complete, so a stale anchor can never be superseded by the ordinary probe). Ask for a fresh
+# signal on the CURRENT head sha, ONCE:
+#   1. `gh workflow run <workflow> --ref <branch>` — dispatches a new run so the NEXT scan has
+#      something conclusive to classify. Guarded by a sha-keyed marker: a starving burst asks GitHub
+#      exactly once per sha, never once per ~40s scan.
+#   2. If that call is unavailable or fails (no workflow_dispatch trigger wired, an older `gh`, no
+#      write scope), fall back to the LOCAL suite's OWN verdict for this exact sha — MAIN_HEALTH_TICK's
+#      ordinary re-suite already produces one regardless of CI's health (CI_GATE REQUIRES
+#      MAIN_HEALTH_TICK=on). A local marker for this sha with no standing local red is good enough
+#      evidence to clear the stale CI anchor, journaled provenance=local-fallback so the row is honest
+#      that the "green" did not come from GitHub Actions itself. _main_health_clear's own
+#      ancestor-supersedes check (HERD-453) is the final backstop against acting on a wrong guess.
+# Fail-soft throughout: an unwritable marker never blocks the attempt; nothing here ever raises.
+_main_health_ci_redispatch() {
+  local _rd_sha="$1" _rd_wf="$2" _rd_marker
+  local _rd_local_sha="" _rd_local_since="" _rd_local_local="" _rd_local_ci=""
+  [ -n "$_rd_sha" ] || return 0
+  _rd_marker="$(_main_health_ci_redispatch_marker "$_rd_sha")"
+  [ -e "$_rd_marker" ] && return 0
+  : > "$_rd_marker" 2>/dev/null || true
+  if [ -n "$_rd_wf" ] && _gh_timeout main_health_ci_redispatch workflow run "$_rd_wf" \
+       --ref "$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+    journal_append main_health_ci_redispatch sha "$_rd_sha" result dispatched
+    return 0
+  fi
+  journal_append main_health_ci_redispatch sha "$_rd_sha" result fallback reason gh-dispatch-unavailable
+  [ -e "$(_main_health_marker "$_rd_sha")" ] || return 0    # local suite has not verified THIS sha yet
+  IFS=$'\x1f' read -r _rd_local_sha _rd_local_since _rd_local_local _rd_local_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  [ -z "$_rd_local_local" ] || return 0    # a standing LOCAL red — never manufacture a green off it
+  rm -f "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true
+  _main_health_clear "?" "$_rd_sha" ci
+  journal_append main_health_ci_redispatch sha "$_rd_sha" result cleared provenance local-fallback
+  return 0
+}
+
+# _main_health_ci_leg — the per-tick branch-CI probe. Fetches the DEFAULT branch's recent CI runs and
+# classifies the newest CONCLUSIVE one (_main_ci_starve_scan). On a FAILING conclusion, fires
+# _main_health_set_red once per (anchor-sha, conclusion, cancelled-count). On a PASSING conclusion —
+# for the classified run's OWN sha, not necessarily the current HEAD (HERD-545 part 3) — clears the CI
+# identity (HERD-372), but only when $MAIN_HEALTH_CI_STATE shows a red was actually standing, so a
+# normally-green branch never journals on every scan. Lever-gated (both MAIN_HEALTH_TICK and, HERD-434,
+# MAIN_HEALTH_CI_GATE) + fail-soft; always returns 0.
 #
 # HERD-434 BUG FIX: `gh run list --branch` wants the BARE branch name GitHub Actions itself knows the
 # run by (e.g. "main") — it silently returns zero rows for a remote-qualified ref like "origin/main".
@@ -8929,6 +9045,23 @@ for r in runs:                       # gh returns newest-first
 # already enabled (MAIN_HEALTH_TICK=on in this project's own .herd/config), and already silently
 # inert. $HERD_BRANCH_NAME (herd-config.sh: the split of $DEFAULT_BRANCH after its last "/") is the
 # bare form every other `gh`-facing branch filter in this codebase already uses.
+#
+# HERD-545 (CI-leg starvation): live 2026-08-05, MAIN RED stood anchored to an OLD sha's CI FAILURE
+# while 17 merges auto-cancelled every newer run — the old `_main_ci_classify "$_sha"` call filtered
+# to runs matching the CURRENT head exactly, so once a merge burst starts cancelling every newer run
+# before it completes, the leg finds NOTHING to classify on every tick after the first and the stale
+# red can never be superseded or even requalified. _main_ci_starve_scan drops that filter: it always
+# classifies the newest CONCLUSIVE run in the window (cancelled ones are no-signal, never red-sustaining
+# — part 1) and counts the distinct newer shas that never got one. Three consequences below:
+#   (1) a standing anchor red whose window now shows newer cancelled runs renders QUALIFIED, naming the
+#       anchor sha and the cancelled count, instead of a bare unqualified "CI <workflow>: <conclusion>"
+#       that reads as a live verdict about the CURRENT head.
+#   (2) once the cancelled count reaches _MAIN_CI_STARVE_K with no run currently in progress, the leg
+#       asks for a fresh signal (_main_health_ci_redispatch) — a real re-dispatch, or a local-suite
+#       fallback — instead of waiting forever for an unthrottled merge cadence to let one through.
+#   (3) a completed PASS clears the anchor off of ITS OWN sha (which may be newer than the current HEAD
+#       at scan time, or simply not equal to it) — _main_health_clear's ancestor-supersedes check
+#       (HERD-453) is what makes "any newer sha's green" sound evidence, not a new invariant here.
 _main_health_ci_leg() {
   _main_health_enabled || return 0
   _main_health_ci_gate_enabled || return 0
@@ -8938,34 +9071,59 @@ _main_health_ci_leg() {
   # in depth: in practice a foreign sha rarely matches the default branch's own CI runs anyway, but this
   # closes the gap on principle and skips a wasted `gh run list` call).
   _main_checkout_sound >/dev/null || return 0
-  local _sha _json _res _bucket _wf _concl _run_id _line _prev
+  local _sha _json _res _bucket _wf _concl _run_id _run_sha _n_cxl _inprog _line _prev
   _sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_sha" ] || return 0
   # HERD-476: databaseId rides along so a FAIL bucket can hand its run id to _main_health_set_red,
   # which threads it to the autofix leg's honest-identity log parse (_main_health_ci_log_identity).
-  # An older `gh` that ignores the extra --json field simply omits it from each object — _main_ci_
-  # classify already reads a missing databaseId as empty, so this is additive, never a new failure mode.
+  # An older `gh` that ignores the extra --json field simply omits it from each object — the scan
+  # already reads a missing databaseId as empty, so this is additive, never a new failure mode.
   _json="$(_gh_timeout main_health_ci run list --branch "$HERD_BRANCH_NAME" --limit 20 \
              --json headSha,status,conclusion,workflowName,databaseId 2>/dev/null)" || return 0
   [ -n "$_json" ] || return 0                              # offline gh / no Actions → byte-identical
-  _res="$(printf '%s' "$_json" | _main_ci_classify "$_sha")"
+  _res="$(printf '%s' "$_json" | _main_ci_starve_scan)"
   [ -n "$_res" ] || return 0
-  IFS=$'\t' read -r _bucket _wf _concl _run_id <<EOF
+  IFS=$'\x1f' read -r _bucket _wf _concl _run_id _run_sha _n_cxl _inprog <<EOF
 $_res
 EOF
+  case "${_n_cxl:-}" in ''|*[!0-9]*) _n_cxl=0 ;; esac
+  case "${_inprog:-}" in 1) _inprog=1 ;; *) _inprog=0 ;; esac
+
   if [ "$_bucket" = "pass" ]; then
     _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
     [ -n "$_prev" ] || return 0                            # no standing CI red to clear — byte-quiet
-    rm -f "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true       # re-arm: a later regression fires fresh
-    _main_health_clear "?" "$_sha" ci
+    rm -f "$MAIN_HEALTH_CI_STATE" "$(_main_health_ci_redispatch_marker "$_sha")" 2>/dev/null || true
+    _main_health_clear "?" "$_run_sha" ci                  # HERD-545 (3): the PASS's own sha, not $_sha
     return 0
   fi
-  [ "$_bucket" = "fail" ] || return 0                      # pending / stale → never a red row, never a clear
-  _line="$_sha $_concl"
+
+  if [ "$_bucket" = "fail" ]; then
+    _line="$_run_sha $_concl $_n_cxl"
+    _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
+    if [ "$_prev" != "$_line" ]; then                      # anchor, conclusion OR cancelled-count changed
+      printf '%s\n' "$_line" > "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true
+      if [ "$_n_cxl" -gt 0 ]; then                          # HERD-545 (1): qualify — never a bare stale red
+        _main_health_set_red "?" "$_run_sha" \
+          "CI red at ${_run_sha:0:7} · ${_n_cxl} newer runs cancelled · awaiting a completed run" ci "$_run_id"
+      else
+        _main_health_set_red "?" "$_run_sha" "CI ${_wf:-run}: ${_concl}" ci "$_run_id"
+      fi
+    fi
+    if [ "$_n_cxl" -ge "$_MAIN_CI_STARVE_K" ] && [ "$_inprog" -eq 0 ]; then
+      _main_health_ci_redispatch "$_sha" "$_wf"             # HERD-545 (2): request a fresh signal, once
+    fi
+    return 0
+  fi
+
+  # bucket = none: NOTHING conclusive anywhere in the window — deep starvation, or simply no Actions run
+  # yet. Never invent a red with nothing to pin it to; but if one was already standing, the anchor is at
+  # least as starved as before, so re-evaluate (never re-render — nothing conclusive to requalify with)
+  # and re-arm the exact same re-dispatch gate off the SAME cancelled-run evidence.
   _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
-  [ "$_prev" = "$_line" ] && return 0                      # already fired for this sha+conclusion — no spam
-  printf '%s\n' "$_line" > "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true
-  _main_health_set_red "?" "$_sha" "CI ${_wf:-run}: ${_concl}" ci "$_run_id"
+  [ -n "$_prev" ] || return 0
+  if [ "$_n_cxl" -ge "$_MAIN_CI_STARVE_K" ] && [ "$_inprog" -eq 0 ]; then
+    _main_health_ci_redispatch "$_sha" ""                  # no conclusive run named a workflow — local-fallback only
+  fi
   return 0
 }
 
@@ -14589,8 +14747,20 @@ record_healthcheck() {
 # eventual full-log write) can never clobber each other's bytes — see the file-offset note in the
 # HERD-494 PR description; each is a fresh O_APPEND open, so every write lands at the CURRENT
 # end-of-file rather than at a stale, per-fd offset.
+#
+# HERD-531 <profile>: an OPTIONAL 4th argument ("--light") passed straight through to healthcheck.sh,
+# set by _healthcheck_gate ONLY when the candidate's exact head sha already carries a CLEAN heavy
+# provenance record from the builder's own pre-PR run (see scripts/herd/health-trust.sh). Empty —
+# every other dispatch — is byte-identical to before: healthcheck.sh runs its own --auto profile
+# selection and this candidate gets the full heavy suite. Both the first run and the solo retry use
+# the SAME profile, so a trusted smoke that reds still retries as a smoke rather than silently
+# escalating mid-verdict. Every invocation below also stamps HERD_HEALTH_PROVENANCE=watcher so the
+# record healthcheck.sh writes for this run can never later be read as builder-local evidence.
 _health_worker() {
-  local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line _hw_filter
+  local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_profile="${4:-}"
+  local _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line _hw_filter
+  local _hw_args=("$_hw_dir")
+  [ -n "$_hw_profile" ] && _hw_args+=("$_hw_profile")
   # BASELINE-AWARE GATE (HERD-190): hand healthcheck.sh the base checkout ($MAIN, the default-branch
   # tree) + a sha-keyed cache dir so a candidate whose failures ALL already fail on the base is
   # surfaced as an inherited ⚠️ (rc 0 → CLEAN) instead of a merge-blocking code error — no fix-PR
@@ -14603,8 +14773,8 @@ _health_worker() {
   # watcher's OWN environment can never silently narrow the FIRST run (only _health_bats_retry_filter,
   # below, may ever arm it, and only for the solo retry).
   HEALTHCHECK_PROGRESS_LOG="$_hw_log" HEALTHCHECK_BATS_FILTER= \
-    HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
-    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log" 2>&1; _hw_rc=$?
+    HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" HERD_HEALTH_PROVENANCE=watcher \
+    bash "$HERD_HEALTHCHECK_BIN" "${_hw_args[@]}" >> "$_hw_log" 2>&1; _hw_rc=$?
   _hw_first="$(sed -n '1p' "$_hw_log" 2>/dev/null)"
   if [ "$_hw_rc" -eq 0 ]; then
     case "$_hw_first" in "⚠️"*) _hw_line=$'CLEAN\tdataenv' ;; *) _hw_line=$'CLEAN\tclean' ;; esac
@@ -14621,12 +14791,12 @@ _health_worker() {
     : > "$_hw_log.retry" 2>/dev/null || true
     if [ -n "$_hw_filter" ]; then
       HEALTHCHECK_PROGRESS_LOG="$_hw_log.retry" HEALTHCHECK_BATS_FILTER="$_hw_filter" \
-        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
-        bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
+        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" HERD_HEALTH_PROVENANCE=watcher \
+        bash "$HERD_HEALTHCHECK_BIN" "${_hw_args[@]}" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
     else
       HEALTHCHECK_PROGRESS_LOG="$_hw_log.retry" HEALTHCHECK_BATS_FILTER= \
-        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
-        bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
+        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" HERD_HEALTH_PROVENANCE=watcher \
+        bash "$HERD_HEALTHCHECK_BIN" "${_hw_args[@]}" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
     fi
     if [ "$_hw_rc2" -eq 0 ]; then
       rm -f "$_hw_log.retry" 2>/dev/null || true                 # transient — the passing retry is the truth
@@ -14807,6 +14977,24 @@ _healthcheck_gate() {
     return 0
   fi
 
+  # SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531): before paying for a ~20-60 min heavy suite, ask
+  # whether this EXACT head sha was already proven clean by the builder's own pre-PR heavy run in this
+  # very worktree. When it was, run the LIGHT profile as a smoke instead of the full re-run — the
+  # suite that matters already ran, on the same commit, from the same clean tree. EVERY other case (no
+  # record, stale sha, non-clean outcome, dirty tree, a record older than the commit, a record the
+  # watcher itself authored, or the lever off) leaves _hg_profile empty and dispatches the full suite
+  # exactly as before. The verdict/ledger/cache machinery below is untouched either way: a trusted
+  # dispatch still produces a real CLEAN/FLAKY/CODEERROR verdict from a real run, so a smoke that reds
+  # still blocks the merge.
+  local _hg_profile="" _hg_prov=""
+  if _hg_prov="$(herd_health_trust_check "$TREES" "$_hg_sha" "$_hg_dir")"; then
+    _hg_profile="--light"
+    journal_append health_trusted pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" \
+      provenance "$_hg_prov" profile light
+  else
+    _hg_prov=""
+  fi
+
   # LEAK-GUARD SNAPSHOT POINT (HERD-54): the suite's tab-leak-guard snapshots the workspace BEFORE it
   # runs, so proactively close any stale resolve·<slug> tab first. Fail-soft; a live resolver is spared.
   _sweep_stale_resolve_tabs
@@ -14821,11 +15009,18 @@ _healthcheck_gate() {
   # stale-sha kill reap the WHOLE suite subtree as one group (HERD-283), and it also keeps a reload's
   # `kill -- -<watcher-pgid>` from ever reaching a live suite. Live health pids stay exempted from
   # _list_project_watchers (HERD-217/245) so reload never SIGTERMs them as "stray watchers" either.
-  _bg_health_worker _health_worker "$_hg_dir" "$_hg_disp" "$_hg_log"
+  _bg_health_worker _health_worker "$_hg_dir" "$_hg_disp" "$_hg_log" "$_hg_profile"
   local _hg_wpid="$_BG_HEALTH_PID"
   _marker_write "$_hg_inflight" "$_hg_wpid" "$_BG_HEALTH_PGID"
   _rotate_health_logs
-  DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running (0s)${C_RESET}"
+  # CONSOLE HONESTY (HERD-531): a trusted dispatch is a SMOKE, not the full suite — say so on the row,
+  # so nobody reads a 30-second green as "the ~350-test suite passed here". Byte-identical when the
+  # lever is off (_hg_profile empty → the original row text).
+  if [ -n "$_hg_profile" ]; then
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · light smoke (0s · heavy trusted from ${_hg_prov})${C_RESET}"
+  else
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running (0s)${C_RESET}"
+  fi
   _HC_RESULT="RUNNING"
   # healthcheck_started (not just a later 'outcome'): the record shows runs IN FLIGHT — so a suite that
   # never finishes (killed, restart) is visible in the journal, and log_path points at the tailable log.
