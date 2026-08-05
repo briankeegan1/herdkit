@@ -326,6 +326,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`
+- `RED_AUTOESCALATE` → `agent-watch.sh`
 - `RED_LEDGER` → `red-ledger.sh`
 - `RED_ROW_RECHECK_MINS` → `agent-watch.sh`
 - `REFIX_COMPLETE_MIN` → —

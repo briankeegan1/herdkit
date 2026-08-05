@@ -52,6 +52,22 @@ _red_ledger_sanitize() {
   printf '%s' "$1" | tr '\t\n\r' '   '
 }
 
+# herd_red_ledger_engine_shaped <why> — HERD-547: the routing rule templates/coordinator.md.tmpl
+# documents at "Routing: APP bug vs HERD-ENGINE bug" made mechanical — true iff <why> (a red's
+# diagnosing text, the SAME string herd_red_ledger_note caches) names a path under herdkit's OWN
+# engine surface (bin/herd, herd.sh, install.sh, scripts/herd/**, scripts/ci/**, migrations/**,
+# pysrc/herd/**): the SAME engine-surface set git-scope-lint.sh already treats as "this is the
+# workflow machinery, not a consuming project's code" (HERD-435). False for everything else,
+# including an empty/missing why — a red this function cannot place is a PROJECT-shaped red by
+# default, never escalated. Pure string match — no git, no I/O, no RED_LEDGER/RED_AUTOESCALATE gate
+# of its own — so it is provable in isolation; a caller decides what to do with the classification.
+herd_red_ledger_engine_shaped() {
+  case "${1:-}" in
+    *bin/herd*|*herd.sh*|*install.sh*|*scripts/herd/*|*scripts/ci/*|*migrations/*|*pysrc/herd/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # herd_red_ledger_note <ledger-file> <key> <class> <why> [now-epoch]
 #   Upsert: a NEW key records first-seen=now; an EXISTING key keeps its original first-seen and just
 #   refreshes why + last-verified. No-op (RED_LEDGER off, or an empty key/ledger-file) → nothing

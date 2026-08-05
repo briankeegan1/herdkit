@@ -53,6 +53,28 @@ _herd_config_dup_keys() {
   ' "$_dk_file"
 }
 
+# _herd_config_file_keys <file> — print, once each in file order, EVERY key a shell-sourced config
+# file assigns (blank/comment lines skipped, an `export KEY=` prefix tolerated) — the same extraction
+# grammar _herd_config_dup_keys uses for its duplicate scan, but returning every key rather than only
+# the duplicated ones. Used by the cross-worktree main-checkout overlay (HERD-558) to discover which
+# keys a foreign config.local sets, WITHOUT sourcing it into the current shell wholesale (that overlay
+# only wants to adopt POLICY-class keys from it, never machine-scoped ones). Pure/read-only.
+_herd_config_file_keys() {
+  local _fk_file="${1:-}"
+  [ -n "$_fk_file" ] && [ -f "$_fk_file" ] || return 0
+  awk '
+    {
+      s = $0
+      sub(/^[ \t]+/, "", s)
+      if (s == "" || s ~ /^#/) next
+      sub(/^export[ \t]+/, "", s)
+      if (s !~ /^[A-Za-z_][A-Za-z0-9_]*=/) next
+      k = s; sub(/=.*/, "", k)
+      if (!seen[k]++) print k
+    }
+  ' "$_fk_file"
+}
+
 # _herd_config_warn_dupes <file> — emit ONE loud stderr WARNING when <file> has duplicate keys. Guarded
 # by an exported once-per-process marker so it fires at most once (and is spared in spawned children),
 # so it is never spammy across every command. A clean config re-checks cheaply and stays silent; the
@@ -260,6 +282,75 @@ if [ -f "$_HERD_CONFIG_LOCAL_FILE" ]; then
   . "$_HERD_CONFIG_LOCAL_FILE"
   _herd_config_warn_dupes "$_HERD_CONFIG_LOCAL_FILE"
 fi
+
+# ── Cross-worktree overlay: the MAIN checkout's config.local (HERD-558) ──────
+# Live failure this closes: `herd config set --local HEALTHCHECK_CMD=true` run in the MAIN checkout
+# only muted MAIN-checkout-context runs. `healthcheck.sh` resolves config from the TARGET WORKTREE's
+# .herd/ — and a linked worktree is a SEPARATE checkout that `git worktree add` never populates with
+# the main checkout's gitignored config.local (it copies only tracked files) — so the overlay block
+# just above finds no sibling config.local in the worktree and the operator's mute never reaches it.
+# 137 suite processes kept running post-"release" because the override took effect nowhere but the
+# main checkout's own shell.
+#
+# PRECEDENCE (mirrored in the config.local template header, bin/herd's _config_ensure_local):
+#     committed config  <  worktree's own config.local  <  MAIN checkout's config.local
+# — for POLICY-class keys only. A policy key is any config key NOT marked scope=machine in
+# templates/capabilities.tsv (HEALTHCHECK_CMD, MERGE_POLICY, HUMAN_VERIFY_POLICY, concurrency caps,
+# …): it governs how the gate/suite BEHAVES, so an operator flipping one from the main checkout means
+# it for every worktree that pool spawns, and it must reach them even though they never inherit the
+# gitignored file directly.
+#
+# MACHINE-scoped keys (MODEL_*, HERD_DRIVER, WATCHER_VIEW*, …) are deliberately EXCLUDED from this
+# outer layer — worktree-local (or the committed baseline, when the worktree sets nothing of its own)
+# keeps winning for them exactly as before this fix. Those keys hold per-seat/per-process state (a
+# builder pane's own model tier, its own driver); an operator's MAIN-checkout preference for "what I
+# run" is not a more correct answer than the worktree's own for "what THIS seat runs", so pulling them
+# from the main checkout would be an unjustified new override, not a bug fix.
+#
+# Only fires when resolving for a WORKTREE distinct from the main checkout — a run already IN the main
+# checkout sourced its own config.local in the block above, so this would be a no-op re-read of the
+# same file. The main checkout is resolved from the ALREADY-SOURCED, committed PROJECT_ROOT (the
+# canonical pointer to it) when that names a real directory; only when PROJECT_ROOT is unset does this
+# fall back to git's own notion of the main working tree (first entry of `git worktree list`, via
+# _herd_main_worktree, defined above) from the worktree's own checkout dir. NEVER guessed by
+# string-manipulating the worktree's path (e.g. stripping a "-trees/<slug>" suffix) — that breaks the
+# moment WORKTREES_DIR is renamed or a project nests its pool differently.
+_herd_wt_project_dir="$(dirname "$(dirname "$_HERD_CONFIG_FILE")")"
+_herd_main_checkout=""
+if [ -n "${PROJECT_ROOT:-}" ] && [ -d "$PROJECT_ROOT" ]; then
+  _herd_main_checkout="$PROJECT_ROOT"
+elif command -v git >/dev/null 2>&1; then
+  _herd_main_checkout="$(_herd_main_worktree "$_herd_wt_project_dir")"
+fi
+if [ -n "$_herd_main_checkout" ]; then
+  _herd_main_checkout_real="$(cd "$_herd_main_checkout" 2>/dev/null && pwd -P || printf '%s' "$_herd_main_checkout")"
+  _herd_wt_project_dir_real="$(cd "$_herd_wt_project_dir" 2>/dev/null && pwd -P || printf '%s' "$_herd_wt_project_dir")"
+  _herd_main_local="$_herd_main_checkout/.herd/config.local"
+  if [ "$_herd_main_checkout_real" != "$_herd_wt_project_dir_real" ] && [ -f "$_herd_main_local" ]; then
+    _herd_caps_file="${HERD_CAPABILITIES_FILE:-${HERDKIT_HOME:-$_HERD_REPO_DEFAULT}/templates/capabilities.tsv}"
+    while IFS= read -r _herd_mco_key; do
+      [ -n "$_herd_mco_key" ] || continue
+      _herd_mco_scope="project"
+      if [ -f "$_herd_caps_file" ]; then
+        _herd_mco_scope="$(awk -F'\t' -v k="$_herd_mco_key" \
+          '$2=="config" && $1==k { s=$6; gsub(/[[:space:]]+$/,"",s); print s; exit }' "$_herd_caps_file")"
+        [ "$_herd_mco_scope" = "machine" ] || _herd_mco_scope="project"
+      fi
+      # Machine-scoped: leave whatever the baseline/worktree-local overlay already resolved standing.
+      [ "$_herd_mco_scope" = "machine" ] && continue
+      _herd_mco_val="$(
+        set +eu 2>/dev/null || true
+        # shellcheck source=/dev/null
+        . "$_herd_main_local" 2>/dev/null || true
+        eval "printf '%s' \"\${${_herd_mco_key}-}\""
+      )"
+      eval "$_herd_mco_key=\"\$_herd_mco_val\""
+    done < <(_herd_config_file_keys "$_herd_main_local")
+    unset _herd_mco_key _herd_mco_scope _herd_mco_val
+  fi
+  unset _herd_main_checkout_real _herd_wt_project_dir_real _herd_main_local _herd_caps_file
+fi
+unset _herd_wt_project_dir _herd_main_checkout
 
 # ── Fallback defaults (generic; no project literals) ─────────────────────────
 # PROJECT_ROOT defaults to the repo that owns the .herd/config we just read (or, if none, the repo
@@ -812,6 +903,7 @@ fi
 : "${MAIN_HEALTH_CI_GATE:="off"}"  # HERD-434: make the DEFAULT BRANCH's own GitHub Actions CI conclusion an input to the MAIN RED alarm — on | off (default off, ship-dormant). MAIN_HEALTH_TICK's local re-suite runs on the WATCHER'S OWN host, so it can be green while CI (a differently-provisioned runner) is red on the identical sha — GROUNDED 2026-07-28: main merged 5 PRs while GitHub Actions CI stayed red on every one and MAIN_HEALTH_TICK reported green throughout, because nothing ever asked GitHub. on (REQUIRES MAIN_HEALTH_TICK=on — reuses its state file, console row and notify-once path) → each tick (throttled, ~every 10 ticks) probes `gh run list` for the default branch's latest COMPLETED run against the current main HEAD; a FAILURE conclusion raises the SAME 'MAIN RED' row/alarm the local suite does (merging its own CI identity field, never clobbering a standing local-suite identity), a later PASS clears it. FAIL-SOFT throughout: offline/unauthenticated gh, no matching run yet, or a run still IN PROGRESS all read as "nothing to report" — NEVER a red row, NEVER a false clear. off (default) → byte-inert: no `gh run list` call, no state, no row. Consumed by agent-watch.sh
 : "${RED_LEDGER:="off"}"          # HERD-539: the shared RED-ROW LEDGER — on | off (default off, ship-dormant). on → every red row this file wires (today: MAIN RED, the 'unlinked merges' alarm) records its diagnosing text into a durable keyed ledger (scripts/herd/red-ledger.sh) the moment it is diagnosed or reverified, and the row renders an extra ' · verified Xm ago' suffix read back from that same ledger — so the text on screen is provably the SAME text that was journaled, with an honest freshness clock next to it. A red going green through the ordinary reverify path additionally journals `red_cleared key <k> reason reverified`, once, so a clear is as visible in the journal as the red was. off (default) → byte-inert: no ledger file, no extra journal line, every red row's text BYTE-IDENTICAL to before this key existed. Consumed by agent-watch.sh + work-units/git-pr.sh via red-ledger.sh
 : "${RED_ROW_RECHECK_MINS:="0"}"  # HERD-539: extends the MAIN_HEALTH_RECHECK_MINS pattern (HERD-222) past main-health — while RED_LEDGER holds a red for a class this file wires a reverify for (today: the 'unlinked merges' alarm, HERD-522), RE-PROBE it every N minutes so a red whose cause was already fixed out-of-band (a PR body edited after merge to add the `Refs:` line it was missing) self-heals through the ordinary red_cleared path instead of standing forever — REF_UNPARSED_FILE never had a clear mechanism before this. 0 (default, off) → byte-identical: a standing alarm is never re-probed. N>0 → at most one re-probe per N minutes per row (measured from that row's own last-verified stamp in the ledger), REQUIRES RED_LEDGER=on (the ledger is where the cadence clock and the clear both live); a non-numeric value reads as 0. Consumed by agent-watch.sh
+: "${RED_AUTOESCALATE:="off"}"    # HERD-547 (HERD-539 leg 4): engine-shaped red auto-escalation — on | off (default off, ship-dormant), REQUIRES RED_LEDGER=on (this reads the SAME diagnosing text red-ledger.sh already caches). on → the moment MAIN RED notes a sha's why-text into the shared ledger, that text is classified against the routing rule templates/coordinator.md.tmpl documents at 'Routing: APP bug vs HERD-ENGINE bug' — a project's own code vs the workflow machinery itself (bin/herd, scripts/herd/**, pysrc/herd/**): an ENGINE-shaped why files automatically via the EXISTING `herd report` path (composes with its own title-dedup rather than reimplementing it), attaching the red-ledger why-text as the issue's diagnosis, and journals `red_escalated`. A shared-pool once-guard (mirrors HERD-371's main-health-fix marker) claims the filing per dedup key across every seat, so a repeat observation of the SAME key no-ops; a project-shaped why is NEVER escalated. Fail-soft throughout: no HERDKIT_HOME/bin/herd, no gh, or `herd report` itself declining (no HERD_REPO, a likely duplicate) all skip WITHOUT filing and journal the reason — never a crash, never a double-file. off (default) → byte-inert: no shellout, no journal line, no filing. Consumed by agent-watch.sh
 : "${ENV_SUSPECT_TIMEOUT:="off"}"  # HERD-546 (HERD-539 leg 3): classify a per-test health-suite TIMEOUT observed while this box is under load as env-suspect, not a bare code red — on | off (default off, ship-dormant). on → when a health worker's run-1 failure is a per-test TIMEOUT (bats' "# timeout after Ns" TAP suffix, or run-suite.sh's HERD-478 per-test-cap-ledger "(TIMEOUT after Ns)" suffix) AND this box looks contended (loadavg1m >= HEALTH_LOAD_THRESHOLD, or another HERD-529 local-suite slot is live), the shared red-ledger (RED_LEDGER row shape) records the diagnosis and the running row reads 'env-suspect · timeout under load · solo re-run queued' while the SAME existing retry-before-red solo re-run plays out — a solo pass clears the note, a solo fail still reds exactly as before. off (default) → byte-identical: no marker, no ledger note, no journal event, the running row is unchanged. Consumed by agent-watch.sh
 : "${HEALTH_LOAD_THRESHOLD:="4"}"  # HERD-546: the loadavg1m reading (whole number) at/above which ENV_SUSPECT_TIMEOUT considers this box "under load" (default 4). Consulted only while ENV_SUSPECT_TIMEOUT=on; a non-numeric value falls back to the default. Consumed by agent-watch.sh
 : "${CHECKOUT_GUARD:="off"}"     # HERD-452: shared-checkout CONTAMINATION GUARD — on | off (default off for consumers, ship-dormant; ON in herdkit's own dogfood .herd/config). GROUNDED 2026-07-31: $MAIN was found detached at a PR branch's head (#563), and the main-health suite — which ran the heavy suite directly against $MAIN, unlike the sandboxed baseline-vs-candidate gate (HERD-361) — reproduced a red off the FEATURE branch's own code and painted it 'MAIN RED', training the operator to ignore a standing alarm that named nothing true about the default branch. Two effects, both gated on this key's PART unconditionally except the third: (1) ROOT CAUSE — _main_health_worker (agent-watch.sh) now ALWAYS runs the heavy suite in a DISPOSABLE detached worktree pinned to the dispatched sha (mirroring HERD-361's sandboxed baseline leg), never live inside $MAIN, so nothing the suite does can mutate the shared checkout — this half is unconditional, not lever-gated. (2) THE ALARM MUST NOT LIE — _main_health_dispatch asserts $MAIN is ATTACHED to the default branch (_main_head_attached) with no foreign contamination (_checkout_offenders, HERD-361) BEFORE every dispatch; unsound → the attempt is WITHHELD (no worker runs, no verdict is ever recorded for it) and a `main_health result=contaminated reason=detached|dirty` line is journaled once per signature — also unconditional, since a lying alarm is never acceptable regardless of this lever. (3) AUTO-HEAL, gated on THIS key — on → when reconcile_checkout_cleanliness (HERD-361) finds $MAIN detached AND otherwise CLEAN (no offenders — nothing tracked would be discarded), it runs a plain `git checkout <default-branch>` (never --force, never reset --hard: clean means neither is needed), journals `checkout_guard result=restored`, and clears the standing CHECKOUT UNCLEAN row the same tick. A DIRTY checkout (offenders present, detached or not) is NEVER auto-touched no matter this lever — that evidence stays for a human. off (default) → this part is byte-identical: no checkout, no journal line, the existing HERD-361 advisory row is the only signal. Consumed by agent-watch.sh
