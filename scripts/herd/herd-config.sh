@@ -632,6 +632,19 @@ fi
 : "${COORDINATOR_CMD:="/coordinator"}"  # the generated coordinator skill the control room runs
 : "${HERD_VERSION:="1"}"
 : "${HERD_REPO:=""}"            # <owner>/herdkit — where engine bugs escalate (herd report)
+# TRACKER_REPO (HERD-534 / GH #651) — the <owner>/<repo> the WORK-TRACKER backend
+# (scripts/herd/backends/github.sh) files/lists/updates/closes items in. LEG A of the bug this key
+# fixes: the github backend used to inject -R $HERD_REPO on every gh issue verb, so any project with
+# HERD_REPO set (report/triage escalation target) had its OWN backlog silently file onto that OTHER
+# repo instead of its own — a `backend switch github --migrate` in one project filed 8 work items onto
+# the herdkit ENGINE repo (#640-647), and the backlog pane listed that other project's
+# engine-escalation issues as local work. TRACKER_REPO is a SEPARATE key the github backend reads
+# EXCLUSIVELY for its own repo selection; it NEVER falls back to HERD_REPO (herd report / herd triage /
+# oss-triage.sh keep using HERD_REPO alone, unaffected). Default '' (unset) → the backend passes no -R
+# flag at all, so `gh` resolves the repo itself from the CWD's `origin` remote — byte-identical to a
+# project whose origin IS its own tracker. Set only when the tracker repo differs from origin (a
+# tracker-only repo separate from the code repo).
+: "${TRACKER_REPO:=""}"
 : "${WATCHER_AUTOMERGE:="true"}"  # legacy lever; MERGE_POLICY takes precedence when set
 : "${MERGE_POLICY:=""}"           # auto | approve | observe (empty → derive from WATCHER_AUTOMERGE)
 : "${HUMAN_VERIFY_POLICY:="hold"}"  # HERD-59: how a PR's HUMAN-VERIFY: block is handled under MERGE_POLICY=auto — hold (default, today's exact per-PR hold) | coordinator (loud, coordinator-actionable hold) | auto (informational: journal + comment the steps, merge on green). Unknown → hold. Consumed by agent-watch.sh + herd-approve.sh
@@ -683,6 +696,17 @@ fi
 # fed; 0 → strict no-surplus. Advisory only: --force / HERD_FORCE_SPAWN=1 bypasses it. Non-numeric → 1.
 : "${SPAWN_AHEAD:="1"}"
 : "${HEALTH_CONCURRENCY:="1"}"   # max healthcheck suites the watcher runs at once (default 1: serialize — all feature worktrees share one git object store, so overlapping suites race on shared .git locks and paint false-red)
+# LOCAL_SUITE_CONCURRENCY (HERD-529) — max HEAVY healthcheck suites this BOX runs at once, across ALL
+# worktrees and ALL callers (builder-local `scripts/herd/healthcheck.sh --heavy` runs AND the
+# watcher's own dispatch) — a distinct, wider ceiling than HEALTH_CONCURRENCY, which only serializes
+# the watcher's OWN dispatch loop and has no visibility into a builder running the heavy suite locally
+# ahead of its own PR. GROUNDED 2026-08-05: an 8-builder fleet ran up to 8 simultaneous builder-local
+# heavy suites (box saturation, a tolerated-as-DATA/ENV 1800s bats timeout that actually meant the
+# suite asserted nothing that run). Enforced in scripts/herd/healthcheck.sh's run_heavy() via a
+# cross-worktree slot pool under $WORKTREES_DIR, namespaced `.local-suite-slot-*` (distinct from the
+# watcher's own `.health-inflight-*` markers, so the two accounting systems never collide). Default 2.
+# Non-numeric → 2 (resolved via herd_numeric, warns once, fails toward the safe default).
+: "${LOCAL_SUITE_CONCURRENCY:="2"}"
 # RESTART-SAFE INFLIGHT TIMEOUTS (HERD-185) — an in-flight review/health worker that outlives this many
 # seconds (age read from its on-disk dispatch marker, so ANY watcher instance — even one that restarted
 # mid-run — can enforce it) is SIGTERMed + reaped by the every-tick corpse sweep, freeing its slot. Well
@@ -765,6 +789,8 @@ fi
 : "${MAIN_HEALTH_RECHECK_MINS:="0"}"  # HERD-222: while MAIN_HEALTH_TICK holds main RED, RE-VERIFY the CURRENT sha every N minutes so a stale red self-heals through the ordinary green→clear path instead of shouting until the next merge (a real red once stood 19h). 0 (default, off) → byte-identical: a sha with a verdict is never re-run. N>0 → at most one re-verify per N minutes, subject to the same HEALTH_CONCURRENCY slot and per-sha dispatch guards; a non-numeric value reads as 0 (a typo can never arm it). Consumed by agent-watch.sh
 : "${MAIN_HEALTH_AUTOFIX:="off"}"  # HERD-222/HERD-476: auto-REMEDIATE a reproduced MAIN RED — on | off (default off, ship-dormant) | spawn. on/spawn → when the main-health suite reproduces a red whose failing-test identity is HONEST (a TAP 'not ok' line, or a concrete test/source file — never healthcheck.sh's content-free '❌ CODE ERROR' banner), the watcher enqueues ONE scribe item citing that test and journals `main_health_autofix result=enqueued`, at most once per distinct failure while main is red. A kind=ci red re-derives its identity from the failing run's own `gh run view --log-failed` output first (HERD-476), so a bare 'CI <workflow>: <conclusion>' never blocks it; an unreadable log skips with reason=ci-log-unreadable instead. spawn additionally dispatches ONE tracked+claimed quick-lane builder (via spawn.sh) against that same identity — RISK: the one path here that writes code unattended, though the ordinary healthcheck+review gate still stands before any merge. on stays file-only: no spawn, no revert, no branch touch. off (default) → byte-identical: no scribe item, no journal line, no spawn. Consumed by agent-watch.sh
 : "${MAIN_HEALTH_CI_GATE:="off"}"  # HERD-434: make the DEFAULT BRANCH's own GitHub Actions CI conclusion an input to the MAIN RED alarm — on | off (default off, ship-dormant). MAIN_HEALTH_TICK's local re-suite runs on the WATCHER'S OWN host, so it can be green while CI (a differently-provisioned runner) is red on the identical sha — GROUNDED 2026-07-28: main merged 5 PRs while GitHub Actions CI stayed red on every one and MAIN_HEALTH_TICK reported green throughout, because nothing ever asked GitHub. on (REQUIRES MAIN_HEALTH_TICK=on — reuses its state file, console row and notify-once path) → each tick (throttled, ~every 10 ticks) probes `gh run list` for the default branch's latest COMPLETED run against the current main HEAD; a FAILURE conclusion raises the SAME 'MAIN RED' row/alarm the local suite does (merging its own CI identity field, never clobbering a standing local-suite identity), a later PASS clears it. FAIL-SOFT throughout: offline/unauthenticated gh, no matching run yet, or a run still IN PROGRESS all read as "nothing to report" — NEVER a red row, NEVER a false clear. off (default) → byte-inert: no `gh run list` call, no state, no row. Consumed by agent-watch.sh
+: "${RED_LEDGER:="off"}"          # HERD-539: the shared RED-ROW LEDGER — on | off (default off, ship-dormant). on → every red row this file wires (today: MAIN RED, the 'unlinked merges' alarm) records its diagnosing text into a durable keyed ledger (scripts/herd/red-ledger.sh) the moment it is diagnosed or reverified, and the row renders an extra ' · verified Xm ago' suffix read back from that same ledger — so the text on screen is provably the SAME text that was journaled, with an honest freshness clock next to it. A red going green through the ordinary reverify path additionally journals `red_cleared key <k> reason reverified`, once, so a clear is as visible in the journal as the red was. off (default) → byte-inert: no ledger file, no extra journal line, every red row's text BYTE-IDENTICAL to before this key existed. Consumed by agent-watch.sh + work-units/git-pr.sh via red-ledger.sh
+: "${RED_ROW_RECHECK_MINS:="0"}"  # HERD-539: extends the MAIN_HEALTH_RECHECK_MINS pattern (HERD-222) past main-health — while RED_LEDGER holds a red for a class this file wires a reverify for (today: the 'unlinked merges' alarm, HERD-522), RE-PROBE it every N minutes so a red whose cause was already fixed out-of-band (a PR body edited after merge to add the `Refs:` line it was missing) self-heals through the ordinary red_cleared path instead of standing forever — REF_UNPARSED_FILE never had a clear mechanism before this. 0 (default, off) → byte-identical: a standing alarm is never re-probed. N>0 → at most one re-probe per N minutes per row (measured from that row's own last-verified stamp in the ledger), REQUIRES RED_LEDGER=on (the ledger is where the cadence clock and the clear both live); a non-numeric value reads as 0. Consumed by agent-watch.sh
 : "${CHECKOUT_GUARD:="off"}"     # HERD-452: shared-checkout CONTAMINATION GUARD — on | off (default off for consumers, ship-dormant; ON in herdkit's own dogfood .herd/config). GROUNDED 2026-07-31: $MAIN was found detached at a PR branch's head (#563), and the main-health suite — which ran the heavy suite directly against $MAIN, unlike the sandboxed baseline-vs-candidate gate (HERD-361) — reproduced a red off the FEATURE branch's own code and painted it 'MAIN RED', training the operator to ignore a standing alarm that named nothing true about the default branch. Two effects, both gated on this key's PART unconditionally except the third: (1) ROOT CAUSE — _main_health_worker (agent-watch.sh) now ALWAYS runs the heavy suite in a DISPOSABLE detached worktree pinned to the dispatched sha (mirroring HERD-361's sandboxed baseline leg), never live inside $MAIN, so nothing the suite does can mutate the shared checkout — this half is unconditional, not lever-gated. (2) THE ALARM MUST NOT LIE — _main_health_dispatch asserts $MAIN is ATTACHED to the default branch (_main_head_attached) with no foreign contamination (_checkout_offenders, HERD-361) BEFORE every dispatch; unsound → the attempt is WITHHELD (no worker runs, no verdict is ever recorded for it) and a `main_health result=contaminated reason=detached|dirty` line is journaled once per signature — also unconditional, since a lying alarm is never acceptable regardless of this lever. (3) AUTO-HEAL, gated on THIS key — on → when reconcile_checkout_cleanliness (HERD-361) finds $MAIN detached AND otherwise CLEAN (no offenders — nothing tracked would be discarded), it runs a plain `git checkout <default-branch>` (never --force, never reset --hard: clean means neither is needed), journals `checkout_guard result=restored`, and clears the standing CHECKOUT UNCLEAN row the same tick. A DIRTY checkout (offenders present, detached or not) is NEVER auto-touched no matter this lever — that evidence stays for a human. off (default) → this part is byte-identical: no checkout, no journal line, the existing HERD-361 advisory row is the only signal. Consumed by agent-watch.sh
 : "${AGING_PR_TTL:="3600"}"      # HERD-334: AGING-PR alarm TTL in SECONDS (default 3600 = 60m). An engine-approved PR (herd/gates PASSED) that branch protection keeps blocking on a required CI check is a quiet steady state today — no TTL covers "engine approved it, CI blocks it, nothing is progressing". Past this TTL the watcher render pass paints a loud ADVISORY 'aging · engine-approved but blocked on <check>' row (never a hold) + journals `pr_aging` once per (pr,sha), and journal-audit.sh reports a gates_passed_no_merge finding. 0 DISABLES the alarm (byte-inert on both surfaces, mirrors DEP_STALE_TTL=0); a non-numeric value reads as the default. Consumed by agent-watch.sh + journal-audit.sh via aging-pr.sh
 : "${STALE_DUP_DETECT:="on"}"    # HERD-188: pre-merge STALE-DUPLICATE gate — on (default) | off. on → the watcher HOLDS (never auto-merges) a PR whose tracked item ref is already Done via another merged PR, or whose touched files were materially changed on the base branch by a merge the branch predates (a stale base). Provable-only + fail-soft (no ref / offline / bad worktree → no hold), so default-on never false-holds a legit PR. off → byte-inert. Consumed by agent-watch.sh via stale-dup-gate.sh
@@ -1160,6 +1186,85 @@ except Exception: pass
 ' "$_td_reg" 2>/dev/null || true
   fi
   return 0
+}
+
+# ── SHARE_LINKS worktree preparation — ONE implementation, every surface (HERD-535, GH #660) ──────
+#
+# SHARE_LINKS (from .herd/config) are the GITIGNORED shared dirs that live only in the main checkout —
+# a project's build/import caches (`node_modules`, `.venv`, `target`, `.godot`, …). `git worktree add`
+# checks out TRACKED files only, so a fresh worktree has none of them and its suite cannot import,
+# build, or run anything.
+#
+# EXTRACTED here from new-feature.sh, where this pass was lane-inline. The builder lanes ran it; the
+# ADOPT_REMOTE_PRS leg of agent-watch.sh — which creates worktrees with a bare `git worktree add` —
+# did not. Every adopted PR then red its healthcheck on missing caches (measured in emberglen-godot:
+# lane worktrees carry the 34-45MB `.godot/` cache, adopted ones carried none; 12/12 probes red,
+# `health_codeerror`) in a way indistinguishable from the branch breaking everything, so the autofix
+# rails bounced builders at phantom bugs. One implementation, both surfaces — never a second,
+# independently-invented preparation pass that can drift.
+#
+# herd_share_link_exposes_secrets <share> — the HERD-87 guard: true when <share> IS, CONTAINS, or SITS
+# UNDER `.herd/secrets`, the work tracker's API credentials. Builders run with tool permissions skipped,
+# so a symlink to `.herd` (which holds the secrets file) or to `.herd/secrets` itself would let a builder
+# read the key and mutate tracker state, violating "the coordinator owns all backlog/tracker updates".
+# Main-checkout filesystem permissions are out of scope; this closes only the provisioned-link vector.
+herd_share_link_exposes_secrets() {
+  local _sle_s="${1#./}"; _sle_s="${_sle_s%/}"     # normalize ./x and a trailing slash
+  case "$_sle_s" in
+    .herd/secrets|.herd/secrets/*) return 0 ;;     # the secrets file, or anything under it
+    ""|.|.herd) return 0 ;;                        # the repo root or the whole .herd dir contains it
+  esac
+  return 1
+}
+
+# herd_share_links_prepare <worktree-dir> [<repo-root>] — symlink every SHARE_LINKS dir from the main
+# checkout into <worktree-dir>. <repo-root> defaults to $PROJECT_ROOT.
+#
+# Sets HERD_SHARE_LINKS_COUNT to the number of links this pass actually CREATED — 0 when SHARE_LINKS is
+# empty, when every share was refused, or when none of them exist in the main checkout. That count is
+# the `links=N` an adoption journals, and the signal a caller uses to tell "prepared" from "there was
+# nothing to prepare". Because it sets a caller-visible variable, NEVER call this in a `$(…)` subshell.
+#
+# Returns 0 when every requested share was HANDLED — linked, skipped because it does not exist in the
+# main checkout, skipped because it is already present in the worktree, or refused by the secrets guard
+# — and 1 when a link could not be created (or the worktree/repo path is unusable). Refusing a dangerous
+# share is FAIL-SOFT and never fails the pass: the safe shares are still provisioned.
+#
+# CALLERS DECIDE what a failure means, which is why this function itself is neither fatal nor silent:
+# a lane treats it as fatal (never report success on a half-built worktree), the ADOPT_REMOTE_PRS leg
+# treats it as an unprepared-worktree marker so a cache-red is never painted as a plain code error.
+herd_share_links_prepare() {
+  local _slp_dir="${1:-}" _slp_repo="${2:-${PROJECT_ROOT:-}}" _slp_share _slp_target _slp_link _slp_rc=0
+  HERD_SHARE_LINKS_COUNT=0
+  [ -n "$_slp_dir" ] && [ -d "$_slp_dir" ] || return 1
+  [ -n "$_slp_repo" ] && [ -d "$_slp_repo" ] || return 1
+  # Unquoted on purpose: SHARE_LINKS is a SPACE-SEPARATED list of dirs.
+  # shellcheck disable=SC2086
+  for _slp_share in ${SHARE_LINKS:-}; do
+    if herd_share_link_exposes_secrets "$_slp_share"; then
+      printf '%s\n' "🚫 refusing SHARE_LINK '$_slp_share': it would expose .herd/secrets into the builder worktree (HERD-87)." >&2
+      printf '%s\n' "   Builders must never reach tracker credentials; the coordinator owns all tracker state. Skipping this link." >&2
+      continue
+    fi
+    _slp_target="$_slp_repo/$_slp_share"
+    _slp_link="$_slp_dir/$_slp_share"
+    if [ ! -e "$_slp_target" ]; then
+      printf '%s\n' "⚠️  skip symlink: $_slp_target does not exist in the main checkout." >&2
+      continue
+    fi
+    # Already provisioned (a re-run over an existing worktree, or the tree carries its own copy of the
+    # path) — never clobber what is already there, and never count it as work this pass did.
+    if [ -e "$_slp_link" ] || [ -L "$_slp_link" ]; then
+      continue
+    fi
+    if ! ln -s "$_slp_target" "$_slp_link" || [ ! -e "$_slp_link" ]; then
+      printf '%s\n' "❌ Failed to symlink $_slp_link -> $_slp_target" >&2
+      _slp_rc=1
+      continue
+    fi
+    HERD_SHARE_LINKS_COUNT=$((HERD_SHARE_LINKS_COUNT + 1))
+  done
+  return "$_slp_rc"
 }
 
 # herd_pretrust_worktree <dir> — mark a worktree as trusted for Claude Code so a builder agent

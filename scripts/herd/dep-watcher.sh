@@ -127,6 +127,9 @@ _dw_check_state() {
             printf 'unknown\n'
             exit 0
         fi
+        # HERD-534: backends/github.sh reads TRACKER_REPO (never HERD_REPO) for its own repo
+        # selection; _herd_resolve_link above already set TRACKER_REPO to the same resolved peer
+        # repo as HERD_REPO, so no extra mirroring is needed here.
         ITEM_STATE=""
         # shellcheck source=/dev/null
         . "$backend_file"

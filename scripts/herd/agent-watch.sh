@@ -182,6 +182,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # tracker-heal and builder-note surfaces, so both age out by one rule. Defines functions + two
 # constants (CONSOLE_ROW_RETENTION, CONSOLE_LEDGER_MAX); display-only, lib-safe.
 . "$HERE/console-section.sh"
+# Shared RED-ROW LEDGER (HERD-539) — the keyed "why + last-verified" cache behind every red row this
+# file wires (MAIN RED, the 'unlinked merges' alarm) plus the recheck-cadence test that extends the
+# MAIN_HEALTH_RECHECK_MINS pattern to those classes. Sourced after console-section.sh, which it reuses
+# (_console_now_epoch, CONSOLE_LEDGER_MAX) rather than duplicating. Defines functions only; wholly
+# inert while RED_LEDGER=off (default).
+. "$HERE/red-ledger.sh"
 # Pre-spawn CLAIM (HERD-50) — sourced for its RELEASE half (herd_claim_release, HERD-162 F12), which
 # the dead-builder reconcile calls to un-wedge a tracker item whose builder died before opening a PR.
 # Sourcing DEFINES functions only (its lane entry point herd_claim_or_abort is never called from here);
@@ -484,6 +490,10 @@ TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
 # warning anywhere). Written once per PR by _reconcile_ref_unparsed_alarm at merge-time reconcile and
 # rendered by build_ref_unparsed. Empty on every healthy repo, so the console is byte-identical.
 REF_UNPARSED_FILE="$TREES/.agent-watch-ref-unparsed"
+# Shared RED-ROW LEDGER (HERD-539, red-ledger.sh) — one keyed "why + last-verified" cache across every
+# red class this file wires (today: main_health:<sha>, ref_unparsed:<pr>). Empty/absent whenever
+# RED_LEDGER=off (default), so nothing reads or writes it.
+RED_LEDGER_FILE="$TREES/.agent-watch-red-ledger"
 # Post-merge reconcile ledger (HERD-232). The post-merge hook chain used to be merge-EVENT-driven: only
 # the seat whose own do_merge landed a PR ever ran it. _sweep_merged_prs re-derives those obligations
 # from the world (recently-MERGED PRs) instead, so a foreign-seat merge, a gh-UI merge, or a watcher
@@ -642,6 +652,17 @@ ADOPT_VERIFY_LEDGER="$TREES/.agent-watch-adopt-verify"
 ADOPT_ORPHAN_LEDGER="$TREES/.agent-watch-adopt-orphans"
 ADOPT_ORPHAN_SEEN_LEDGER="$TREES/.agent-watch-adopt-orphan-seen"
 ADOPT_ORPHAN_ROWS_LIMIT=5
+# ADOPT_UNPREPARED_LEDGER (HERD-535, GitHub issue #660) — one "<dir>\t<slug>\t<reason>" row per adopted
+# worktree that did NOT get the lane's SHARE_LINKS preparation. `git worktree add` checks out TRACKED
+# files only, so an adopted tree has none of the gitignored build/import caches (`node_modules`,
+# `.venv`, `target`, `.godot`) a lane worktree is handed at spawn — and a suite that cannot import
+# anything reds EVERY probe in a way indistinguishable from the branch breaking everything (12/12
+# probes, `health_codeerror`, in emberglen-godot), which then bounced builders at phantom bugs.
+# _adopt_prepare_worktree now runs the SAME pass the lanes run; this ledger is the record of the cases
+# where it could NOT (no SHARE_LINKS configured, or the pass failed), and it is what lets the health row
+# SAY SO — a red on an unprepared worktree is QUALIFIED as possibly-cache, never presented as a plain
+# code error. Rows are deduped per dir and cleared the moment a later prep for that dir succeeds.
+ADOPT_UNPREPARED_LEDGER="$TREES/.agent-watch-adopt-unprepared"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -978,13 +999,15 @@ build_tracker_drift() {
 # The console half of the silent-miss alarm. _reconcile_ref_unparsed_alarm (work-units/git-pr.sh)
 # writes one ledger row per merged PR whose body MENTIONED `refs:` yet parsed to no tracker id; these
 # two functions render it. Nothing here scans or writes — a pure renderer, like build_tracker_drift.
+# HERD-539: with RED_ROW_RECHECK_MINS>0 (and RED_LEDGER=on), reconcile_ref_unparsed below ALSO re-probes
+# a standing row on a cadence and clears it automatically once the PR's body parses — an operator
+# relinking the item still works, but is no longer the only cure.
 
 # _ref_unparsed_classify <line>  ("<epoch>\t<pr>\t<line>")
 #   Prints "<epoch>\tloud". Always LOUD, so the row NEVER ages out of the display: the merge already
 #   landed and the tracker item is already sitting open, so time passing makes it worse, not stale.
-#   The one thing that clears it is an operator relinking the item — there is no automatic cure, which
-#   is exactly the fact this alarm exists to state out loud. Bounded by construction: one row per PR
-#   (the alarm dedupes on the ledger) and the ledger is tail-kept at CONSOLE_LEDGER_MAX on write.
+#   Bounded by construction: one row per PR (the alarm dedupes on the ledger) and the ledger is
+#   tail-kept at CONSOLE_LEDGER_MAX on write.
 _ref_unparsed_classify() {
   local _ru_epoch
   IFS=$'\t' read -r _ru_epoch _ <<EOF
@@ -995,7 +1018,8 @@ EOF
 
 # _ref_unparsed_row <line>  ("<epoch>\t<pr>\t<line>") → one loud console row quoting the offending
 #   line, so the operator can see WHY it did not parse without opening the PR. Fail-soft: a row with
-#   no PR number renders nothing.
+#   no PR number renders nothing. HERD-539: appends the shared red-ledger's last-verified suffix when
+#   RED_LEDGER is on (empty, so byte-inert, otherwise).
 _ref_unparsed_row() {
   local _ru_epoch _ru_pr _ru_line hhmm
   IFS=$'\t' read -r _ru_epoch _ru_pr _ru_line <<EOF
@@ -1003,9 +1027,73 @@ $1
 EOF
   [ -n "${_ru_pr:-}" ] || return 0
   hhmm="$(epoch_to_hhmm "${_ru_epoch:-0}")"
-  printf '    %s🔗%s %s#%s%s %sunlinked%s %s"%s" parsed to no ref · %s%s' \
+  printf '    %s🔗%s %s#%s%s %sunlinked%s %s"%s" parsed to no ref · %s%s%s' \
     "$C_RED" "$C_RESET" "$C_BOLD" "$_ru_pr" "$C_RESET" \
-    "$C_RED" "$C_RESET" "$C_DIM" "${_ru_line:-}" "$hhmm" "$C_RESET"
+    "$C_RED" "$C_RESET" "$C_DIM" "${_ru_line:-}" "$hhmm" "$C_RESET" \
+    "$(herd_red_ledger_row_suffix "$RED_LEDGER_FILE" "ref_unparsed:${_ru_pr}")"
+}
+
+# _red_row_recheck_mins — RED_ROW_RECHECK_MINS sanitized to a non-negative integer; any non-numeric
+# value (unset, empty, a typo) reads as 0/off, mirroring _main_health_recheck_mins.
+_red_row_recheck_mins() {
+  case "${RED_ROW_RECHECK_MINS:-0}" in
+    ''|*[!0-9]*) printf '0' ;;
+    *)           printf '%s' "$RED_ROW_RECHECK_MINS" ;;
+  esac
+}
+
+# reconcile_ref_unparsed — HERD-539 leg 2: extends the MAIN_HEALTH_RECHECK_MINS pattern to the
+# 'unlinked merges' alarm (HERD-522), which before this had NO clear mechanism at all. Each standing
+# REF_UNPARSED_FILE row is a dedup key (ref_unparsed:<pr>) in the shared red-ledger; once its
+# last-verified stamp is at least RED_ROW_RECHECK_MINS old, this re-fetches the PR's CURRENT body
+# (someone may have edited it post-merge to add the `Refs:` line it was missing) and re-parses it:
+#   • now parses    → drop the row from REF_UNPARSED_FILE, clear the ledger entry, journal
+#                      red_cleared key ref_unparsed:<pr> reason reverified (herd_red_ledger_clear).
+#   • still unparsed → just refresh the ledger's last-verified stamp (no re-alarm — already alarmed).
+# REQUIRES RED_LEDGER=on (the cadence clock and the clear both live in the ledger) AND
+# RED_ROW_RECHECK_MINS>0 — byte-inert (no gh call, no ledger write, REF_UNPARSED_FILE untouched)
+# whenever either is at its default. Fail-soft throughout: no gh / offline / an unreadable body just
+# skips that row for this tick, never a false clear.
+reconcile_ref_unparsed() {
+  _red_ledger_enabled || return 0
+  local _rru_mins; _rru_mins="$(_red_row_recheck_mins)"
+  [ "$_rru_mins" -gt 0 ] 2>/dev/null || return 0
+  [ -s "${REF_UNPARSED_FILE:-}" ] 2>/dev/null || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local _rru_now; _rru_now="$(_console_now_epoch)"
+  local _rru_line _rru_epoch _rru_pr _rru_rest _rru_key _rru_row _rru_lv _rru_body _rru_ref
+  while IFS= read -r _rru_line; do
+    [ -n "$_rru_line" ] || continue
+    _rru_epoch="" _rru_pr="" _rru_rest=""
+    IFS=$'\t' read -r _rru_epoch _rru_pr _rru_rest <<EOF
+$_rru_line
+EOF
+    [ -n "${_rru_pr:-}" ] || continue
+    _rru_key="ref_unparsed:${_rru_pr}"
+    _rru_row="$(herd_red_ledger_get "$RED_LEDGER_FILE" "$_rru_key")"
+    _rru_lv="${_rru_epoch:-}"
+    if [ -n "$_rru_row" ]; then
+      IFS=$'\t' read -r _ _ _ _rru_lv <<EOF
+$_rru_row
+EOF
+    fi
+    herd_red_ledger_recheck_due "${_rru_lv:-0}" "$_rru_mins" "$_rru_now" || continue
+    _rru_body="$(_gh_timeout reconcile_ref_unparsed pr view "$_rru_pr" --json body -q .body 2>/dev/null || true)"
+    if [ -z "$_rru_body" ]; then
+      herd_red_ledger_note "$RED_LEDGER_FILE" "$_rru_key" ref_unparsed "$_rru_rest" "$_rru_now"
+      continue
+    fi
+    _rru_ref="$(printf '%s' "$_rru_body" | herd_pr_ref_from_body)"
+    if [ -n "$_rru_ref" ]; then
+      awk -F'\t' -v p="$_rru_pr" '$2!=p' "$REF_UNPARSED_FILE" > "${REF_UNPARSED_FILE}.tmp.$$" 2>/dev/null \
+        && mv "${REF_UNPARSED_FILE}.tmp.$$" "$REF_UNPARSED_FILE" 2>/dev/null \
+        || rm -f "${REF_UNPARSED_FILE}.tmp.$$" 2>/dev/null
+      herd_red_ledger_clear "$RED_LEDGER_FILE" "$_rru_key" reverified
+    else
+      herd_red_ledger_note "$RED_LEDGER_FILE" "$_rru_key" ref_unparsed "$_rru_rest" "$_rru_now"
+    fi
+  done < "$REF_UNPARSED_FILE"
+  return 0
 }
 
 # build_ref_unparsed — the "unlinked merges" section: the newest 3 alarm rows, newest first. Empty
@@ -1169,6 +1257,9 @@ build_main_health() {
     _bm_defer="$(_main_health_defer_note)"
     [ -n "$_bm_defer" ] && _bm_qual="${_bm_qual}${C_DIM} · ${_bm_defer}${C_RESET}"
   fi
+  # HERD-539: the shared red-ledger's last-verified stamp for this exact sha, if RED_LEDGER is on —
+  # empty string (byte-inert) otherwise, so the row is unchanged when the lever is off.
+  _bm_qual="${_bm_qual}$(herd_red_ledger_row_suffix "$RED_LEDGER_FILE" "main_health:${_bm_sha}")"
   MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(${_bm_attr})${C_RESET}${_bm_qual}"$'\n'
 }
 
@@ -2492,6 +2583,100 @@ _adopt_self_heal_mismatch() {
   return 0
 }
 
+# ── Adopted-worktree PREPARATION (HERD-535, GitHub issue #660) ────────────────────────────────────
+# A lane worktree is never JUST `git worktree add`: new-feature.sh follows it with the SHARE_LINKS
+# symlink pass that gives the tree the gitignored build/import caches its suite needs. The adopt leg
+# skipped that pass entirely, so every adopted PR arrived at the gate with a checkout that could not
+# import, build, or run — 12/12 health probes red, `health_codeerror`, on a branch that was fine.
+#
+# The three functions below are the fix and its honesty rail:
+#   • _adopt_prepare_worktree — runs the ONE shared pass (herd_share_links_prepare, herd-config.sh) and
+#     journals `adopt_prepared … links=N` on success.
+#   • _adopt_unprepared_mark / _adopt_unprepared_note / _adopt_unprepared_clear — the ledger behind the
+#     health row's unprepared-worktree QUALIFIER, for the cases where preparation could not run.
+#
+# Fail-soft throughout: preparation never fails an adopt. An unprepared worktree is still adopted and
+# still gated — the difference is that its red is labelled as possibly-cache instead of code.
+
+# _adopt_unprepared_note <dir> <slug> — print the recorded reason this worktree is unprepared, or
+# return 1 when there is no row for it. Matches on EITHER key: the health row knows the worktree dir,
+# the console rows know the slug. An empty key never matches (it must not match every row).
+_adopt_unprepared_note() {
+  local _aun_dir="${1:-}" _aun_slug="${2:-}"
+  [ -s "$ADOPT_UNPREPARED_LEDGER" ] || return 1
+  awk -F'\t' -v d="$_aun_dir" -v s="$_aun_slug" \
+    '(d != "" && $1 == d) || (s != "" && $2 == s) { print $3; found = 1; exit } END { exit !found }' \
+    "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null
+}
+
+# _adopt_pr_ever_adopted <pr> — true iff ANY sha of this PR was adopted by this leg. _adopt_pr_recorded
+# answers the (pr,sha) once-guard question; this answers the DURABLE one ("is this an adopted PR at
+# all"), which is what the health-row qualifier needs: an adopted PR's sha moves every time its builder
+# pushes, but the worktree it was adopted into is the same one all the way through.
+#
+# It is also what keeps a stale unprepared row from ever mis-qualifying somebody ELSE's red: a merged
+# adopt's worktree is reaped and a later LANE worktree can be born at the very same path/slug, but it
+# carries a different PR — and a PR the adopt leg never adopted can never match this ledger.
+_adopt_pr_ever_adopted() {
+  local _apea_pr="${1:-}"
+  [ -n "$_apea_pr" ] || return 1
+  [ -s "$ADOPT_PR_LEDGER" ] || return 1
+  awk -F'\t' -v p="$_apea_pr" '$1 == p { found = 1; exit } END { exit !found }' "$ADOPT_PR_LEDGER" 2>/dev/null
+}
+
+# _adopt_unprepared_mark <dir> <slug> <reason> — append-only, deduped per dir.
+_adopt_unprepared_mark() {
+  local _aum_dir="${1:-}" _aum_slug="${2:-}" _aum_reason="${3:-}"
+  [ -n "$_aum_dir" ] || return 0
+  _adopt_unprepared_note "$_aum_dir" "" >/dev/null 2>&1 && return 0
+  printf '%s\t%s\t%s\n' "$_aum_dir" "$_aum_slug" "$_aum_reason" >> "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null || true
+  return 0
+}
+
+# _adopt_unprepared_clear <dir> — drop this worktree's row (a later prep succeeded, so the qualifier
+# must stop firing — a stale marker that outlives the condition is its own false signal).
+_adopt_unprepared_clear() {
+  local _auc_dir="${1:-}" _auc_keep
+  [ -n "$_auc_dir" ] || return 0
+  [ -s "$ADOPT_UNPREPARED_LEDGER" ] || return 0
+  _auc_keep="$(awk -F'\t' -v d="$_auc_dir" '$1 != d' "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null || true)"
+  if [ -n "$_auc_keep" ]; then
+    printf '%s\n' "$_auc_keep" > "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null || true
+  else
+    : > "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# _adopt_prepare_worktree <pr> <sha> <branch> <slug> <dir> — the preparation pass itself. Always
+# returns 0 (preparation is never fatal to an adopt); the OUTCOME is what it journals:
+#   • links were made          → `adopt_prepared` with links=N, and any stale unprepared row cleared.
+#   • SHARE_LINKS empty, the pass failed, or nothing resolved → `adopt_unprepared` with the reason,
+#     plus a ledger row so the health row can qualify a red on this worktree.
+# SHARE_LINKS empty is deliberately UNPREPARED, not "prepared with 0 links": on a project that needs no
+# shared caches that is harmless, and on one that does it is exactly the misconfiguration that makes an
+# adopted PR red — either way the operator should be able to see it in the journal.
+_adopt_prepare_worktree() {
+  local _apw_pr="${1:-}" _apw_sha="${2:-}" _apw_branch="${3:-}" _apw_slug="${4:-}" _apw_dir="${5:-}"
+  local _apw_reason=""
+  if [ -z "${SHARE_LINKS:-}" ]; then
+    _apw_reason="SHARE_LINKS is empty — no shared build/import caches are configured for this project"
+  elif ! herd_share_links_prepare "$_apw_dir" "$MAIN"; then
+    _apw_reason="the SHARE_LINKS symlink pass failed for $_apw_dir"
+  elif [ "${HERD_SHARE_LINKS_COUNT:-0}" -eq 0 ]; then
+    _apw_reason="no SHARE_LINKS entry resolved to an existing dir in $MAIN"
+  else
+    journal_append adopt_prepared pr "$_apw_pr" sha "$_apw_sha" branch "$_apw_branch" \
+      slug "$_apw_slug" dir "$_apw_dir" links "${HERD_SHARE_LINKS_COUNT:-0}"
+    _adopt_unprepared_clear "$_apw_dir"
+    return 0
+  fi
+  journal_append adopt_unprepared pr "$_apw_pr" sha "$_apw_sha" branch "$_apw_branch" \
+    slug "$_apw_slug" dir "$_apw_dir" links 0 reason "$_apw_reason"
+  _adopt_unprepared_mark "$_apw_dir" "$_apw_slug" "$_apw_reason"
+  return 0
+}
+
 # _adopt_remote_pr <pr> <branch> <sha> — the mutating half: fetch the branch, then `git worktree add`
 # it into WORKTREES_DIR/<slug>, where <slug> is resolved by herd_branch_slug — the SAME slugifier
 # candidate discovery uses (branch_to_slug/_worktree_for_slug, pysrc/herd/live_runtime.py), so the
@@ -2522,6 +2707,10 @@ _adopt_remote_pr() {
     _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "git worktree add failed"
     return 1
   fi
+  # HERD-535 / GH #660: the worktree exists but is BARE — run the SAME preparation the builder lanes
+  # run (herd_share_links_prepare), or record that we could not. Never fatal: an unprepared worktree is
+  # still an adopted, gated worktree — it is just one whose health red must be read differently.
+  _adopt_prepare_worktree "$_arp_pr" "$_arp_sha" "$_arp_branch" "$_arp_slug" "$_arp_dir"
   journal_append pr_adopted pr "$_arp_pr" sha "$_arp_sha" branch "$_arp_branch" slug "$_arp_slug" dir "$_arp_dir"
   _adopt_pr_mark_adopted "$_arp_pr" "$_arp_sha"
   # HERD-526: `pr_adopted` is a claim about git, not about the GATE. Enqueue the adopt for the DISCOVERY
@@ -7747,6 +7936,10 @@ _main_health_clear() {
   fi
   rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true
   journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result green
+  # HERD-539: the red-ledger's counterpart to the row this clears — keyed on the PINNED red sha
+  # (_mc_pv_sha), which is what herd_red_ledger_note recorded it under at diagnosis time. No-op when
+  # RED_LEDGER is off, or when this sha never had a ledger entry (e.g. the lever was off when it reddened).
+  herd_red_ledger_clear "$RED_LEDGER_FILE" "main_health:${_mc_pv_sha}" reverified
   if [ -n "$_mc_own" ]; then
     herd_driver_notify "✅ main green" "default branch health recovered at #${_mc_pr}" default
   fi
@@ -8306,6 +8499,10 @@ _main_health_set_red() {
   printf '%s\x1f%s\x1f%s\x1f%s\n' "$_sr_sha" "$_sr_since" "$_sr_local" "$_sr_ci" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
   _sr_render="$_sr_local"; [ -n "$_sr_render" ] || _sr_render="$_sr_ci"
   journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_render" since "$_sr_since"
+  # HERD-539: cache the SAME diagnosing text just journaled above into the shared red-ledger, keyed on
+  # this sha, so build_main_health's row can render it back verbatim + an honest last-verified stamp.
+  # No-op when RED_LEDGER is off.
+  herd_red_ledger_note "$RED_LEDGER_FILE" "main_health:${_sr_sha}" main_health "$_sr_render"
   if [ "$_sr_wasred" -eq 0 ]; then
     herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_render} (since #${_sr_since})" default
   fi
@@ -11122,6 +11319,33 @@ _health_needs_you_row() {
   printf '%s' "    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hnr_sl}${C_RESET}${_hnr_pn} ${C_RED}needs you · health-check failed · ${_hnr_detail}${C_RESET}"$'\n'"       ${C_DIM}└─ fix in the worktree + push (auto-re-runs) · full suite: ${_hnr_log}${C_RESET}"
 }
 
+# _HEALTH_UNPREPARED_TAG / _health_qualify_unprepared <pr#> <worktree-dir> <slug> <detail>
+# (HERD-535, GitHub issue #660)
+#
+# An ADOPTED worktree that never got the lane's SHARE_LINKS preparation has none of the gitignored
+# build/import caches its suite needs, so EVERY probe reds — identically to the branch being broken.
+# That is the exact shape that bounced builders at phantom bugs in emberglen-godot. The remedy is not
+# to hide the red (the PR genuinely is not passing) but to stop presenting it as a plain CODE error:
+# echo <detail> with the unprepared-worktree marker appended.
+#
+# TWO conditions, both required, because a marker that fires on the wrong row is its own false signal:
+#   1. this PR was ADOPTED by the adopt leg (_adopt_pr_ever_adopted) — never a lane worktree's red, even
+#      when a lane is later born at the very path a reaped adopt once occupied, and
+#   2. that worktree carries a standing `adopt_unprepared` row.
+#
+# Byte-identical passthrough otherwise — which is every lane worktree, every prepared adopt, and the
+# whole console on a project that never turns ADOPT_REMOTE_PRS on.
+_HEALTH_UNPREPARED_TAG='unprepared worktree (adopted without SHARE_LINKS caches) — may be a missing-cache red, not a code error'
+
+_health_qualify_unprepared() {
+  local _hqu_pr="${1:-}" _hqu_dir="${2:-}" _hqu_slug="${3:-}" _hqu_detail="${4:-}"
+  if _adopt_pr_ever_adopted "$_hqu_pr" && _adopt_unprepared_note "$_hqu_dir" "$_hqu_slug" >/dev/null 2>&1; then
+    printf '%s' "${_hqu_detail} · ${_HEALTH_UNPREPARED_TAG}"
+    return 0
+  fi
+  printf '%s' "$_hqu_detail"
+}
+
 # _handle_health_codeerror <pr#> <slug> <headSha> <display-idx> <worktree-dir> <detail>
 # Called for EVERY reproduced healthcheck CODE ERROR — fresh from the collector or replayed from the
 # sha-cache — so the row stays truthful on every tick. Always sets DISPLAY[<idx>]; returns 0.
@@ -11145,6 +11369,13 @@ _handle_health_codeerror() {
     DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_detail}${C_RESET}"
     return 0
   fi
+
+  # HERD-535 / GH #660: qualify the detail ONCE, here, before any row is painted or any bounce comment
+  # is written, so EVERY downstream surface (the needs-you row, the dry-run row, the budget-cap row, the
+  # PR comment the autofix rail posts) tells a human — and a builder — that this red may be the adopted
+  # worktree's missing caches rather than the diff. Applied AFTER the infra-cap and leak-guard branches
+  # above: both classify on the detail's own shape, and neither is a code-error row this can inform.
+  _hhc_detail="$(_health_qualify_unprepared "$_hhc_pr" "$_hhc_wt" "$_hhc_slug" "$_hhc_detail")"
 
   if ! _health_autofix_enabled || [ -n "${DRYRUN:-}" ]; then
     # OFF / dry-run: no bounce, no ledger write. Row truth still applies — a builder a HUMAN re-tasked
@@ -13714,12 +13945,25 @@ _health_fail_detail() {
 # _health_progress <log> — cheap live progress from a bats/TAP stream: "<done>/<plan>" parsed from the
 # '1..N' plan line + the count of ok/not-ok result lines so far. Empty when the log has no TAP plan (the
 # suite isn't TAP, or hasn't emitted its plan yet) — the running row then shows just elapsed time.
+#
+# HERD-533 leg 3: healthcheck.sh now tees the suite's raw (unbuffered) output into "<log>.progress"
+# AS IT RUNS (HEALTHCHECK_PROGRESS_LOG), while <log> itself still fills in one shot at the very end
+# (the classic, byte-identical-at-rest verdict file the collector's `sed -n '1p'` classifies). Prefer
+# the growing companion when it carries anything — this is the ONLY thing that makes the k/N counter
+# below move DURING a run instead of staying frozen until the suite exits. Fail-soft: no companion
+# (an older worker, or a caller that never set HEALTHCHECK_PROGRESS_LOG) falls straight through to
+# reading <log> itself — today's exact behavior.
+_health_progress_source() {
+  [ -s "${1}.progress" ] && { printf '%s' "${1}.progress"; return 0; }
+  printf '%s' "$1"
+}
 _health_progress() {
-  [ -f "$1" ] || return 0
+  local _hp_src; _hp_src="$(_health_progress_source "$1")"
+  [ -f "$_hp_src" ] || return 0
   local _hp_plan _hp_done
-  _hp_plan="$(grep -m1 -oE '^1\.\.[0-9]+' "$1" 2>/dev/null | grep -oE '[0-9]+$')"
+  _hp_plan="$(grep -m1 -oE '^1\.\.[0-9]+' "$_hp_src" 2>/dev/null | grep -oE '[0-9]+$')"
   [ -n "$_hp_plan" ] || return 0
-  _hp_done="$(grep -cE '^(ok|not ok) ' "$1" 2>/dev/null || printf 0)"
+  _hp_done="$(grep -cE '^(ok|not ok) ' "$_hp_src" 2>/dev/null || printf 0)"
   [ "${_hp_done:-0}" -gt 0 ] 2>/dev/null && printf 'test %s/%s' "$_hp_done" "$_hp_plan"
 }
 
@@ -13733,11 +13977,12 @@ _health_progress() {
 # Pure read of the tailable log the health worker (bash or the Python engine) streams into; no state
 # mutation, so the render half can call it every tick.
 _health_inflight_note() {
-  local _hin_log="$1" _hin_prog
+  local _hin_log="$1" _hin_prog _hin_src
   _hin_prog="$(_health_progress "$_hin_log")"
   if [ -n "$_hin_prog" ]; then printf '%s' "$_hin_prog"; return 0; fi
-  if [ -s "$_hin_log" ]; then
-    printf '%s lines' "$(grep -c '' "$_hin_log" 2>/dev/null || printf 0)"
+  _hin_src="$(_health_progress_source "$_hin_log")"
+  if [ -s "$_hin_src" ]; then
+    printf '%s lines' "$(grep -c '' "$_hin_src" 2>/dev/null || printf 0)"
   else
     printf 'no output yet'
   fi
@@ -13776,10 +14021,19 @@ _gate_health_inflight() {
 #   1. a live HEALTH worker  → the existing shared _health_running_row (unchanged bytes: the same row
 #      the bash gate step and the render half have always agreed on, log-line note and all);
 #   2. a live REVIEWER       → `review · in progress (<age>)`;
-#   3. neither               → <fallback-row> VERBATIM.
+#   3. QUEUED (HERD-533 leg 2) → no live worker for THIS (pr,sha) yet, but another suite already holds
+#      every HEALTH_CONCURRENCY slot → `health-check · queued (n ahead)`, never the bare placeholder a
+#      genuinely-stuck 40-minute wait is indistinguishable from (the live incident this fixes: PR #659
+#      read "running 23m" — no signal ever told the operator it had not actually started). Reads the
+#      SAME engine-agnostic marker files _health_slot_free already uses (bash worker OR the Python
+#      engine's dispatch both write `.health-inflight-*`), so this fires under either engine. n==0 (a
+#      free slot, about to dispatch — typically gone by the very next tick) is deliberately NOT queued:
+#      that transient reads as the pre-existing bare placeholder below, matching today.
+#   4. neither               → <fallback-row> VERBATIM.
 # Both gate branches call this, so "what phase is this PR in" has ONE answer on the console. Reads only
 # marker files the rails already write; side-effect-free; byte-identical to the pre-HERD-453 rows
-# whenever no worker is in flight (the fallback is passed in by the caller unchanged).
+# whenever no worker is in flight AND no slot is contended (the fallback is passed in by the caller
+# unchanged).
 _gate_phase_row() {
   local _gpr_sl="$1" _gpr_pn="$2" _gpr_pr="$3" _gpr_sha="$4" _gpr_fallback="$5" _gpr_inf
   if [ -n "$_gpr_sha" ]; then
@@ -13791,6 +14045,10 @@ _gate_phase_row() {
     _gpr_inf="$(_review_inflight_file "$_gpr_pr" "$_gpr_sha")"
     if [ -f "$_gpr_inf" ] && _review_pid_live "$_gpr_inf"; then
       printf '%s' "    ${C_YELLOW}🔍${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}review · in progress ($(_fmt_age "$(_marker_age_or_mtime "$_gpr_inf")"))${C_RESET}"
+      return 0
+    fi
+    if ! _health_slot_free; then
+      printf '%s' "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}health-check · queued ($(_count_live_healthchecks) ahead)${C_RESET}"
       return 0
     fi
   fi
@@ -16182,6 +16440,12 @@ EOF
   # merge, a no-slot deferral, a killed worker), and re-verifies a standing red on the
   # MAIN_HEALTH_RECHECK_MINS cadence. Byte-inert when MAIN_HEALTH_TICK=off.
   reconcile_main_health
+
+  # Unlinked-merges re-verify (HERD-539 leg 2): the SAME reconciled-invariant shape as main-health
+  # above, applied to the 'unlinked merges' alarm (HERD-522) — a standing row's PR body is re-probed
+  # on the RED_ROW_RECHECK_MINS cadence and cleared once it parses. Byte-inert when RED_LEDGER=off OR
+  # RED_ROW_RECHECK_MINS=0 (both default off).
+  reconcile_ref_unparsed
 
   # Branch-CI main-red leg (HERD-334, HERD-434): the MAIN RED machinery reflected only the LOCAL suite,
   # which runs on the WATCHER'S OWN (fast, idle) host and can be green while the DEFAULT branch's CI on

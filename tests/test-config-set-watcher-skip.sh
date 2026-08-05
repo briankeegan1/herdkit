@@ -34,6 +34,21 @@ ok()   { PASS=$((PASS + 1)); echo "PASS: $1"; }
 DECOYS=""
 _reap_decoys() { local p; for p in $DECOYS; do kill -9 "$p" 2>/dev/null || true; done; }
 
+# _reap_wedged_herdr — kill any HANGING stub herdr (and its sleep) left behind by leg (C). The bound
+# stops the reload SUBSHELL and its DIRECT children; a herdr that was a GRANDCHILD at expiry outlives
+# it, and while that orphan is harmless to the operator (the command already returned), it must not
+# outlive this fixture. $BIN is a fresh mktemp path, so this match can only ever name our own stub.
+_reap_wedged_herdr() {
+  local p k
+  for p in $(ps -eo pid=,command= 2>/dev/null | grep -F "$BIN/herdr" | grep -v grep | awk '{print $1}'); do
+    for k in $(ps -eo pid=,ppid= 2>/dev/null | awk -v pp="$p" '$2 == pp { print $1 }'); do
+      kill -9 "$k" 2>/dev/null || true
+    done
+    kill -9 "$p" 2>/dev/null || true
+  done
+  return 0
+}
+
 # ── stubs on PATH ────────────────────────────────────────────────────────────────────────────────
 BIN="$T/bin"; mkdir -p "$BIN"
 # pgrep: `-P` (children of a pid) delegates to the REAL pgrep so the bounded-reload descendant kill is
@@ -158,12 +173,23 @@ ok "B2 the restart actually stops the live watcher"
 printf '#!/usr/bin/env bash\nsleep 120\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
 W="$T/wedged"; _make_project "$W" "hk519-wedge"
 WPID2="$(_plant_watcher hk519-wedge)"; DECOYS="$DECOYS $WPID2"
+# The output is captured to a FILE, not through `$( )`. A command substitution reads its pipe until
+# EVERY holder of the write end closes it — including a leaked herdr GRANDCHILD that the bound's
+# direct-children sweep missed — so a pipe capture here times the ORPHAN'S `sleep 120`, not the
+# command: `herd config set` returns at the 1s bound with the right rc and output, yet ELAPSED reads
+# ~121s and this leg fails its own <60s assertion. That is what TIMED OUT this test against
+# scripts/ci/run-suite.sh's 120s per-test cap in main-health (intermittent: whether the in-flight
+# herdr is a child or a grandchild at expiry decides it). A file capture measures the command itself,
+# which is what the bound is a claim about.
+WEDGED_OUT="$T/wedged.out"
 t0=$SECONDS
-OUT="$( cd "$W" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 FAKE_STRAY_PIDS="" \
-          HERD_RELOAD_SKIP_LAUNCH=fallback HERD_RELOAD_SIGTERM_POLLS=15 \
-          HERD_CONFIG_RELOAD_TIMEOUT=1 \
-          bash "$HERD" config set REVIEW_CONCURRENCY 9 2>&1 )"; RC=$?
+( cd "$W" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 FAKE_STRAY_PIDS="" \
+    HERD_RELOAD_SKIP_LAUNCH=fallback HERD_RELOAD_SIGTERM_POLLS=15 \
+    HERD_CONFIG_RELOAD_TIMEOUT=1 \
+    bash "$HERD" config set REVIEW_CONCURRENCY 9 ) > "$WEDGED_OUT" 2>&1; RC=$?
 ELAPSED=$((SECONDS - t0))
+OUT="$(cat "$WEDGED_OUT")"
+_reap_wedged_herdr
 printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
 [ "$RC" -eq 0 ] || fail "(C) a wedged reload made config set FATAL (rc=$RC) — it must warn, not die: $OUT"
 [ "$ELAPSED" -lt 60 ] || fail "(C) the bound did not hold — config set took ${ELAPSED}s against a wedged herdr"

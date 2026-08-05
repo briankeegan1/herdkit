@@ -2,6 +2,11 @@
 # test-backend-github.sh — hermetic test of the GitHub-Issues work-tracker backend's 3-op
 # contract using a FAKE `gh` on PATH. No network, no real gh, no repo writes. The stub logs every
 # invocation and returns canned output, so the test asserts CALL SHAPE (not GitHub behavior).
+#
+# HERD-534 / GH #651+#652: this backend now targets TRACKER_REPO exclusively — NEVER HERD_REPO
+# (reserved for herd report / oss-triage cross-repo escalation). Cases 0/0b are the regression guard
+# for the original contamination bug (a project with HERD_REPO configured had its OWN tracker ops
+# silently target that OTHER repo). Case 8 covers the new rich TSV op (LEG B, GH #652).
 # Run:  bash tests/test-backend-github.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -57,8 +62,8 @@ EOF
 chmod +x "$T/bin/gh"
 export PATH="$T/bin:$PATH"
 
-# The backend reads $HERD_REPO from config; set it so every op should target this repo.
-export HERD_REPO="acme/widgets"
+# The backend reads $TRACKER_REPO from config; set it so every op should target this repo.
+export TRACKER_REPO="acme/widgets"
 
 run() {
   ( cd "$T" && . "$BACKEND"
@@ -69,19 +74,45 @@ run() {
     printf 'ITEM_STATE=%s\n' "${ITEM_STATE:-}" )
 }
 
+# 0. HERD-534 / GH #651 (LEG A) regression guard: HERD_REPO set to a DIFFERENT repo than
+#    TRACKER_REPO must NEVER leak into a tracker op's -R flag — the exact cross-project
+#    contamination bug (a project's OWN backlog silently filed onto its escalation target).
+: > "$GHLOG"
+out0="$( ( cd "$T" && HERD_REPO="briankeegan1/herdkit" . "$BACKEND"
+  _BACKEND_RESULT=""
+  _backend_add_item REQ0 "add item while HERD_REPO points elsewhere" >/dev/null
+  printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}" ) )"
+grep -q "RESULT=DONE" <<< "$out0" || fail "add_item under a foreign HERD_REPO did not report DONE ($out0)"
+grep -q -- "-R acme/widgets" "$GHLOG" || fail "add_item did not target TRACKER_REPO (-R acme/widgets) ($GHLOG: $(cat "$GHLOG"))"
+grep -q -- "-R briankeegan1/herdkit" "$GHLOG" && fail "add_item leaked HERD_REPO (-R briankeegan1/herdkit) into a tracker op — the HERD-534 contamination bug"
+pass
+
+# 0b. TRACKER_REPO unset entirely → no -R flag at all, so `gh` resolves the repo itself from the
+#     CWD's origin remote — a project whose origin IS its tracker stays byte-identical. HERD_REPO
+#     being set must not change this either (the backend never reads it).
+: > "$GHLOG"
+outu0="$( ( cd "$T" && unset TRACKER_REPO; HERD_REPO="briankeegan1/herdkit"; . "$BACKEND"
+  _BACKEND_RESULT=""
+  _backend_list_open >/dev/null
+  printf 'RESULT=%s\n' "${_BACKEND_RESULT:-}" ) )"
+grep -q -- "-R " "$GHLOG" && fail "list_open with TRACKER_REPO unset must pass NO -R flag ($GHLOG: $(cat "$GHLOG"))"
+grep -q "^gh issue list --state open" "$GHLOG" || fail "list_open with TRACKER_REPO unset did not run a bare 'gh issue list --state open' ($(cat "$GHLOG"))"
+pass
+
 # 1. add_item → gh issue create with the configured repo, title, and body; returns DONE + URL.
+: > "$GHLOG"
 out="$(run _backend_add_item REQ1 "add a dark-mode toggle")"
 grep -q "RESULT=DONE" <<< "$out" || fail "add_item did not report DONE ($out)"
 grep -q "https://github.com/acme/widgets/issues/42" <<< "$out" || fail "add_item did not surface the created issue URL"
 grep -q "issue create" "$GHLOG" || fail "add_item did not invoke 'gh issue create'"
-grep -q -- "-R acme/widgets" "$GHLOG" || fail "add_item did not target HERD_REPO (-R acme/widgets)"
+grep -q -- "-R acme/widgets" "$GHLOG" || fail "add_item did not target TRACKER_REPO (-R acme/widgets)"
 grep -q -- "--title add a dark-mode toggle" "$GHLOG" || fail "add_item did not pass the request as --title"
 grep -q -- "--body add a dark-mode toggle" "$GHLOG" || fail "add_item did not pass the request as --body"
 pass
 
 # 2. list_open → parses the canned `gh issue list` JSON to "#<number> <title>" lines.
 open="$(run _backend_list_open)"
-grep -q -- "issue list -R acme/widgets --state open" "$GHLOG" || fail "list_open did not invoke 'gh issue list --state open' on HERD_REPO"
+grep -q -- "issue list -R acme/widgets --state open" "$GHLOG" || fail "list_open did not invoke 'gh issue list --state open' on TRACKER_REPO"
 grep -q "^#7 first open issue$" <<< "$open" || fail "list_open missing '#7 first open issue' ($open)"
 grep -q "^#9 second open issue$" <<< "$open" || fail "list_open missing '#9 second open issue'"
 pass
@@ -237,6 +268,39 @@ lq="$(run _backend_list_queued)"
 grep -q "^#7${TAB}alice${TAB}sequenced after 9${TAB}1700000000$" <<< "$lq" \
   || fail "list_queued did not emit the parsed marker TSV for #7 ($lq)"
 grep -q "^#9" <<< "$lq" && fail "list_queued surfaced #9 which carries no 📌 marker ($lq)"
+pass
+
+# 8. LEG B (GH #652) — _backend_list_open_rich matches backends/linear.sh's TSV shape:
+#    "#<id>\t<state-type>\t<state-name>\t<title>\t<desc>\t<assignee>\t<url>". The issue body is
+#    fetched in the SAME gh issue list --json call (no extra round-trip), flattened, and truncated
+#    to ~180 chars (shorter than linear's 280 cap).
+: > "$GHLOG"
+LONGBODY="$(python3 -c 'print("word " * 60, end="")')"
+cat > "$T/bin/gh" <<EOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$GHLOG"
+case "\$1 \$2" in
+  "issue list")
+    printf '%s' '[{"number":7,"title":"first open issue","body":"line one\nline two with\ttabs","assignees":[{"login":"alice"}],"url":"https://github.com/acme/widgets/issues/7"},{"number":9,"title":"second open issue","body":"$LONGBODY","assignees":[],"url":"https://github.com/acme/widgets/issues/9"}]'
+    ;;
+  *) : ;;
+esac
+EOF
+chmod +x "$T/bin/gh"
+rich="$(run _backend_list_open_rich)"
+grep -q -- "issue list -R acme/widgets --state open" "$GHLOG" \
+  || fail "list_open_rich did not invoke 'gh issue list --state open' on TRACKER_REPO"
+grep -q -- "number,title,body,assignees,url" "$GHLOG" \
+  || fail "list_open_rich did not fetch the body in the SAME --json call ($(cat "$GHLOG"))"
+line7="$(printf '%s\n' "$rich" | grep '^#7')"
+[ -n "$line7" ] || fail "list_open_rich missing a row for #7 ($rich)"
+grep -qF -- "$(printf '#7\t\t\tfirst open issue\tline one line two with tabs\talice\thttps://github.com/acme/widgets/issues/7')" <<< "$line7" \
+  || fail "list_open_rich #7 row did not match the linear TSV shape (id/state-type/state-name/title/desc/assignee/url): $line7"
+line9="$(printf '%s\n' "$rich" | grep '^#9')"
+[ -n "$line9" ] || fail "list_open_rich missing a row for #9 ($rich)"
+desc9="$(printf '%s' "$line9" | cut -f5)"
+[ "${#desc9}" -le 180 ] || fail "list_open_rich did not cap the description at ~180 chars (got ${#desc9})"
+case "$desc9" in *…) ;; *) fail "list_open_rich truncated description missing the ellipsis marker ($desc9)" ;; esac
 pass
 
 echo "ALL PASS ($PASS checks)"

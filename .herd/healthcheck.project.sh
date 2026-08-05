@@ -504,23 +504,23 @@ _hk_suite_cores() {
   printf '%s' "$n"
 }
 
-# _hk_live_sibling_suites — how many OTHER healthcheck suites are concurrently running RIGHT NOW,
-# read from the SAME $WORKTREES_DIR/.health-inflight-<pr>-<sha> markers the watcher's own slot check
-# (_count_live_healthchecks / _health_slot_free in agent-watch.sh) reads — same directory, same
-# marker naming, so this fan-out clamp and the HEALTH_CONCURRENCY slot gate never disagree on how
-# many suites are actually in flight. Deliberately a SIMPLE pid-liveness probe (kill -0), not that
-# function's full pid-recycling identity check (_inflight_verified_live, start-time comparison via
-# `ps`) — this is a worker-COUNT heuristic feeding bats --jobs, not a merge-correctness gate, so a
-# rare stale-marker over-count only makes THIS suite a touch more conservative, never wrong.
-# Resolved the SAME way _hk_regtabs() above resolves WORKTREES_DIR — read fresh from .herd/config in
-# a subshell — rather than trusting an inherited env var, since a solo/local run outside the watcher
-# never has one exported. Fail-soft: no .herd/config, no WORKTREES_DIR, or no markers at all → 0
-# (solo — the pre-HERD-499 behavior, unchanged).
-_hk_live_sibling_suites() {
+# _hk_local_suite_slot_count — how many local-suite slots (HERD-529 leg A, scripts/herd/healthcheck.sh's
+# $WORKTREES_DIR/.local-suite-slot-<n> markers) are held RIGHT NOW — builder-local heavy runs AND
+# watcher-dispatched ones alike, since leg A's chokepoint (run_heavy()) slots BOTH before invoking this
+# very script. Superseded HERD-499's `_hk_live_sibling_suites`, which read the WATCHER-ONLY
+# $WORKTREES_DIR/.health-inflight-<pr>-<sha> markers — blind to exactly the builder-local suites leg A
+# exists to count. Deliberately a SIMPLE pid-liveness probe (kill -0), not leg A's own full
+# pid-recycling identity check — this is a worker-COUNT heuristic feeding bats --jobs, not a
+# merge-correctness gate, so a rare stale-marker over-count only makes THIS suite a touch more
+# conservative, never wrong. Resolved the SAME way _hk_regtabs() above resolves WORKTREES_DIR — read
+# fresh from .herd/config in a subshell — rather than trusting an inherited env var, since a solo/local
+# run outside the watcher never has one exported. Fail-soft: no .herd/config, no WORKTREES_DIR, or no
+# markers at all → 0 (solo).
+_hk_local_suite_slot_count() {
   local _hls_tree="" _hls_f _hls_pid _hls_n=0
   [ -f .herd/config ] && _hls_tree="$(. .herd/config 2>/dev/null && printf '%s' "${WORKTREES_DIR:-}")"
   [ -n "$_hls_tree" ] && [ -d "$_hls_tree" ] || { printf 0; return; }
-  for _hls_f in "$_hls_tree"/.health-inflight-*; do
+  for _hls_f in "$_hls_tree"/.local-suite-slot-*; do
     [ -e "$_hls_f" ] || continue
     _hls_pid="$(head -n1 "$_hls_f" 2>/dev/null)"
     case "$_hls_pid" in ''|*[!0-9]*) continue ;; esac
@@ -528,26 +528,36 @@ _hk_live_sibling_suites() {
   done
   printf '%s' "$_hls_n"
 }
+# _hk_suite_workers — HERD-529 leg B: an EXPLICIT HEALTHCHECK_SUITE_WORKERS always wins UNCHANGED — no
+# core-count cap, no live-suite clamp; setting it by hand is a deliberate operator override (only a
+# non-numeric typo falls through to the dynamic default below, so a bad override never silently loses
+# fan-out). UNSET derives the default DYNAMICALLY instead of the old flat 4: max(2, cores / max(1, live
+# local suite slots)) — right-sized to how many OTHER heavy suites (builder-local or
+# watcher-dispatched) are ACTUALLY sharing this box right now, per leg A's cross-worktree slot count,
+# rather than a flat 4 that oversubscribes a small/shared box or undersubscribes a big idle one.
+# Supersedes HERD-499's separate "clamp the request" step (which used to apply even to an explicit
+# request — GROUNDED then: 3 concurrent suites x 10 workers/suite = load 37 on a 14-core box
+# false-redded an unrelated diff; that oversubscription risk is now what the DEFAULT is sized to avoid
+# in the first place, so an explicit override no longer needs a second clamp on top of it).
 _hk_suite_workers() {
-  local cores req w divisor cap
+  local cores req live divisor w
   cores="$(_hk_suite_cores)"
-  req="${HEALTHCHECK_SUITE_WORKERS:-4}"
-  case "$req" in ''|*[!0-9]*) req=4 ;; esac
-  [ "$req" -ge 1 ] 2>/dev/null || req=1
-  # HERD-499: clamp the box-core ceiling by how many sibling suites are CURRENTLY sharing this box's
-  # cores — effective ceiling = max(1, cores / max(1, live sibling suites)) — not just this box's raw
-  # core count. GROUNDED: 3 concurrent suites × 10 workers/suite = load 37 on a 14-core box
-  # false-redded an unrelated 8-comment diff on bats timeout-only tests — an OVERSUBSCRIBED-load
-  # flake, not a code error. This complements, rather than replaces, the retry-before-red FLAKY
-  # reclassification agent-watch.sh's _health_worker already does (a timeout-only red that passes
-  # clean on the solo retry is reported FLAKY, not CODEERROR) — that masks the cost of oversubscription
-  # AFTER paying it once; clamping fan-out here avoids causing it in the first place.
-  divisor="$(_hk_live_sibling_suites)"
-  case "$divisor" in ''|*[!0-9]*) divisor=0 ;; esac
-  [ "$divisor" -ge 1 ] 2>/dev/null || divisor=1
-  cap=$((cores / divisor))
-  [ "$cap" -ge 1 ] 2>/dev/null || cap=1
-  w="$req"; [ "$w" -le "$cap" ] || w="$cap"
+  if [ -n "${HEALTHCHECK_SUITE_WORKERS:-}" ]; then
+    req="$HEALTHCHECK_SUITE_WORKERS"
+    case "$req" in
+      *[!0-9]*) : ;;   # non-numeric typo → fall through to the dynamic default
+      *)
+        [ "$req" -ge 1 ] 2>/dev/null || req=1
+        printf '%s' "$req"
+        return
+        ;;
+    esac
+  fi
+  live="$(_hk_local_suite_slot_count)"
+  case "$live" in ''|*[!0-9]*) live=0 ;; esac
+  divisor="$live"; [ "$divisor" -ge 1 ] 2>/dev/null || divisor=1
+  w=$((cores / divisor))
+  [ "$w" -ge 2 ] 2>/dev/null || w=2
   printf '%s' "$w"
 }
 _HK_SUITE_WORKERS="$(_hk_suite_workers)"
