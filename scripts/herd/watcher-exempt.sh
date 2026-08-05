@@ -384,12 +384,13 @@ watcher_singleton_verdict() {
   [ -n "$table" ] || table="$(watcher_ps_table)"
   lockpid="$(watcher_lock_pid)"
   # ONE table sample feeds the listing, so the argv0 match and the exemptions resolve against the
-  # same instant the verdict describes — never two racy `ps` calls.
+  # same instant the verdict describes — never two racy `ps` calls. The listing itself is the
+  # SETTLED + RENDER-VERIFIED view (see below), not the raw kill-list watcher_list_mains.
   while IFS= read -r pid; do
     [ -n "$pid" ] || continue
     count=$((count + 1))
     mains="${mains:+$mains,}$pid"
-  done < <(watcher_list_mains "$table")
+  done < <(watcher_list_mains_settled "$table")
 
   if [ "$count" -eq 0 ]; then
     state=NONE
@@ -402,6 +403,181 @@ watcher_singleton_verdict() {
     state=LOCK_DRIFT
   fi
   printf '%s\t%s\t%s\t%s\n' "$state" "${lockpid:--}" "${mains:--}" "$count"
+}
+
+# ── Settle-threshold + render-time re-verify for the DUPLICATE COUNT (HERD-548) ────────────────────
+# GROUNDED 2026-08-05: post-reload, a single `ps` sample briefly saw FOUR argv0-tagged pids — THREE
+# already dead (or dying) by the time anything could act on the sample. A tick fork inherits the
+# argv0 the INSTANT it is forked, before it has had any chance to become marker-owned or reparented to
+# the canonical watcher — the two PROVEN-fork exemptions _wx_exempt already applies. A sample taken in
+# that narrow window sees a pid that is, in truth, already on its way out, and watcher_singleton_verdict
+# had no defense against it: one ps call in, one verdict out, no persistence, no re-check.
+#
+# watcher_list_mains stays exactly as strict as before — it doubles as the KILL LIST for
+# _stop_project_watcher, where UNDER-listing a genuine duplicate is the dangerous failure, so nothing
+# here may narrow it. This is a second, CLASSIFY-ONLY view layered on top, for the surfaces where
+# OVER-counting a transient is the dangerous failure instead (the alarm row, the resurrect probe):
+#   • SETTLE   — a NON-CANONICAL main younger than WATCHER_SETTLE_SECS is not yet trusted; the next
+#     tick (the default cadence is 4s, comfortably above the 2s default settle window) gets another
+#     look, by which point a transient has either died or proven itself a persisting duplicate. The
+#     canonical (lockfile) pid is NEVER settle-filtered — a freshly-acquired LEGITIMATE watcher must
+#     read OK immediately, not NONE for its first couple of seconds.
+#   • RENDER-TIME RE-VERIFY — every survivor is re-checked with `kill -0` right before it is returned,
+#     so a pid that died in the gap between the ps sample and this call is never named in a verdict.
+# Deliberately NOT status.sh's multi-sample-plus-sleep persistence check (_status_dup_verified): that
+# check costs ~0.3-0.6s of real sleep, fine for an on-demand `herd status`, too slow to pay every
+# ~4s tick. Both checks are instant (one ps -o etime= per candidate, one kill -0 per candidate).
+WATCHER_SETTLE_SECS="${HERD_WATCHER_SETTLE_SECS:-2}"
+
+# _wx_etime_secs <etime> — parse `ps -o etime=`'s `[[dd-]hh:]mm:ss` ELAPSED-TIME format into whole
+# seconds. This is already an OFFSET, not a locale-formatted timestamp, so no date parsing (and no
+# macOS/Linux `date` flag divergence) is needed — unlike _pid_starttime's `lstart`, which answers a
+# different question (a stable recycling-guard token, not "how old is this pid right now").
+_wx_etime_secs() {
+  local e="${1:-}" days=0 rest hh=0 mm ss
+  [ -n "$e" ] || return 0
+  rest="$e"
+  case "$e" in *-*) days="${e%%-*}"; rest="${e#*-}" ;; esac
+  case "$rest" in *:*:*) hh="${rest%%:*}"; rest="${rest#*:}" ;; esac
+  mm="${rest%%:*}"; ss="${rest#*:}"
+  case "$days" in ''|*[!0-9]*) return 0 ;; esac
+  case "$hh"   in ''|*[!0-9]*) return 0 ;; esac
+  case "$mm"   in ''|*[!0-9]*) return 0 ;; esac
+  case "$ss"   in ''|*[!0-9]*) return 0 ;; esac
+  # 10# forces base-10: ps zero-pads mm/ss ("08", "09"), and bash arithmetic otherwise reads a
+  # leading-zero literal as OCTAL — "09" is not even valid octal and would abort the whole expression.
+  printf '%s' $(( 10#$days * 86400 + 10#$hh * 3600 + 10#$mm * 60 + 10#$ss ))
+}
+
+# _wx_pid_age_secs <pid> — <pid>'s elapsed lifetime in whole seconds via `ps -o etime=`; empty when the
+# pid is gone or ps cannot answer. HERD_SWEEP_PS_ETIME_CMD is a test seam (mirrors watcher_ps_table's
+# HERD_SWEEP_PS_CMD) so a hermetic test can plant a synthetic age for a fictional pid.
+_wx_pid_age_secs() {
+  local p="${1:-}" raw
+  [ -n "$p" ] || return 0
+  if [ -n "${HERD_SWEEP_PS_ETIME_CMD:-}" ]; then raw="$("$HERD_SWEEP_PS_ETIME_CMD" "$p" 2>/dev/null)"
+  else raw="$(ps -o etime= -p "$p" 2>/dev/null | tr -d '[:space:]')"; fi
+  _wx_etime_secs "$raw"
+}
+
+# _wx_pid_settled <pid> — true iff <pid> has been alive at least WATCHER_SETTLE_SECS. FAIL-OPEN: an
+# unreadable/empty age (a ps hiccup, or a test seam that answers nothing for this pid) settles the pid
+# rather than excluding it — this check only ever REMOVES a false positive, so it must never invent a
+# false negative by hiding a pid whose age it simply could not read.
+_wx_pid_settled() {
+  local age; age="$(_wx_pid_age_secs "${1:-}")"
+  case "$age" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$age" -ge "$WATCHER_SETTLE_SECS" ]
+}
+
+# _wx_pid_alive <pid> — RENDER-TIME liveness for the settle-filtered view, RIGHT NOW. Mirrors
+# status.sh's _status_pid_alive: `kill -0` asks the kernel, the only authority that cannot be stale, so
+# production always uses it. Under the $HERD_SWEEP_PS_CMD hermetic-test seam a synthetic pid is
+# fictional and the kernel would call every one of them dead — liveness there instead comes from a
+# FRESH watcher_ps_table call (the same seam, re-invoked, never a frozen sample), so a stateful test
+# fixture can model a candidate that is present at scan time and gone by the time this asks again — one
+# seam, one truth, the identical trick tests/test-watcher-exempt.sh's case (j) already relies on for
+# _status_pid_alive. Deliberately does NOT accept a caller-supplied table: reusing the scan's own
+# sample here would defeat the entire point of a RE-verify.
+_wx_pid_alive() {
+  local pid="${1:-}" p table
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -n "${HERD_SWEEP_PS_CMD:-}" ]; then
+    table="$(watcher_ps_table)"
+    while IFS=$' \t' read -r p _; do
+      [ "$p" = "$pid" ] && return 0
+    done <<EOF
+$table
+EOF
+    return 1
+  fi
+  kill -0 "$pid" 2>/dev/null
+}
+
+# watcher_list_mains_settled [table] — the CLASSIFY-ONLY view: the canonical lockfile pid (unfiltered)
+# plus every OTHER watcher_list_mains entry that is both SETTLED and, re-verified RIGHT NOW via
+# _wx_pid_alive, still alive. NEVER a kill list — watcher_singleton_verdict is its one caller.
+#
+# TWO PASSES, fail-OPEN by construction. Pass 1 is the render-time re-verify ALONE (no age filter) —
+# this is the "is anyone home at all" answer and must never go empty just because a genuine
+# SOLE candidate has not aged past the settle window yet. The empty-lockfile LOCK_DRIFT case is exactly
+# this: a freshly-started sole watcher with no recorded pid (canon empty) must still be SEEN as that
+# one live main, not silently downgraded to NONE by its own youth — an under-count there is actively
+# dangerous (it would tell watcher-resurrect.sh nobody is home and invite a real duplicate spawn).
+# Pass 2 narrows to canonical + settled extras ONLY WHEN that narrowing still leaves someone standing;
+# if EVERY alive candidate is still young (no canonical to anchor on — every candidate is an unproven
+# extra), pass 2 yields nothing and the function falls back to pass 1's unfiltered alive set rather
+# than manufacture a false NONE. The settle filter can therefore only ever suppress extras it has a
+# trustworthy anchor to compare against; it can never erase the last sign of life.
+watcher_list_mains_settled() {
+  local table="${1:-}" canon pid alive="" settled=""
+  [ -n "$table" ] || table="$(watcher_ps_table)"
+  canon="$(watcher_canonical_pid)"
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    _wx_pid_alive "$pid" || continue
+    alive="${alive}${alive:+$'\n'}$pid"
+  done < <(watcher_list_mains "$table")
+  [ -n "$alive" ] || return 0
+
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    if [ -n "$canon" ] && [ "$pid" = "$canon" ]; then
+      settled="${settled}${settled:+$'\n'}$pid"; continue
+    fi
+    _wx_pid_settled "$pid" || continue
+    settled="${settled}${settled:+$'\n'}$pid"
+  done <<< "$alive"
+
+  if [ -n "$settled" ]; then
+    printf '%s\n' "$settled"
+  else
+    printf '%s\n' "$alive"
+  fi
+}
+
+# ── Crash-loop hard-stop marker (HERD-548) ──────────────────────────────────────────────────────────
+# GROUNDED 2026-08-05: post-reload the watcher crash-looped silently for ~2 minutes (repeated fast
+# child deaths, zero journal, zero console beyond the header) then self-resolved with nobody the
+# wiser. herd-watch.sh's own supervising loop (WATCHER_CRASHLOOP_GUARD=on) now DETECTS the loop itself
+# (N consecutive sub-threshold child deaths) and trips this marker instead of retrying forever.
+# watcher-resurrect.sh's external cron cadence must see the SAME marker and refuse to relaunch on top
+# of a structurally broken build — repeatedly launching the identical crash is amplification, not
+# resurrection. A plain operator-run `herd pane watch` is NOT blocked by this marker (see the header of
+# each reader): only the unattended cron probe treats it as a hard stop.
+watcher_crashloop_file() {
+  local trees; trees="$(_wx_trees)"
+  [ -n "$trees" ] || return 0
+  printf '%s/.watcher-crashloop' "$trees"
+}
+
+# watcher_crashloop_trip <reason> — record a tripped crash loop: reason, then the epoch it tripped.
+# Fail-soft: an unwritable trees dir is a silent no-op (the loud stderr + journal event still fire from
+# the caller; a missing marker only costs watcher-resurrect.sh's extra courtesy check, never correctness
+# — its own `herd reload` will simply re-observe the same crash and refuse to double-launch nothing new).
+watcher_crashloop_trip() {
+  local f; f="$(watcher_crashloop_file)"
+  [ -n "$f" ] || return 0
+  printf '%s\n%s\n' "${1:-crashloop}" "$(date +%s)" > "$f" 2>/dev/null || true
+  return 0
+}
+
+# watcher_crashloop_active — success iff a crash-loop marker is currently standing. Deliberately NO
+# TTL: unlike the self-restart handoff window (a benign, self-clearing exec), a crash loop is a REAL
+# fault that must stay visible until a watcher PROVES it survives — see watcher_crashloop_clear.
+watcher_crashloop_active() {
+  local f; f="$(watcher_crashloop_file)"
+  [ -n "$f" ] && [ -f "$f" ]
+}
+
+# watcher_crashloop_clear — called by agent-watch.sh once a watcher has PROVEN it is not looping (it
+# survived past the same settle window herd-watch.sh's loop uses to call a death "fast"). Idempotent;
+# a no-op when no marker stands.
+watcher_crashloop_clear() {
+  local f; f="$(watcher_crashloop_file)"
+  [ -n "$f" ] && rm -f "$f" 2>/dev/null
+  return 0
 }
 
 fi

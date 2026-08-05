@@ -10,6 +10,9 @@
 #   herd report     file a cross-repo issue against HERD_REPO (or any peer from .herd/links via
 #                   --to <name>) via HERD_REPORT_BACKEND (default github), stamped with this
 #                   project + the lane involved + the version pin. Dedups before filing.
+#                   --diagnosis <text> appends an extended why excerpt as its own body section,
+#                   kept out of the (short) title — the auto-escalation hook agent-watch.sh's
+#                   RED_AUTOESCALATE lever calls through this uses it to attach a red-ledger diagnosis.
 #   herd link       manage the cross-repo link registry (.herd/links): list shows all configured
 #                   peer repos; --scan proposes new ones from the fleet registry (dry-run by
 #                   default, --write applies). Use a link with: herd report --to <name> "<symptom>".
@@ -2792,6 +2795,18 @@ _config_ensure_local() {
 # model tiers, operator-posture opt-ins) so it never diverges the shared project baseline or dirties
 # the ff-only `herd update` pull. ZERO-SECRET: credentials live in .herd/secrets, never here.
 # Managed by `herd config set --local KEY VALUE`; `herd config list` shows each value's source.
+#
+# PRECEDENCE ACROSS A WORKTREE POOL (HERD-558): a builder's linked git worktree never receives THIS
+# file — `git worktree add` copies only tracked files, and this one is gitignored — so a worktree
+# resolves its OWN sibling config.local (if it happens to have one) first. For POLICY-class keys
+# (anything NOT scope=machine in templates/capabilities.tsv — HEALTHCHECK_CMD, MERGE_POLICY,
+# HUMAN_VERIFY_POLICY, concurrency caps, …) the MAIN checkout's copy of this file is then layered on
+# top as the OUTERMOST override, so an operator's `herd config set --local` here reaches every
+# worktree in the pool, not just this main checkout's own shell:
+#     committed .herd/config  <  worktree's own config.local  <  MAIN checkout's config.local (policy)
+# MACHINE-scoped keys (MODEL_*, HERD_DRIVER, WATCHER_VIEW*, …) are excluded from that outer layer —
+# worktree-local (or the baseline) keeps winning for them, since they hold per-seat state a MAIN
+# checkout's preference does not override.
 HDR
 }
 
@@ -5769,7 +5784,7 @@ EOF
 }
 
 cmd_report() {
-  local to_name="" dep_flag=""
+  local to_name="" dep_flag="" diagnosis=""
   while true; do
     case "${1:-}" in
       --to)
@@ -5780,11 +5795,19 @@ cmd_report() {
       # --dep: after filing, ALSO record a blocked-on dep on the filed item (default stays
       # fire-and-forget). A dep must name its target peer, so --dep requires --to.
       --dep) dep_flag=1; shift ;;
+      # --diagnosis: an extended why-text appended to the issue BODY as its own section, kept out
+      # of the title (HERD-547) — a red-ledger diagnosis excerpt can be long, and a tracker title
+      # must stay short (the backend takes the report's first line verbatim as the issue title).
+      --diagnosis)
+        diagnosis="${2:-}"
+        [ -n "$diagnosis" ] || die "--diagnosis requires text"
+        shift 2 ;;
+      --diagnosis=*) diagnosis="${1#--diagnosis=}"; shift ;;
       *) break ;;
     esac
   done
   local symptom="${1:-}"
-  [ -n "$symptom" ] || die "usage: herd report [--to <link>] [--dep] \"<symptom + which lane>\""
+  [ -n "$symptom" ] || die "usage: herd report [--to <link>] [--dep] [--diagnosis <text>] \"<symptom + which lane>\""
   [ -z "$dep_flag" ] || [ -n "$to_name" ] \
     || die "herd report --dep requires --to <link> (a dependency must name the peer it blocks on)"
   local root; root="$(pwd)"
@@ -5856,6 +5879,7 @@ cmd_report() {
   local title body report_text
   title="[$project] $symptom"
   body="$(printf 'Reported from project **%s** (HERD_VERSION %s) via \`herd report\`.\n\n**Symptom / lane:** %s\n\n_Stamped automatically; add a repro below._' "$project" "$ver" "$symptom")"
+  [ -n "$diagnosis" ] && body="$(printf '%s\n\n**Red-ledger diagnosis:**\n%s' "$body" "$diagnosis")"
   # The first line is the issue title (the github/linear backends take head -n1 as the title).
   report_text="$(printf '%s\n\n%s' "$title" "$body")"
 
@@ -8642,11 +8666,13 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       a frozen-archive banner on BACKLOG.md when leaving the file
                                       backend, restarts the backlog pane, journals the switch
   herd report [--to <link>] [--dep]   file a report on HERD_REPO (or a peer from .herd/links
-              "<sym>"                 via --to) using HERD_REPORT_BACKEND (default: github);
-                                      deduplicates first (HERD_REPORT_FORCE=1 to override).
+              [--diagnosis <text>]    via --to) using HERD_REPORT_BACKEND (default: github);
+              "<sym>"                 deduplicates first (HERD_REPORT_FORCE=1 to override).
                                       --dep also records the filed item as a blocked-on
                                       dependency in .herd/deps (requires --to); without it
-                                      report stays fire-and-forget
+                                      report stays fire-and-forget. --diagnosis appends an
+                                      extended why excerpt as its own body section, kept out
+                                      of the (short) title
   herd link list                      list peer repos registered in .herd/links
   herd link --scan [--write]          propose candidate peer links from the fleet registry
                                       (~/.herd/fleet); dry-run by default, --write applies

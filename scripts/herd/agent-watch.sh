@@ -205,9 +205,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # herd_spawn_gate_saturated, is never called from here); safe to source in lib mode.
 # shellcheck source=/dev/null
 . "$HERE/herd-spawn-gate.sh"
-# SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531) — the shared provenance-record library, sourced for its
-# READ half (herd_health_trust_check), which the health dispatch below consults before running a full
-# suite. Sourcing DEFINES functions only; byte-inert until HEALTH_TRUST_BUILDER is opted in.
+# SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531) — the shared provenance-record library. Sourced here for
+# its READ half, herd_health_trust_check, which _healthcheck_gate below still consults — but
+# _healthcheck_gate itself is the bash-parity DISPATCH gate (see its own header comment, HERD-555):
+# it has had zero production callers since the Python engine port, so this READ call is exercised only
+# by tests/sim driving _healthcheck_gate directly, never by a live watcher tick. The ACTUAL live READ
+# (the one HEALTH_TRUST_BUILDER=on candidates hit today) is pysrc/herd/live_runtime.py's
+# LiveGates.health, which ports this same herd_health_trust_check contract. Sourcing DEFINES functions
+# only; byte-inert until HEALTH_TRUST_BUILDER is opted in.
 # shellcheck source=scripts/herd/health-trust.sh
 . "$HERE/health-trust.sh"
 
@@ -5701,9 +5706,10 @@ _effective_health_pane() {
 _health_pane_registry_file() { printf '%s' "$TREES/.health-pane-registry-$1-$2"; }
 
 # _spawn_health_pane <pr#> <slug> <sha> <worktree-dir> — stand up the disposable `health·<slug>` view
-# pane for an in-flight suite, ONCE. Called from the render pass while a suite is genuinely in flight
-# (a live inflight marker), so it rides the same signal leg (b)'s row does — and works identically
-# whether the bash gate or the Python engine is running the suite. Self-gating + idempotent + fail-soft:
+# pane for an in-flight suite, ONCE. A PRIMITIVE: the only caller is the per-tick reconcile below, which
+# decides from the OBSERVED inflight marker — never from a dispatch event — so it rides the same signal
+# leg (b)'s row does and works identically whether the bash gate or the Python engine ran the suite.
+# Self-gating + idempotent + fail-soft:
 #   • HEALTH_PANE off / dry-run / headless (no panes) / herdr absent → returns 0 having done NOTHING.
 #   • a registry row already present for this (pr,sha) → returns 0 (one pane per suite).
 # The pane runs `tail -F` of the sha-scoped health log the worker streams into (leg b's TEE), stamped
@@ -5755,14 +5761,74 @@ _retire_health_pane() {
   rm -f "$_rhp_reg" 2>/dev/null || true
 }
 
-# _reconcile_health_panes — retire every disposable health pane whose suite has ENDED, EVERY tick,
-# whoever ran (or killed) the suite. Byte-quiet on a seat with no health-pane rows — the overwhelming
-# common case, and the whole of the HEALTH_PANE=off default (spawn never wrote a row). A pane is kept
-# ONLY while its (pr,sha) inflight marker is still pid-live; the instant the suite finishes, is
-# collected, or its worker dies, the marker stops being live and the pane is retired. Dry-run-inert.
+# _health_pane_slug_dir <pr#> — echo "<slug>\t<dir>" for the builder worktree THIS TICK'S DISCOVERY PASS
+# matched to <pr#>, or return 1 when no worktree row claims it. The source is $FEATS — the very records
+# every console row is rendered from (`git worktree list` ⋈ the PR JSON, see _discover_feature_worktrees),
+# so a pane's identity is derived from OBSERVED state and never from whoever dispatched the suite. Unset
+# $FEATS (lib-mode callers, a sim harness) is an EMPTY index, not an error: returns 1, byte-quiet.
+_health_pane_slug_dir() {
+  local _hps_pr="${1:-}" _hps_rec _hps_dir _hps_slug _hps_branch _hps_prnum _hps_rest
+  [ -n "$_hps_pr" ] || return 1
+  for _hps_rec in ${FEATS[@]+"${FEATS[@]}"}; do
+    IFS=$'\037' read -r _hps_dir _hps_slug _hps_branch _hps_prnum _hps_rest <<EOF
+$_hps_rec
+EOF
+    [ "${_hps_prnum:-}" = "$_hps_pr" ] || continue
+    [ -n "${_hps_slug:-}" ] && [ -n "${_hps_dir:-}" ] || continue
+    printf '%s\t%s' "$_hps_slug" "$_hps_dir"
+    return 0
+  done
+  return 1
+}
+
+# _reconcile_health_panes — THE per-tick RECONCILED INVARIANT for the disposable health panes (HERD-554):
+# "one `health·<slug>` pane per OBSERVED in-flight suite, and none for a suite that has ended", asserted
+# fresh EVERY bash render tick against the marker files themselves — never as a side-effect of a dispatch
+# event (multi-seat rule 1). Both directions, in one pass:
+#
+#   live suite, no pane   → stand one up streaming its sha-scoped log (via the _spawn_health_pane
+#                           primitive above);
+#   pane, suite ended     → retire it through the existing guarded-close path.
+#
+# The CREATE half is what makes this ENGINE-AGNOSTIC. It used to hang off the bash render pass's
+# automerge-candidate branch (agent-watch.sh's `_gate_health_inflight && _spawn_health_pane` hook), which
+# is only ever reached for a CLEAN candidate this seat is about to merge — so under ENGINE_IMPL=python,
+# where pysrc/herd/live_runtime.py dispatches the suite and the PR sits BLOCKED-but-unblessed (or held)
+# while it runs, HEALTH_PANE=on was silently inert: no pane ever appeared. Keying off `.health-inflight-*`
+# instead means ANY writer of that marker — the bash gate, the Python engine, a second seat — gets a pane
+# by construction, and the two halves can never disagree about which suite is live because they read the
+# same file (_health_pid_live, the same predicate the console's running row uses).
+#
+# Contracts held: HEALTH_PANE=off (the ship default) is a HARD no-op — the create half is skipped whole,
+# spawn never wrote a row, so the retire half walks an empty glob. Dry-run, headless, and herdr-absent
+# are inert through the primitives. Byte-quiet on a seat with no live suites and no rows — the
+# overwhelming common case. Idempotent: a registry row already present for a (pr,sha) is left alone.
 _reconcile_health_panes() {
   [ -z "${DRYRUN:-}" ] || return 0
-  local _rcp_f _rcp_base _rcp_rest _rcp_pr _rcp_sha _rcp_inf
+  local _rcp_f _rcp_base _rcp_rest _rcp_pr _rcp_sha _rcp_inf _rcp_id _rcp_slug _rcp_dir
+
+  # (a) CREATE — gated on the lever FIRST so `off` costs not even a glob walk.
+  if [ "$(_effective_health_pane)" = on ]; then
+    for _rcp_f in "$TREES"/.health-inflight-*; do
+      [ -e "$_rcp_f" ] || continue
+      _rcp_base="${_rcp_f##*/}"; _rcp_rest="${_rcp_base#.health-inflight-}"
+      _rcp_pr="${_rcp_rest%-*}"; _rcp_sha="${_rcp_rest##*-}"
+      # PR-keyed suites ONLY. The `main-<sha>` MAIN_HEALTH_TICK rail has no builder worktree and no
+      # slug, so it gets no `health·<slug>` pane — same as before this half existed.
+      case "$_rcp_pr" in ''|*[!0-9]*) continue ;; esac
+      [ -n "$_rcp_sha" ] || continue
+      [ -f "$(_health_pane_registry_file "$_rcp_pr" "$_rcp_sha")" ] && continue
+      # A dead / recycled-pid / expired marker is NOT a live suite (HERD-451 identity, not existence):
+      # never stand a pane up over a corpse.
+      _health_pid_live "$_rcp_f" || continue
+      _rcp_id="$(_health_pane_slug_dir "$_rcp_pr")" || continue
+      IFS=$'\t' read -r _rcp_slug _rcp_dir <<< "$_rcp_id"
+      _spawn_health_pane "$_rcp_pr" "$_rcp_slug" "$_rcp_sha" "$_rcp_dir"
+    done
+  fi
+
+  # (b) RETIRE — a pane is kept ONLY while its (pr,sha) inflight marker is still pid-live; the instant
+  # the suite finishes, is collected, or its worker dies, the marker stops being live and it is retired.
   for _rcp_f in "$TREES"/.health-pane-registry-*; do
     [ -e "$_rcp_f" ] || continue
     _rcp_base="${_rcp_f##*/}"; _rcp_rest="${_rcp_base#.health-pane-registry-}"
@@ -8211,6 +8277,72 @@ _main_health_fix_clear() {
   return 0
 }
 
+# ── HERD-547 (HERD-539 leg 4): ENGINE-SHAPED RED AUTO-ESCALATION ──────────────────────────────────
+# The red-ledger CONSUMER side: once a red's diagnosing text is cached into the shared ledger (see
+# herd_red_ledger_note call sites), a caller ALSO offers it here. Ship-dormant behind RED_AUTOESCALATE
+# (default off; requires RED_LEDGER=on too — see herd-config.sh).
+
+# _red_autoescalate_enabled — true iff RED_AUTOESCALATE opts in AND RED_LEDGER is on (there is nothing
+# to classify without the ledger's own why-text). Any unrecognized value reads as off (fail toward
+# dormant, mirrors every other RED_LEDGER-adjacent lever).
+_red_autoescalate_enabled() {
+  _red_ledger_enabled || return 1
+  case "$(printf '%s' "${RED_AUTOESCALATE:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _red_escalate_herd_bin — the herd CLI to shell `report` through. HERD_RED_ESCALATE_HERD_BIN is a
+# test seam (mirrors HERD_FLEET_HERD_BIN); the real path resolves the SAME way _main_health_fix_pysrc
+# resolves pysrc (HERDKIT_HOME, else computed from $HERE).
+_red_escalate_herd_bin() {
+  printf '%s' "${HERD_RED_ESCALATE_HERD_BIN:-${HERDKIT_HOME:-$(cd "$HERE/../.." 2>/dev/null && pwd)}/bin/herd}"
+}
+
+# _red_escalate_once <key> — shared-pool "AT MOST ONCE per dedup key" guard (mirrors
+# _main_health_fix_mark's HERD-371 pattern via the generic `--once` store primitive): rc 0 = the
+# FIRST call across the whole pool to see this exact key — file it; nonzero = already claimed
+# (dedup) OR the store/python3 is unavailable — either way, the caller must NOT file.
+_red_escalate_once() {
+  local _reo_key="$1" _reo_pyp
+  _reo_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_reo_pyp" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_reo_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --once "red_escalated::$_reo_key" >/dev/null 2>&1
+}
+
+# _red_escalate_engine_red <key> <class> <why> — when the SAME why-text a caller just cached into the
+# red-ledger maps to ENGINE code (herd_red_ledger_engine_shaped, the routing rule
+# templates/coordinator.md.tmpl documents at "Routing: APP bug vs HERD-ENGINE bug"), file it via the
+# EXISTING `herd report` path — never a bespoke gh call, so this composes with report's own
+# title-dedup instead of reimplementing it — at most once per dedup key across the whole shared pool.
+# A project-shaped why (herd_red_ledger_engine_shaped says no) is NEVER escalated — not even the
+# once-guard is consulted, so a project's own reds can never exhaust it.
+#
+# Fail-soft throughout, always returns 0: RED_AUTOESCALATE off, no HERDKIT_HOME/bin/herd resolvable,
+# no python3/pysrc, or `herd report` itself declining (no gh, no HERD_REPO, a likely duplicate) all
+# skip WITHOUT filing — never a crash, never a double-file — and (except the plain off-switch) log
+# why via journal_append red_escalated.
+_red_escalate_engine_red() {
+  local _re_key="$1" _re_class="$2" _re_why="$3" _re_bin
+  _red_autoescalate_enabled || return 0
+  herd_red_ledger_engine_shaped "$_re_why" || return 0
+  _re_bin="$(_red_escalate_herd_bin)"
+  if [ ! -x "$_re_bin" ]; then
+    journal_append red_escalated key "$_re_key" class "$_re_class" result skipped reason no-herd-bin
+    return 0
+  fi
+  _red_escalate_once "$_re_key" || return 0   # dedup or store-unavailable — silent no-op either way
+  if ( cd "${MAIN:-.}" && "$_re_bin" report --diagnosis "$_re_why" "engine-shaped red: ${_re_key}" ) >/dev/null 2>&1; then
+    journal_append red_escalated key "$_re_key" class "$_re_class" result filed
+  else
+    journal_append red_escalated key "$_re_key" class "$_re_class" result skipped reason report-failed
+  fi
+  return 0
+}
+
 # ── PER-PHASE DURATION BASELINES + anomaly self-filing (HERD-496) ──────────────────────────────────
 # The operator's self-observation ask: the watcher already TIMES every phase it runs (a dispatch
 # marker's age at collection, a bounce prompt to a wake result) — this teaches it what "normal" looks
@@ -8753,6 +8885,9 @@ _main_health_set_red() {
   # this sha, so build_main_health's row can render it back verbatim + an honest last-verified stamp.
   # No-op when RED_LEDGER is off.
   herd_red_ledger_note "$RED_LEDGER_FILE" "main_health:${_sr_sha}" main_health "$_sr_render"
+  # HERD-547 (HERD-539 leg 4): offer the SAME why-text to engine-shaped auto-escalation. No-op
+  # unless RED_AUTOESCALATE is on; never fires twice for the same key (shared-pool once-guard).
+  _red_escalate_engine_red "main_health:${_sr_sha}" main_health "$_sr_render"
   if [ "$_sr_wasred" -eq 0 ]; then
     herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_render} (since #${_sr_since})" default
   fi
@@ -14438,9 +14573,9 @@ _health_running_row() {
 # resolve), but on an operator's console it reads as a stop. The reviewer leg was invisible on BOTH
 # gate branches, so a ~4-minute adversarial review rendered as a frozen placeholder.
 
-# _gate_health_inflight <pr#> <sha> — true iff a health worker is live for this exact (pr,sha). The one
-# predicate behind both the running row and the HERD-313 health-pane spawn, so the pane can never be
-# stood up for a suite the row does not show (or vice versa).
+# _gate_health_inflight <pr#> <sha> — true iff a health worker is live for this exact (pr,sha). Shares
+# its liveness predicate (_health_pid_live over the sha-scoped marker) with the HERD-554 health-pane
+# reconcile, so a pane can never be stood up for a suite the console row does not show (or vice versa).
 _gate_health_inflight() {
   [ -n "${2:-}" ] || return 1
   _health_pid_live "$(_health_inflight_file "${1}-${2}")"
@@ -15074,6 +15209,25 @@ _health_worker() {
   printf '%s\n' "$_hw_line" > "$_hw_out.tmp.$$" 2>/dev/null && mv "$_hw_out.tmp.$$" "$_hw_out" 2>/dev/null || true
 }
 
+# RETIREMENT NOTE (HERD-555): _healthcheck_gate has had ZERO production callers since the Python
+# engine port (HERD-300/P5b) — docs/symbol-index.md confirms "callers: —", and grepping
+# agent-watch.sh's own tick loop for an invocation (as opposed to a comment mentioning it) finds none.
+# The LIVE health dispatch — including the sha-matched builder-local trust READ this function used to
+# be the only caller of (herd_health_trust_check, health-trust.sh) — is pysrc/herd/live_runtime.py's
+# LiveGates.health today.
+#
+# It is deliberately NOT deleted: per the P5b lesson (only the outer `_tick_act` entrypoint was
+# actually orphaned; every helper below it stayed because tests/sim drive it directly — see
+# docs/HERD-42 / the P5b bash-deletion notes), this function is the direct SUT of a large bash
+# hermetic test/sim surface that still verifies bash-side gate parity — deleting it would red all of:
+# tests/test-healthcheck-gate.sh, test-health-autofix.sh, test-health-observability.sh,
+# test-watcher-health-cache.sh, test-restart-safe-dispatch.sh, test-watcher-self-restart.sh,
+# test-gate-order-stale-dup.sh, test-merge-fairness.sh, test-watcher-leakguard-exemption.sh,
+# test-health-trust.sh (case 14, the trusted-dispatch decision itself), and the sim scenarios under
+# scripts/herd/sim/ (sandbox-concurrency, sandbox-shared-config, sandbox-multiseat,
+# sandbox-self-restart, engine-down, engine-pause). None of those were in scope to rewrite here —
+# rewriting that whole surface onto the Python gate is its own item, not a HERD-555 side effect.
+#
 # _healthcheck_gate <pr#> <slug> <worktree-dir> <display-idx> [headSha] — the serialized, ASYNC,
 # retry-before-red healthcheck as a NON-BLOCKING dispatch/collect state machine (unified with the review
 # gate — see _review_gate_step). Sets DISPLAY[<idx>] and the global _HC_RESULT to one token; returns 0
@@ -16719,9 +16873,12 @@ EOF
           # HERD-453: one shared phase row — a live suite, a live reviewer, else today's placeholder.
           DISPLAY[i]="$(_gate_phase_row "$sl" "$pn" "$prnum" "$headsha" \
             "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}health-check${C_RESET}")"
-          # HERD-313 leg (a): stand up the disposable health·<slug> WATCH pane (once). Self-gating on
-          # HEALTH_PANE (off default ⇒ no-op), idempotent, fail-soft — never touches the row above.
-          _gate_health_inflight "$prnum" "$headsha" && _spawn_health_pane "$prnum" "$slug" "$headsha" "$dir"
+          # HERD-554: the disposable health·<slug> WATCH pane used to be stood up from HERE, on this one
+          # automerge-candidate branch — which is only ever reached for a CLEAN candidate this seat is
+          # about to merge. Under ENGINE_IMPL=python the suite is dispatched by live_runtime.py while the
+          # PR sits BLOCKED-but-unblessed (the `else` branch below) or held, so HEALTH_PANE=on never
+          # produced a pane at all. The spawn now lives in _reconcile_health_panes, keyed off the OBSERVED
+          # `.health-inflight-*` marker, so every engine gets a pane by construction.
         else
           # BLOCKED-but-unblessed: the gate cycle is what CLEARS this state, so name the phase it is
           # actually in and say what is awaited, rather than shouting GitHub's mergeStateStatus token.
@@ -16933,9 +17090,12 @@ EOF
   # Byte-inert unless RESOLVER_PANE=on (no rows exist to reconcile).
   _reconcile_resolver_panes
 
-  # Health-pane reconcile (HERD-313 leg a): retire the disposable `health·<slug>` view pane of every
-  # suite that has ENDED, whoever ran it (mirrors the resolver-pane reconcile above). Byte-inert unless
-  # HEALTH_PANE=on left rows to reconcile — under the ship default there are none, so this does nothing.
+  # Health-pane reconcile (HERD-313 leg a, made a full invariant in HERD-554): assert BOTH directions of
+  # "one disposable `health·<slug>` view pane per OBSERVED in-flight suite" — stand one up for a live
+  # suite that has none (whichever engine dispatched it), retire the pane of every suite that has ENDED
+  # (whoever ran it). Mirrors the resolver-pane reconcile above, and reads the same `.health-inflight-*`
+  # markers the console's own running row does. Byte-inert unless HEALTH_PANE=on — under the ship default
+  # the create half is skipped whole and no rows exist to retire, so this does nothing.
   _reconcile_health_panes
 
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
@@ -17072,13 +17232,34 @@ fi
 # parses no positional args — and expanded with the `+` guard so `set -u` tolerates the empty array.
 _WATCH_ARGV=("$@")
 
+# ── HERD-548: STARTUP IS JOURNAL-VISIBLE, FIRST after config load ──────────────────────────────────
+# GROUNDED 2026-08-05: post-reload the watcher crash-looped silently for ~2 minutes (child pid churn,
+# zero journal entry, zero console beyond the header) then self-resolved — an unexplained outage
+# nobody could reconstruct afterward, because nothing recorded that a boot was even ATTEMPTED. Every
+# launch reaching this line — the final, argv0-tagged image, config already loaded — journals
+# watcher_boot UNCONDITIONALLY (best-effort/fail-soft like every other journal_append call; this is
+# forensic instrumentation of the always-on boot path, not new opt-in automation, so it carries no
+# config lever). Every exit path between here and the tick loop below journals watcher_boot_failed
+# with a phase + reason FIRST, so a journal that shows repeated watcher_boot with no matching tick
+# activity — and no watcher_boot_failed either — is itself the "died some other way" signal: the gap
+# this incident could not explain is now a gap a human (or `herd why`) can actually see.
+_WATCH_BOOT_EPOCH="$(_now_epoch 2>/dev/null || date +%s 2>/dev/null || echo 0)"
+_watcher_boot_engine_sha() { git -C "$HERE" rev-parse --short HEAD 2>/dev/null || printf 'unknown'; }
+journal_append watcher_boot \
+  pid "$$" argv0 "${HERD_WATCH_ARGV0:-}" engine_sha "$(_watcher_boot_engine_sha)" \
+  workspace "${WORKSPACE_NAME:-}" component agent-watch
+
 # ── Launch-binding banner + foreign-cwd guard (issue #60) ───────────────────────────────────────
 # Print the resolved WORKSPACE_NAME/PROJECT_ROOT and refuse to run from outside PROJECT_ROOT (unless
 # HERD_ALLOW_FOREIGN_CWD=1). Placed AFTER the argv0 re-exec so it prints exactly once, in the final
 # tagged process. The config-source refusal (herd-config.sh) already fired on the first pass if the
 # config was engine-dogfood-only; this catches the complementary case — a real config but a $PWD
 # that is not inside the project it resolves to.
-herd_console_guard "herd watch" || exit 1
+if ! herd_console_guard "herd watch"; then
+  journal_append watcher_boot_failed pid "$$" phase console_guard \
+    reason "foreign-cwd-or-invalid-project-config" workspace "${WORKSPACE_NAME:-}" component agent-watch
+  exit 1
+fi
 
 # ── HERD-189 TEST-HERMETICITY GUARD: refuse to run the REAL watch loop under a hermetic test ─────
 # The test suite must NEVER launch a live watcher/daemon against the real control room. A hermetic
@@ -17101,6 +17282,8 @@ herd_console_guard "herd watch" || exit 1
 if [ -n "${HERD_HERMETIC_GUARD:-}" ]; then
   printf '%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" \
     >> "$HERD_HERMETIC_GUARD" 2>/dev/null || true
+  journal_append watcher_boot_failed pid "$$" phase hermetic_guard \
+    reason "test-hermeticity-redirect" workspace "${WORKSPACE_NAME:-}" component agent-watch
   exit 0
 fi
 
@@ -17114,7 +17297,11 @@ fi
 # (matching the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths
 # (cmd_pane_watch / cmd_reload) mirror this check before spawning so a duplicate is caught at the
 # launcher too.
-_acquire_watcher_singleton || exit 1
+if ! _acquire_watcher_singleton; then
+  journal_append watcher_boot_failed pid "$$" phase singleton_lock \
+    reason "duplicate-watcher-already-live" workspace "${WORKSPACE_NAME:-}" component agent-watch
+  exit 1
+fi
 # The incoming generation owns the lock: any self-restart handoff window is over (HERD-266). Clearing
 # it HERE — after the acquire, in both the exec'd image and a cold launch — means the duplicate alarm
 # is suppressed for exactly the exec, never a tick longer. A crashed exec that never reached this line
@@ -17507,6 +17694,23 @@ _sweep_reviewer_registry
 # so the shared _resolver_agent_alive liveness check (a live resolver is always spared) has a roster.
 AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 _sweep_stale_resolve_tabs
+
+# HERD-548 leg 2: about to enter the live tick loop — the whole one-shot startup sequence above has
+# run without this process dying, which is meaningfully further than any of the guard-exit paths above
+# and further than a fast crash-loop death would ever get. Clear a standing crash-loop marker ONLY once
+# this watcher has PROVEN it is not that loop: wait out any remainder of HERD_WATCH_CRASHLOOP_FAST_SECS
+# (the EXACT threshold herd-watch.sh's supervising loop uses to call a death "fast" — leg 3's
+# WATCHER_SETTLE_SECS is a DIFFERENT constant, for the duplicate-watcher COUNT, and must not be reused
+# here) before clearing, so a build that is still crashing moments after this line — a bug in the tick
+# loop itself, not the boot path above — never gets a marker it has not actually earned. Bounded to
+# HERD_WATCH_CRASHLOOP_FAST_SECS, paid once at startup.
+if declare -f watcher_crashloop_clear >/dev/null 2>&1; then
+  _wcl_elapsed=$(( $(_now_epoch 2>/dev/null || date +%s) - ${_WATCH_BOOT_EPOCH:-0} ))
+  [ "$_wcl_elapsed" -lt "${HERD_WATCH_CRASHLOOP_FAST_SECS:-5}" ] \
+    && sleep "$(( ${HERD_WATCH_CRASHLOOP_FAST_SECS:-5} - _wcl_elapsed ))" 2>/dev/null
+  watcher_crashloop_clear
+  unset _wcl_elapsed
+fi
 
 while true; do
   _tick_render_reconcile

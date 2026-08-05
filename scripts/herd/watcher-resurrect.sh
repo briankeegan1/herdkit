@@ -27,6 +27,18 @@
 #      exit 1 so a cron job's own failure channel (mail, `systemctl status`, launchd's exit-code log)
 #      surfaces it.
 #
+# CRASH-LOOP HARD STOP (HERD-548). Checked BEFORE the liveness classification, every pass: a standing
+# watcher-exempt.sh crash-loop marker (tripped by herd-watch.sh's own supervising loop after N
+# consecutive fast child deaths, WATCHER_CRASHLOOP_GUARD=on) means a relaunch was ALREADY tried,
+# repeatedly, and gave up loudly moments ago. This probe never fights that: relaunching the identical
+# broken build on an external cron cadence is amplification, not resurrection — the same silent churn
+# the marker exists to stop, just on a slower clock. Refuses (journals
+# `watcher_resurrect_blocked_crashloop`, exit 1) without ever taking a `ps` sample. The marker clears
+# itself the moment a later watcher PROVES it survives (agent-watch.sh, just before its tick loop), so
+# the very next probe after a genuine fix behaves normally again — nothing here requires a human to
+# manually clear it, though a human running `herd pane watch` after a fix is what typically clears it
+# first.
+#
 # SHIP-DORMANT: WATCHER_RESURRECT (default off, herd-config.sh) gates the ENTIRE probe — off is a
 # byte-inert no-op even when this script is invoked directly: no verdict call, no journal write, no
 # relaunch, exit 0. Installing a cron/launchd job that calls `herd watcher-resurrect` is therefore
@@ -68,6 +80,21 @@ watcher_resurrect_herd_bin() {
 watcher_resurrect_probe() {
   watcher_resurrect_enabled || return 0
   declare -f watcher_singleton_verdict >/dev/null 2>&1 || return 0
+
+  # HERD-548: a standing crash-loop marker is a HARD STOP for this unattended probe — herd-watch.sh's
+  # own supervising loop already tried, N consecutive times, and gave up loudly. Relaunching the
+  # identical broken build on this probe's external cron cadence is not resurrection, it is
+  # amplification: the exact silent churn the marker exists to stop. A plain operator running
+  # `herd pane watch` by hand is NOT gated by this marker (see watcher-exempt.sh's header) — only this
+  # unattended path treats it as a refusal. Checked BEFORE the verdict call so a standing loop never
+  # even pays for a `ps` sample.
+  if declare -f watcher_crashloop_active >/dev/null 2>&1 && watcher_crashloop_active; then
+    declare -f journal_append >/dev/null 2>&1 \
+      && journal_append watcher_resurrect_blocked_crashloop workspace "${WORKSPACE_NAME:-}"
+    printf 'watcher-resurrect: standing crash-loop marker for workspace %s — refusing to relaunch (fix the underlying fault, then clear it with a successful '"'"'herd pane watch'"'"')\n' \
+      "${WORKSPACE_NAME:-}" >&2
+    return 1
+  fi
 
   local verdict state
   verdict="$(watcher_singleton_verdict)"

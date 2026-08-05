@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # healthcheck.node.sh (EXAMPLE) — a per-project health command for a Node project.
 # Copy to .herd/healthcheck.project.sh and point HEALTHCHECK_CMD at it. Same contract as
-# templates/healthcheck.project.sh: exit 0 clean, 1 code error, 2 data/env (tolerated).
+# templates/healthcheck.project.sh: exit 0 clean, 1 code error, 2 data/env (tolerated). The wrapper
+# forwards --heavy as $2 (HERD-551) — see templates/healthcheck.project.sh's header for the full
+# profile/HEAVY-SKIPPED contract.
 set -u
-DIR="${1:?usage: healthcheck.node.sh <worktree-dir> [--oneline]}"
-ONELINE=""; [ "${2:-}" = "--oneline" ] && ONELINE=1
+DIR="${1:?usage: healthcheck.node.sh <worktree-dir> [--heavy] [--oneline]}"
+ONELINE=""
+for _hk_arg in "$@"; do [ "$_hk_arg" = "--oneline" ] && ONELINE=1; done
 cd "$DIR" 2>/dev/null || { echo "no such dir: $DIR"; exit 1; }
 
 # 1. Typecheck / lint as the hard code gate (adapt to your toolchain).

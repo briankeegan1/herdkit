@@ -63,15 +63,17 @@ Role summarized from each file's top-of-file comment.
 - `herd-resolve.sh` — herd-resolve.sh <slug> — spin up an isolated, test-gated CONFLICT RESOLVER agent in its own
 - `herd-review.sh` — herd-review.sh <pr> <slug> — the PRE-MERGE ADVERSARIAL REVIEW GATE.
 - `herd-spawn-gate.sh` — ADVISORY pre-spawn review-gate saturation check, SOURCED by the lane
-- `herd-watch.sh` — launcher for the live "herd watch" status console (agent-watch.sh).
+- `herd-watch.sh` — launcher / pane wrapper for the live "herd watch" status console (agent-watch.sh).
 - `hermetic-env-scrub.sh` — HERD-458: seal off herd-config.sh's own EXPORTED keys before a hermetic
 - `human-verify.sh` — the shared parser for the per-PR HUMAN-VERIFY hold convention.
+- `journal-act.sh` — THE RAIL-DISPATCH half of "journal-audit findings become ACTIONS" (HERD-544).
 - `journal-audit.sh` — journal-driven self-audit / gap-finder (HERD-238 / N12).
 - `journal-emission-lint.sh` — THE shared CONSUMER-ONLY EVENT guard (HERD-442): every journal event
 - `journal-test-env.sh` — HERD-223 shared TEST layer: pin JOURNAL_FILE to a throwaway path so a
 - `journal.sh` — the herdkit engine journal: an append-only JSONL record of every key gate event
 - `layout-reconcile.sh` — the shared EYES-ON-LAYOUT helper for the herd control room.
 - `ledger.sh` — the COORDINATOR PROGRESS LEDGER (HERD-103): durable, cross-session coordinator state so
+- `lever-reachability-lint.sh` — THE shared INERT-LEVER guard (HERD-556): a config key documented in
 - `lifecycle.sh` — the SUPERVISED-PROCESS CONTRACT (HERD-193): no spawned process lingers unaccounted.
 - `merge-policy.sh` — THE resolver for the effective merge policy (HERD-159, unified in HERD-210).
 - `new-feature.sh` — new-feature.sh <name> — spin up an isolated worktree off the latest default branch.
@@ -142,7 +144,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -167,6 +169,8 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-quick.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`, `resolver-pane.sh`
 - `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
+- `herd-watch.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
+- `journal-act.sh` → `agent-watch.sh`, `journal.sh`
 - `journal-audit.sh` → `aging-pr.sh`, `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`
 - `ledger.sh` → `herd-config.sh`
 - `new-feature.sh` → `herd-config.sh`, `herd-preflight.sh`
@@ -221,7 +225,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `CI_AUTOREPAIR` → `ci-repair.sh`
 - `CI_FAST_BOUNCE` → `agent-watch.sh`
 - `CLAIM_RELEASE` → `herd-claim.sh`
-- `CLAIM_REQUIRED` → `bin/herd`, `herd-claim.sh`
+- `CLAIM_REQUIRED` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
 - `COMMIT_CONVENTION` → `bin/herd`, `healthcheck.sh`
 - `CONTEXT_PROVISION` → `bin/herd`
@@ -249,17 +253,20 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `ENGINE_MIN` → `bin/herd`, `agent-watch.sh`, `engine-version.sh`
 - `ENGINE_PAUSE` → `agent-watch.sh`
 - `ENGINE_SEAT_RECONCILE` → `agent-watch.sh`, `git-pr.sh`
+- `ENV_SUSPECT_TIMEOUT` → `agent-watch.sh`
 - `FINISH_STALL_MIN` → `agent-watch.sh`
 - `GATE_DISPATCH` → `agent-watch.sh`
+- `GATE_SCALE` → `agent-watch.sh`
 - `GATE_STATUS` → `agent-watch.sh`, `config-viability.sh`
 - `GATE_STATUS_PENDING` → —
 - `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
-- `HEALTHCHECK_AUTOFIX` → `bin/herd`, `agent-watch.sh`
+- `HEALTHCHECK_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
-- `HEALTH_CONCURRENCY` → `agent-watch.sh`
+- `HEALTH_CONCURRENCY` → `agent-watch.sh`, `engine-version.sh`
 - `HEALTH_EARLY_REAP_SECS` → `agent-watch.sh`
 - `HEALTH_INFLIGHT_TIMEOUT` → `bin/herd`, `agent-watch.sh`, `lifecycle.sh`, `sweep.sh`
+- `HEALTH_LOAD_THRESHOLD` → `agent-watch.sh`
 - `HEALTH_PANE` → `agent-watch.sh`
 - `HEALTH_SUITE_SCOPE` → `suite-shard.sh`
 - `HEALTH_TIMEOUT_HEADROOM` → `agent-watch.sh`
@@ -268,7 +275,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HERD_DRIVER` → `bin/herd`, `context-guard.sh`, `driver.sh`, `herd-preflight.sh`
 - `HERD_LIMIT_RESUME_BUFFER` → `agent-watch.sh`
 - `HERD_LIMIT_UNKNOWN_WAIT` → `agent-watch.sh`
-- `HERD_REFIX_WAIT_TIMEOUT` → `agent-watch.sh`
+- `HERD_REFIX_WAIT_TIMEOUT` → `agent-watch.sh`, `journal-act.sh`
 - `HERD_REPO` → `bin/herd`, `herd-links.sh`, `oss-triage.sh`
 - `HERD_THEME` → `bin/herd`, `theme.sh`
 - `HERD_VERSION` → `bin/herd`
@@ -277,6 +284,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `INFRA_BREAKER_MAX` → `agent-watch.sh`
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
 - `JOURNAL_AUDIT` → `agent-watch.sh`, `journal-audit.sh`
+- `JOURNAL_AUDIT_ACT` → `journal-audit.sh`
 - `JOURNAL_AUDIT_DISPATCH_TTL` → `journal-audit.sh`
 - `JOURNAL_AUDIT_MERGE_GRACE` → `journal-audit.sh`
 - `JOURNAL_AUDIT_PUSHED_GRACE` → `journal-audit.sh`
@@ -320,17 +328,19 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`
+- `RED_AUTOESCALATE` → `agent-watch.sh`
 - `RED_LEDGER` → `red-ledger.sh`
 - `RED_ROW_RECHECK_MINS` → `agent-watch.sh`
 - `REFIX_COMPLETE_MIN` → —
 - `REFIX_MAX_ROUNDS` → `agent-watch.sh`
 - `RESEARCH_POLL` → `research-step.sh`
 - `RESOLVER_PANE` → `resolver-pane.sh`
+- `RESOLVE_AUTOFIX` → `agent-watch.sh`
 - `RESOLVE_CLAIM` → `resolver-claim.sh`
 - `RESOLVE_CLAIM_TTL` → `resolver-claim.sh`
-- `REVIEW_AUTOFIX` → `bin/herd`, `agent-watch.sh`
+- `REVIEW_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
-- `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `herd-spawn-gate.sh`
+- `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `engine-version.sh`, `herd-spawn-gate.sh`
 - `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`, `git-pr.sh`
 - `REVIEW_ESCALATE_MAXFILES` → `posture-lint.sh`, `git-pr.sh`
 - `REVIEW_EVIDENCE_ESCALATE_ROUNDS` → `agent-watch.sh`
@@ -350,7 +360,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `SHIPPED_KEEP` → —
 - `SMOKE_CMD` → `bin/herd`, `herd-resolve.sh`
 - `SPAWN_AHEAD` → `agent-watch.sh`, `herd-spawn-gate.sh`
-- `STALE_BASE_AUTOFIX` → `bin/herd`, `agent-watch.sh`
+- `STALE_BASE_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `STALE_DUP_DETECT` → `agent-watch.sh`, `stale-dup-gate.sh`
 - `STALL_QUIET_MIN` → `agent-watch.sh`
 - `STORE_BACKEND` → —
@@ -361,6 +371,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `TRACKED_SPAWNS` → `bin/herd`
 - `TRACKER_REPO` → `bin/herd`, `herd-links.sh`, `tracker-state-sweep.sh`
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
+- `WATCHER_CRASHLOOP_GUARD` → `herd-watch.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
 - `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`
 - `WATCHER_RESURRECT` → `bin/herd`, `watcher-resurrect.sh`
@@ -377,6 +388,6 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCH_CLAUDE_PROBE_TIMEOUT` → `agent-watch.sh`
 - `WEDGE_AUTOWAKE` → `agent-watch.sh`
 - `WEDGE_GRACE_MIN` → `agent-watch.sh`
-- `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`, `sweep.sh`, `watcher-resurrect.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `healthcheck.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
+- `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `herd-watch.sh`, `status.sh`, `sweep.sh`, `watcher-resurrect.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `healthcheck.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `herd-watch.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
 - `WORK_UNIT_KIND` → `agent-watch.sh`, `work-unit.sh`

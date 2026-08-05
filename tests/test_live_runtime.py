@@ -1979,7 +1979,7 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
                 disp_r.append(cand.pr)
                 _marker_write(self.state.review_inflight_file(cand), os.getpid())
 
-            def _dispatch_health(self, cand):
+            def _dispatch_health(self, cand, profile=""):
                 disp_h.append(cand.pr)
                 _marker_write(self.state.health_inflight_file(cand), os.getpid())
 
@@ -3115,7 +3115,7 @@ class TestPreDispatchWorktreeGuard(unittest.TestCase):
         dispatched = []
 
         class Stub(LiveGates):
-            def _dispatch_health(self, cand):
+            def _dispatch_health(self, cand, profile=""):
                 dispatched.append(cand.pr)
                 _marker_write(self.state.health_inflight_file(cand), os.getpid())
 
@@ -3189,7 +3189,7 @@ class TestAdoptSlugParityRegression(unittest.TestCase):
         dispatched = []
 
         class Stub(LiveGates):
-            def _dispatch_health(self, cand):
+            def _dispatch_health(self, cand, profile=""):
                 dispatched.append(cand.pr)
                 _marker_write(self.state.health_inflight_file(cand), os.getpid())
 
@@ -3249,6 +3249,246 @@ def _git_init_repo(path):
     subprocess.run(["git", "-C", path, "add", "f"], check=True)
     subprocess.run(["git", "-C", path, "commit", "-q", "-m", "init"], check=True)
     return subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"]).decode().strip()
+
+
+class TestHealthTrustBuilder(unittest.TestCase):
+    """HERD-531/555: the sha-matched builder-local HEALTH TRUST read, ported from
+    scripts/herd/health-trust.sh's ``herd_health_trust_check`` into the Python health dispatch that
+    actually runs today (the old bash reader, agent-watch.sh:_healthcheck_gate, has been dead code
+    since the P5b port). Mirrors tests/test-health-trust.sh's disqualifier matrix; the WRITE side (the
+    provenance record) stays bash-authored, so these tests plant records by hand exactly as
+    healthcheck.sh's ``herd_health_trust_write`` would."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.trees = os.path.join(self.tmp, "trees")
+        os.makedirs(self.trees, exist_ok=True)
+        self.wt = os.path.join(self.tmp, "wt")
+        self.sha = _git_init_repo(self.wt)
+        self.wt_abs = os.path.realpath(self.wt)
+
+    def _rec_file(self, sha):
+        return os.path.join(self.trees, ".health-provenance-%s" % sha)
+
+    def _plant(self, sha, wt, prof, outcome, dur, prov, state, epoch):
+        with open(self._rec_file(sha), "w", encoding="utf-8") as fh:
+            fh.write("\t".join([sha, wt, prof, outcome, str(dur), prov, state, str(epoch)]) + "\n")
+
+    def _commit_epoch(self, sha=None):
+        out = subprocess.check_output(
+            ["git", "-C", self.wt, "show", "-s", "--format=%ct", sha or self.sha])
+        return int(out.decode().strip())
+
+    # ── _health_trust_on: the lever ───────────────────────────────────────────────────────────────
+    def test_lever_truthy_set_matches_other_gate_keys(self):
+        for v in ("1", "true", "on", "yes", "enable", "enabled", "ON", "Enabled"):
+            self.assertTrue(LR._health_trust_on({"HEALTH_TRUST_BUILDER": v}), v)
+
+    def test_lever_absent_off_and_typo_all_read_off(self):
+        for cfg in ({}, {"HEALTH_TRUST_BUILDER": ""}, {"HEALTH_TRUST_BUILDER": "off"},
+                    {"HEALTH_TRUST_BUILDER": "0"}, {"HEALTH_TRUST_BUILDER": "bogus"}, None):
+            self.assertFalse(LR._health_trust_on(cfg), cfg)
+
+    # ── _health_trust_file ────────────────────────────────────────────────────────────────────────
+    def test_trust_file_empty_when_either_arg_empty(self):
+        self.assertEqual(LR._health_trust_file("", self.sha), "")
+        self.assertEqual(LR._health_trust_file(self.trees, ""), "")
+
+    # ── _health_trust_check: the happy path + every disqualifier ─────────────────────────────────
+    def test_no_record_is_not_trusted(self):
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "no record for sha")
+
+    def test_no_sha_is_not_trusted(self):
+        prov, reason = LR._health_trust_check(self.trees, "", self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "no head sha")
+
+    def test_clean_heavy_record_from_clean_tree_is_trusted(self):
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1234, "builder-local", "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "builder-local")
+        self.assertEqual(reason, "")
+
+    def test_non_clean_outcome_not_trusted(self):
+        epoch = self._commit_epoch() + 60
+        for outcome in ("CODEERROR", "DATAENV"):
+            self._plant(self.sha, self.wt_abs, "heavy", outcome, 1, "builder-local", "clean", epoch)
+            prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+            self.assertEqual(prov, "")
+            self.assertIn("outcome=%s" % outcome, reason)
+
+    def test_light_profile_record_not_trusted(self):
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, self.wt_abs, "light", "CLEAN", 1, "builder-local", "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertIn("profile=light", reason)
+
+    def test_watcher_provenance_never_trusted(self):
+        """Trust must always trace back to a real builder-local heavy suite — a record the watcher
+        itself authored (a prior TRUSTED light smoke) can never justify the next trusted skip."""
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "watcher", "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertIn("provenance=watcher", reason)
+
+    def test_dirty_tree_state_not_trusted(self):
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "dirty", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertIn("tree_state=dirty", reason)
+
+    def test_worktree_mismatch_not_trusted(self):
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, os.path.join(self.wt_abs, "elsewhere"), "heavy", "CLEAN", 1,
+                    "builder-local", "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertIn("record worktree", reason)
+
+    def test_record_older_than_commit_not_trusted(self):
+        ct = self._commit_epoch()
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", ct - 60)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "record predates the commit")
+
+    def test_unresolvable_commit_not_trusted(self):
+        nogit = os.path.join(self.tmp, "not-a-repo")
+        os.makedirs(nogit, exist_ok=True)
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, os.path.realpath(nogit), "heavy", "CLEAN", 1, "builder-local",
+                    "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, nogit)
+        self.assertEqual(prov, "")
+
+    def test_stale_sha_never_trusts_the_new_head(self):
+        """A record planted for the FIRST commit never trusts a SECOND, later commit — the new sha
+        has no record of its own (each record is keyed by its own filename)."""
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch)
+        open(os.path.join(self.wt, "g"), "w").write("y")
+        subprocess.run(["git", "-C", self.wt, "add", "g"], check=True)
+        subprocess.run(["git", "-C", self.wt, "commit", "-q", "-m", "two"], check=True)
+        sha2 = subprocess.check_output(["git", "-C", self.wt, "rev-parse", "HEAD"]).decode().strip()
+        self.assertNotEqual(sha2, self.sha)
+        prov, reason = LR._health_trust_check(self.trees, sha2, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "no record for sha")
+
+    def test_body_sha_mismatch_is_malformed_not_guessed_at(self):
+        """A record whose BODY disagrees with its own filename (a hand-forged/corrupt file) is
+        refused as stale, never trusted on the strength of the filename alone."""
+        epoch = self._commit_epoch() + 60
+        other = "b" * 40
+        with open(self._rec_file(self.sha), "w", encoding="utf-8") as fh:
+            fh.write("\t".join([other, self.wt_abs, "heavy", "CLEAN", "1", "builder-local",
+                                "clean", str(epoch)]) + "\n")
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "stale sha in record")
+
+    def test_truncated_record_is_malformed(self):
+        with open(self._rec_file(self.sha), "w", encoding="utf-8") as fh:
+            fh.write("only\ttwo\n")
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "malformed record")
+
+    def test_empty_record_is_malformed(self):
+        open(self._rec_file(self.sha), "w").close()
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "malformed record")
+
+    # ── wired into LiveGates.health(): lever off is byte-identical ───────────────────────────────
+    def _gates(self, config=None, jpath=None):
+        state = LiveState(state_dir=self.trees)
+        journal = LiveJournal(jpath or os.path.join(self.tmp, "j.jsonl"))
+        return LiveGates("/nonexistent-home", state, journal, config=config or {})
+
+    def test_lever_off_never_calls_trust_check(self):
+        """Poison _health_trust_check: with the lever off (the default), health() must never even
+        open the provenance file — the same byte-identical proof TestMergeResultGateByteIdentical
+        uses for MERGE_RESULT_GATE."""
+        cand = LiveCandidate(pr=1, sha=self.sha, slug="feat-x", worktree=self.wt)
+        g = self._gates(config={})
+        self.assertFalse(g._health_trust_on)
+        orig = LR._health_trust_check
+        LR._health_trust_check = lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("trust check reached with HEALTH_TRUST_BUILDER off"))
+        try:
+            dispatched = []
+            g._dispatch_health = lambda cand, profile="": dispatched.append((cand.pr, profile))
+            self.assertEqual(g.health(cand), WAIT)
+        finally:
+            LR._health_trust_check = orig
+        self.assertEqual(dispatched, [("1", "")])
+
+    def test_lever_on_trusted_record_dispatches_light_and_journals(self):
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch)
+        jpath = os.path.join(self.tmp, "j.jsonl")
+        g = self._gates(config={"HEALTH_TRUST_BUILDER": "on"}, jpath=jpath)
+        self.assertTrue(g._health_trust_on)
+        cand = LiveCandidate(pr=1, sha=self.sha, slug="feat-x", worktree=self.wt)
+        dispatched = []
+        g._dispatch_health = lambda cand, profile="": dispatched.append((cand.pr, profile))
+        self.assertEqual(g.health(cand), WAIT)
+        self.assertEqual(dispatched, [("1", "--light")])
+        rows = [e for e in events(jpath) if e["event"] == "health_trusted"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0]["pr"]), "1")
+        self.assertEqual(rows[0]["provenance"], "builder-local")
+        self.assertEqual(rows[0]["profile"], "light")
+
+    def test_lever_on_no_record_dispatches_full_and_journals_nothing(self):
+        jpath = os.path.join(self.tmp, "j.jsonl")
+        g = self._gates(config={"HEALTH_TRUST_BUILDER": "on"}, jpath=jpath)
+        cand = LiveCandidate(pr=1, sha=self.sha, slug="feat-x", worktree=self.wt)
+        dispatched = []
+        g._dispatch_health = lambda cand, profile="": dispatched.append((cand.pr, profile))
+        self.assertEqual(g.health(cand), WAIT)
+        self.assertEqual(dispatched, [("1", "")])
+        rows = [e for e in events(jpath)] if os.path.exists(jpath) else []
+        self.assertEqual([e for e in rows if e["event"] == "health_trusted"], [])
+
+    # ── the REAL _dispatch_health: profile forwarded as the worker's final argv element ───────────
+    def test_dispatch_health_forwards_profile_as_final_argv(self):
+        state = LiveState(state_dir=self.trees)
+        gates = LiveGates("/nonexistent-home", state, LiveJournal(os.path.join(self.tmp, "j2.jsonl")))
+        cand = LiveCandidate(pr=7, sha="deadbeef", slug="feat-x", worktree=self.wt)
+        sub = TestHealthDispatchFreshness._RecordingHealthSub()
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            gates._dispatch_health(cand, "--light")
+        finally:
+            LR.subprocess = orig
+        self.assertIsNotNone(sub.argv)
+        self.assertEqual(sub.argv[-1], "--light")
+        # the nonce (matching the live marker) is now second-to-last, not last, when a profile rides.
+        inflight = state.health_inflight_file(cand)
+        self.assertEqual(_marker_nonce(inflight), sub.argv[-2])
+
+    def test_dispatch_health_no_profile_argv_unchanged(self):
+        state = LiveState(state_dir=self.trees)
+        gates = LiveGates("/nonexistent-home", state, LiveJournal(os.path.join(self.tmp, "j3.jsonl")))
+        cand = LiveCandidate(pr=7, sha="deadbeef", slug="feat-x", worktree=self.wt)
+        sub = TestHealthDispatchFreshness._RecordingHealthSub()
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            gates._dispatch_health(cand)
+        finally:
+            LR.subprocess = orig
+        inflight = state.health_inflight_file(cand)
+        self.assertEqual(sub.argv[-1], _marker_nonce(inflight))
 
 
 class TestMainHealthSlotPriority(unittest.TestCase):

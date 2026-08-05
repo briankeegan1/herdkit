@@ -5,11 +5,21 @@
 # so a one-line script tweak isn't forced through the project's full (possibly slow) gate:
 #
 #   • heavy — run the PROJECT health command ($HEALTHCHECK_CMD from .herd/config), invoked as
-#       $HEALTHCHECK_CMD <worktree-dir> [--oneline].  It owns the project-specific notion of
+#       $HEALTHCHECK_CMD <worktree-dir> --heavy [--oneline].  It owns the project-specific notion of
 #       "healthy" (boot a server, run the test suite, shellcheck + bats, …) and MUST exit:
 #         0 = clean (or only a tolerated data/env issue)
 #         1 = a real CODE error
 #         2 = a data/env issue (tolerated — treated as clean, surfaced as a ⚠️)
+#       PROFILE FORWARDING (HERD-551 / GH #674): the resolved profile is passed through as $2 — dir
+#       stays $1 — so a profile-aware project script (one that runs extra/slower probes ONLY under
+#       --heavy) actually sees the request instead of silently defaulting to its own light behavior
+#       while the wrapper reports clean. A script that ignores $2 (like herdkit's own, and the
+#       templates/healthcheck.*.sh examples) is byte-identical either way.
+#       CONTRADICTION HARD-ERROR (HERD-551): if a --heavy run's output contains a line starting with
+#       the literal marker "HEAVY-SKIPPED:" — the documented convention for a project script that
+#       received --heavy but still skipped its heavy probes (missing tool, env cap, a stale default,
+#       …) — healthcheck.sh fails LOUDLY (exit 1) regardless of the script's own exit code. A --heavy
+#       request that silently downgrades must never read as clean.
 #       BASELINE-AWARE (HERD-190): a heavy code error whose failing tests ALL already fail on the base
 #       (origin/main) is INHERITED — surfaced as a tolerated ⚠️, not blocked — so a fix-PR never
 #       deadlocks on a base failure it did not introduce. See the baseline-aware gate section below;
@@ -174,6 +184,17 @@ else
   herd_env_export_lint() { return 2; }
 fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# inert-lever guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/lever-reachability-lint.sh"
+[ -f "$DIR/scripts/herd/lever-reachability-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/lever-reachability-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_LEVER_REACHABILITY_SKIP_REASON="lever-reachability-lint.sh not present"
+  herd_lever_reachability_lint() { return 2; }
+fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # test-cap-ledger guard (rc 2), never break the healthcheck it is a part of.
 # Prefer the tree-under-test's copy when present (HERD-309).
 _HERD_LINT_SRC="$HERE/test-cap-ledger.sh"
@@ -333,7 +354,10 @@ _baseline_base_set() {
 
   # Run the base suite in FULL mode (TAP), extract + cache its known-failure set. A tolerated data/env
   # (⚠️, rc 2) or clean (rc 0) base simply yields no 'not ok' lines → an empty set (base green).
-  _bl_out="$(bash -c "cd '$_bl_dir' && $HEALTHCHECK_CMD '$_bl_dir'" 2>&1)"
+  # HERD-551: forward --heavy here too — the base run must be the SAME profile as the PR run it is
+  # diffed against, else a profile-aware project script would compare a heavy PR suite's failures
+  # against a light base run's (near-empty) known-failure set and never find anything "inherited".
+  _bl_out="$(bash -c "cd '$_bl_dir' && $HEALTHCHECK_CMD '$_bl_dir' --heavy" 2>&1)"
   _bl_set="$(_baseline_notok_set "$_bl_out")"
   printf '%s\n' "$_bl_set" > "$_bl_cache" 2>/dev/null || true
   git -C "$_bl_src" worktree remove --force "$_bl_dir" >/dev/null 2>&1 || true
@@ -546,19 +570,34 @@ run_heavy() {
   # (tee is a transparent passthrough of the same bytes; `pipefail`, scoped to this one subshell via
   # the command substitution, keeps $HEALTHCHECK_CMD's — not tee's — exit code). With the env var
   # unset (every caller except the async worker) the tee target is /dev/null: byte-identical.
+  # HERD-551 / GH #674: forward the resolved profile — dir stays $1, profile is $2 — so a
+  # profile-aware project script actually sees --heavy instead of defaulting to light while this
+  # wrapper reports clean. See the header contract comment above.
   [ -n "${HEALTHCHECK_PROGRESS_LOG:-}" ] && { : > "$HEALTHCHECK_PROGRESS_LOG"; } 2>/dev/null
   if [ "$_cap_active" -eq 1 ]; then
     _cap_cap="$(herd_numeric LOCAL_SUITE_CONCURRENCY 2)"
     case "$_cap_cap" in ''|*[!0-9]*) _cap_cap=2 ;; esac
     if [ -n "$ONELINE" ]; then
-      out="$(set -o pipefail; capacity_acquire_and_run suite "$_cap_cap" "$_cap_class" -- bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+      out="$(set -o pipefail; capacity_acquire_and_run suite "$_cap_cap" "$_cap_class" -- bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
     else
-      out="$(set -o pipefail; capacity_acquire_and_run suite "$_cap_cap" "$_cap_class" -- bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR'" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+      out="$(set -o pipefail; capacity_acquire_and_run suite "$_cap_cap" "$_cap_class" -- bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
     fi
   elif [ -n "$ONELINE" ]; then
-    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
   else
-    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR'" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+  fi
+  # HERD-551 / GH #674 CONTRADICTION HARD-ERROR: a project script invoked with --heavy that still
+  # emits the documented "HEAVY-SKIPPED:" marker is telling us it did NOT run its heavy probes —
+  # trusting its exit code here would be exactly the silent-clean gate-integrity hole GH #674 found
+  # (six heavy probes + visual regression never ran while the gate reported clean). This check runs
+  # BEFORE the baseline-aware downgrade and the normal rc dispatch below, and fires regardless of rc
+  # (0/1/2) — a script that skips heavy work and still exits 0 is the exact failure mode being closed.
+  if grep -q '^HEAVY-SKIPPED:' <<< "$out"; then
+    echo "❌ HEAVY/LIGHT CONTRADICTION: wrapper invoked --heavy but the project health command reports it skipped heavy work (see the HEAVY-SKIPPED: line below) — refusing to report this as clean"
+    printf '%s\n' "$out"
+    command -v journal_append >/dev/null 2>&1 && journal_append heavy_skipped_contradiction result blocked component healthcheck
+    exit 1
   fi
   # BASELINE-AWARE GATE (HERD-190): a CODE error whose failing tests ALL already fail on the base
   # (origin/main) is INHERITED, not introduced by this change — surface it as a tolerated ⚠️ (exit 0)
@@ -783,6 +822,22 @@ EOF
   if [ "$eexp_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ env-export — $(printf '%s' "$eexp_errs" | head -1) set but not exported";  # pipe-ok: head in a command substitution; status not gated
     else echo "❌ ENV-EXPORT: a config key the Python engine core reads from os.environ is set but not \`export\`ed by herd-config.sh (the child tick process never sees it)"; printf '%s\n' "$eexp_errs"; fi
+    exit 1
+  fi
+
+  # inert-lever guard (HERD-556) — a config key documented in templates/capabilities.tsv must have a
+  # consumer the shipped engine can actually REACH. HEALTH_PANE and HEALTH_TRUST_BUILDER were both
+  # silent no-ops: set, defaulted, documented, unit-tested — and inert, because their only consumers
+  # hung off `_healthcheck_gate`, defined-but-never-called since the P5b port moved dispatch into
+  # pysrc. The SAME lint the heavy gate runs (scripts/herd/lever-reachability-lint.sh). Same red
+  # semantics as caps-sync / env-export. A deliberately-unreachable lever opts out in
+  # tests/lever-reachability-exempt.tsv, with its reason. Skipped (never red) when the lint is absent
+  # or the tree has no engine capability surface.
+  local lrch_errs lrch_rc
+  lrch_errs="$(herd_lever_reachability_lint ".")"; lrch_rc=$?
+  if [ "$lrch_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ lever-reachability — $(printf '%s' "$lrch_errs" | grep -E '^(LEVER-UNREACHABLE|EXEMPT-MALFORMED|STALE-EXEMPT)' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ LEVER-REACHABILITY: a capabilities.tsv config key's only consumers sit in bash functions the entrypoints never reach (wire the consumer onto a live path, or record it in tests/lever-reachability-exempt.tsv with its reason)"; printf '%s\n' "$lrch_errs" | grep -E '^(LEVER-UNREACHABLE|EXEMPT-MALFORMED|STALE-EXEMPT)' || printf '%s\n' "$lrch_errs"; fi
     exit 1
   fi
 

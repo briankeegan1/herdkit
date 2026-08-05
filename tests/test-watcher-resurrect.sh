@@ -217,4 +217,32 @@ ok
 ok
 unset STUB_RELOAD_SUCCEEDS
 
+# ── (8) HERD-548: a standing crash-loop marker is a HARD STOP — never fought, no reload call ────
+# herd-watch.sh's own supervising loop already tried N times and gave up loudly; this probe must
+# refuse without ever taking a ps sample, even though the underlying state is a genuine NONE
+# (zero live mains) that would otherwise trigger a relaunch.
+reset_state
+type watcher_crashloop_trip >/dev/null 2>&1 || fail "8: watcher_crashloop_trip (watcher-exempt.sh) not in scope"
+type watcher_crashloop_active >/dev/null 2>&1 || fail "8: watcher_crashloop_active (watcher-exempt.sh) not in scope"
+watcher_crashloop_trip "test-induced crashloop"
+watcher_crashloop_active || fail "8: setup — the crash-loop marker did not take"
+verdict="$(watcher_singleton_verdict)"
+case "$verdict" in NONE*) : ;; *) fail "8: precondition failed — expected state NONE, got: $verdict" ;; esac
+watcher_resurrect_probe
+rc=$?
+[ "$rc" -eq 1 ] || fail "8: a standing crash-loop marker must refuse with exit 1 (got $rc)"
+ok
+[ "$(call_count)" -eq 0 ] || fail "8: a standing crash-loop marker must NEVER trigger herd reload (got $(call_count) calls)"
+ok
+grep -q '"event":"watcher_resurrect_blocked_crashloop"' "$JOURNAL_FILE" \
+  || fail "8: watcher_resurrect_blocked_crashloop must be journaled (got: $(cat "$JOURNAL_FILE"))"
+ok
+grep -q '"event":"watcher_resurrect_detected"' "$JOURNAL_FILE" \
+  && fail "8: a blocked probe must never also journal watcher_resurrect_detected"
+ok
+watcher_crashloop_clear
+watcher_crashloop_active && fail "8: watcher_crashloop_clear must actually clear the marker"
+ok
+echo "PASS (8) a standing crash-loop marker hard-stops the probe — never fought, no reload call"
+
 echo "ALL PASS ($pass checks)"

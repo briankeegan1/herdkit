@@ -1525,9 +1525,20 @@ def _total_health_inflight(state_dir):
 # predates the dispatch (a leftover from a prior/garbage run) is never trusted regardless of its mtime.
 # Args: $1 healthcheck.sh  $2 worktree  $3 dispatch-out  $4 log  $5 MAIN(base)  $6 TREES(base cache)
 #       $7 dispatch-nonce (epoch.pid — echoed verbatim as the out-file's first field).
+#       $8 OPTIONAL profile ("--light") — HERD-531/555: stamped by LiveGates.health only when the
+#       sha-matched builder-local trust check (_health_trust_check) trusted this exact head sha,
+#       forwarded straight through to healthcheck.sh so a trusted dispatch really runs the light
+#       profile instead of the full heavy suite. Empty on every OTHER dispatch, byte-identical to
+#       before this key existed. Both the first run and the solo retry below share this SAME profile
+#       (one `_run`), so a trusted smoke that reds still retries as a smoke rather than silently
+#       escalating mid-verdict. Every invocation — trusted or not — stamps HERD_HEALTH_PROVENANCE=watcher
+#       so the provenance record healthcheck.sh writes for THIS run can never later be read back as
+#       builder-local evidence (health-trust.sh's own anti-compounding rule).
 _HEALTH_WORKER_SH = r'''
 set -u
-hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"; nonce="$7"
+hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"; nonce="$7"; profile="${8:-}"
+args=("$dir")
+[ -n "$profile" ] && args+=("$profile")
 # HERD-533: hand healthcheck.sh a per-attempt progress companion ("$1.progress") via
 # HEALTHCHECK_PROGRESS_LOG (HERD-494's convention — agent-watch.sh's bash worker sets the same var).
 # healthcheck.sh tees the suite's raw output there AS IT RUNS, so an operator tailing it sees real
@@ -1537,7 +1548,8 @@ hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"; nonce="$7"
 _run() {
   : > "$1.progress" 2>/dev/null || true
   HERD_BASELINE_DIR="$base" HERD_BASELINE_CACHE="$cache" HEALTHCHECK_PROGRESS_LOG="$1.progress" \
-    bash "$hc" "$dir" > "$1" 2>&1
+    HERD_HEALTH_PROVENANCE=watcher \
+    bash "$hc" "${args[@]}" > "$1" 2>&1
 }
 _run "$log"; rc=$?
 first="$(sed -n '1p' "$log" 2>/dev/null)"
@@ -1877,6 +1889,111 @@ class _GraphQLDiscovery:
         return _pool_scoped(_select_candidates(discover_via_graphql(self._repo), self._config))
 
 
+# ── HEALTH_TRUST_BUILDER (HERD-531/555) — sha-matched builder-local health trust, READ side ─────────
+# The WRITE side (the provenance record a heavy healthcheck.sh run authors) stays in bash —
+# scripts/herd/health-trust.sh, sourced by healthcheck.sh. This is a port of that same library's READ
+# side, herd_health_trust_check, into the health dispatch that actually runs today. The bash READ
+# (agent-watch.sh:_healthcheck_gate) has been dead code since the P5b port: _healthcheck_gate's only
+# caller was never wired into the live pipeline, so builders wrote trust records nobody consulted.
+#
+# FAIL-CLOSED, identical to health-trust.sh: every disqualifier below is a full heavy re-run, exactly
+# as if this trust check did not exist. SHIP-DORMANT: HEALTH_TRUST_BUILDER off (the default) means
+# ``_health_trust_on`` is False and :meth:`LiveGates.health` never even opens the record file — zero
+# behavior change, byte-identical to before this existed.
+
+def _health_trust_on(config):
+    """Port of ``herd_health_trust_on`` (health-trust.sh) — is HEALTH_TRUST_BUILDER on? An
+    unrecognized value reads OFF, so a typo can never arm a path that skips the authoritative suite."""
+    val = str((config or {}).get("HEALTH_TRUST_BUILDER", "") or "").strip().lower()
+    return val in ("1", "true", "on", "yes", "enable", "enabled")
+
+
+def _health_trust_abspath(path):
+    """Port of ``_herd_health_trust_abspath`` — the PHYSICAL absolute path (mirrors ``cd && pwd -P``),
+    so a /tmp pool that resolves to /private/tmp on macOS still compares equal between the bash writer
+    and this reader. Fails soft to the raw argument on any resolution error."""
+    if not path:
+        return ""
+    try:
+        return os.path.realpath(path)
+    except Exception:
+        return path
+
+
+def _health_trust_file(trees, sha):
+    """Port of ``herd_health_trust_file`` — the provenance record path for ``sha`` in the ``trees``
+    pool, or ``""`` when either argument is empty (never a stub ``/.health-provenance-`` path)."""
+    if not trees or not sha:
+        return ""
+    return os.path.join(trees.rstrip("/"), ".health-provenance-%s" % sha)
+
+
+def _health_trust_commit_epoch(worktree, sha):
+    """The commit time (``%ct``) of ``sha`` as resolved from ``worktree`` — ``""`` on ANY failure (no
+    git, unresolvable commit, no worktree), which the caller treats as unresolvable-and-refused,
+    mirroring health-trust.sh's own ``git show -s --format=%ct`` call."""
+    try:
+        out = subprocess.check_output(["git", "-C", worktree, "show", "-s", "--format=%ct", sha],
+                                      stderr=subprocess.DEVNULL)
+        return out.decode().strip()
+    except Exception:
+        return ""
+
+
+def _health_trust_check(trees, sha, worktree):
+    """Port of ``herd_health_trust_check`` (health-trust.sh) — is there a record that EARNS a skip of
+    the full heavy re-run for this exact ``(sha, worktree)``? Returns ``(provenance, reason)``: a
+    non-empty ``provenance`` means TRUSTED; an empty ``provenance`` means NOT trusted and ``reason``
+    names the disqualifier (mirrors ``$HERD_HEALTH_TRUST_REASON``). Read-only — never mutates the
+    record, never raises; every disqualifier below is a plain full re-run, same as before this
+    existed."""
+    if not sha:
+        return "", "no head sha"
+    path = _health_trust_file(trees, sha)
+    if not path:
+        return "", "no worktree pool"
+    if not os.path.isfile(path):
+        return "", "no record for sha"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            line = fh.readline().rstrip("\n")
+    except Exception:
+        return "", "malformed record"
+    # A truncated/garbled/interrupted-write record proves nothing — refuse it rather than guessing at
+    # whichever fields happen to be present (mirrors the bash reader's own $_ht_epoch emptiness check).
+    fields = line.split("\t")
+    if len(fields) != 8:
+        return "", "malformed record"
+    r_sha, r_wt, r_prof, r_out, _r_dur, r_prov, r_state, r_epoch = fields
+    if not r_epoch or not r_epoch.isdigit():
+        return "", "malformed record"
+    # STALE SHA: the record must name the very commit being gated.
+    if r_sha != sha:
+        return "", "stale sha in record"
+    if r_prof != "heavy":
+        return "", "profile=%s (not heavy)" % r_prof
+    if r_out != "CLEAN":
+        return "", "outcome=%s (not CLEAN)" % r_out
+    # provenance=watcher would let a trusted (light) run justify the NEXT trusted run — trust must
+    # always trace back to a real builder-local heavy suite, never compound on itself.
+    if r_prov != "builder-local":
+        return "", "provenance=%s (not builder-local)" % r_prov
+    if r_state != "clean":
+        return "", "tree_state=%s (uncommitted edits at run time)" % r_state
+    if worktree:
+        wt_abs = _health_trust_abspath(worktree)
+        if r_wt != wt_abs:
+            return "", "record worktree %s != %s" % (r_wt, wt_abs)
+    # RECORD-OLDER-THAN-THE-SHA: a record written BEFORE the commit existed cannot have tested it (a
+    # recycled path, a clock skew, a hand-forged file). An unresolvable commit is refused too.
+    ct = _health_trust_commit_epoch(worktree or r_wt, sha)
+    if not ct or not ct.isdigit():
+        return "", "commit time unresolvable"
+    if int(r_epoch) < int(ct):
+        return "", "record predates the commit"
+    return r_prov, ""
+
+
 # ── gate dispatch: shell out to the existing leaf scripts, consume their contract output ───────────
 
 class LiveGates:
@@ -1917,6 +2034,9 @@ class LiveGates:
         # verification unconditionally — see _merge_queue_enabled's docstring for why the queue is
         # never a "set two config keys coherently" trap.
         self._merge_result_gate = _merge_result_gate_enabled(cfg) or _merge_queue_enabled(cfg)
+        # HEALTH_TRUST_BUILDER (HERD-531/555): ship-dormant, default off. Resolved ONCE per tick, same
+        # rationale as _merge_result_gate above — off means health() never even opens a provenance file.
+        self._health_trust_on = _health_trust_on(cfg)
 
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
@@ -2021,11 +2141,29 @@ class LiveGates:
                 self.journal.append("health_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                                     "inflight", _hc_n, "limit", self._health_max)
             return WAIT
-        # 4. DISPATCH the async suite worker + lay the marker → wait.
-        self._dispatch_health(cand)
+        # 4. SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531/555): before paying for a ~20-60 min heavy suite,
+        #    ask whether this EXACT head sha was already proven clean by the builder's own pre-PR heavy
+        #    run in this very worktree (see _health_trust_check above). When it was, dispatch the LIGHT
+        #    profile as a smoke instead of the full re-run — the suite that matters already ran, on the
+        #    same commit, from the same clean tree. Every other case (lever off, no record, stale sha,
+        #    non-clean outcome, dirty tree, a record older than the commit, or a record the watcher
+        #    itself authored) leaves ``profile`` empty and dispatches the full suite exactly as before.
+        #    The verdict/ledger/cache machinery is untouched either way: a trusted dispatch still
+        #    produces a real CLEAN/FLAKY/CODEERROR verdict from a real run, so a smoke that reds still
+        #    blocks the merge. Byte-identical when HEALTH_TRUST_BUILDER is off: ``_health_trust_check``
+        #    is never even called.
+        profile = ""
+        if self._health_trust_on:
+            prov, _reason = _health_trust_check(st.dir, cand.sha, cand.worktree)
+            if prov:
+                profile = "--light"
+                self.journal.append("health_trusted", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
+                                    "provenance", prov, "profile", "light")
+        # 5. DISPATCH the async suite worker + lay the marker → wait.
+        self._dispatch_health(cand, profile)
         return WAIT
 
-    def _dispatch_health(self, cand):
+    def _dispatch_health(self, cand, profile=""):
         st = self.state
         disp = st.health_dispatch_file(cand)
         inflight = st.health_inflight_file(cand)
@@ -2041,11 +2179,16 @@ class LiveGates:
         #     collector ignores any out-file whose nonce does not match the live marker (never trusts mtime).
         nonce = _dispatch_nonce()
         base = os.environ.get("MAIN") or os.environ.get("PROJECT_ROOT") or ""
+        argv = ["bash", "-c", _HEALTH_WORKER_SH, "_",
+                self._script("healthcheck.sh"), cand.worktree, disp, log, base, st.dir or "", nonce]
+        # HERD-531/555 <profile>: an OPTIONAL 8th arg, "--light" ONLY when the trust check above
+        # trusted this exact (sha, worktree) — see _HEALTH_WORKER_SH. Omitted (byte-identical argv) on
+        # every untrusted dispatch, mirroring the bash worker's own optional 4th positional.
+        if profile:
+            argv.append(profile)
         try:
             proc = subprocess.Popen(
-                ["bash", "-c", _HEALTH_WORKER_SH, "_",
-                 self._script("healthcheck.sh"), cand.worktree, disp, log, base, st.dir or "", nonce],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
             )
         except Exception as exc:
             self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "health",
@@ -4318,7 +4461,8 @@ _BREAKER_KEYS = ("INFRA_BREAKER_MAX", "INFRA_BREAKER_COOLDOWN")
 
 _CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
                     "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
-                    "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE")
+                    "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE",
+                    "HEALTH_TRUST_BUILDER")
                    + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS)
 
 
