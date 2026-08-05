@@ -24,8 +24,10 @@
 #                       later ticks. "review queued" = waiting for a concurrency slot.
 #   ⏳ merging         — health passed AND review PASSed, merging now
 #   🔀 resolving …     — PR CONFLICTING: auto-spawned the isolated, test-gated conflict resolver
-#                       (herd-resolve.sh). Hands-off. "re-resolving (round N)" = a RESPAWN (HERD-55)
-#                       after a new commit reshaped the conflict or the prior resolver died.
+#                       (herd-resolve.sh) — RESOLVE_AUTOFIX=on only (default off; HERD-541), and only
+#                       once the PR's own builder is done/idle/absent. Hands-off. "re-resolving
+#                       (round N)" = a RESPAWN (HERD-55) after a new commit reshaped the conflict or
+#                       the prior resolver died.
 #   ⚠️ needs you · …   — PR CONFLICTING OR healthcheck returned a CODE error (❌), OR the review
 #                       gate returned BLOCK, OR the resolver ran and it's STILL conflicting
 #                       ("resolver failed"), OR the resolver ESCALATED a semantically-ambiguous
@@ -50,11 +52,14 @@
 # if it can't ff — never force), (3) git worktree remove --force <wt>, (4) close its herdr tab,
 # and record the merge in a persistent state file so "recently landed" survives re-renders.
 #
-# AUTO-RESOLVE rule (full auto, safety-railed): when a PR FIRST goes CONFLICTING, the watcher
-# auto-spawns the EXISTING isolated resolver (herd-resolve.sh <slug>), keyed to the head sha. HERD-55
-# adds sha-keyed RESPAWN: if a CONFLICTING PR gets a NEW commit (its sha changes → the conflict
-# surface changed) OR the dispatched resolver is POSITIVELY DEAD without clearing it, the watcher
-# re-dispatches a fresh resolver for the new sha (journaling resolver_respawn). Hard rails:
+# AUTO-RESOLVE rule (full auto, safety-railed; RESOLVE_AUTOFIX=on, default off — HERD-541): when a PR
+# FIRST goes CONFLICTING AND its own builder is done/idle/absent (a WORKING builder is NEVER yanked —
+# see _dispatch_conflict_autofix), the watcher auto-spawns the EXISTING isolated resolver
+# (herd-resolve.sh <slug>), keyed to the head sha. HERD-55 adds sha-keyed RESPAWN: if a CONFLICTING PR
+# gets a NEW commit (its sha changes → the conflict surface changed) OR the dispatched resolver is
+# POSITIVELY DEAD without clearing it, the watcher re-dispatches a fresh resolver for the new sha
+# (journaling resolver_respawn). RESOLVE_AUTOFIX=off (the default) leaves today's behavior: a true
+# conflict is always the classic needs-you row — nothing is auto-dispatched. Hard rails:
 # (1) respawn budget — dispatches per PR are capped at REFIX_MAX_ROUNDS, then the PR surfaces
 # "resolver gave up · needs you" (never an infinite resolver loop); (2) escalation preserved +
 # terminal — the resolver aborts + escalates semantically-ambiguous conflicts, and an ESCALATE is
@@ -6340,6 +6345,58 @@ _classify_conflict() {
   fi
   _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "conflict" && return
   CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("new-commit")
+}
+
+# resolve_autofix_enabled — HERD-541 master lever for RESOLVE_AUTOFIX. Default OFF (ship-dormant).
+# Mirrors ci_autorepair_enabled's recognized-value set; any unrecognized value reads as off.
+resolve_autofix_enabled() {
+  case "$(printf '%s' "${RESOLVE_AUTOFIX:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _dispatch_conflict_autofix — HERD-541 RESOLVE_AUTOFIX=on|off (default off, ship-dormant; yolo
+# posture adopts on). Consumes the CONF_* dispatch queue _classify_conflict populated THIS tick —
+# never spawned there, so the classify pass stays render-ordered and dry-run-safe (see its own header
+# comment). Every queued entry has ALREADY cleared _classify_conflict's own gauntlet — the sha-keyed
+# once-guard (resolver_dispatched_sha), the in-flight hold (_resolver_in_flight), and the
+# resolver_dispatch_count/REFIX_MAX_ROUNDS cap — so this pass adds exactly ONE more gate: the PR's own
+# builder must be done/idle/absent. A WORKING builder is NEVER yanked — its worktree may be mid-edit
+# toward this exact conflict, and landing a resolver on top of live WIP is the same two-agents-one-
+# directory hazard every other healer rail in this file guards against (_handle_ci_repair,
+# _handle_stale_dup). A foreign RESOLVE_CLAIM hold (when armed) is honored the same way those rails
+# honor it — peeked BEFORE the row is painted, so a held dispatch never claims 'resolving · auto'.
+#
+# off (default) → byte-identical to before this function existed: CONF_IDX is computed and dropped,
+# and the needs-you row _classify_conflict already painted for each entry stands untouched — a true
+# git conflict is the classic needs-you.
+_dispatch_conflict_autofix() {
+  [ "${#CONF_IDX[@]}" -gt 0 ] || return 0
+  resolve_autofix_enabled || return 0
+  [ -z "${DRYRUN:-}" ] || return 0
+  local _dca_k=0 _dca_idx _dca_slug _dca_pr _dca_branch _dca_sha _dca_reason
+  local _dca_sl _dca_pn _dca_round _dca_cap
+  for _dca_idx in "${CONF_IDX[@]}"; do
+    _dca_slug="${CONF_SLUG[_dca_k]}"; _dca_pr="${CONF_PR[_dca_k]}"; _dca_branch="${CONF_BRANCH[_dca_k]}"
+    _dca_sha="${CONF_SHA[_dca_k]}"; _dca_reason="${CONF_REASON[_dca_k]}"
+    _dca_k=$((_dca_k + 1))
+    # NEVER yank a working builder — leave today's needs-you row exactly as _classify_conflict painted it.
+    [ "$(_agent_status "$_dca_slug")" = "working" ] && continue
+    _dca_sl="$(_slug_cell "$_dca_slug")"; _dca_pn=" ${C_DIM}#${_dca_pr}${C_RESET} ·"
+    if _resolve_claim_should_hold "$_dca_pr" "$_dca_sha" "$_dca_slug"; then
+      DISPLAY[_dca_idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${_dca_sl}${C_RESET}${_dca_pn} ${C_YELLOW}resolving · held — another seat is resolving${C_RESET}"
+      FLAIR_STATE[_dca_idx]="busy"
+      continue
+    fi
+    _dca_cap="${REFIX_MAX_ROUNDS:-3}"
+    _dca_round="$(( $(resolver_dispatch_count "$_dca_pr") + 1 ))"
+    journal_append resolve_autodispatch pr "$_dca_pr" slug "$_dca_slug" sha "${_dca_sha:--}" \
+      reason "$_dca_reason" round "$_dca_round"
+    DISPLAY[_dca_idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${_dca_sl}${C_RESET}${_dca_pn} ${C_YELLOW}resolving · auto (round ${_dca_round}/${_dca_cap})${C_RESET}"
+    FLAIR_STATE[_dca_idx]="busy"
+    spawn_resolver "$_dca_slug" "$_dca_pr" "$_dca_branch" "$_dca_sha"
+  done
 }
 
 # reconcile_enqueued <pr#> <headSha> — true if a POST-MERGE reconcile was already enqueued for this
@@ -16197,6 +16254,11 @@ EOF
     [ -n "$_bmismatch" ] && DISPLAY[i]="${DISPLAY[i]} ${C_YELLOW}· ${_bmismatch}${C_RESET}"
     i=$((i + 1))
   done
+
+  # HERD-541: the resolve pass — dispatches herd-resolve.sh for whatever _classify_conflict queued
+  # into CONF_* this tick. Ship-dormant under RESOLVE_AUTOFIX=off (the default): CONF_IDX is computed
+  # and dropped, byte-identical to before this function existed.
+  _dispatch_conflict_autofix
 
   # HERD-147 flair — assemble the pasture header + any queued merge celebration from THIS tick's herd
   # snapshot, BEFORE render. Both no-op (leave PASTURE/CELEBRATE empty) when WATCHER_FLAIR is off, so
