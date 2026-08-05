@@ -669,3 +669,72 @@ correctness fix, not a new config key — the switch is a bare env read in `herd
 itself (no `templates/capabilities.tsv` row, no `herd-config.sh` `:=` default), the same class of
 escape hatch as e.g. `HERD_SKIP_PREFLIGHT`. Leave it unset (the default, effectively "on") unless a
 driver's roster read is known to be unreliable enough that the retries would just add noise.
+
+## HERD-523 / issues #633+#634: review-dispatch wake verification, and the viewer tab that leaked
+
+The stall above is not builder-specific — it is a property of *delivering a prompt into a pane*, and
+review dispatch does exactly that. `herd-review.sh` starts the reviewer as a split inside the builder's
+tab (`herd_driver_launch_agent name="review·<slug>" … split=down`), reads a pane id back out of the
+response, and declares agent-pane mode. A pane id proves the invocation was DELIVERED, never that it
+EXECUTED. On 2026-08-04 (money-bets, the same night as #632) the reviewer command sat in the pane
+unexecuted: the gate then polled a result file that nobody was ever going to write for the full
+`HERD_REVIEW_AGENT_TIMEOUT` window (default 1800s) before falling through to the standalone
+`review·<slug>` viewer tab — the fallback it could have taken 20 seconds in.
+
+### The shared sequence, and the one thing that differs
+
+The delivery → poll → in-pane retry → escalate sequence now lives ONCE in `scripts/herd/driver.sh`:
+
+| helper | role |
+|---|---|
+| `_herd_wake_agent_status <name>` | the registered agent's `agent_status` out of the driver roster |
+| `_herd_wake_wait_working <name> <window>` | backed-off poll (immediate, then 1s, 2s, 3s… capped at 5s) |
+| `_herd_wake_window <raw>` | normalize the poll-window test seam to seconds (default 20) |
+| `_herd_wake_observable <name> <pane>` | fail-soft preflight: can this driver observe wake state AT ALL? |
+| `_herd_wake_attempts <name> <pane> <pointer> <window>` | the sequence itself → prints `none\|enter\|prompt`, returns 0 iff woken |
+
+Both entry points compose those. `herd_spawn_wake_verify` (HERD-516, above) is unchanged in behavior.
+`herd_review_wake_verify <slug> <pane> <pointer>` is the review twin, and it differs in exactly two
+places — deliberately, because the callers' contracts differ:
+
+- **Identity.** The reviewer registers as `review·<slug>`, which herdr carries in its SANITIZED form
+  (`review-<slug>`, `herd_agent_name_sanitize`). The lookup sanitizes internally, so callers pass the
+  plain branch slug.
+- **The escalation edge.** A stalled *builder* is left running (the watcher's dead/wedge rails own it)
+  and the spawn proceeds. A stalled *reviewer* is TORN DOWN — its pane executes nothing, so leaving it
+  behind is a pure leak and a duplicate-reviewer hazard on the next dispatch — through the same guarded
+  close every reviewer teardown uses (`herd_close_pane_verified … ":review"`, HERD-134/HERD-418), then
+  it returns **1** so the caller falls back with knowledge instead of after a 30-minute silence.
+
+The retry is always **in the SAME pane**. A retry that allocated a fresh tab would leak exactly the
+viewer tab the other half of this item exists to stop leaking.
+
+`review_wake_result` (`slug`, `pane`, `woke`, `retried`, `pane_closed`) is journaled on every run that
+actually polls. **Kill switch:** `HERD_REVIEW_WAKE_VERIFY=off`, same class as `HERD_SPAWN_WAKE_VERIFY`
+— a bare env read, no `templates/capabilities.tsv` row, no `herd-config.sh` `:=` default. With it off
+(or under the headless driver, or when the roster cannot report the identity) `herd_review_wake_verify`
+returns 0 and the dispatch path is byte-identical to before.
+
+### The viewer tab that could never be swept (issue #634)
+
+The standalone `review·<slug>` fallback tab's ONLY record was a line appended to `$WORKTREES_DIR/.herd-tabs`
+under a bare `|| true`. Both teardown paths key on that registry — merge teardown (`herd_teardown_slug`)
+and the orphan sweep's allowlist model — so a failed append left the tab live, unregistered, and
+therefore permanently invisible to every rail, with the evidence swallowed. Two changes, in the two
+places that matter:
+
+1. **Teardown no longer depends on the registry.** `_close_review_viewer_tab <slug>` (`agent-watch.sh`)
+   closes the tab on verdict consumption by SLUG-LABELED lookup — the mechanism `_purge_stale_review_tab`
+   already uses on re-dispatch — so it works with an EMPTY `.herd-tabs`, then drops the row if one
+   exists. The label match is anchored (exact label, or label + `" "` for the decorated `review·<slug> ✅`
+   form) rather than `_purge_stale_review_tab`'s bare prefix, since this closes on someone else's
+   verdict and must never catch a prefix-colliding slug's tab. Byte-quiet no-op in the common case
+   where the reviewer ran as a split inside the builder's tab. Journals `review_viewer_tab_closed`.
+2. **A failed registration is visible.** The append's `|| true` is replaced by a journaled
+   `tab_registry_write_failed` (+ a loud stderr line). The tab is still created — registration is not a
+   gate on the review — but the leak is now diagnosable instead of silent.
+
+Proof: `tests/test-review-dispatch-verify.sh` (stubbed driver: a stalled dispatch retries once in the
+SAME pane and allocates no tab, the stalled pane is closed, the caller is told; teardown fires on verdict
+consumption with an EMPTY `.herd-tabs`; a failed registration journals) and `tests/test-spawn-wake-verify.sh`
+(the spawn twin, unchanged across the shared-helper extraction).
