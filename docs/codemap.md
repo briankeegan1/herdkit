@@ -286,6 +286,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `LINEAR_TEAM_ID` → `bin/herd`
 - `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `LOCAL_REVIEW_GLOB` → `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
+- `LOCAL_SUITE_CONCURRENCY` → `healthcheck.sh`
 - `MAIN_HEALTH_AUTOFIX` → `agent-watch.sh`
 - `MAIN_HEALTH_CI_GATE` → `agent-watch.sh`
 - `MAIN_HEALTH_RECHECK_MINS` → `agent-watch.sh`
@@ -374,5 +375,5 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WEDGE_AUTOWAKE` → `agent-watch.sh`
 - `WEDGE_GRACE_MIN` → `agent-watch.sh`
 - `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `status.sh`, `sweep.sh`, `watcher-resurrect.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `healthcheck.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
 - `WORK_UNIT_KIND` → `agent-watch.sh`, `work-unit.sh`
