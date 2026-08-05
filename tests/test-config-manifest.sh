@@ -241,6 +241,9 @@ EXEMPT_NAMES = {
     "PRS_LOOKUP_OK",  # assigned in work-units/git-pr.sh's _prs_fetch_tick, read in agent-watch.sh — a
                        # deliberate cross-file contract (HERD-398) between the git-pr adapter and the
                        # watcher tick, mirroring PRS_JSON above, not a .herd/config knob
+    "REF_UNPARSED_FILE",  # assigned in agent-watch.sh (its ref-unparsed console ledger path), read in
+                           # work-units/git-pr.sh's _reconcile_ref_unparsed_alarm — the mirror-direction
+                           # cross-file contract (HERD-537) of PRS_LOOKUP_OK above, not a .herd/config knob
     "RESEARCH_HEARTBEAT", "RESEARCH_INBOX", "RESEARCH_MODEL", "RESEARCH_QUEUE",
     "RESEARCH_REPORTS", "RESEARCH_TAB", "RESEARCH_TREES", "RESOLVER_MODEL", "ROOT",
     "SCRIBE_BACKEND_DIR", "SCRIBE_MODEL", "SCRIBE_TAB", "SLUG", "SPAWN_HOLDS", "STATES_FILE",
