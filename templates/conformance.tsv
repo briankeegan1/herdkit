@@ -526,3 +526,8 @@ ANOMALY_BASELINES	unit	tests/test-phase-anomaly-baselines.sh
 ANOMALY_BASELINES	unit	tests/test_store.py
 ANOMALY_FILE_COOLDOWN_SECS	unit	tests/test-phase-anomaly-suspend-skip.sh
 GATE_SCALE	sim	tests/test-gate-scale.sh
+tab-discipline.sh	unit	tests/test-tab-discipline.sh
+tab-discipline.sh	sim	tests/test-sandbox-real-panes.sh
+tab-create-lint.sh	unit	tests/test-tab-discipline.sh
+TAB_DISCIPLINE	unit	tests/test-tab-discipline.sh
+TAB_DISCIPLINE	sim	tests/test-sandbox-real-panes.sh

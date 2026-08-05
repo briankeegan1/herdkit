@@ -983,6 +983,36 @@ case "$_hc_gscope_rc" in
      exit 1 ;;
 esac
 
+# 5e. tab-discipline creation guard (HERD-569) — the operator directive is that only builder tabs and
+# the scribe may exist, so engine code may open a workspace TAB only from the builder-lane, scribe or
+# control-room modules. Everything else splits a pane inside the tab it belongs to. scripts/herd/sim/,
+# scripts/herd/experiment/ and tests/ stand up real tabs in DISPOSABLE workspaces and are classified
+# FIXTURE — scanned, counted, never flagged. A deliberate exception is a `callsite` row in
+# templates/tab-discipline-exempt.tsv, WITH its reason (a bare row reds EXEMPT-MALFORMED; a row that
+# excuses nothing reds STALE-EXEMPT). ONE implementation shared with the builder's light pre-PR gate
+# (scripts/herd/tab-create-lint.sh), so the two can never disagree.
+tabc_note="tab-discipline: clean"
+HERD_TAB_CREATE_SKIP_REASON=""
+if [ -f scripts/herd/tab-create-lint.sh ]; then
+  . scripts/herd/tab-create-lint.sh
+  _hc_tabc_errs="$(herd_tab_create_lint ".")"; _hc_tabc_rc=$?
+else
+  _hc_tabc_errs=""; _hc_tabc_rc=2
+  HERD_TAB_CREATE_SKIP_REASON="scripts/herd/tab-create-lint.sh not present"
+fi
+case "$_hc_tabc_rc" in
+  0) tabc_note="tab-discipline: clean" ;;
+  2) tabc_note="tab-discipline: skipped ($HERD_TAB_CREATE_SKIP_REASON)" ;;
+  *) tabc_note="tab-discipline: OUT-OF-MODULE TAB CREATES"
+     if [ -n "$ONELINE" ]; then
+       echo "tab-discipline: $(printf '%s' "$_hc_tabc_errs" | grep -E '^(TAB-CREATE|EXEMPT-MALFORMED|STALE-EXEMPT)' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
+     else
+       echo "TAB-DISCIPLINE: engine code opens a workspace tab outside the builder-lane/scribe/control-room modules (split a pane instead, or record a 'callsite' row with its reason in templates/tab-discipline-exempt.tsv)"
+       printf '%s\n' "$_hc_tabc_errs" | grep -E '^(TAB-CREATE|EXEMPT-MALFORMED|STALE-EXEMPT)' || printf '%s\n' "$_hc_tabc_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 5d. env-export guard (HERD-449) — a config knob the Python engine core reads from os.environ
 # (pysrc/herd/live_runtime.py's _CORE_ENV_KEYS) must be `export`ed by herd-config.sh, or the
 # `live_runtime --tick` CHILD process never sees it and silently defaults — the bug that starved
@@ -1086,5 +1116,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $eexp_note; $tcl_note; $lrch_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $tabc_note; $eexp_note; $tcl_note; $lrch_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $tabc_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $chl_note"; }
 exit 0
