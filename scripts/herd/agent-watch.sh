@@ -579,6 +579,15 @@ ORPHAN_PR_ROWS_LIMIT=5    # most-recent orphan rows rendered (display bound; the
 # console when every open PR has a builder record.
 UNGATED_PR_LEDGER="$TREES/.agent-watch-ungated-prs"
 UNGATED_PR_ROWS_LIMIT=5
+# TEAMMATE PRESENCE on those ungated rows (HERD-527, GH #639 phase 1). An ungated PR is not always an
+# ORPHAN: on a two-operator project (WATCHER_SCOPE=all) it is routinely a TEAMMATE'S PR, actively being
+# built in their worktree on their machine — and the row above nudges "enable ADOPT_REMOTE_PRS or git
+# worktree add to adopt", which is precisely the wrong advice for it. Under TEAM_PRESENCE=on the
+# throttled presence scan REWRITES this ledger with one "<pr>\t<item-id>\t<assignee>" row per ungated PR
+# whose tracker item is IN PROGRESS and ASSIGNED, and _ungated_pr_row renders those rows attributed
+# instead (adopt nudge suppressed). Rewritten whole per scan, so it self-corrects the moment the item
+# closes, is unassigned, or the PR stops being ungated. Off (default) → never written, never read.
+TEAM_PRESENCE_LEDGER="$TREES/.agent-watch-team-presence"
 # Adopt-remote-PRs ledgers (HERD-369), sibling of the orphan-PR ledger above. Under ADOPT_REMOTE_PRS=on
 # the tick's ADOPT leg (built on top of the SAME orphan diff) attempts `git fetch` + `git worktree add`
 # per orphan PR. TWO separate ledgers, ADVISED (herd-advise.sh) against conflating "succeeded" with
@@ -1997,12 +2006,28 @@ EOF
 
 # _ungated_pr_row <line>  ("<epoch>\t<pr>\t<title>\t<branch>") → one themed console row. Fail-soft: a
 # row missing its PR number renders nothing (drops out of the section).
+#
+# HERD-527: when the TEAM_PRESENCE cache attributes this PR to a teammate who is mid-build on their own
+# machine, the row says so and the adopt nudge is SUPPRESSED — "adopt this" is exactly the wrong advice
+# for a PR someone else is actively building. With TEAM_PRESENCE off (default) the cache is always
+# empty, the lookup returns nothing, and this prints the pre-HERD-527 bytes verbatim.
 _ungated_pr_row() {
-  local _ug_epoch _ug_pr _ug_title _ug_branch
+  local _ug_epoch _ug_pr _ug_title _ug_branch _ug_who
   IFS=$'\t' read -r _ug_epoch _ug_pr _ug_title _ug_branch <<EOF
 $1
 EOF
   [ -n "${_ug_pr:-}" ] || return 0
+  _ug_who="$(_team_presence_lookup "$_ug_pr")"
+  if [ -n "$_ug_who" ]; then
+    local _ug_id _ug_assignee
+    IFS=$'\t' read -r _ug_id _ug_assignee <<EOF
+$_ug_who
+EOF
+    printf '    %s🔓%s %s#%s%s %s %s%s · ungated here · %s building %s on their machine%s' \
+      "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
+      "$C_DIM" "${_ug_branch:-}" "$_ug_assignee" "$_ug_id" "$C_RESET"
+    return 0
+  fi
   printf '    %s🔓%s %s#%s%s %s %s%s · ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree add to adopt%s' \
     "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
     "$C_DIM" "${_ug_branch:-}" "$C_RESET"
@@ -2074,11 +2099,220 @@ for pr in prs:
 # _ungated_prs_scan.
 build_ungated_prs() {
   UNGATED_PR_SECTION_ROWS=""
+  # HERD-527: load the presence attributions ONCE per render, not once per row — herd_console_section
+  # runs _ungated_pr_row in a command-substitution SUBSHELL, which inherits this global, so every row's
+  # lookup is an in-memory string match against a cache read at most once a tick. Empty (and so a pure
+  # no-op) whenever TEAM_PRESENCE is off — that is what keeps the off-path byte-identical.
+  _team_presence_load
   [ -s "$UNGATED_PR_LEDGER" ] || return 0
   local rows
   rows="$(herd_console_section "$UNGATED_PR_LEDGER" "$UNGATED_PR_ROWS_LIMIT" \
     _ungated_pr_classify _ungated_pr_row)"
   [ -n "$rows" ] && UNGATED_PR_SECTION_ROWS="${rows}"$'\n'
+  return 0
+}
+
+# ── Teammate presence on the ungated rows (HERD-527, GitHub issue #639 phase 1) ───────────────────
+# THE DEFECT (grounded: emberglen-godot, two operators). The watcher discovers work through LOCAL git
+# worktrees, so every PR a TEAMMATE is building on THEIR machine lands in the unconditional ungated
+# section above and is labelled "ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree
+# add to adopt". Under WATCHER_SCOPE=all — the team posture — that is not merely uninformative, it is
+# actively wrong: adopting a branch someone else is mid-build on is the last thing an operator should
+# do. The console says "nobody is on this" about work that is very much being done.
+#
+# THE FIX, PHASE 1 — REUSE THE CLAIM MACHINERY, ADD NO CHANNEL. The tracker ALREADY carries who-is-
+# building: a claim sets the item's assignee AND moves it to in-progress (HERD-50 / HERD-244), and every
+# PR body carries `Refs: <id>` (HERD-522). Those two facts join to exactly the missing sentence. So this
+# leg invents no presence protocol, opens no socket, writes NOTHING anywhere (least of all the tracker —
+# a builder/watcher that mutates item state corrupts the queue): it is a pure READ that resolves
+# ungated PR → tracker item → (state, assignee), and re-words the row when the answer is
+# "in-progress, assigned".
+#
+# WHAT PHASE 2 IS NOT: a real presence channel (heartbeats, a per-seat liveness feed) and a view toggle
+# are deliberately OUT of scope here — the tracker join answers the grounded complaint with zero new
+# moving parts, and a channel should only be built once that proves insufficient.
+#
+# COST. Two reads per SCAN (not per 4 s repaint): one `gh pr list --json number,body` and one backend
+# roster call, both on the ~60 s cadence the adopt leg already uses. Their result is a ledger the repaint
+# reads from memory. Zero reads when TEAM_PRESENCE is off, and zero when nothing is ungated.
+
+# _team_presence_enabled — true iff TEAM_PRESENCE opts in. Default OFF; any unrecognized value reads as
+# off (fail toward the byte-identical console), mirroring _adopt_remote_prs_enabled.
+_team_presence_enabled() {
+  case "$(printf '%s' "${TEAM_PRESENCE:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _TEAM_PRESENCE_CACHE — this render's in-memory copy of $TEAM_PRESENCE_LEDGER ("<pr>\t<id>\t<assignee>"
+# rows). Always EMPTY when the feature is off, so _team_presence_lookup is a single string test on the
+# off-path and _ungated_pr_row's pre-HERD-527 branch is the only one that can be taken.
+_TEAM_PRESENCE_CACHE=""
+
+# _team_presence_load — refresh _TEAM_PRESENCE_CACHE from the ledger, once per render pass. Fail-soft:
+# an absent/unreadable ledger simply yields an empty cache (today's rows).
+_team_presence_load() {
+  _TEAM_PRESENCE_CACHE=""
+  _team_presence_enabled || return 0
+  [ -s "$TEAM_PRESENCE_LEDGER" ] || return 0
+  _TEAM_PRESENCE_CACHE="$(cat "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true)"
+  return 0
+}
+
+# _team_presence_lookup <pr#> → "<item-id>\t<assignee>" when this tick's cache attributes that PR to a
+# teammate mid-build, else nothing. Pure in-memory; never touches the network or the tracker.
+_team_presence_lookup() {
+  local _tp_pr="${1:-}" _tp_line _tp_num _tp_id _tp_who
+  [ -n "$_tp_pr" ] || return 0
+  [ -n "$_TEAM_PRESENCE_CACHE" ] || return 0
+  while IFS=$'\t' read -r _tp_num _tp_id _tp_who; do
+    [ "$_tp_num" = "$_tp_pr" ] || continue
+    [ -n "${_tp_id:-}" ] && [ -n "${_tp_who:-}" ] || continue
+    printf '%s\t%s' "$_tp_id" "$_tp_who"
+    return 0
+  done <<EOF
+$_TEAM_PRESENCE_CACHE
+EOF
+  return 0
+}
+
+# _team_presence_roster — the ACTIVE backend's rich open-item roster, one TSV line per open item:
+#   "#<id>\t<state-type>\t<state-name>\t<title>\t<desc>\t<assignee>\t<url>"
+# Sourced in a SUBSHELL (secrets + backend), exactly the _reconcile_via_ref / _inbox_scan discipline, so
+# the _backend_* helpers never leak into the watcher namespace. This is the SAME op `herd backlog --rich`
+# reads — the one existing seam that already returns state AND assignee for every open item in ONE call,
+# which is why the whole scan costs one tracker round-trip regardless of how many PRs are ungated.
+# OPTIONAL by contract: a backend that does not define it (file, github, changelog) prints nothing, and
+# so does an unreachable/unauthenticated one — both land on the same fail-soft "today's rows" path.
+_team_presence_roster() {
+  local _tp_bdir _tp_bfile
+  _tp_bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+  _tp_bfile="$_tp_bdir/${SCRIBE_BACKEND:-file}.sh"
+  [ -f "$_tp_bfile" ] || return 0
+  (
+    _tp_secrets="$MAIN/.herd/secrets"
+    # shellcheck source=/dev/null
+    [ -f "$_tp_secrets" ] && . "$_tp_secrets"
+    # shellcheck source=/dev/null
+    . "$_tp_bfile" 2>/dev/null || exit 0
+    command -v _backend_list_open_rich >/dev/null 2>&1 || exit 0
+    cd "$MAIN" 2>/dev/null || exit 0
+    _backend_list_open_rich 2>/dev/null || true
+  )
+}
+
+# _team_presence_resolve <ungated-ledger-text> <bodies-json> <roster-tsv> → the attribution rows
+# ("<pr>\t<item-id>\t<assignee>"), one per ungated PR that resolves to an IN-PROGRESS, ASSIGNED item.
+# PURE: no network, no file, no clock — everything it needs is in its three arguments, which is what
+# makes the join directly testable without a tracker or a gh.
+#
+# Resolution order per PR, first hit wins:
+#   1. the PR body's `Refs: <id>` line, via the SHARED parser (HERD_PR_REF_PY, HERD-522) — the same
+#      decoration-tolerant rules the merge-time reconcile uses, so a heading/bold/list-item ref resolves
+#      here exactly as it does there.
+#   2. a TOKEN-EXACT branch-name match: an id from the roster that appears in the branch delimited by
+#      non-alphanumerics (`feat/herd-527-teammate` → HERD-527). Deliberately token-exact and
+#      case-insensitive rather than substring: `HERD-5` must never claim `feat/herd-52-x`. This covers a
+#      teammate's PR that predates the Refs convention, or one opened by hand.
+# A ref that resolves to no OPEN roster row (done/canceled, another team, a typo) attributes nothing.
+#
+# IN PROGRESS is read from the roster's state TYPE — the machine key, never the human label, so a team
+# that renamed "In Progress" to "Cooking" still reads correctly: `started` (Linear) / `indeterminate`
+# (Jira). An item that is in progress but UNASSIGNED attributes nothing either: "someone is building
+# this" without a name is not the sentence this feature exists to print.
+_team_presence_resolve() {
+  UNGATED="${1:-}" BODIES="${2:-[]}" ROSTER="${3:-}" python3 -c '
+import os, sys, json
+'"$HERD_PR_REF_PY"'
+import re
+IN_PROGRESS = ("started", "indeterminate")   # Linear state type · Jira statusCategory key
+def _norm(s):
+    """UPPERCASE, every run of non-alphanumerics collapsed to a single "-", edges stripped."""
+    return re.sub(r"^-+|-+$", "", re.sub(r"[^0-9A-Za-z]+", "-", (s or "").upper()))
+# roster: id (upper) -> assignee, for OPEN items that are in-progress AND assigned
+roster = {}
+for line in (os.environ.get("ROSTER") or "").splitlines():
+    f = line.split("\t")
+    if len(f) < 6:
+        continue
+    ident = f[0].lstrip("#").strip()
+    if not ident or f[1].strip().lower() not in IN_PROGRESS:
+        continue
+    assignee = " ".join(f[5].split())
+    if not assignee:
+        continue
+    roster[ident.upper()] = (ident, assignee)
+if not roster:
+    sys.exit(0)
+try:
+    bodies = json.loads(os.environ.get("BODIES") or "[]")
+    if not isinstance(bodies, list):
+        raise ValueError
+except Exception:
+    bodies = []          # unreadable body roster → the branch-name path alone (fail-soft, never a crash)
+body_by_pr = {}
+for pr in bodies:
+    if isinstance(pr, dict) and pr.get("number") is not None:
+        body_by_pr[str(pr.get("number"))] = pr.get("body") or ""
+for line in (os.environ.get("UNGATED") or "").splitlines():
+    f = line.split("\t")
+    if len(f) < 2:
+        continue
+    num = f[1].strip()
+    if not num:
+        continue
+    branch = f[3] if len(f) > 3 else ""
+    hit = roster.get((pr_ref_from_body(body_by_pr.get(num, "")) or "").upper())
+    if hit is None and branch:
+        # Normalize BOTH sides to "-"-joined alphanumeric tokens, then require the id to sit on token
+        # boundaries: `feat/herd-527-teammate` -> FEAT-HERD-527-TEAMMATE contains HERD-527, while
+        # `feat/herd-52-x` -> FEAT-HERD-52-X does NOT (the boundary after 52 kills the prefix match).
+        slug = _norm(branch)
+        for key, cand in roster.items():
+            nkey = _norm(key)
+            if nkey and re.search(r"(?:^|-)" + re.escape(nkey) + r"(?:-|$)", slug):
+                hit = cand
+                break
+    if hit is None:
+        continue
+    print("%s\t%s\t%s" % (num, hit[0], hit[1]))
+' 2>/dev/null || true
+}
+
+# _team_presence_scan — the throttled leg: REWRITE $TEAM_PRESENCE_LEDGER from live tracker state.
+# Self-gates on TEAM_PRESENCE; off (default) never runs, never creates the ledger.
+#
+# FAIL-SOFT CONTRACT, one rule, so the console can never lie: the ledger is ONLY ever the product of a
+# COMPLETE successful resolution. Any incomplete step — a `gh` error/timeout, no python3, a backend that
+# cannot be sourced, a tracker that is down or exposes no rich roster op, a roster with nobody
+# in-progress-and-assigned — leaves the ledger EMPTY, and every ungated PR renders exactly TODAY's row.
+# The one exception is a failed `gh` BODIES fetch, which returns early WITHOUT touching the ledger:
+# that mirrors _ungated_prs_scan's PRS_LOOKUP_OK discipline (a transient network blip is not evidence,
+# and the branch-name path would otherwise silently become the only resolver for a tick). Stale
+# attribution never accumulates: the ledger is rewritten whole on every scan.
+_team_presence_scan() {
+  _team_presence_enabled || return 0
+  # Nothing ungated → nothing to attribute. Cheapest possible exit: no gh, no tracker call.
+  if [ ! -s "$UNGATED_PR_LEDGER" ]; then
+    : > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true
+    return 0
+  fi
+  local _tp_ungated _tp_bodies _tp_rc=0 _tp_roster _tp_rows
+  _tp_ungated="$(cat "$UNGATED_PR_LEDGER" 2>/dev/null || true)"
+  [ -n "$_tp_ungated" ] || { : > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true; return 0; }
+  # PR BODIES — the tick's own roster (PRS_JSON) deliberately does NOT carry `body`: adding it would
+  # inflate every tick's fetch (and the env it is threaded through) for every operator, on or off. One
+  # extra list call on the ~60 s scan cadence keeps the hot path untouched.
+  _tp_bodies="$(_gh_timeout team_presence_bodies pr list --json number,body 2>/dev/null)" || _tp_rc=$?
+  [ "$_tp_rc" -eq 0 ] || return 0       # transient fetch failure → keep last known, retry next scan
+  _tp_roster="$(_team_presence_roster)"
+  _tp_rows="$(_team_presence_resolve "$_tp_ungated" "${_tp_bodies:-[]}" "$_tp_roster")"
+  if [ -n "$_tp_rows" ]; then
+    printf '%s\n' "$_tp_rows" > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true
+  else
+    : > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -15553,6 +15787,19 @@ EOF
   # (zero extra gh). Renders whenever an open PR carries no builder/worktree record and the adopt leg
   # has not (yet, or ever will) picked it up — see _ungated_prs_scan's header comment.
   _ungated_prs_scan "$PRS_JSON" "$_orphan_claimed"
+
+  # HERD-527 (GH #639 phase 1) teammate presence — throttled to the ~60 s scan cadence (two network
+  # reads: PR bodies + the backend's rich roster), exactly like adopt_scan above. It runs BETWEEN the
+  # scan and the render because it reads the ledger the scan just rewrote and writes the attribution
+  # cache build_ungated_prs reads. Self-gates on TEAM_PRESENCE; off (default) is byte-inert — no gh, no
+  # backend call, no ledger, and _ungated_pr_row's attribution branch is unreachable.
+  if _team_presence_enabled; then
+    _TEAM_PRESENCE_SCAN_TICK=$((_TEAM_PRESENCE_SCAN_TICK + 1))
+    if [ "$_TEAM_PRESENCE_SCAN_TICK" -ge "$_TEAM_PRESENCE_SCAN_INTERVAL" ]; then
+      _TEAM_PRESENCE_SCAN_TICK=0
+      _team_presence_scan
+    fi
+  fi
   build_ungated_prs
 
   # HERD-369 adopt remote PRs — throttled to the ~60 s scan cadence (network + git mutation, unlike
@@ -16118,6 +16365,10 @@ _FINISH_STALL_SCAN_INTERVAL=15   # HERD-402: finish_stall_scan journal summary e
                                   # emission is throttled, the leg's own detection/action still runs
                                   # every tick (see the FEATS loop's _reconcile_finish_stall call)
 _FINISH_STALL_SCAN_TICK=$_FINISH_STALL_SCAN_INTERVAL  # primed so the FIRST enabled tick emits, then every interval
+_TEAM_PRESENCE_SCAN_INTERVAL=15  # HERD-527: teammate-presence resolve every ~60 s (15 × 4 s sleep) —
+                                  # the two tracker/gh reads never ride the 4 s repaint; the repaint
+                                  # renders from the ledger those reads leave behind
+_TEAM_PRESENCE_SCAN_TICK=$_TEAM_PRESENCE_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
 
 # ENGINE WATCHDOG state (HERD-306) — the resident supervisor's fault memory across ticks. There is no
 # bash action-pass fallback anymore: _engine_tick_watchdog runs the sole (Python) engine core, RETRIES

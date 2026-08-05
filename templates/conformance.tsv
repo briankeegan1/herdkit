@@ -370,6 +370,7 @@ WATCHER_SELF_RESTART	sim	tests/test-sandbox-self-restart.sh
 OPERATOR_INBOX	unit	tests/test-operator-inbox.sh
 ORPHAN_PR_ROWS	unit	tests/test-orphan-pr-rows.sh
 ADOPT_REMOTE_PRS	unit	tests/test-adopt-remote-prs.sh
+TEAM_PRESENCE	unit	tests/test-team-presence.sh
 BUDGET_DAILY	unit	tests/test-budget-governance.sh
 MODEL_ESCALATE_GLOB	unit	tests/test-model-escalate.sh
 MODEL_ESCALATE	unit	tests/test-model-escalate.sh
