@@ -470,6 +470,20 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # Ships OFF (byte-inert). Pair with OPERATOR_INBOX=on to render audit rows in the console.
 # JOURNAL_AUDIT="off"      # off (default) | on
 
+# Journal-audit findings become ACTIONS — the universal never-stuck invariant (HERD-544). Requires
+# JOURNAL_AUDIT=on (it acts on that auditor's findings). Detection alone leaves the engine stuck in
+# the seam between rails: every stall class that DOES auto-resolve has an owner (refix, stale-base,
+# wedge, dead-builder, limit-park, resurrect), but a journal-audit finding had none — it rendered and
+# waited for a human. When on, each class maps to ONE bounded action: a *_dispatched with no terminal
+# frees the gate slot it still holds so the next tick re-dispatches; a refix_bounce with no wake is
+# re-delivered ONCE to the builder's pane (a wake that lands closes the finding itself); a MAIN RED
+# past TTL arms the main-health re-verify; a merge with no reap runs the retirement invariant now;
+# and ANY class with no mapped action auto-files ONE dedup-keyed tracker item so the gap becomes work.
+# At most once per finding key across every seat; a finding still standing afterwards escalates loudly
+# exactly once, then is silent — no action can loop. Bounded (≤3 actions per sweep, each timed out) and
+# fail-soft. NEVER a merge gate. Ships OFF (byte-inert — findings stay advisory). Adopted by `yolo`.
+# JOURNAL_AUDIT_ACT="off"  # off (default) | on
+
 # Supervised-process contract (HERD-193). When on, every population herdkit spawns records four
 # properties at spawn — OWNER (which component spawned it), DEADLINE (reused from that population's
 # existing timeout: REVIEW_INFLIGHT_TIMEOUT / HEALTH_INFLIGHT_TIMEOUT / DRAINER_HEARTBEAT_TIMEOUT),

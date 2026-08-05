@@ -38,11 +38,23 @@
 #       `approval_recorded` event (i.e. history older than this check) has no evidence anywhere and is
 #       reported unproven — which is precisely what the retroactive sweep exists to surface.
 #
+# FINDINGS BECOME ACTIONS (HERD-544, JOURNAL_AUDIT_ACT — off by default):
+#   Detection alone leaves the engine stuck in the seam between rails: every stall class that DOES
+#   auto-resolve has an owner (refix, stale-base, wedge, dead-builder, limit-park, resurrect), but a
+#   finding here has none — it renders and waits for a human. With JOURNAL_AUDIT_ACT=on each class is
+#   mapped to ONE bounded action (see the ACT section at the bottom of this file and the rails in
+#   scripts/herd/journal-act.sh), and any class with NO mapped action auto-files ONE dedup-keyed
+#   tracker item, so a gap becomes WORK instead of another report. Each action fires at most ONCE per
+#   finding key across every seat (shared-pool once-guard); a finding still standing afterwards
+#   escalates loudly, exactly once. Every action is journaled `audit_acted class=… result=…`.
+#
 # BINDING CONSTRAINTS:
-#   • ADVISORY ONLY — never gates a merge, never mutates git/PRs/tracker/BACKLOG, never auto-heals.
-#     Findings are journaled as `journal_audit` events (component=audit) and appended as operator-inbox
-#     ledger rows so a human can see them. Nothing is fixed.
+#   • ADVISORY BY DEFAULT — with JOURNAL_AUDIT_ACT off (the default) this auditor never gates a merge,
+#     never mutates git/PRs/tracker/BACKLOG and never auto-heals. Findings are journaled as
+#     `journal_audit` events (component=audit) and appended as operator-inbox ledger rows so a human
+#     can see them; nothing is fixed. Turning the ACT lever on adds heals — never a merge gate.
 #   • SHIP-DORMANT — JOURNAL_AUDIT=off (default) is byte-inert: no journal read, no write, no inbox.
+#     JOURNAL_AUDIT_ACT=off (default) is byte-inert on top of that: findings report exactly as before.
 #   • FAIL-SOFT — missing/empty/short journal, no python3, unreadable path: silent exit 0.
 #   • BOUNDED WINDOW — only the last JOURNAL_AUDIT_WINDOW_SECS of events are considered (default 24h).
 #   • IDEMPOTENT — a seen-ledger keys each finding so re-runs do not re-flood the inbox/journal.
@@ -70,6 +82,13 @@
 #                                 a MEANINGFUL exit status (non-zero ⇒ unreadable). Defaults to
 #                                 `gh pr view <pr#> --json body -q .body`. With no override and no gh,
 #                                 check (g) skips silently — a missing optional tool is never a finding.
+#   JOURNAL_AUDIT_ACT             on|off (default off). off → findings stay advisory, byte-identically.
+#   HERD_JOURNAL_AUDIT_ACT_CMD    the ACTION-RAIL seam, invoked as `<cmd> <class> <key> <k=v…>` and
+#                                 printing ONE result token on stdout. Defaults to
+#                                 `bash journal-act.sh` (the live rails). Tests pin a stub here so no
+#                                 action ever reaches a real control room.
+#   HERD_JOURNAL_AUDIT_SCRIBE_CMD the TRACKER-FILING seam for an unmapped/escalated finding, invoked
+#                                 as `<cmd> "<request>"`. Defaults to `bash scribe.sh`.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
@@ -128,11 +147,16 @@ FIXTURE_SLUGS="${HERD_JOURNAL_AUDIT_FIXTURE_SLUGS:-retiree conv stuck hd}"
 AGING_PR_TTL_SECS="$(_aging_pr_ttl_secs)"
 
 # ── replay: pure python scanner → one finding line per violation ─────────────
-# Each stdout line:  kind\tkey\tsummary
+# Each stdout line:  kind\tkey\tsummary\tctx
 # kind ∈ merge_without_reap | dispatch_no_outcome | refix_bounce_no_wake |
 #        red_state_stale | pushed_no_unresolved | main_detached | fixture_slug | watcher_restart_blocked |
 #        checkout_unclean | gates_passed_no_merge
-# key is a stable dedup token; summary is a short human phrase for the inbox row.
+# key is a stable dedup token; summary is a short human phrase for the inbox row; ctx is the finding's
+# ACTION CONTEXT (HERD-544) — a space-separated `k=v` list (pr=, sha=, slug=, round=) taken from the
+# very event that violated the invariant, so the action pass can drive the matching rail without
+# re-deriving anything. ctx is a FOURTH field, never folded into the summary: the journal_audit event
+# and the inbox row read from fields 1-3 exactly as before, so a run with JOURNAL_AUDIT_ACT off is
+# byte-identical to the pre-HERD-544 auditor.
 # shellcheck disable=SC2016
 FINDINGS="$(
   JOURNAL_FILE="$_jf" \
@@ -217,7 +241,16 @@ except OSError:
 # Sort chronologically (window may span rotations only if live file is contiguous — fine).
 events.sort(key=lambda o: o["_ts"])
 
-findings = []  # (kind, key, summary)
+findings = []  # (kind, key, summary, ctx)
+
+def ctx(**kw):
+    """ACTION CONTEXT (HERD-544): this finding's own facts as a space-separated `k=v` list, taken
+    from the violating event itself. Empty/None fields are DROPPED rather than emitted as `k=`, so a
+    rail can test `[ -n "$slug" ]` and mean it. Values are whitespace-flattened: ctx is the fourth
+    TAB-separated field and is word-split into argv by the action pass, so an embedded space or tab
+    would silently become an extra argument."""
+    return " ".join("%s=%s" % (k, " ".join(str(v).split()))
+                    for k, v in kw.items() if v not in (None, ""))
 
 # ── (a) merge without reap ──────────────────────────────────────────────────
 # For each merge, require a later reap with same pr (preferred) or same slug.
@@ -242,7 +275,7 @@ for m in merges:
     if not ok:
         key = "merge_without_reap|pr=%s|slug=%s" % (pr if pr is not None else "", slug)
         summary = "merge without reap · pr=%s slug=%s" % (pr if pr is not None else "?", slug or "?")
-        findings.append(("merge_without_reap", key, summary))
+        findings.append(("merge_without_reap", key, summary, ctx(pr=pr, sha=m.get("sha"), slug=slug)))
 
 # ── (b) *_dispatched with no terminal past family TTL ───────────────────────
 # Terminal map: review_dispatched → verdict_recorded (same pr + sha when present).
@@ -288,7 +321,7 @@ for d in dispatches:
     if not ok:
         key = "dispatch_no_outcome|%s|pr=%s|sha=%s" % (ev, pr if pr is not None else "", sha)
         summary = "%s with no terminal · pr=%s sha=%s" % (ev, pr if pr is not None else "?", (sha[:8] if sha else "?"))
-        findings.append(("dispatch_no_outcome", key, summary))
+        findings.append(("dispatch_no_outcome", key, summary, ctx(pr=pr, sha=sha, slug=d.get("slug"), event=ev)))
 
 # ── (c) refix_bounce without refix_wake_result ──────────────────────────────
 bounces = [e for e in events if e.get("event") == "refix_bounce"]
@@ -316,7 +349,7 @@ for b in bounces:
             pr if pr is not None else "", sha, round_ if round_ is not None else "")
         summary = "refix_bounce with no wake_result · pr=%s round=%s" % (
             pr if pr is not None else "?", round_ if round_ is not None else "?")
-        findings.append(("refix_bounce_no_wake", key, summary))
+        findings.append(("refix_bounce_no_wake", key, summary, ctx(pr=pr, sha=sha, slug=b.get("slug"), round=round_)))
 
 # ── (d) red state older than TTL ────────────────────────────────────────────
 # main_health result=red without a later main_health result=green (any sha clears).
@@ -332,7 +365,7 @@ for r in reds:
         key = "red_state_stale|sha=%s|ts=%s" % (sha, r["_ts"].strftime("%Y%m%dT%H%M%SZ"))
         summary = "MAIN RED older than TTL · sha=%s failed=%s" % (
             (sha[:8] if sha else "?"), str(r.get("failed") or r.get("detail") or "")[:60])
-        findings.append(("red_state_stale", key, summary))
+        findings.append(("red_state_stale", key, summary, ctx(pr=r.get("pr"), sha=sha)))
 
 # ── (k) gates passed but no merge older than TTL (HERD-334) ──────────────────
 # A `gate_status` (state=success, context=herd/gates) event is the engine's marker for "all gates
@@ -366,7 +399,7 @@ if aging_pr_ttl > 0:
         key = "gates_passed_no_merge|pr=%s|sha=%s" % (pr if pr is not None else "", sha)
         summary = "engine-approved but unmerged past TTL · pr=%s sha=%s — blocked on a required check?" % (
             pr if pr is not None else "?", (sha[:8] if sha else "?"))
-        findings.append(("gates_passed_no_merge", key, summary))
+        findings.append(("gates_passed_no_merge", key, summary, ctx(pr=pr, sha=sha, slug=b.get("slug"))))
 
 # ── (e) pushed=no never followed by pushed=yes ──────────────────────────────
 # Match codemap_refresh / symbol_index_refresh (and any event carrying pushed=no).
@@ -388,7 +421,7 @@ for p in pushed_no:
     if not ok:
         key = "pushed_no_unresolved|event=%s|ts=%s" % (ev, p["_ts"].strftime("%Y%m%dT%H%M%SZ"))
         summary = "pushed=no never followed by pushed=yes · %s" % (ev or "event")
-        findings.append(("pushed_no_unresolved", key, summary))
+        findings.append(("pushed_no_unresolved", key, summary, ctx(event=ev)))
 
 # ── (i) detached shared checkout (HERD-336) ─────────────────────────────────
 # main_detached result=detected not cleared by a later result=reattached (same head, or an empty head
@@ -406,7 +439,7 @@ for d in det:
         key = "main_detached|sha=%s|ts=%s" % (head, d["_ts"].strftime("%Y%m%dT%H%M%SZ"))
         summary = "shared checkout DETACHED (never reattached) · head=%s branch=%s" % (
             (head[:8] if head else "?"), str(d.get("branch") or "?"))
-        findings.append(("main_detached", key, summary))
+        findings.append(("main_detached", key, summary, ctx(sha=head)))
 
 # ── (f) known-fixture slugs ─────────────────────────────────────────────────
 seen_fixture = set()
@@ -419,7 +452,7 @@ for e in events:
         seen_fixture.add(slug)
         key = "fixture_slug|%s" % slug
         summary = "known-fixture slug in journal · slug=%s event=%s" % (slug, e.get("event") or "?")
-        findings.append(("fixture_slug", key, summary))
+        findings.append(("fixture_slug", key, summary, ctx(slug=slug)))
 
 # ── (h) watcher_restart_blocked events (HERD-342) ──────────────────────────
 # A blocked restart is a direct signal that an orphaned lock holder is preventing engine recovery.
@@ -434,7 +467,7 @@ for e in events:
         holder,
         (" workspace=%s" % workspace) if workspace else "",
     )
-    findings.append(("watcher_restart_blocked", key, summary))
+    findings.append(("watcher_restart_blocked", key, summary, ctx(holder_pid=holder, workspace=workspace)))
 
 # ── (j) unclean shared checkout (HERD-361) ──────────────────────────────────
 # reconcile_checkout_cleanliness journals `checkout_unclean result=detected/violation` when the shared
@@ -453,13 +486,13 @@ for e in events:
     key = "checkout_unclean|sha=%s|files=%s" % (head, paths)
     summary = "shared checkout UNCLEAN (evidence preserved) · head=%s detached=%s paths=%s" % (
         (head[:8] if head else "?"), detached, (paths[:80] if paths else "?"))
-    findings.append(("checkout_unclean", key, summary))
+    findings.append(("checkout_unclean", key, summary, ctx(sha=head)))
 
-for kind, key, summary in findings:
+for kind, key, summary, fctx in findings:
     # TAB-separated; summary flattened (no tabs/newlines).
     summary = " ".join(summary.split())
     key = " ".join(key.split())
-    print("%s\t%s\t%s" % (kind, key, summary))
+    print("%s\t%s\t%s\t%s" % (kind, key, summary, fctx))
 PY
 )" || FINDINGS=""
 
@@ -682,9 +715,197 @@ _inbox_append() {
   fi
 }
 
+# ── ACT: findings become ACTIONS (HERD-544) ──────────────────────────────────
+# THE UNIVERSAL NEVER-STUCK INVARIANT. Everything above this line only REPORTS. Behind
+# JOURNAL_AUDIT_ACT (off by default, ship-dormant) each finding class is instead mapped to ONE
+# bounded action, so a stall that no other rail owns is owned HERE:
+#   dispatch_no_outcome  → free the held gate slot (HERD-185 hygiene); the next tick re-dispatches
+#   refix_bounce_no_wake → re-deliver the bounce ONCE; a wake that lands closes the finding itself
+#   red_state_stale      → arm the main-health re-verify rail for the current $MAIN HEAD
+#   merge_without_reap   → run the retirement invariant (HERD-164) now
+#   ANY OTHER CLASS      → no mapped action, so the GAP becomes WORK: file one dedup-keyed tracker
+#                          item via the scribe. A class nothing can heal must never be a class
+#                          nothing knows about.
+# The rails themselves live in journal-act.sh (which composes agent-watch.sh's LIB mode); this file
+# owns only WHEN to act, HOW OFTEN, and what to do when acting did not help.
+#
+# ONCE PER FINDING KEY, ACROSS SEATS. Findings derive from the SHARED journal, so two seats replaying
+# the same window see the same key and would both act. Each action is claimed through the shared-pool
+# once-guard (pysrc/herd/store.py `--once`, the primitive the finish-stall and draft-promote rails
+# already use), keyed `audit_act::<finding key>` — exactly one seat acts, ever. The action pass runs
+# BEFORE the seen-ledger check on purpose: the seen-ledger suppresses re-REPORTING a known finding,
+# but a finding that is still being FOUND is one the world has not fixed, and that is precisely when
+# the escalation below must fire.
+#
+# ACT ONCE, THEN ESCALATE. A finding still standing on a later sweep means the mapped action did not
+# clear it. That is not a reason to act again (the action is bounded by design and a loop is exactly
+# the failure mode this item exists to end) — it is a reason to be LOUD: a second guard,
+# `audit_escalate::<key>`, fires exactly one escalation (journal + a loud inbox row + a filed tracker
+# item) and then the key is silent forever. An UNMAPPED class burns both guards at once: its filing
+# IS the terminal outcome, so it can never escalate into a duplicate item.
+#
+# ALL FAIL-SOFT. Every leg — the once-guard, the rail, the scribe — degrades to a result token and a
+# journal line. The audit sweep NEVER fails because a heal could not be attempted.
+#
+# BOUNDED PER SWEEP. This auditor runs INSIDE the watcher's housekeeping tick, and a rail is a real
+# shellout (journal-act.sh stands up agent-watch.sh's library, then talks to git / gh / a driver pane).
+# A dirty journal can hold a dozen findings at once, so acting on all of them in one pass would turn a
+# housekeeping sweep into a minutes-long tick stall — the very "stuck" this item exists to end. Two
+# bounds prevent that: each rail is wrapped in `timeout`, and at most _JA_ACT_MAX actions fire per
+# sweep. Nothing is dropped: the once-guards are keyed by FINDING, not by sweep, so a finding not
+# reached this pass is simply acted on the next one. Deliberate inline constant, not a config key
+# (mirrors _MAIN_HEALTH_DIED_MAX); HERD_JOURNAL_AUDIT_ACT_MAX is a test seam, not an operator knob.
+_JA_ACT_MAX="$(_num_or "${HERD_JOURNAL_AUDIT_ACT_MAX:-}" 3)"
+_JA_ACT_SPENT=0
+
+# _ja_act_enabled — true iff JOURNAL_AUDIT_ACT opts in. Default OFF; any unrecognized value reads as
+# off (fail toward dormant — mirrors _ja_enabled above and every other ship-dormant lever).
+_ja_act_enabled() {
+  case "$(printf '%s' "${JOURNAL_AUDIT_ACT:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _ja_store_pysrc — pysrc/ for the shared-pool store shellout, or empty when it cannot be found
+# (mirrors agent-watch.sh's _main_health_fix_pysrc). Empty ⇒ every caller falls back, never crashes.
+_ja_store_pysrc() {
+  local _sp_home _sp_pyp
+  _sp_home="${HERDKIT_HOME:-$(cd "$HERE/../.." 2>/dev/null && pwd)}"
+  _sp_pyp="$_sp_home/pysrc"
+  [ -f "$_sp_pyp/herd/store.py" ] && printf '%s' "$_sp_pyp"
+}
+
+# _ja_act_once <guard-key> — true iff THIS call is the first, across every seat, to claim <guard-key>.
+# Primary: the shared-pool once-guard (atomic, cross-seat). FALLBACK, when the store is unavailable
+# (no pysrc, a store error): the auditor's own seen-ledger, which makes the guard seat-LOCAL but never
+# lets one seat act twice — the safe direction. NB the seen-ledger is tail-trimmed at 500 lines, so a
+# very long-lived dirty seat could in principle re-arm a fallback guard; that is a bounded second
+# attempt on a finding that has been standing for hundreds of distinct findings, never a loop.
+_ja_act_once() {
+  local _ao_key="$1" _ao_pyp="" _ao_rc=0
+  # `|| _ao_pyp=""`, NOT a bare assignment: this file runs under `set -e`, and _ja_store_pysrc exits
+  # non-zero when the store module is absent — the very case this fallback exists for. A bare
+  # assignment from a failing command substitution would abort the whole sweep instead of degrading.
+  _ao_pyp="$(_ja_store_pysrc)" || _ao_pyp=""
+  if [ -n "$_ao_pyp" ]; then
+    PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_ao_pyp" WORKTREES_DIR="${WORKTREES_DIR:-}" \
+      python3 -m herd.store --once "$_ao_key" >/dev/null 2>&1 || _ao_rc=$?
+    case "$_ao_rc" in
+      0) return 0 ;;   # we won it
+      3) return 1 ;;   # another seat / an earlier sweep already claimed it
+      *) : ;;          # store unusable → fall through to the seat-local ledger
+    esac
+  fi
+  _seen_has "$_ao_key" && return 1
+  _seen_mark "$_ao_key"
+  return 0
+}
+
+# _ja_act_mapped <kind> — true iff this finding class has a rail in journal-act.sh. Kept HERE, next to
+# the escalation policy, and asserted against journal-act.sh's own case arms by the unit test: a class
+# that gains a rail must gain it in both places or the test reds.
+_ja_act_mapped() {
+  case "$1" in
+    merge_without_reap|dispatch_no_outcome|refix_bounce_no_wake|red_state_stale) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _ja_act_rail <kind> <key> <ctx> — drive the mapped rail, print its one-word result token.
+# HERD_JOURNAL_AUDIT_ACT_CMD is the seam (invoked as `<cmd> <kind> <key> <ctx…>`); it defaults to the
+# live journal-act.sh. Bounded by `timeout` where coreutils has it — a rail that hangs (a wedged
+# driver RPC, a stalled `gh`) must never stall the watcher's housekeeping sweep. The token is scrubbed
+# to [a-z0-9_-] so a misbehaving seam can never inject fields into the journal line below.
+_ja_act_rail() {
+  local _ar_cmd _ar_out=""
+  _ar_cmd="${HERD_JOURNAL_AUDIT_ACT_CMD:-bash $HERE/journal-act.sh}"
+  # Word-split deliberately: both the seam and $3 (the `k=v` context) are command-LINE fragments.
+  # </dev/null: this runs inside the findings-reading loop, and a rail that read stdin would eat it.
+  # shellcheck disable=SC2086
+  if command -v timeout >/dev/null 2>&1; then
+    _ar_out="$(timeout 60 $_ar_cmd "$1" "$2" $3 2>/dev/null </dev/null)" || _ar_out=""
+  else
+    _ar_out="$($_ar_cmd "$1" "$2" $3 2>/dev/null </dev/null)" || _ar_out=""
+  fi
+  # FIRST line only, via parameter expansion rather than `| head -1`: the rail is a command whose
+  # output we do not control, and closing a pipe on it early is the EPIPE-under-pipefail shape.
+  _ar_out="${_ar_out%%$'\n'*}"
+  _ar_out="$(printf '%s' "$_ar_out" | tr -cd 'a-z0-9_-')"
+  [ -n "$_ar_out" ] || _ar_out="failed"
+  printf '%s' "$_ar_out"
+}
+
+# _ja_file_item <kind> <key> <summary> [escalated] — file ONE tracker item through the scribe so a gap
+# (or a heal that did not take) becomes WORK. The caller's once-guard is the dedup; the finding KEY is
+# carried in the body so a human — and a later sweep from a fresh pool — can still recognize the
+# duplicate. First line is a SHORT title (the tracker backend takes line 1 verbatim as the title, so a
+# long first line becomes an unreadable item).
+_ja_file_item() {
+  local _fi_kind="$1" _fi_key="$2" _fi_summary="$3" _fi_mode="${4:-unmapped}" _fi_cmd _fi_title _fi_body
+  _fi_cmd="${HERD_JOURNAL_AUDIT_SCRIBE_CMD:-bash $HERE/scribe.sh}"
+  if [ "$_fi_mode" = "escalated" ]; then
+    _fi_title="journal-audit: ${_fi_kind} did not clear after its auto-action"
+    _fi_body="The journal auditor (JOURNAL_AUDIT_ACT=on) ran the mapped action for this finding class and the finding was STILL found on a later sweep — the rail did not unstick it."
+  else
+    _fi_title="journal-audit: ${_fi_kind} has no mapped auto-action"
+    _fi_body="The journal auditor found this class but NO rail owns it, so nothing can heal it automatically. Map it to a bounded action in scripts/herd/journal-act.sh (and _ja_act_mapped in journal-audit.sh), or record why it must stay advisory."
+  fi
+  _fi_title="${_fi_title:0:78}"
+  # shellcheck disable=SC2086  # the seam is a command LINE, not a single argv[0]
+  $_fi_cmd "$(printf '%s\n\n%s\n\nFinding: %s\nDedup key: %s\nFiled by: scripts/herd/journal-audit.sh (HERD-544)' \
+    "$_fi_title" "$_fi_body" "$_fi_summary" "$_fi_key")" >/dev/null 2>&1 </dev/null
+}
+
+# _ja_act <kind> <key> <summary> <ctx> — the whole action policy for ONE finding. Hard no-op (and
+# byte-identical output) while JOURNAL_AUDIT_ACT is off.
+_ja_act() {
+  _ja_act_enabled || return 0
+  local _aa_kind="$1" _aa_key="$2" _aa_summary="$3" _aa_ctx="${4:-}" _aa_result=""
+  # Per-sweep budget spent → leave this finding for the next sweep. Checked BEFORE the once-guard so a
+  # skipped finding does not burn its at-most-once claim without acting on it.
+  [ "$_JA_ACT_SPENT" -lt "$_JA_ACT_MAX" ] 2>/dev/null || return 0
+  if _ja_act_once "audit_act::${_aa_key}"; then
+    _JA_ACT_SPENT=$((_JA_ACT_SPENT + 1))
+    if _ja_act_mapped "$_aa_kind"; then
+      _aa_result="$(_ja_act_rail "$_aa_kind" "$_aa_key" "$_aa_ctx")"
+    else
+      # No rail owns this class: filing IS the action, and it is TERMINAL — burn the escalation guard
+      # in the same breath so a class that keeps being found can never file a second item.
+      _ja_act_once "audit_escalate::${_aa_key}" >/dev/null 2>&1 || true
+      if _ja_file_item "$_aa_kind" "$_aa_key" "$_aa_summary"; then _aa_result="filed"; else _aa_result="file_failed"; fi
+    fi
+    journal_append audit_acted \
+      class "$_aa_kind" \
+      key "$_aa_key" \
+      result "$_aa_result" \
+      component audit
+    _inbox_append "audit-act:${_aa_kind}" "auto-action ${_aa_result} · ${_aa_summary}"
+    return 0
+  fi
+  # Acted already, and the finding is STILL standing → escalate LOUDLY, exactly once.
+  _ja_act_once "audit_escalate::${_aa_key}" || return 0
+  _JA_ACT_SPENT=$((_JA_ACT_SPENT + 1))
+  if _ja_file_item "$_aa_kind" "$_aa_key" "$_aa_summary" escalated; then
+    _aa_result="escalated"
+  else
+    _aa_result="escalate_file_failed"
+  fi
+  journal_append audit_acted \
+    class "$_aa_kind" \
+    key "$_aa_key" \
+    result "$_aa_result" \
+    component audit
+  _inbox_append "audit-escalated:${_aa_kind}" "ESCALATED — auto-action did not clear it · ${_aa_summary}"
+  return 0
+}
+
 n_new=0
-while IFS=$'\t' read -r kind key summary; do
+while IFS=$'\t' read -r kind key summary ctx; do
   [ -n "$kind" ] || continue
+  # ACT FIRST, on EVERY finding — new or already-reported. A finding the seen-ledger has muted is
+  # still a live stall; muting the report must never mute the heal.
+  _ja_act "$kind" "$key" "$summary" "${ctx:-}"
   _seen_has "$key" && continue
   _seen_mark "$key"
   # One journal_audit event per finding — component=audit so herd log filters cleanly.
