@@ -47,3 +47,4 @@ INFRA_BREAKER_COOLDOWN	gate	how long the infra circuit breaker opened by INFRA_B
 herd-review.sh	gate	the adversarial pre-merge review dispatcher — THE review gate
 STALE_BASE_AUTOFIX	autofix	auto-heals a STALE-BASE hold with a git-merge re-task bounce
 REVIEW_AUTOFIX	autofix	auto-bounces a BLOCK review verdict to the builder agent
+CAPACITY_BUDGET	gate	orders WHEN a watcher-dispatched vs builder-local heavy suite is admitted to run — a dispatch-timing decision on the same critical path as GATE_DISPATCH (HERD-557)

@@ -14892,6 +14892,15 @@ _health_sibling_suites_live() {
     case "$_hsl_pid" in ''|*[!0-9]*) continue ;; esac
     kill -0 "$_hsl_pid" 2>/dev/null && _hsl_n=$((_hsl_n + 1))
   done
+  # HERD-557: CAPACITY_BUDGET=on suites live under a DISTINCT marker family (`.capacity-suite-live-*`,
+  # scripts/herd/capacity-ledger.sh) instead of the legacy `.local-suite-slot-*` one above — union both
+  # so this load heuristic stays accurate regardless of which path a given box's suites are running.
+  for _hsl_f in "$TREES"/.capacity-suite-live-*; do
+    [ -e "$_hsl_f" ] || continue
+    _hsl_pid="$(sed -n '1p' "$_hsl_f" 2>/dev/null)"
+    case "$_hsl_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$_hsl_pid" 2>/dev/null && _hsl_n=$((_hsl_n + 1))
+  done
   printf '%s' "$_hsl_n"
 }
 
@@ -15023,13 +15032,21 @@ _health_worker() {
     # before this change (a full, unfiltered re-run).
     _hw_filter="$(_health_bats_retry_filter "$_hw_log")"
     : > "$_hw_log.retry" 2>/dev/null || true
+    # HERD-557: this solo re-run is the RETRY-SOLO tenant of the capacity ledger — a DRAIN BARRIER
+    # (waits for every other live suite to finish, then holds the whole ledger alone) rather than
+    # merely a higher priority, so a reproduced failure is never muddied by contention with a sibling
+    # suite. HERD_HEALTH_RETRY_KIND=flaky-solo is a no-op byte-identical to before whenever
+    # CAPACITY_BUDGET=off (the ship default) or the ledger is unavailable — healthcheck.sh only reads
+    # this var on the CAPACITY_BUDGET=on path.
     if [ -n "$_hw_filter" ]; then
       HEALTHCHECK_PROGRESS_LOG="$_hw_log.retry" HEALTHCHECK_BATS_FILTER="$_hw_filter" \
         HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" HERD_HEALTH_PROVENANCE=watcher \
+        HERD_HEALTH_RETRY_KIND=flaky-solo \
         bash "$HERD_HEALTHCHECK_BIN" "${_hw_args[@]}" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
     else
       HEALTHCHECK_PROGRESS_LOG="$_hw_log.retry" HEALTHCHECK_BATS_FILTER= \
         HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" HERD_HEALTH_PROVENANCE=watcher \
+        HERD_HEALTH_RETRY_KIND=flaky-solo \
         bash "$HERD_HEALTHCHECK_BIN" "${_hw_args[@]}" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
     fi
     if [ "$_hw_rc2" -eq 0 ]; then
