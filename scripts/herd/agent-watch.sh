@@ -119,6 +119,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # marker this file writes (watcher_handoff_begin/_clear). Defines functions + one constant; idempotent.
 # shellcheck source=/dev/null
 . "$HERE/watcher-exempt.sh"
+# SHARED `Refs:` PARSER (HERD-522) — THE one implementation of "given a PR body, print its explicit
+# tracker ref", plus the silent-miss probe the reconcile alarms on. Sourced BEFORE stale-dup-gate.sh
+# and work-units/git-pr.sh because both call into it; defines two functions + one python snippet
+# (HERD_PR_REF_PY, which sweep.sh prepends to its own driver), and sourcing it twice is a no-op.
+# shellcheck source=/dev/null
+. "$HERE/pr-ref.sh"
 # STALE-DUPLICATE gate (HERD-188) — the pre-merge check that HOLDS a PR re-implementing already-shipped
 # work (duplicate item ref) or sitting on a stale base. Sourcing DEFINES functions only (no CLI); the
 # gate is default-on but provable-only + fail-soft, so it never false-holds. Disabled by STALE_DUP_DETECT=off.
@@ -467,6 +473,12 @@ CI_CHECKS_STATE="$TREES/.agent-watch-ci-checks"
 # the console, never a silent correction.
 TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
 TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
+# UNPARSEABLE-REF alarm surface (HERD-522, GH #637). One "<epoch>\t<pr>\t<line>" row per merged PR
+# whose body MENTIONED `refs:` yet yielded no parseable tracker id — the shape that used to reconcile
+# silently to nothing (emberglen-godot PR #125's `## Refs: EMG-111` heading: item left open, no
+# warning anywhere). Written once per PR by _reconcile_ref_unparsed_alarm at merge-time reconcile and
+# rendered by build_ref_unparsed. Empty on every healthy repo, so the console is byte-identical.
+REF_UNPARSED_FILE="$TREES/.agent-watch-ref-unparsed"
 # Post-merge reconcile ledger (HERD-232). The post-merge hook chain used to be merge-EVENT-driven: only
 # the seat whose own do_merge landed a PR ever ran it. _sweep_merged_prs re-derives those obligations
 # from the world (recently-MERGED PRs) instead, so a foreign-seat merge, a gh-UI merge, or a watcher
@@ -711,6 +723,7 @@ LANDED=""
 BLOCKED=""
 RECONCILE_PENDING=""    # HERD-438: "reconcile pending" section rows (empty when nothing is mid-flight)
 TRACKER_DRIFT=""
+REF_UNPARSED_ROWS=""    # HERD-522: the "unlinked merges" section rows (empty when every merged PR's Refs: parsed)
 SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
@@ -914,6 +927,54 @@ build_tracker_drift() {
   local rows
   rows="$(herd_console_section_tracker "$TRACKER_HEAL_FILE" 3 _tracker_heal_row)"
   [ -n "$rows" ] && TRACKER_DRIFT="${rows}"$'\n'
+  return 0
+}
+
+# ── Unlinked merges (HERD-522, GH #637) ───────────────────────────────────────────────────────────
+# The console half of the silent-miss alarm. _reconcile_ref_unparsed_alarm (work-units/git-pr.sh)
+# writes one ledger row per merged PR whose body MENTIONED `refs:` yet parsed to no tracker id; these
+# two functions render it. Nothing here scans or writes — a pure renderer, like build_tracker_drift.
+
+# _ref_unparsed_classify <line>  ("<epoch>\t<pr>\t<line>")
+#   Prints "<epoch>\tloud". Always LOUD, so the row NEVER ages out of the display: the merge already
+#   landed and the tracker item is already sitting open, so time passing makes it worse, not stale.
+#   The one thing that clears it is an operator relinking the item — there is no automatic cure, which
+#   is exactly the fact this alarm exists to state out loud. Bounded by construction: one row per PR
+#   (the alarm dedupes on the ledger) and the ledger is tail-kept at CONSOLE_LEDGER_MAX on write.
+_ref_unparsed_classify() {
+  local _ru_epoch
+  IFS=$'\t' read -r _ru_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tloud' "${_ru_epoch:-}"
+}
+
+# _ref_unparsed_row <line>  ("<epoch>\t<pr>\t<line>") → one loud console row quoting the offending
+#   line, so the operator can see WHY it did not parse without opening the PR. Fail-soft: a row with
+#   no PR number renders nothing.
+_ref_unparsed_row() {
+  local _ru_epoch _ru_pr _ru_line hhmm
+  IFS=$'\t' read -r _ru_epoch _ru_pr _ru_line <<EOF
+$1
+EOF
+  [ -n "${_ru_pr:-}" ] || return 0
+  hhmm="$(epoch_to_hhmm "${_ru_epoch:-0}")"
+  printf '    %s🔗%s %s#%s%s %sunlinked%s %s"%s" parsed to no ref · %s%s' \
+    "$C_RED" "$C_RESET" "$C_BOLD" "$_ru_pr" "$C_RESET" \
+    "$C_RED" "$C_RESET" "$C_DIM" "${_ru_line:-}" "$hhmm" "$C_RESET"
+}
+
+# build_ref_unparsed — the "unlinked merges" section: the newest 3 alarm rows, newest first. Empty
+# (REF_UNPARSED_ROWS="") whenever the ledger is absent or empty — which is every repo where every
+# merged PR's `Refs:` line parsed — so render() omits the section entirely and the console is
+# byte-identical to before HERD-522. Carries NO config gate, deliberately: a merge that silently
+# failed to link its tracker item is a correctness fact, not a preference (same posture as the
+# HERD-460 "ungated PRs" section).
+build_ref_unparsed() {
+  REF_UNPARSED_ROWS=""
+  local rows
+  rows="$(herd_console_section "$REF_UNPARSED_FILE" 3 _ref_unparsed_classify _ref_unparsed_row)"
+  [ -n "$rows" ] && REF_UNPARSED_ROWS="${rows}"$'\n'
   return 0
 }
 
@@ -2293,6 +2354,14 @@ render() {
   fi
   if [ -n "${TRACKER_DRIFT:-}" ]; then
     frame="${frame}  ${C_DIM}tracker healed${C_RESET}"$'\n'"${TRACKER_DRIFT}"$'\n'
+  fi
+  # UNLINKED MERGES (HERD-522, GH #637) — merged PRs whose `refs:` line parsed to no tracker id, so
+  # the reconcile linked nothing and the item is still open. Sits directly under "tracker healed"
+  # because it is the same subject seen from the other side: what the tracker sweep CANNOT heal,
+  # because there is no ref to heal by. Empty on every repo where every merged PR's ref parsed, so
+  # the console is byte-identical when this never fires.
+  if [ -n "${REF_UNPARSED_ROWS:-}" ]; then
+    frame="${frame}  ${C_RED}unlinked merges${C_RESET}"$'\n'"${REF_UNPARSED_ROWS}"$'\n'
   fi
   if [ -n "${SPAWN_HOLDS:-}" ]; then
     frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
@@ -5599,66 +5668,12 @@ record_reconcile() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$RECONCILE_STATE"
 }
 
-# HERD_PR_REF_PY — THE ONE implementation of "given a PR body, print its explicit `Refs:` value".
-# Every surface that reads a PR's tracker ref reuses this snippet rather than re-deriving the rules,
-# per the invariance-first doctrine (docs/multi-seat-doctrine.md): merge-time reconcile
-# (_reconcile_pr_ref, below) and the sweep's retroactive-linkage leg (sweep.sh) both parse the same
-# bytes, and a faithful copy in the second place is a copy that drifts. Same shape as
-# backends/linear.sh's _LINEAR_PICK_STATE_PY: a python function definition, prepended to whichever
-# driver the caller needs (one body on stdin, or a whole `gh pr list` array).
-#
-# The rules, in one place:
-#   • STRIP HTML COMMENT BLOCKS FIRST. `gh pr view --json body` returns raw markdown with `<!-- … -->`
-#     intact — GitHub does not strip them from a classic PULL_REQUEST_TEMPLATE.md. An example `Refs:`
-#     buried in the template's own comment would otherwise poison every untracked PR.
-#   • The FIRST `Refs:` line, case-insensitive, anchored at line start; first whitespace-delimited
-#     token after the colon.
-#   • STRIP TRAILING PUNCTUATION. `Refs: HERD-267,` and `Refs: HERD-267.` are the same ref as
-#     `Refs: HERD-267`. Without this the sweep's shape test reads `267,` as "not an identifier" and
-#     declares — with no lookup at all — that the item was never minted.
-#   • A template PLACEHOLDER (`<…>`, none, n/a, na) is NOT a ref.
-HERD_PR_REF_PY='
-import re
-_PR_REF_PLACEHOLDER = {"", "none", "n/a", "na"}
-def pr_ref_from_body(body):
-    body = re.sub(r"<!--.*?-->", "", body or "", flags=re.DOTALL)
-    for line in body.splitlines():
-        m = re.match(r"^\s*refs:\s*(\S+)", line, re.IGNORECASE)
-        if not m:
-            continue
-        ref = m.group(1).rstrip(".,;:!)]}")
-        if ref.startswith("<") or ref.lower() in _PR_REF_PLACEHOLDER:
-            return ""
-        return ref
-    return ""
-'
-
-# herd_pr_ref_from_body — read a PR body on stdin, print its `Refs:` value (empty when there is none).
-# The shell-side entry point to HERD_PR_REF_PY.
-#
-# NO-PYTHON3 FALLBACK. python3 is a hard engine dep, but this function sits on the merge tail, and the
-# pre-HERD-267 code degraded to a grep/sed pass rather than silently dropping every explicit ref onto
-# the fuzzy path. That degradation is preserved: the comment strip is what needs python (a multi-line
-# regex), so without it we grep the RAW body — the line-start anchor and the placeholder guard are
-# still a partial defense, exactly as before.
-herd_pr_ref_from_body() {
-  local body ref
-  body="$(cat)"
-  if command -v python3 >/dev/null 2>&1; then
-    ref="$(printf '%s' "$body" | python3 -c "$HERD_PR_REF_PY"'
-import sys
-sys.stdout.write(pr_ref_from_body(sys.stdin.read()))' 2>/dev/null)" && { printf '%s' "$ref"; return 0; }
-  fi
-  # Degraded path: same rules, minus the HTML-comment strip.
-  ref="$(printf '%s\n' "$body" \
-    | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
-    | head -n1 \
-    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//; s/[.,;:!)}]+$//' 2>/dev/null || true)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
-  case "$ref" in
-    ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;
-  esac
-  printf '%s' "$ref"
-}
+# THE `Refs:` PARSER — moved to scripts/herd/pr-ref.sh (HERD-522), sourced near the top of this file
+# alongside the other shared libraries. HERD_PR_REF_PY (the python snippet sweep.sh prepends to its
+# own `gh pr list` driver), herd_pr_ref_from_body and herd_pr_ref_unparsed_line all live there now,
+# as ONE implementation the reconcile, the sweep, the stale-dup gate and the tracker-state sweep
+# every one of them share. This is a MOVE, not a rewrite of the call sites: both names resolve at
+# CALL time exactly as before.
 
 # _reconcile_pr_ref — moved to work-units/git-pr.sh (HERD-398, Phase 3 work-unit extraction).
 
@@ -14989,6 +15004,7 @@ _tick_render_reconcile() {
   build_reconcile_pending
   build_blocked
   build_tracker_drift
+  build_ref_unparsed        # HERD-522: merged PRs whose `refs:` line parsed to nothing (empty when none)
   build_spawn_holds
   build_engine_note
   build_engine_seat_note   # HERD-308: the dual-engine HALT/coexistence row (empty unless a mismatch)

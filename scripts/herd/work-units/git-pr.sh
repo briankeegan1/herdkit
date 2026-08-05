@@ -146,8 +146,45 @@ _reconcile_pr_ref() {
   body="$(_gh_timeout reconcile_pr_ref pr view "$1" --json body -q .body 2>/dev/null || true)"
   [ -n "$body" ] || return 0
   ref="$(printf '%s' "$body" | herd_pr_ref_from_body)"
-  [ -n "$ref" ] || return 0
+  if [ -z "$ref" ]; then
+    _reconcile_ref_unparsed_alarm "$1" "$body"
+    return 0
+  fi
   printf '%s' "$ref"
+}
+
+# _reconcile_ref_unparsed_alarm <pr#> <body> — HERD-522 (GH #637): the SILENT-MISS alarm.
+#
+# A body that carries no `Refs:` line at all is ordinary — the reconcile falls through to the fuzzy
+# scribe path by design, and saying so every time would be noise. A body that MENTIONS `refs:` and
+# still yields nothing is a different animal: the builder MEANT to link an item and the linkage was
+# dropped. That is precisely what happened to emberglen-godot PR #125 (`## Refs: EMG-111`, written as
+# a markdown heading), and the whole defect was that it happened with ZERO warning — the tracker item
+# sat open, `herd status` read healthy, and only a human reading the tracker months later would have
+# noticed. Tolerant matching (pr-ref.sh) fixes THAT body; this alarm is what stops the NEXT
+# undiscovered decoration from being silent too.
+#
+# ONCE PER PR. The alarm is keyed on the ledger by PR number, so the two call paths into
+# _reconcile_pr_ref (reconcile_backlog's, and do_merge's ref-for-the-landed-row fallback) plus any
+# re-entered tick together produce exactly one event and one console row.
+#
+# Fail-soft and NEVER on the merge's critical path: no python3, an unwritable ledger, a body with no
+# refs: mention — every one of them returns quietly. It is an advisory, not a gate.
+_reconcile_ref_unparsed_alarm() {
+  local ru_pr="$1" ru_body="$2" ru_line
+  ru_line="$(printf '%s' "$ru_body" | herd_pr_ref_unparsed_line 2>/dev/null || true)"
+  [ -n "$ru_line" ] || return 0
+  # Already alarmed for this PR? (TAB-delimited ledger; match the pr field exactly.)
+  if [ -s "${REF_UNPARSED_FILE:-}" ] 2>/dev/null; then
+    awk -F'\t' -v p="$ru_pr" '$2==p{f=1} END{exit !f}' "$REF_UNPARSED_FILE" 2>/dev/null && return 0
+  fi
+  journal_append reconcile_ref_unparsed pr "$ru_pr" line "$ru_line"
+  [ -n "${REF_UNPARSED_FILE:-}" ] || return 0
+  printf '%s\t%s\t%s\n' "$(date +%s)" "$ru_pr" "$ru_line" >> "$REF_UNPARSED_FILE" 2>/dev/null || true
+  command -v herd_console_trim >/dev/null 2>&1 && herd_console_trim "$REF_UNPARSED_FILE" "${CONSOLE_LEDGER_MAX:-20}"
+  command -v herd_driver_notify >/dev/null 2>&1 \
+    && herd_driver_notify "🔗 unlinked merge · PR #${ru_pr}" "a 'refs:' line that parses to nothing: ${ru_line}" default
+  return 0
 }
 
 # reconcile_backlog <pr#> <slug> <headSha> — the POST-MERGE auto-reconcile HOOK. Fires on EVERY
