@@ -336,6 +336,7 @@ STALE_BASE_AUTOFIX	unit	tests/test-stale-base-autofix.sh
 STALE_BASE_AUTOFIX	sim	tests/test-sandbox-self-restart.sh
 CI_AUTOREPAIR	unit	tests/test-ci-autorepair.sh
 CI_FAST_BOUNCE	unit	tests/test-ci-fastbounce.sh
+RESOLVE_AUTOFIX	none-yet	unit: tests/test-resolve-autofix.bats is a real hermetic proof (off byte-identical, idle-builder auto-dispatch exactly once, second-tick hold, working-builder never yanked, ESCALATE falls back to needs-you) but is deliberately NOT wired into `herd conformance run`'s bash-exec harness (bats syntax, not bash) or tests/herd.bats' auto-glob (HERD-295 marks that file the #1 stale-base collision point, and agent-watch.sh has concurrent builders mid-edit) — run directly: bats tests/test-resolve-autofix.bats
 MERGE_FAIRNESS	unit	tests/test-merge-fairness.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-concurrency.sh
 MERGE_FAIRNESS	sim	tests/test-sandbox-multiseat.sh
