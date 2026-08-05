@@ -233,6 +233,45 @@ reconcile_main_health
 ok "(b) a stale red re-verifies on the cadence, clears itself, and notifies recovery once"
 MAIN_HEALTH_RECHECK_MINS=0
 
+# ── (f) RED LEDGER (HERD-539): the row carries its why + a last-verified stamp, and a reverify clears
+#     it through the shared ledger, journaling red_cleared reason=reverified ─────────────────────────
+reset_state
+RED_LEDGER=on
+printf 'red-file\n' > "$HC_MODE"
+new_sha "fix: a change that reds main, with the red ledger on"
+SHA="$(head_sha)"
+reconcile_main_health; settle
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(f) setup: the red did not paint"
+[ -s "$RED_LEDGER_FILE" ]   || fail "(f) RED_LEDGER=on did not write a ledger entry for the red"
+ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
+grep -q 'verified 0m ago' <<< "$ROW" || fail "(f) the MAIN RED row carries no last-verified suffix: $ROW"
+ok "(f) RED_LEDGER=on: a reproduced red is cached in the shared ledger and the row renders a verified-Xm-ago suffix"
+
+# The cadence-driven re-verify clears it through herd_red_ledger_clear, journaling red_cleared once.
+MAIN_HEALTH_RECHECK_MINS=30
+printf 'green\n' > "$HC_MODE"
+touch -t 200001010000 "$(_main_health_marker "$SHA")"
+reconcile_main_health; settle
+[ -s "$MAIN_HEALTH_STATE" ] && fail "(f) the green reverify did not clear main red"
+[ "$(jcount "\"event\":\"red_cleared\".*\"key\":\"main_health:${SHA}\".*\"reason\":\"reverified\"")" -eq 1 ] \
+  || fail "(f) the reverify clear did not journal red_cleared key=main_health:$SHA reason=reverified"
+ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
+[ -z "$ROW" ] || fail "(f) the MAIN RED row survived the ledger-tracked clear: $ROW"
+MAIN_HEALTH_RECHECK_MINS=0
+RED_LEDGER=off
+ok "(f) a cadence-driven reverify clears the ledger entry and journals red_cleared key=main_health:<sha> reason=reverified"
+
+# RED_LEDGER=off (default): the exact same red produces a byte-identical row — no suffix, no ledger file.
+reset_state
+printf 'red-file\n' > "$HC_MODE"
+new_sha "fix: a change that reds main, with the red ledger off (default)"
+reconcile_main_health; settle
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(f) setup: the red did not paint with RED_LEDGER off"
+[ -e "$RED_LEDGER_FILE" ] && fail "(f) RED_LEDGER=off (default) still wrote a ledger file"
+ROW="$(build_main_health; printf '%s' "${MAIN_HEALTH:-}")"
+grep -q 'verified' <<< "$ROW" && fail "(f) RED_LEDGER=off (default) still rendered a verified-ago suffix: $ROW"
+ok "(f) RED_LEDGER=off (default): byte-identical MAIN RED row, no ledger file written"
+
 # ── (c) DIED WORKER: a killed suite is re-dispatched, once, and bounded ──────────────────────────────
 reset_state
 printf 'slow\n' > "$HC_MODE"

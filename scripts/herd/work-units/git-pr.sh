@@ -182,6 +182,11 @@ _reconcile_ref_unparsed_alarm() {
   [ -n "${REF_UNPARSED_FILE:-}" ] || return 0
   printf '%s\t%s\t%s\n' "$(date +%s)" "$ru_pr" "$ru_line" >> "$REF_UNPARSED_FILE" 2>/dev/null || true
   command -v herd_console_trim >/dev/null 2>&1 && herd_console_trim "$REF_UNPARSED_FILE" "${CONSOLE_LEDGER_MAX:-20}"
+  # HERD-539: seed the shared red-ledger with the SAME offending line just journaled above, so the
+  # console row can render it back + a last-verified stamp, and reconcile_ref_unparsed (agent-watch.sh)
+  # has a cadence clock to re-probe against. No-op when RED_LEDGER is off.
+  command -v herd_red_ledger_note >/dev/null 2>&1 \
+    && herd_red_ledger_note "${RED_LEDGER_FILE:-}" "ref_unparsed:${ru_pr}" ref_unparsed "$ru_line"
   # NO herd_driver_notify. A desktop notification was the obvious "loud", and it is the wrong loud
   # here: this fires from a post-merge sweep that re-probes every recently-merged PR, so it is a
   # SURFACE (a standing console row) rather than an EVENT worth interrupting a human for — and, as the

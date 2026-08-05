@@ -182,6 +182,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # tracker-heal and builder-note surfaces, so both age out by one rule. Defines functions + two
 # constants (CONSOLE_ROW_RETENTION, CONSOLE_LEDGER_MAX); display-only, lib-safe.
 . "$HERE/console-section.sh"
+# Shared RED-ROW LEDGER (HERD-539) — the keyed "why + last-verified" cache behind every red row this
+# file wires (MAIN RED, the 'unlinked merges' alarm) plus the recheck-cadence test that extends the
+# MAIN_HEALTH_RECHECK_MINS pattern to those classes. Sourced after console-section.sh, which it reuses
+# (_console_now_epoch, CONSOLE_LEDGER_MAX) rather than duplicating. Defines functions only; wholly
+# inert while RED_LEDGER=off (default).
+. "$HERE/red-ledger.sh"
 # Pre-spawn CLAIM (HERD-50) — sourced for its RELEASE half (herd_claim_release, HERD-162 F12), which
 # the dead-builder reconcile calls to un-wedge a tracker item whose builder died before opening a PR.
 # Sourcing DEFINES functions only (its lane entry point herd_claim_or_abort is never called from here);
@@ -479,6 +485,10 @@ TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
 # warning anywhere). Written once per PR by _reconcile_ref_unparsed_alarm at merge-time reconcile and
 # rendered by build_ref_unparsed. Empty on every healthy repo, so the console is byte-identical.
 REF_UNPARSED_FILE="$TREES/.agent-watch-ref-unparsed"
+# Shared RED-ROW LEDGER (HERD-539, red-ledger.sh) — one keyed "why + last-verified" cache across every
+# red class this file wires (today: main_health:<sha>, ref_unparsed:<pr>). Empty/absent whenever
+# RED_LEDGER=off (default), so nothing reads or writes it.
+RED_LEDGER_FILE="$TREES/.agent-watch-red-ledger"
 # Post-merge reconcile ledger (HERD-232). The post-merge hook chain used to be merge-EVENT-driven: only
 # the seat whose own do_merge landed a PR ever ran it. _sweep_merged_prs re-derives those obligations
 # from the world (recently-MERGED PRs) instead, so a foreign-seat merge, a gh-UI merge, or a watcher
@@ -973,13 +983,15 @@ build_tracker_drift() {
 # The console half of the silent-miss alarm. _reconcile_ref_unparsed_alarm (work-units/git-pr.sh)
 # writes one ledger row per merged PR whose body MENTIONED `refs:` yet parsed to no tracker id; these
 # two functions render it. Nothing here scans or writes — a pure renderer, like build_tracker_drift.
+# HERD-539: with RED_ROW_RECHECK_MINS>0 (and RED_LEDGER=on), reconcile_ref_unparsed below ALSO re-probes
+# a standing row on a cadence and clears it automatically once the PR's body parses — an operator
+# relinking the item still works, but is no longer the only cure.
 
 # _ref_unparsed_classify <line>  ("<epoch>\t<pr>\t<line>")
 #   Prints "<epoch>\tloud". Always LOUD, so the row NEVER ages out of the display: the merge already
 #   landed and the tracker item is already sitting open, so time passing makes it worse, not stale.
-#   The one thing that clears it is an operator relinking the item — there is no automatic cure, which
-#   is exactly the fact this alarm exists to state out loud. Bounded by construction: one row per PR
-#   (the alarm dedupes on the ledger) and the ledger is tail-kept at CONSOLE_LEDGER_MAX on write.
+#   Bounded by construction: one row per PR (the alarm dedupes on the ledger) and the ledger is
+#   tail-kept at CONSOLE_LEDGER_MAX on write.
 _ref_unparsed_classify() {
   local _ru_epoch
   IFS=$'\t' read -r _ru_epoch _ <<EOF
@@ -990,7 +1002,8 @@ EOF
 
 # _ref_unparsed_row <line>  ("<epoch>\t<pr>\t<line>") → one loud console row quoting the offending
 #   line, so the operator can see WHY it did not parse without opening the PR. Fail-soft: a row with
-#   no PR number renders nothing.
+#   no PR number renders nothing. HERD-539: appends the shared red-ledger's last-verified suffix when
+#   RED_LEDGER is on (empty, so byte-inert, otherwise).
 _ref_unparsed_row() {
   local _ru_epoch _ru_pr _ru_line hhmm
   IFS=$'\t' read -r _ru_epoch _ru_pr _ru_line <<EOF
@@ -998,9 +1011,73 @@ $1
 EOF
   [ -n "${_ru_pr:-}" ] || return 0
   hhmm="$(epoch_to_hhmm "${_ru_epoch:-0}")"
-  printf '    %s🔗%s %s#%s%s %sunlinked%s %s"%s" parsed to no ref · %s%s' \
+  printf '    %s🔗%s %s#%s%s %sunlinked%s %s"%s" parsed to no ref · %s%s%s' \
     "$C_RED" "$C_RESET" "$C_BOLD" "$_ru_pr" "$C_RESET" \
-    "$C_RED" "$C_RESET" "$C_DIM" "${_ru_line:-}" "$hhmm" "$C_RESET"
+    "$C_RED" "$C_RESET" "$C_DIM" "${_ru_line:-}" "$hhmm" "$C_RESET" \
+    "$(herd_red_ledger_row_suffix "$RED_LEDGER_FILE" "ref_unparsed:${_ru_pr}")"
+}
+
+# _red_row_recheck_mins — RED_ROW_RECHECK_MINS sanitized to a non-negative integer; any non-numeric
+# value (unset, empty, a typo) reads as 0/off, mirroring _main_health_recheck_mins.
+_red_row_recheck_mins() {
+  case "${RED_ROW_RECHECK_MINS:-0}" in
+    ''|*[!0-9]*) printf '0' ;;
+    *)           printf '%s' "$RED_ROW_RECHECK_MINS" ;;
+  esac
+}
+
+# reconcile_ref_unparsed — HERD-539 leg 2: extends the MAIN_HEALTH_RECHECK_MINS pattern to the
+# 'unlinked merges' alarm (HERD-522), which before this had NO clear mechanism at all. Each standing
+# REF_UNPARSED_FILE row is a dedup key (ref_unparsed:<pr>) in the shared red-ledger; once its
+# last-verified stamp is at least RED_ROW_RECHECK_MINS old, this re-fetches the PR's CURRENT body
+# (someone may have edited it post-merge to add the `Refs:` line it was missing) and re-parses it:
+#   • now parses    → drop the row from REF_UNPARSED_FILE, clear the ledger entry, journal
+#                      red_cleared key ref_unparsed:<pr> reason reverified (herd_red_ledger_clear).
+#   • still unparsed → just refresh the ledger's last-verified stamp (no re-alarm — already alarmed).
+# REQUIRES RED_LEDGER=on (the cadence clock and the clear both live in the ledger) AND
+# RED_ROW_RECHECK_MINS>0 — byte-inert (no gh call, no ledger write, REF_UNPARSED_FILE untouched)
+# whenever either is at its default. Fail-soft throughout: no gh / offline / an unreadable body just
+# skips that row for this tick, never a false clear.
+reconcile_ref_unparsed() {
+  _red_ledger_enabled || return 0
+  local _rru_mins; _rru_mins="$(_red_row_recheck_mins)"
+  [ "$_rru_mins" -gt 0 ] 2>/dev/null || return 0
+  [ -s "${REF_UNPARSED_FILE:-}" ] 2>/dev/null || return 0
+  command -v gh >/dev/null 2>&1 || return 0
+  local _rru_now; _rru_now="$(_console_now_epoch)"
+  local _rru_line _rru_epoch _rru_pr _rru_rest _rru_key _rru_row _rru_lv _rru_body _rru_ref
+  while IFS= read -r _rru_line; do
+    [ -n "$_rru_line" ] || continue
+    _rru_epoch="" _rru_pr="" _rru_rest=""
+    IFS=$'\t' read -r _rru_epoch _rru_pr _rru_rest <<EOF
+$_rru_line
+EOF
+    [ -n "${_rru_pr:-}" ] || continue
+    _rru_key="ref_unparsed:${_rru_pr}"
+    _rru_row="$(herd_red_ledger_get "$RED_LEDGER_FILE" "$_rru_key")"
+    _rru_lv="${_rru_epoch:-}"
+    if [ -n "$_rru_row" ]; then
+      IFS=$'\t' read -r _ _ _ _rru_lv <<EOF
+$_rru_row
+EOF
+    fi
+    herd_red_ledger_recheck_due "${_rru_lv:-0}" "$_rru_mins" "$_rru_now" || continue
+    _rru_body="$(_gh_timeout reconcile_ref_unparsed pr view "$_rru_pr" --json body -q .body 2>/dev/null || true)"
+    if [ -z "$_rru_body" ]; then
+      herd_red_ledger_note "$RED_LEDGER_FILE" "$_rru_key" ref_unparsed "$_rru_rest" "$_rru_now"
+      continue
+    fi
+    _rru_ref="$(printf '%s' "$_rru_body" | herd_pr_ref_from_body)"
+    if [ -n "$_rru_ref" ]; then
+      awk -F'\t' -v p="$_rru_pr" '$2!=p' "$REF_UNPARSED_FILE" > "${REF_UNPARSED_FILE}.tmp.$$" 2>/dev/null \
+        && mv "${REF_UNPARSED_FILE}.tmp.$$" "$REF_UNPARSED_FILE" 2>/dev/null \
+        || rm -f "${REF_UNPARSED_FILE}.tmp.$$" 2>/dev/null
+      herd_red_ledger_clear "$RED_LEDGER_FILE" "$_rru_key" reverified
+    else
+      herd_red_ledger_note "$RED_LEDGER_FILE" "$_rru_key" ref_unparsed "$_rru_rest" "$_rru_now"
+    fi
+  done < "$REF_UNPARSED_FILE"
+  return 0
 }
 
 # build_ref_unparsed — the "unlinked merges" section: the newest 3 alarm rows, newest first. Empty
@@ -1164,6 +1241,9 @@ build_main_health() {
     _bm_defer="$(_main_health_defer_note)"
     [ -n "$_bm_defer" ] && _bm_qual="${_bm_qual}${C_DIM} · ${_bm_defer}${C_RESET}"
   fi
+  # HERD-539: the shared red-ledger's last-verified stamp for this exact sha, if RED_LEDGER is on —
+  # empty string (byte-inert) otherwise, so the row is unchanged when the lever is off.
+  _bm_qual="${_bm_qual}$(herd_red_ledger_row_suffix "$RED_LEDGER_FILE" "main_health:${_bm_sha}")"
   MAIN_HEALTH="    ${C_RED}🚨 ${C_BOLD}MAIN RED${C_RESET}${C_RED} — ${_bm_fail} ${C_DIM}(${_bm_attr})${C_RESET}${_bm_qual}"$'\n'
 }
 
@@ -7738,6 +7818,10 @@ _main_health_clear() {
   fi
   rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true
   journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result green
+  # HERD-539: the red-ledger's counterpart to the row this clears — keyed on the PINNED red sha
+  # (_mc_pv_sha), which is what herd_red_ledger_note recorded it under at diagnosis time. No-op when
+  # RED_LEDGER is off, or when this sha never had a ledger entry (e.g. the lever was off when it reddened).
+  herd_red_ledger_clear "$RED_LEDGER_FILE" "main_health:${_mc_pv_sha}" reverified
   if [ -n "$_mc_own" ]; then
     herd_driver_notify "✅ main green" "default branch health recovered at #${_mc_pr}" default
   fi
@@ -8297,6 +8381,10 @@ _main_health_set_red() {
   printf '%s\x1f%s\x1f%s\x1f%s\n' "$_sr_sha" "$_sr_since" "$_sr_local" "$_sr_ci" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
   _sr_render="$_sr_local"; [ -n "$_sr_render" ] || _sr_render="$_sr_ci"
   journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_render" since "$_sr_since"
+  # HERD-539: cache the SAME diagnosing text just journaled above into the shared red-ledger, keyed on
+  # this sha, so build_main_health's row can render it back verbatim + an honest last-verified stamp.
+  # No-op when RED_LEDGER is off.
+  herd_red_ledger_note "$RED_LEDGER_FILE" "main_health:${_sr_sha}" main_health "$_sr_render"
   if [ "$_sr_wasred" -eq 0 ]; then
     herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_render} (since #${_sr_since})" default
   fi
@@ -16163,6 +16251,12 @@ EOF
   # merge, a no-slot deferral, a killed worker), and re-verifies a standing red on the
   # MAIN_HEALTH_RECHECK_MINS cadence. Byte-inert when MAIN_HEALTH_TICK=off.
   reconcile_main_health
+
+  # Unlinked-merges re-verify (HERD-539 leg 2): the SAME reconciled-invariant shape as main-health
+  # above, applied to the 'unlinked merges' alarm (HERD-522) — a standing row's PR body is re-probed
+  # on the RED_ROW_RECHECK_MINS cadence and cleared once it parses. Byte-inert when RED_LEDGER=off OR
+  # RED_ROW_RECHECK_MINS=0 (both default off).
+  reconcile_ref_unparsed
 
   # Branch-CI main-red leg (HERD-334, HERD-434): the MAIN RED machinery reflected only the LOCAL suite,
   # which runs on the WATCHER'S OWN (fast, idle) host and can be green while the DEFAULT branch's CI on
