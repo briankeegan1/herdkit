@@ -17215,13 +17215,34 @@ fi
 # parses no positional args — and expanded with the `+` guard so `set -u` tolerates the empty array.
 _WATCH_ARGV=("$@")
 
+# ── HERD-548: STARTUP IS JOURNAL-VISIBLE, FIRST after config load ──────────────────────────────────
+# GROUNDED 2026-08-05: post-reload the watcher crash-looped silently for ~2 minutes (child pid churn,
+# zero journal entry, zero console beyond the header) then self-resolved — an unexplained outage
+# nobody could reconstruct afterward, because nothing recorded that a boot was even ATTEMPTED. Every
+# launch reaching this line — the final, argv0-tagged image, config already loaded — journals
+# watcher_boot UNCONDITIONALLY (best-effort/fail-soft like every other journal_append call; this is
+# forensic instrumentation of the always-on boot path, not new opt-in automation, so it carries no
+# config lever). Every exit path between here and the tick loop below journals watcher_boot_failed
+# with a phase + reason FIRST, so a journal that shows repeated watcher_boot with no matching tick
+# activity — and no watcher_boot_failed either — is itself the "died some other way" signal: the gap
+# this incident could not explain is now a gap a human (or `herd why`) can actually see.
+_WATCH_BOOT_EPOCH="$(_now_epoch 2>/dev/null || date +%s 2>/dev/null || echo 0)"
+_watcher_boot_engine_sha() { git -C "$HERE" rev-parse --short HEAD 2>/dev/null || printf 'unknown'; }
+journal_append watcher_boot \
+  pid "$$" argv0 "${HERD_WATCH_ARGV0:-}" engine_sha "$(_watcher_boot_engine_sha)" \
+  workspace "${WORKSPACE_NAME:-}" component agent-watch
+
 # ── Launch-binding banner + foreign-cwd guard (issue #60) ───────────────────────────────────────
 # Print the resolved WORKSPACE_NAME/PROJECT_ROOT and refuse to run from outside PROJECT_ROOT (unless
 # HERD_ALLOW_FOREIGN_CWD=1). Placed AFTER the argv0 re-exec so it prints exactly once, in the final
 # tagged process. The config-source refusal (herd-config.sh) already fired on the first pass if the
 # config was engine-dogfood-only; this catches the complementary case — a real config but a $PWD
 # that is not inside the project it resolves to.
-herd_console_guard "herd watch" || exit 1
+if ! herd_console_guard "herd watch"; then
+  journal_append watcher_boot_failed pid "$$" phase console_guard \
+    reason "foreign-cwd-or-invalid-project-config" workspace "${WORKSPACE_NAME:-}" component agent-watch
+  exit 1
+fi
 
 # ── HERD-189 TEST-HERMETICITY GUARD: refuse to run the REAL watch loop under a hermetic test ─────
 # The test suite must NEVER launch a live watcher/daemon against the real control room. A hermetic
@@ -17244,6 +17265,8 @@ herd_console_guard "herd watch" || exit 1
 if [ -n "${HERD_HERMETIC_GUARD:-}" ]; then
   printf '%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" \
     >> "$HERD_HERMETIC_GUARD" 2>/dev/null || true
+  journal_append watcher_boot_failed pid "$$" phase hermetic_guard \
+    reason "test-hermeticity-redirect" workspace "${WORKSPACE_NAME:-}" component agent-watch
   exit 0
 fi
 
@@ -17257,7 +17280,11 @@ fi
 # (matching the coordinator/scribe/researcher/dep-watcher pattern). bin/herd's launch paths
 # (cmd_pane_watch / cmd_reload) mirror this check before spawning so a duplicate is caught at the
 # launcher too.
-_acquire_watcher_singleton || exit 1
+if ! _acquire_watcher_singleton; then
+  journal_append watcher_boot_failed pid "$$" phase singleton_lock \
+    reason "duplicate-watcher-already-live" workspace "${WORKSPACE_NAME:-}" component agent-watch
+  exit 1
+fi
 # The incoming generation owns the lock: any self-restart handoff window is over (HERD-266). Clearing
 # it HERE — after the acquire, in both the exec'd image and a cold launch — means the duplicate alarm
 # is suppressed for exactly the exec, never a tick longer. A crashed exec that never reached this line
@@ -17650,6 +17677,23 @@ _sweep_reviewer_registry
 # so the shared _resolver_agent_alive liveness check (a live resolver is always spared) has a roster.
 AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 _sweep_stale_resolve_tabs
+
+# HERD-548 leg 2: about to enter the live tick loop — the whole one-shot startup sequence above has
+# run without this process dying, which is meaningfully further than any of the guard-exit paths above
+# and further than a fast crash-loop death would ever get. Clear a standing crash-loop marker ONLY once
+# this watcher has PROVEN it is not that loop: wait out any remainder of HERD_WATCH_CRASHLOOP_FAST_SECS
+# (the EXACT threshold herd-watch.sh's supervising loop uses to call a death "fast" — leg 3's
+# WATCHER_SETTLE_SECS is a DIFFERENT constant, for the duplicate-watcher COUNT, and must not be reused
+# here) before clearing, so a build that is still crashing moments after this line — a bug in the tick
+# loop itself, not the boot path above — never gets a marker it has not actually earned. Bounded to
+# HERD_WATCH_CRASHLOOP_FAST_SECS, paid once at startup.
+if declare -f watcher_crashloop_clear >/dev/null 2>&1; then
+  _wcl_elapsed=$(( $(_now_epoch 2>/dev/null || date +%s) - ${_WATCH_BOOT_EPOCH:-0} ))
+  [ "$_wcl_elapsed" -lt "${HERD_WATCH_CRASHLOOP_FAST_SECS:-5}" ] \
+    && sleep "$(( ${HERD_WATCH_CRASHLOOP_FAST_SECS:-5} - _wcl_elapsed ))" 2>/dev/null
+  watcher_crashloop_clear
+  unset _wcl_elapsed
+fi
 
 while true; do
   _tick_render_reconcile
