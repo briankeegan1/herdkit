@@ -69,6 +69,12 @@ EXEMPT_NAMES = {
                        # .herd/config knob an operator would set
     "BATS_TEST_TIMEOUT",  # bats-core's OWN recognized per-test-timeout env var; herdkit only reads
                            # an operator override and re-exports it down to bats, it does not own it
+    "HERD_SUITE_SCOPE_TESTS",  # HERD-532 INTERNAL HANDOFF, not an operator knob: the wrapper COMPUTES
+                                # this allow-list from the declared HEALTH_SUITE_SCOPE key (via
+                                # scripts/herd/suite-shard.sh's herd_suite_tests_for_diff) and exports
+                                # it down to tests/discover-tests.bash. Same class as HERMETIC_TEST
+                                # above — an engine-authored cross-file seam nobody would ever set in
+                                # .herd/config; the SETTABLE knob (HEALTH_SUITE_SCOPE) is declared
 }
 
 def scan_ghosts(files):

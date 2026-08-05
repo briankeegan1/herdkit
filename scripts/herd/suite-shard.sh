@@ -71,7 +71,7 @@
 # not in the curated set (retired/renamed/exempted) is dropped silently HERE — and asserted present
 # by tests/test-suite-scope.sh, so a rename is caught by the proof rather than silently shrinking
 # the core.
-HERD_SUITE_CORE_TESTS="${HERD_SUITE_CORE_TESTS:-test-caps-sync-light.sh test-config-manifest.sh test-conformance.sh test-daemon-hermeticity.sh test-doc-drift.sh test-env-export-lint.sh test-gate-coverage.sh test-git-scope-lint.sh test-hermetic-env-scrub.sh test-journal-hermeticity.sh test-pipe-safety.sh test-suite-shard.sh test-suite-scope.sh test-test-cap-ledger.sh}"
+HERD_SUITE_CORE_TESTS="${HERD_SUITE_CORE_TESTS:-test-caps-sync-light.sh test-config-manifest.sh test-conformance.sh test-daemon-hermeticity.sh test-doc-drift.sh test-env-export-lint.sh test-gate-coverage.sh test-git-scope-lint.sh test-healthcheck-project-env-manifest.sh test-hermetic-env-scrub.sh test-journal-hermeticity.sh test-pipe-safety.sh test-suite-shard.sh test-suite-scope.sh test-test-cap-ledger.sh}"
 
 # WIDE-BLAST paths: a change here can plausibly affect ANY test, so it selects the full curated set.
 # Space-separated repo-root-relative paths (matched exactly, after a leading './' is stripped):
