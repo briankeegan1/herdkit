@@ -8129,6 +8129,72 @@ _main_health_fix_clear() {
   return 0
 }
 
+# ── HERD-547 (HERD-539 leg 4): ENGINE-SHAPED RED AUTO-ESCALATION ──────────────────────────────────
+# The red-ledger CONSUMER side: once a red's diagnosing text is cached into the shared ledger (see
+# herd_red_ledger_note call sites), a caller ALSO offers it here. Ship-dormant behind RED_AUTOESCALATE
+# (default off; requires RED_LEDGER=on too — see herd-config.sh).
+
+# _red_autoescalate_enabled — true iff RED_AUTOESCALATE opts in AND RED_LEDGER is on (there is nothing
+# to classify without the ledger's own why-text). Any unrecognized value reads as off (fail toward
+# dormant, mirrors every other RED_LEDGER-adjacent lever).
+_red_autoescalate_enabled() {
+  _red_ledger_enabled || return 1
+  case "$(printf '%s' "${RED_AUTOESCALATE:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _red_escalate_herd_bin — the herd CLI to shell `report` through. HERD_RED_ESCALATE_HERD_BIN is a
+# test seam (mirrors HERD_FLEET_HERD_BIN); the real path resolves the SAME way _main_health_fix_pysrc
+# resolves pysrc (HERDKIT_HOME, else computed from $HERE).
+_red_escalate_herd_bin() {
+  printf '%s' "${HERD_RED_ESCALATE_HERD_BIN:-${HERDKIT_HOME:-$(cd "$HERE/../.." 2>/dev/null && pwd)}/bin/herd}"
+}
+
+# _red_escalate_once <key> — shared-pool "AT MOST ONCE per dedup key" guard (mirrors
+# _main_health_fix_mark's HERD-371 pattern via the generic `--once` store primitive): rc 0 = the
+# FIRST call across the whole pool to see this exact key — file it; nonzero = already claimed
+# (dedup) OR the store/python3 is unavailable — either way, the caller must NOT file.
+_red_escalate_once() {
+  local _reo_key="$1" _reo_pyp
+  _reo_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_reo_pyp" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_reo_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --once "red_escalated::$_reo_key" >/dev/null 2>&1
+}
+
+# _red_escalate_engine_red <key> <class> <why> — when the SAME why-text a caller just cached into the
+# red-ledger maps to ENGINE code (herd_red_ledger_engine_shaped, the routing rule
+# templates/coordinator.md.tmpl documents at "Routing: APP bug vs HERD-ENGINE bug"), file it via the
+# EXISTING `herd report` path — never a bespoke gh call, so this composes with report's own
+# title-dedup instead of reimplementing it — at most once per dedup key across the whole shared pool.
+# A project-shaped why (herd_red_ledger_engine_shaped says no) is NEVER escalated — not even the
+# once-guard is consulted, so a project's own reds can never exhaust it.
+#
+# Fail-soft throughout, always returns 0: RED_AUTOESCALATE off, no HERDKIT_HOME/bin/herd resolvable,
+# no python3/pysrc, or `herd report` itself declining (no gh, no HERD_REPO, a likely duplicate) all
+# skip WITHOUT filing — never a crash, never a double-file — and (except the plain off-switch) log
+# why via journal_append red_escalated.
+_red_escalate_engine_red() {
+  local _re_key="$1" _re_class="$2" _re_why="$3" _re_bin
+  _red_autoescalate_enabled || return 0
+  herd_red_ledger_engine_shaped "$_re_why" || return 0
+  _re_bin="$(_red_escalate_herd_bin)"
+  if [ ! -x "$_re_bin" ]; then
+    journal_append red_escalated key "$_re_key" class "$_re_class" result skipped reason no-herd-bin
+    return 0
+  fi
+  _red_escalate_once "$_re_key" || return 0   # dedup or store-unavailable — silent no-op either way
+  if ( cd "${MAIN:-.}" && "$_re_bin" report --diagnosis "$_re_why" "engine-shaped red: ${_re_key}" ) >/dev/null 2>&1; then
+    journal_append red_escalated key "$_re_key" class "$_re_class" result filed
+  else
+    journal_append red_escalated key "$_re_key" class "$_re_class" result skipped reason report-failed
+  fi
+  return 0
+}
+
 # ── PER-PHASE DURATION BASELINES + anomaly self-filing (HERD-496) ──────────────────────────────────
 # The operator's self-observation ask: the watcher already TIMES every phase it runs (a dispatch
 # marker's age at collection, a bounce prompt to a wake result) — this teaches it what "normal" looks
@@ -8671,6 +8737,9 @@ _main_health_set_red() {
   # this sha, so build_main_health's row can render it back verbatim + an honest last-verified stamp.
   # No-op when RED_LEDGER is off.
   herd_red_ledger_note "$RED_LEDGER_FILE" "main_health:${_sr_sha}" main_health "$_sr_render"
+  # HERD-547 (HERD-539 leg 4): offer the SAME why-text to engine-shaped auto-escalation. No-op
+  # unless RED_AUTOESCALATE is on; never fires twice for the same key (shared-pool once-guard).
+  _red_escalate_engine_red "main_health:${_sr_sha}" main_health "$_sr_render"
   if [ "$_sr_wasred" -eq 0 ]; then
     herd_driver_notify "🚨 MAIN RED" "default branch health FAILED after #${_sr_pr}: ${_sr_render} (since #${_sr_since})" default
   fi
