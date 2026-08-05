@@ -935,6 +935,35 @@ class LiveState:
             return ""
         return reason
 
+    def recorded_review_source(self, pr, sha):
+        """The PROVENANCE field of this ``(pr, sha)``'s recorded verdict (HERD-559) —
+        ``reviewer`` | ``pregate`` | ``skipped-low-risk`` | ``carried-forward`` — or ``""`` when no row
+        exists. The review rail can now refuse a diff two ways (a model's correctness finding and a
+        deterministic pre-gate lint red), and a reader that cannot tell them apart would misdescribe
+        both: the refix prompt would point a mechanical red at a review that was never written.
+
+        FAIL-SOFT exactly like ``recorded_review_reason``: a legacy row with no source field, like a
+        missing or unreadable ledger, is not an error. A row that HAS a verdict but no provenance is
+        ``reviewer`` — that is what every row written before provenance existed meant."""
+        if self._store is not None:
+            try:
+                return self._store.recorded_review_source(pr, sha)
+            except Exception:
+                return ""
+        path = self.review_ledger()
+        if not path or not os.path.exists(path):
+            return ""
+        source = ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and f[1] == str(pr) and f[2] == str(sha):
+                        source = f[4] if len(f) >= 5 else "reviewer"
+        except Exception:
+            return ""
+        return source
+
     def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         """Append one review ledger row ``<epoch> <pr> <sha> <verdict> <source> [reason…]``
         (agent-watch.sh:1820).
@@ -2100,6 +2129,10 @@ class LiveGates:
         self.reused_review = False
         self.reused_health = False
         cfg = config or {}
+        # HERD-559: the review fast path (pre-gate, tier, floor, latency) resolves its levers per
+        # candidate, not once per tick — the levers are cheap string reads and keeping the dict is
+        # what lets `_review_tier` stay a pure function of (config, diff).
+        self.config = cfg
         self._health_max = _pos_int(cfg.get("HEALTH_CONCURRENCY"), 1)
         self._review_max = _pos_int(cfg.get("REVIEW_CONCURRENCY"), 2)
         # HERD-373: a LiveGates instance is constructed fresh once per tick (_run_live_tick), so
@@ -2411,6 +2444,18 @@ class LiveGates:
                 verdict = parse_review_verdict(text)
             except Exception:
                 text, verdict = "", "INFRA"
+            # REVIEW LATENCY TELEMETRY (HERD-559 leg 3) — dispatch→verdict wall-clock, read from the
+            # inflight marker BEFORE the scratch is dropped below. The fast path exists because review
+            # wall-clock is the pipeline's ceiling, so measure it rather than estimate it: one event
+            # per collected verdict, carrying the seconds and the verdict that produced them. Pure
+            # telemetry — no gate, dispatch or merge decision reads it. REVIEW_LATENCY=off is a hard
+            # no-op. Emitted for an INFRA collect too: a reviewer that burned four minutes and died
+            # without a verdict is part of the ceiling, and hiding it would flatter the measurement.
+            if (self.config.get("REVIEW_LATENCY") or "on") != "off":
+                elapsed = _marker_age(inflight) if inflight else None
+                if elapsed is not None and elapsed >= 0:
+                    self.journal.append("review_latency", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "secs", elapsed, "verdict", verdict)
             if verdict in ("PASS", "BLOCK"):
                 # HERD-473: a BLOCK carries the reviewer's STRUCTURED reason into the ledger row, in the
                 # same write that records the verdict — so the reason can never exist without its verdict
@@ -2442,16 +2487,169 @@ class LiveGates:
         #     in-flight reviewer count reaches the limit (mirrors bash's ``_count_live_reviews >= _review_conc``
         #     QUEUED path, agent-watch.sh:3115). Dead markers are not counted — a crashed reviewer never
         #     wedges a slot (``_count_live_reviews``, agent-watch.sh:2455).
+        # 3.6 MECHANICAL-RED PRE-GATE (HERD-559 leg 1, REVIEW_PREGATE=on; ship-dormant). The cheap
+        #     deterministic lint set runs BEFORE a reviewer is spawned, so a mechanical red — a
+        #     caps-sync miss, a pipe-safety miss, a doc-drift miss — costs zero model time instead of a
+        #     full adversarial pass. Placed ABOVE the concurrency check on purpose: a pre-gate red must
+        #     never queue behind in-flight reviews, because it is not going to use a slot at all.
+        #     Recorded as a real sha-keyed BLOCK with provenance `pregate` (distinct from `reviewer` —
+        #     a deterministic lint refusal is not a model's correctness finding) so the refix bounce,
+        #     the merge decision and `herd approve why` all work unchanged.
+        pregate = self._review_pregate(cand)
+        if pregate is not None:
+            st.record_review(cand.pr, cand.sha, "BLOCK", "pregate", pregate["reason"])
+            self.journal.append("review_pregate_red", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "lints", pregate["lints"],
+                                "reason", "mechanical lint red — review dispatch skipped, no slot burned")
+            return "BLOCK"
         _rv_n = _count_live_inflight(st.dir, ".review-inflight")
         if _rv_n >= self._review_max:
             self.journal.append("review_queued", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                                 "inflight", _rv_n, "limit", self._review_max)
             return WAIT
+        # 3.7 RISK-TIER (HERD-559 leg 2, REVIEW_TIERING=on; ship-dormant). Chooses the reviewer MODEL
+        #     for this diff — or, for a docs/test-only diff, skips the reviewer outright with a
+        #     sha-keyed low-risk PASS. Decided AFTER the concurrency check because a dispatched review
+        #     is what the tier is FOR; a SKIP short-circuits before any dispatch either way.
+        tier, model = self._review_tier(cand)
+        if tier == "SKIP":
+            st.record_review(cand.pr, cand.sha, "PASS", "skipped-low-risk", "")
+            self.journal.append("review_skipped", "pr", cand.pr, "sha", cand.sha,
+                                "reason", "docs/test-only low-risk diff")
+            return "PASS"
         # 4. DISPATCH the reviewer async + lay the marker → wait.
-        self._dispatch_review(cand)
+        self._dispatch_review(cand, model)
         return WAIT
 
-    def _dispatch_review(self, cand):
+    # ── HERD-559 review fast path ─────────────────────────────────────────────────────────────────
+    def _pregate_script(self):
+        """``scripts/herd/review-pregate.sh`` — the ONE implementation of the mechanical lint set and
+        the mechanical-diff classifier, shared verbatim with ``agent-watch.sh`` and ``herd-review.sh``
+        so the three call sites can never disagree about what is mechanically red or mechanically
+        shaped. Invoked as a SUBPROCESS: its lint bodies are read from the TREE UNDER TEST, and
+        builder-authored code must never be imported into the engine core."""
+        return self._script("review-pregate.sh")
+
+    def _review_pregate(self, cand):
+        """Run the mechanical pre-gate for this candidate.
+
+        Returns ``None`` when the reviewer should proceed (lever off, no worktree, the script absent,
+        the diff clean, or the pre-gate could not attribute its findings) and a
+        ``{"lints", "reason", "findings"}`` dict when this diff introduced a mechanical red.
+
+        The rc contract is the shared script's: 0 clean · 1 red (findings on stdout) · 2 skipped.
+        **2 is treated exactly like 0**, deliberately: the script skips when it cannot compute the
+        merge base it subtracts pre-existing findings against, and bouncing a builder onto a red it
+        cannot fix inside its own item would wedge the PR. A pre-gate that is not sure must let the
+        reviewer run — fail-soft always beats false-red."""
+        if (self.config.get("REVIEW_PREGATE") or "off") != "on":
+            return None
+        script = self._pregate_script()
+        tree = cand.worktree or ""
+        if not script or not os.path.exists(script) or not tree or not os.path.isdir(tree):
+            return None
+        base = self.config.get("DEFAULT_BRANCH") or os.environ.get("DEFAULT_BRANCH") or "main"
+        try:
+            out = subprocess.run(["bash", script, "lint", tree, base],
+                                 capture_output=True, text=True, timeout=_PREGATE_TIMEOUT)
+        except Exception:
+            return None                      # a timeout or a spawn failure is never a finding
+        if out.returncode != 1:
+            return None
+        findings = (out.stdout or "").strip()
+        if not findings:
+            return None                      # rc 1 with no output would be an unattributable red
+        lints = ",".join(sorted(set(
+            line.split(":", 1)[0][len("PREGATE "):].strip()
+            for line in findings.splitlines() if line.startswith("PREGATE "))))
+        return {"lints": lints or "mechanical",
+                "reason": "mechanical lint red (%s) — no reviewer dispatched" % (lints or "mechanical"),
+                "findings": findings}
+
+    def _review_tier(self, cand):
+        """``(tier, model)`` for this candidate's diff — the risk-tier classification, ported from
+        ``work-units/git-pr.sh:_classify_review_tier`` and gated behind ``REVIEW_TIERING=on``.
+
+        WHY IT IS GATED rather than simply matching bash: the P5 engine port never carried the tiering
+        across, so on the live core every PR has been dispatching ``$MODEL_REVIEW`` regardless of
+        ``REVIEW_ESCALATE_GLOB`` / ``DOCS_ONLY_GLOB``. Restoring it silently would change, on the next
+        engine upgrade, WHICH model reviews a PR and whether a docs-only diff is reviewed at all —
+        an operator's call, never an upgrade's side effect. Off (the default) returns
+        ``("STRONG", "")``: no ``gh`` call, no classification, byte-identical dispatch.
+
+        Fails SAFE in one direction only, exactly as the bash original: any uncertainty (unreadable or
+        empty diff) is STRONG, never a downgrade, and an escalate-glob or over-size match wins over
+        every cheaper tier."""
+        if (self.config.get("REVIEW_TIERING") or "off") != "on":
+            return "STRONG", ""
+        escalate = self.config.get("REVIEW_ESCALATE_GLOB") or ""
+        docs_only = self.config.get("DOCS_ONLY_GLOB") or ""
+        floor_on = (self.config.get("REVIEW_MECH_FLOOR") or "off") == "on"
+        if not escalate and not docs_only and not floor_on:
+            return "STRONG", ""
+        paths = self._review_diff_paths(cand)
+        if not paths:
+            return "STRONG", ""              # unreadable/empty diff → never downgrade blind
+        # DOCS/TEST-ONLY: every changed path is a *.md doc or under tests/ → skip the review entirely.
+        if all(p.endswith(".md") or p.startswith("tests/") for p in paths):
+            return "SKIP", ""
+        # ESCALATION WINS — the glob and the size checks run before every cheaper tier.
+        if escalate:
+            rx = _review_glob(escalate)
+            if rx is None or any(rx.search(p) for p in paths):
+                # An unparseable SAFETY glob fails to STRONG: an operator who pinned engine paths into
+                # it must never get a cheaper reviewer because of a typo in the pattern.
+                return "STRONG", ""
+        if len(paths) > _pos_int(self.config.get("REVIEW_ESCALATE_MAXFILES"), 10):
+            return "STRONG", ""
+        if docs_only:
+            rx = _review_glob(docs_only)
+            # An unparseable DOCS glob simply does not downgrade (it is an opt-IN to a cheaper tier,
+            # not a safety net), so it falls through to the tiers below rather than forcing STRONG.
+            if rx is not None and all(rx.search(p) for p in paths):
+                return "DOCS", self.config.get("REVIEW_MODEL_DOCS") or ""
+        if escalate or docs_only:
+            return "CHEAP", self.config.get("REVIEW_MODEL_CHEAP") or ""
+        # No operator glob is configured, so the tier so far is the STRONG default. The FLOOR is the
+        # only thing that may lower it, and only for a diff the shared classifier positively
+        # recognizes as mechanical (a TSV row edit, a pure rename, a version bump).
+        if floor_on and self._review_mech_floor(cand):
+            self.journal.append("review_tier_floor", "pr", cand.pr, "sha", cand.sha,
+                                "model", self.config.get("REVIEW_MODEL_CHEAP") or "",
+                                "reason", "small mechanical diff (TSV row / rename / version bump)"
+                                          " — floored to the cheap tier")
+            return "CHEAP", self.config.get("REVIEW_MODEL_CHEAP") or ""
+        return "STRONG", ""
+
+    def _review_mech_floor(self, cand):
+        """True iff the shared classifier recognizes this worktree's diff as small + mechanical
+        (rc 0). Every other rc — not mechanical (1), undecidable (2), missing script, timeout — is
+        False, so the floor can only ever fire on a POSITIVE recognition."""
+        script = self._pregate_script()
+        tree = cand.worktree or ""
+        if not script or not os.path.exists(script) or not tree or not os.path.isdir(tree):
+            return False
+        base = self.config.get("DEFAULT_BRANCH") or os.environ.get("DEFAULT_BRANCH") or "main"
+        try:
+            out = subprocess.run(["bash", script, "floor", tree, base],
+                                 capture_output=True, text=True, timeout=_PREGATE_TIMEOUT)
+        except Exception:
+            return False
+        return out.returncode == 0
+
+    def _review_diff_paths(self, cand):
+        """This PR's changed-file paths (``gh pr diff --name-only``) — the classifier's only input.
+        Empty on ANY failure, which the caller reads as "do not downgrade"."""
+        try:
+            out = subprocess.run(["gh", "pr", "diff", str(cand.pr), "--name-only"],
+                                 capture_output=True, text=True, timeout=_PREGATE_TIMEOUT)
+        except Exception:
+            return []
+        if out.returncode != 0:
+            return []
+        return [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+
+    def _dispatch_review(self, cand, tier_model=""):
         st = self.state
         result = st.review_result_file(cand)
         inflight = st.review_inflight_file(cand)
@@ -2471,7 +2669,13 @@ class LiveGates:
         # MODEL_REVIEW is an UNEXPORTED shell var the python child never saw; the reviewer, which sources
         # config itself, still ran the right model, so only the journal was wrong. Pinning + the
         # herd-config.sh export close both halves.)
-        model = env.get("HERD_REVIEW_MODEL") or env.get("MODEL_REVIEW") or ""
+        # HERD-559: the risk TIER's chosen model, when the classifier picked one, is resolved FIRST —
+        # it is a per-diff decision that must beat the per-project default, exactly as bash's
+        # `_dispatch_review <model>` argument does. An EMPTY tier_model (the default, and always so
+        # while REVIEW_TIERING is off) leaves this chain byte-identical to before: the operator's
+        # HERD_REVIEW_MODEL override, else MODEL_REVIEW. Whatever wins is pinned into the reviewer's
+        # env, so `review_dispatched.model` can still never diverge from what actually ran.
+        model = tier_model or env.get("HERD_REVIEW_MODEL") or env.get("MODEL_REVIEW") or ""
         if model:
             env["HERD_REVIEW_MODEL"] = model
         try:
@@ -2493,6 +2697,31 @@ class LiveGates:
         # the reviewer's result file.
         self.journal.append("review_dispatched", "pr", cand.pr, "sha", cand.sha, "pid", proc.pid,
                             "model", model, "log_path", result, "pin", cand.sha)
+
+
+# HERD-559: one bound for every review-fast-path subprocess (the shared lint set, the mechanical-diff
+# classifier, the classifier's `gh pr diff`). Generous enough for the pre-gate's two-pass baseline
+# subtraction on a large tree, hard enough that a hung git/gh costs at most one tick — the same
+# "bounded so a stuck call never hangs the tick" rule as _HV_BODY_TIMEOUT / _HOLD_COMMENT_TIMEOUT.
+_PREGATE_TIMEOUT = 120
+
+
+def _review_glob(pattern):
+    """Compile one of the review-tiering egrep keys, or ``None`` when it does not compile.
+
+    ``re.search`` semantics at every call site, never ``re.match``: these keys are documented and used
+    as UNANCHORED egrep patterns — this repo's own ``DOCS_ONLY_GLOB="[.](md|txt)"`` is a suffix
+    pattern a prefix-anchored match could never satisfy (``work_unit.py`` records the two rounds of
+    review that established this).
+
+    ``None`` for an unparseable pattern is deliberately NOT "matches nothing": the caller must decide,
+    per key, which way an unusable pattern fails. For ``REVIEW_ESCALATE_GLOB`` — a SAFETY glob whose
+    whole job is to force the strong tier — silently treating it as "matched nothing" would let the
+    very paths the operator pinned fall through to a cheaper reviewer, so the caller fails to STRONG."""
+    try:
+        return re.compile(pattern)
+    except re.error:
+        return None
 
 
 def parse_review_verdict(text):
@@ -3658,6 +3887,21 @@ class LiveTick:
             return ("PR #%s failed the healthcheck (CODEERROR).\n"
                     "Read the failing suite output, fix every CODE error, run the healthcheck, and "
                     "push your fix." % cand.pr)
+        # HERD-559: a PRE-GATE block never reached a model, so there is no review to read and no
+        # comment to reply to — the canned prompt below would send the builder hunting for a finding
+        # that was never posted. Name the mechanical red instead and point at the light healthcheck,
+        # which runs the SAME shared lints locally, so the builder can reproduce and fix it directly.
+        source = ""
+        if hasattr(self.state, "recorded_review_source"):
+            source = self.state.recorded_review_source(cand.pr, cand.sha) or ""
+        if source == "pregate":
+            reason = self.state.recorded_review_reason(cand.pr, cand.sha) or "a mechanical lint red"
+            return ("PR #%s was blocked BEFORE the adversarial review by the mechanical pre-gate: %s.\n"
+                    "No reviewer was dispatched — the deterministic lint set found a red your diff "
+                    "introduced. Reproduce it locally with "
+                    "`bash scripts/herd/healthcheck.sh <your worktree> --light` (it runs the same "
+                    "shared lints), fix every finding, and push. The review runs automatically once "
+                    "the diff is mechanically clean." % (cand.pr, reason))
         return ("PR #%s was review-blocked.\n"
                 "Read the full review: gh pr view %s\n"
                 "Fix every issue the reviewer raised, run the healthcheck, push your fix, and "
@@ -4176,7 +4420,15 @@ class LiveTick:
             # are the same string by construction and can never drift. Appended ONLY when non-empty:
             # a PASS, a reason-less legacy reviewer line, and every sim/fixture tick journal a
             # byte-identical `verdict_recorded` to the one they journaled before this field existed.
-            _vfields = ["pr", cand.pr, "sha", cand.sha, "value", verdict, "source", "reviewer"]
+            # HERD-559: the provenance is READ BACK from the ledger row the rail just wrote rather
+            # than hardcoded "reviewer" — the review rail can now also produce a `pregate` BLOCK, and a
+            # deterministic lint refusal journaled as a model's finding would misdescribe the record
+            # for every downstream reader. A legacy/absent source reads back "reviewer", so every
+            # pre-HERD-559 path journals byte-identically.
+            _vsource = "reviewer"
+            if hasattr(self.state, "recorded_review_source"):
+                _vsource = self.state.recorded_review_source(cand.pr, cand.sha) or "reviewer"
+            _vfields = ["pr", cand.pr, "sha", cand.sha, "value", verdict, "source", _vsource]
             _vreason = self.state.recorded_review_reason(cand.pr, cand.sha)
             if _vreason:
                 _vfields += ["reason", _vreason]
@@ -4536,11 +4788,21 @@ _CONCURRENCY_KEYS = ("HEALTH_CONCURRENCY", "REVIEW_CONCURRENCY")
 # but does not export.
 _BREAKER_KEYS = ("INFRA_BREAKER_MAX", "INFRA_BREAKER_COOLDOWN")
 
+# HERD-559 review fast path: the pre-gate lever, the mechanical-floor lever + its ceilings, the
+# tiering activation lever, the latency-telemetry lever, and the tiering keys the ported classifier
+# reads (they were only ever consumed by the bash reference path before, so none of them crossed into
+# this child process — the very gap that left the tiering dormant on the live core).
+_REVIEW_FASTPATH_KEYS = ("REVIEW_PREGATE", "REVIEW_MECH_FLOOR", "REVIEW_MECH_FLOOR_MAXFILES",
+                         "REVIEW_MECH_FLOOR_MAXLINES", "REVIEW_TIERING", "REVIEW_LATENCY",
+                         "REVIEW_ESCALATE_GLOB", "REVIEW_ESCALATE_MAXFILES", "DOCS_ONLY_GLOB",
+                         "REVIEW_MODEL_CHEAP", "REVIEW_MODEL_DOCS")
+
 _CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
                     "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
                     "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE",
                     "HEALTH_TRUST_BUILDER")
-                   + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS)
+                   + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS
+                   + _REVIEW_FASTPATH_KEYS)
 
 
 def _config_from_env(scenario=None):

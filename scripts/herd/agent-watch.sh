@@ -3549,6 +3549,18 @@ _record_advisory_notes() {
 _review_inflight_file() { printf '%s' "$TREES/.review-inflight-$1-$2"; }
 _review_result_file()   { printf '%s' "$TREES/.review-result-$1-$2"; }
 _review_tier_file()     { printf '%s' "$TREES/.review-tier-$1-$2"; }
+# Mechanical-red pre-gate outcome cache (HERD-559), sha-keyed exactly like the tier cache: the lint
+# set is deterministic on a given tree, so it runs at most ONCE per commit however many ticks a
+# candidate sits queued. One token: CLEAN | SKIP (a red is not cached here — it is recorded as a real
+# BLOCK verdict in the review ledger, which is already the sha-keyed once-record).
+_review_pregate_file() { printf '%s' "$TREES/.review-pregate-$1-$2"; }
+# The pre-gate's FULL lint output for this pr+sha, held for the auto-refix bounce (the structured
+# .review-block-* cache carries only rule/why/location; the builder needs the findings themselves).
+# NAMED SO THE SHA IS THE LAST DASH-SEGMENT: _discard_stale_reviews decides staleness with
+# `${base##*-}` = sha, so a suffix after the sha (`.review-block-<pr>-<sha>-lint`) would read as the
+# literal word "lint", never match, and be swept on the very next tick — deleting the CURRENT sha's
+# findings before the bounce could ever read them.
+_review_lint_file()    { printf '%s' "$TREES/.review-lint-$1-$2"; }
 # Structured-BLOCK detail cache (HERD-104): the reviewer's rule/why/location for THIS exact pr+sha,
 # written when a BLOCK verdict is collected (see _persist_block_fields) so the auto-refix bounce can
 # surface an ACTIONABLE finding instead of "read the PR". Sha-keyed like the markers above; a newer
@@ -3919,8 +3931,122 @@ _resolver_lane_starting() {
   return 1
 }
 
+# ── MECHANICAL-RED PRE-GATE (HERD-559) ────────────────────────────────────────────────────────────
+# Review latency is the pipeline's ceiling once health is fast, and part of that latency is spent
+# discovering things a lint already knows: three mechanical reds (a caps-sync miss, a pipe-safety
+# miss, a doc-drift miss) shipped review-only in a single day, each burning a full adversarial review
+# to report what a deterministic check answers in seconds. This runs that check set FIRST, so the
+# reviewer only ever sees mechanically-clean diffs and a mechanical red costs no review slot at all.
+#
+# The lint set + the baseline subtraction that keeps it honest live in ONE place —
+# scripts/herd/review-pregate.sh, shared verbatim with the live Python core and herd-review.sh. It is
+# invoked as a SUBPROCESS, never sourced: its lint bodies are read from the TREE UNDER TEST (so a
+# branch that changes a lint is linted by its own version), and builder-authored code must not be
+# sourced into the watcher process.
+: "${HERD_REVIEW_PREGATE_BIN:="$HERE/review-pregate.sh"}"
+
+# _review_pregate_enabled — REVIEW_PREGATE=on (opt-in). Anything else, including a typo, is off: this
+# gate can bounce a builder, so it must never activate by accident.
+_review_pregate_enabled() { [ "${REVIEW_PREGATE:-off}" = "on" ]; }
+
+# _review_pregate_step <pr#> <slug> <headSha> — the pre-dispatch mechanical check for this exact
+# pr+sha. Returns 0 always and reports through TWO globals:
+#   $_REVIEW_PREGATE_VERDICT — CLEAN | SKIP | RED
+#       CLEAN — no NEW mechanical red; the caller proceeds to the normal reviewer dispatch
+#       SKIP  — the lever is off, the worktree/binary is absent, or the pre-gate could not attribute
+#               its findings to this diff (no computable merge base). Handled identically to CLEAN by
+#               design: the reviewer runs exactly as it does today. A pre-gate that cannot be sure
+#               must never bounce a builder — a false red wedges a PR on a red its author cannot fix.
+#       RED   — a mechanical red this diff INTRODUCED. The caller records the BLOCK, dispatches nothing.
+#   $_REVIEW_PREGATE_FINDINGS — the lint output, on RED.
+#
+# GLOBALS, NOT AN ECHOED TOKEN, and deliberately so: the findings are the whole point of the bounce,
+# and a caller reading the token through `$(…)` would run this in a SUBSHELL where every global
+# assignment is discarded — the verdict would arrive and the findings would silently be empty. So the
+# result travels one way for both values, and the caller invokes this DIRECTLY.
+_REVIEW_PREGATE_FINDINGS=""
+_REVIEW_PREGATE_VERDICT=""
+_review_pregate_step() {
+  local _pgs_pr="$1" _pgs_slug="$2" _pgs_sha="$3" _pgs_cache _pgs_wt _pgs_rc
+  _REVIEW_PREGATE_FINDINGS=""
+  _REVIEW_PREGATE_VERDICT=SKIP
+  _review_pregate_enabled || return 0
+  [ -f "$HERD_REVIEW_PREGATE_BIN" ] || return 0
+  _pgs_wt="$TREES/$_pgs_slug"
+  [ -d "$_pgs_wt" ] || return 0
+
+  # Sha-keyed cache: the lint set is deterministic on a fixed tree, so re-running it every tick while
+  # the review sits QUEUED would be pure waste. Mirrors the tier cache's lifecycle exactly (written
+  # here, dropped by _discard_stale_reviews on a new head and by the verdict-collection cleanup).
+  _pgs_cache="$(_review_pregate_file "$_pgs_pr" "$_pgs_sha")"
+  if [ -s "$_pgs_cache" ]; then
+    _REVIEW_PREGATE_VERDICT="$(cat "$_pgs_cache" 2>/dev/null)"
+    case "$_REVIEW_PREGATE_VERDICT" in CLEAN|SKIP) : ;; *) _REVIEW_PREGATE_VERDICT=SKIP ;; esac
+    return 0
+  fi
+
+  _REVIEW_PREGATE_FINDINGS="$(bash "$HERD_REVIEW_PREGATE_BIN" lint "$_pgs_wt" "${DEFAULT_BRANCH:-main}" 2>/dev/null)"
+  _pgs_rc=$?
+  case "$_pgs_rc" in
+    1)
+      # A red is NOT cached in this file — the ledger's BLOCK row is already the sha-keyed record, and
+      # caching here too would give one outcome two homes that could disagree.
+      _REVIEW_PREGATE_VERDICT=RED ;;
+    0) _REVIEW_PREGATE_VERDICT=CLEAN; printf 'CLEAN' > "$_pgs_cache" 2>/dev/null || true ;;
+    *) _REVIEW_PREGATE_VERDICT=SKIP;  printf 'SKIP'  > "$_pgs_cache" 2>/dev/null || true ;;
+  esac
+  return 0
+}
+
+# _record_pregate_block <pr#> <slug> <headSha> <findings> — turn a pre-gate red into the SAME durable
+# artifacts a reviewer BLOCK produces, so every downstream consumer (the merge decision, the refix
+# bounce, `herd approve why`, the console row) works unchanged:
+#   • a sha-keyed BLOCK in the review ledger with provenance source=pregate — DISTINCT from
+#     source=reviewer, because a human reading the ledger must be able to tell a deterministic lint
+#     refusal from a model's correctness finding;
+#   • the structured rule/why/location cache the auto-refix bounce reads, so the builder is handed the
+#     actual lint output rather than "read the PR";
+#   • the review_pregate_red journal event.
+_record_pregate_block() {
+  local _rpb_pr="$1" _rpb_slug="$2" _rpb_sha="$3" _rpb_find="$4" _rpb_lints _rpb_first
+  # The lint names that fired, comma-joined, as the ledger's one-line reason.
+  _rpb_lints="$(printf '%s\n' "$_rpb_find" | sed -n 's/^PREGATE \([a-z-]*\):.*/\1/p' | paste -sd, - 2>/dev/null)"  # pipe-ok: bounded finding block (at most one line per lint), far under a pipe buffer
+  [ -n "$_rpb_lints" ] || _rpb_lints="mechanical"
+  _rpb_first="$(printf '%s\n' "$_rpb_find" | sed -n '2p')"
+  record_review "$_rpb_pr" "$_rpb_sha" "BLOCK" "pregate" "mechanical lint red (${_rpb_lints}) — no reviewer dispatched"
+  # rule / why / location, the three lines _handle_block_verdict reads back for the bounce prompt.
+  printf '%s\n%s\n%s\n' \
+    "mechanical lint: ${_rpb_lints}" \
+    "the deterministic pre-review lint set found a red this diff introduced; the adversarial review was not dispatched" \
+    "${_rpb_first:-see the lint output below}" \
+    > "$(_review_block_file "$_rpb_pr" "$_rpb_sha")" 2>/dev/null || true
+  # The FULL lint output, for the bounce prompt. Sha-keyed on its own name so the stale-sha sweep
+  # treats it exactly like every other per-(pr,sha) review artifact.
+  printf '%s\n' "$_rpb_find" > "$(_review_lint_file "$_rpb_pr" "$_rpb_sha")" 2>/dev/null || true
+  journal_append review_pregate_red pr "$_rpb_pr" sha "$_rpb_sha" slug "$_rpb_slug" \
+    lints "$_rpb_lints" reason "mechanical lint red — review dispatch skipped, no slot burned"
+}
+
 # ── Risk-tiered review classification (REVIEW_ESCALATE_GLOB / DOCS_ONLY_GLOB) ─────────────────────
 # _classify_review_tier — moved to work-units/git-pr.sh (HERD-398, Phase 3 work-unit extraction).
+
+# _review_mech_floor_applies <slug> — HERD-559 leg 2, the SMALL-MECHANICAL-DIFF FLOOR. True when
+# REVIEW_MECH_FLOOR=on AND this worktree's diff is one the shared classifier positively recognizes as
+# carrying no correctness surface (a TSV row edit, a pure 100%-similarity rename, or a version bump —
+# small, and matching no REVIEW_ESCALATE_GLOB path). The classifier itself lives in review-pregate.sh
+# so the bash leg and the live Python core can never disagree about what "mechanical" means.
+#
+# A FLOOR, not an override: the caller consults it ONLY where the tier would otherwise be the STRONG
+# default, so it can lower a tier and never raise one — and the evidence-triggered Opus escalation,
+# applied after it, still wins outright.
+_review_mech_floor_applies() {
+  local _mfa_slug="$1" _mfa_wt
+  [ "${REVIEW_MECH_FLOOR:-off}" = "on" ] || return 1
+  [ -f "$HERD_REVIEW_PREGATE_BIN" ] || return 1
+  _mfa_wt="$TREES/$_mfa_slug"
+  [ -d "$_mfa_wt" ] || return 1
+  bash "$HERD_REVIEW_PREGATE_BIN" floor "$_mfa_wt" "${DEFAULT_BRANCH:-main}" >/dev/null 2>&1
+}
 
 # _review_tier <pr#> <headSha> — the tier for this exact pr+sha, CACHED sha-keyed (mirroring the
 # review-once ledger) so the `gh pr diff` classification runs at most ONCE per commit even while the
@@ -4093,7 +4219,7 @@ _sweep_reviewer_registry() {
 # (HERD-113 — a stale reviewer's pane must not linger), and drop its markers so the slot frees up.
 _discard_stale_reviews() {
   local pr="$1" sha="$2" f base
-  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"* "$TREES/.review-block-$pr-"* "$TREES/.review-registry-$pr-"*; do
+  for f in "$TREES/.review-result-$pr-"* "$TREES/.review-inflight-$pr-"* "$TREES/.review-tier-$pr-"* "$TREES/.review-block-$pr-"* "$TREES/.review-pregate-$pr-"* "$TREES/.review-lint-$pr-"* "$TREES/.review-registry-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -4585,6 +4711,19 @@ _review_gate_step() {
     # inflight marker is removed below (mirrors the healthcheck gate's own _hg_elapsed / HERD-281).
     local _rgs_elapsed; _rgs_elapsed="$(_marker_age "$inflight")"
     case "$_rgs_elapsed" in ''|-1|*[!0-9]*) : ;; *) _phase_anomaly_observe review "review" "$_rgs_elapsed" ;; esac
+    # REVIEW LATENCY TELEMETRY (HERD-559 leg 3). The whole fast path exists because review wall-clock
+    # is the pipeline's ceiling — so MEASURE it rather than estimate it. One event per collected
+    # verdict, carrying the dispatch→verdict seconds together with the tier and verdict that produced
+    # them, so the ceiling can be read per-tier (is the cheap tier actually faster? does the floor pay
+    # for itself?) and not just in aggregate. Read from the SAME marker age above, BEFORE the marker
+    # is removed below. Pure telemetry: nothing gates on it. REVIEW_LATENCY=off is a hard no-op.
+    if [ "${REVIEW_LATENCY:-on}" != "off" ]; then
+      case "$_rgs_elapsed" in
+        ''|-1|*[!0-9]*) : ;;
+        *) journal_append review_latency pr "$pr" sha "$sha" slug "$slug" \
+             secs "$_rgs_elapsed" verdict "$_rgs_echo" tier "$(cat "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || printf STRONG)" ;;
+      esac
+    fi
     # Verdict is now durably in the ledger → drop the reviewer's scratch files. VERDICT CONSUMED →
     # retire the reviewer's pane (HERD-113): a PASS/BLOCK reviewer leaves its pane OPEN with an idle
     # session showing the verdict banner; now that the watcher has read the verdict that pane has done
@@ -4633,6 +4772,18 @@ _review_gate_step() {
   # so a carry consumes neither a reviewer slot nor a pending Opus escalation.
   if _maybe_carry_forward_review "$pr" "$slug" "$sha"; then echo PASS; return 0; fi
 
+  # MECHANICAL-RED PRE-GATE (HERD-559, opt-in via REVIEW_PREGATE). Placed here deliberately: BELOW the
+  # collect/in-flight branches (a review already running still finishes and its verdict is recorded)
+  # and below the carry-forward (a provably-already-reviewed sha needs no lint), but ABOVE the tier
+  # classification, the escalation-arm consumption and the concurrency check — so a mechanical red
+  # spends no reviewer slot, no `gh pr diff` classification and no pending Opus escalation. Byte-inert
+  # with the lever off: _review_pregate_step returns SKIP before touching anything.
+  _review_pregate_step "$pr" "$slug" "$sha"          # DIRECT call: `$(…)` would lose the findings
+  if [ "$_REVIEW_PREGATE_VERDICT" = "RED" ]; then
+    _record_pregate_block "$pr" "$slug" "$sha" "$_REVIEW_PREGATE_FINDINGS"
+    echo BLOCK; return 0
+  fi
+
   # RISK-TIERED review gate (opt-in via REVIEW_ESCALATE_GLOB and/or DOCS_ONLY_GLOB). Default (BOTH
   # empty) → the STRONG tier with an EMPTY model, i.e. today's unchanged always-$MODEL_REVIEW path; no
   # diff is classified at all. When either glob is set, classify this pr+sha's diff ONCE (cached,
@@ -4654,6 +4805,19 @@ _review_gate_step() {
     [ "$tier" = "CHEAP" ] && _rt_model="$REVIEW_MODEL_CHEAP"
     # DOCS-only diff (opt-in via DOCS_ONLY_GLOB): a real adversarial review on the cheapest tier.
     [ "$tier" = "DOCS" ]  && _rt_model="$REVIEW_MODEL_DOCS"
+  fi
+
+  # SMALL-MECHANICAL-DIFF FLOOR (HERD-559 leg 2, opt-in via REVIEW_MECH_FLOOR). Consulted ONLY when
+  # the tier so far is the STRONG default (an EMPTY model — either no tiering glob is configured at
+  # all, or the classification above chose STRONG). That placement is the whole safety argument: the
+  # floor can only ever LOWER a strong tier to the cheap one, never touch a tier the operator's globs
+  # already chose, and never raise anything. A diff of pure TSV rows / a 100%-similarity rename / a
+  # version bump has nothing for an adversarial correctness reviewer to find, so paying the strong
+  # tier for it is pure latency. Byte-inert with the lever off (the probe short-circuits on the key).
+  if [ -z "$_rt_model" ] && _review_mech_floor_applies "$slug"; then
+    _rt_model="$REVIEW_MODEL_CHEAP"
+    journal_append review_tier_floor pr "$pr" sha "$sha" model "$_rt_model" \
+      reason "small mechanical diff (TSV row / rename / version bump) — floored to the cheap tier"
   fi
 
   # EVIDENCE-TRIGGERED ESCALATION: if a builder's second refix round still arrived BLOCKed on this PR
@@ -10938,9 +11102,15 @@ _handle_block_verdict() {
     # sends the builder a "fix" prompt with nothing to fix (2026-07-02 incident: a no-verdict
     # default-BLOCK woke a builder that then worked on noise and had to be stood down by hand).
     # Provenance lives in the review ledger row's source field; legacy/absent → "reviewer".
+    # HERD-559: `pregate` is the SECOND provenance that satisfies this gate, and for the same reason
+    # the gate exists. The bar is not "a model wrote it" — it is "this verdict carries a finding the
+    # builder can act on". A mechanical pre-gate red carries the literal lint output naming the file
+    # and the rule, which is MORE actionable than most review findings; refusing to bounce it would
+    # strand a PR on a red whose fix is mechanical. Every other provenance (a gate-generated default,
+    # a carried-forward PASS's inverse) still carries nothing to fix and still must not wake anybody.
     local _hbv_src
     _hbv_src="$(review_verdict_source "$_hbv_pr" "$_hbv_sha")"
-    if [ "$_hbv_src" != "reviewer" ]; then
+    if [ "$_hbv_src" != "reviewer" ] && [ "$_hbv_src" != "pregate" ]; then
       DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · review blocked without a reviewer finding (${_hbv_src}) · not auto-refixed · see PR #${_hbv_pr}${C_RESET}"
       return 0
     fi
@@ -11026,6 +11196,22 @@ _handle_block_verdict() {
       _hbv_prompt="PR #${_hbv_pr} was review-blocked.
 ${_hbv_finding}Read the full review: gh pr view ${_hbv_pr}
 Fix every issue the reviewer raised, run the healthcheck, push your fix, and reply to the review comment once done."
+      # HERD-559: a PRE-GATE red never reached a model, so there is no review to read and no comment to
+      # reply to — pointing the builder at `gh pr view` would send it hunting for a finding that was
+      # never posted. Hand it the lint output verbatim instead: that IS the finding, and it names the
+      # rule and the file. Falls back to the standard prompt above if the lint capture is missing.
+      if [ "$_hbv_src" = "pregate" ]; then
+        local _hbv_lint=""
+        [ -s "$(_review_lint_file "$_hbv_pr" "$_hbv_sha")" ] \
+          && _hbv_lint="$(cat "$(_review_lint_file "$_hbv_pr" "$_hbv_sha")" 2>/dev/null)"
+        if [ -n "$_hbv_lint" ]; then
+          _hbv_prompt="PR #${_hbv_pr} was blocked BEFORE the adversarial review by the mechanical pre-gate: the deterministic lint set found a red your diff introduced, so no reviewer was dispatched.
+
+${_hbv_lint}
+
+Fix every finding above, run the healthcheck, and push. The review runs automatically once the diff is mechanically clean."
+        fi
+      fi
       # Target the builder's AGENT pane whether it reads idle OR 'done' (never a 'working' one) —
       # a 'done' builder's agent TUI is still up and waiting, so submitting the raw re-task prompt
       # (type + explicit Enter — HERD-186 / issue #86) wakes it. This is the SINGLE wake path for

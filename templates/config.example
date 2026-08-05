@@ -195,6 +195,27 @@ MODEL_REVIEW="claude-sonnet-4-6"    # pre-merge gate; escalate to Opus via REVIE
 # DOCS_ONLY_GLOB='\.(md|txt)$'        # every changed path matches → $REVIEW_MODEL_DOCS review
 # REVIEW_MODEL_DOCS="claude-haiku-4-5"  # cheapest tier for pure-docs diffs
 
+# review FAST PATH (HERD-559) — once the healthcheck is fast, the ~5 minutes of serial LLM review is
+# what binds every PR. Three composable levers, all ship-dormant except the telemetry:
+#   • REVIEW_PREGATE=on   runs the cheap deterministic lint set (caps-sync, the config-manifest
+#     ghost/dead-key scan, journal-emission, pipe-safety, git-scope, doc-drift — the SAME shared
+#     implementations the healthcheck already runs) BEFORE dispatching a reviewer. A red bounces the
+#     builder with the lint output and burns no review slot, so the reviewer only ever sees a
+#     mechanically-clean diff. Baseline-subtracted: a red already standing on the default branch is
+#     never attributed to this diff, and an uncomputable baseline skips the pre-gate entirely.
+#   • REVIEW_MECH_FLOOR=on routes a small purely-mechanical diff (TSV rows / a 100% rename / a
+#     version bump) to $REVIEW_MODEL_CHEAP even with no tiering glob set. It only ever LOWERS the
+#     strong default; REVIEW_ESCALATE_GLOB always wins.
+#   • REVIEW_TIERING=on   makes REVIEW_ESCALATE_GLOB / DOCS_ONLY_GLOB take effect on the LIVE Python
+#     engine core (the bash reference path has always honored them; the engine port did not carry
+#     the classification across). Dormant because flipping it changes which model reviews a PR.
+# REVIEW_PREGATE="on"                 # lint before the reviewer; default off
+# REVIEW_MECH_FLOOR="on"              # floor mechanical diffs to the cheap tier; default off
+# REVIEW_MECH_FLOOR_MAXFILES="5"      # bigger than this is never "small and mechanical"
+# REVIEW_MECH_FLOOR_MAXLINES="40"     # ditto, in changed lines
+# REVIEW_TIERING="on"                 # activate risk tiering on the live engine core; default off
+# REVIEW_LATENCY="off"                # telemetry-only; default on — journals dispatch→verdict secs
+
 # privacy / safety
 DENY_PATHS="data/"                  # never committed; the local lane is scoped here
 REVIEW_CHECKLIST=".herd/review-checklist.md"  # project risk list injected into the review gate
