@@ -77,6 +77,7 @@ Role summarized from each file's top-of-file comment.
 - `oss-triage.sh` — OSS auto-triage (HERD-255 / HERD-168 part 1/3).
 - `pipe-safety-lint.sh` — THE shared pipe-safety guard (HERD-299): a NEW '<producer> | grep -q'
 - `posture-lint.sh` — the CONFIG-POSTURE DOCTOR (HERD-154): a deterministic, no-LLM, report-only lint
+- `pr-ref.sh` — THE ONE implementation of "given a PR body, print its explicit `Refs:` value" (HERD-522).
 - `push-gate.sh` — the shared helper for the PUSH_GATE=human hold convention (HERD-123).
 - `research-get.sh` — research-get.sh <id> — coordinator helper to fetch a research finding by its REQ_ID (the id
 - `research-step.sh` — queue/report mechanics for the READ-ONLY research drainer. The researcher
@@ -139,7 +140,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `push-gate.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -178,12 +179,13 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `spawn-step.sh` → `herd-config.sh`
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
-- `stale-dup-gate.sh` → `derived-files.sh`
+- `stale-dup-gate.sh` → `derived-files.sh`, `pr-ref.sh`
+- `status.sh` → `watcher-exempt.sh`
 - `steps.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
 - `sweep.sh` → `agent-watch.sh`, `create-retry.sh`, `derived-files.sh`, `journal.sh`, `watcher-exempt.sh`
 - `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
-- `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`
+- `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`, `pr-ref.sh`
 - `triggers.sh` → `herd-config.sh`, `journal.sh`
 - `watcher-resurrect.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
 - `work-unit.sh` → `agent-watch.sh`, `journal.sh`
