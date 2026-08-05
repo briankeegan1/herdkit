@@ -484,6 +484,45 @@ emit_infra_fail() {
   exit 2
 }
 
+# ── MECHANICAL-RED PRE-GATE (HERD-559) ───────────────────────────────────────────────────────────
+# The reviewer's own preamble runs the SAME shared mechanical lint set the dispatch legs run, for the
+# case they cannot cover: a DIRECT invocation (`herd-review.sh <pr> <slug>` by hand, a lane's local
+# pre-PR review, a future caller). It is the last point before a model is spawned, so a red here still
+# costs zero model time — the verdict is emitted from this process and the reviewer never starts.
+#
+# NOT a second implementation: it shells the same scripts/herd/review-pregate.sh, which is also
+# baseline-subtracted, so a lint red already standing on the default branch is never attributed here
+# either. Dormant unless REVIEW_PREGATE=on; skipped silently (rc 2) when the pre-gate cannot attribute
+# its findings, in which case this review proceeds exactly as it does today.
+#
+# Placed AFTER _emit_verdict / emit_infra_fail are defined (the verdict must travel the SAME single
+# exit channel every other path uses — result file included) and BEFORE both mode branches, so PR mode
+# and --local mode are covered by one block.
+if [ "${REVIEW_PREGATE:-off}" = "on" ] && [ -f "$HERE/review-pregate.sh" ] && [ -d "$DIR" ]; then
+  _PREGATE_OUT="$(bash "$HERE/review-pregate.sh" lint "$DIR" "${DEFAULT_BRANCH:-main}" 2>/dev/null)"
+  _PREGATE_RC=$?
+  if [ "$_PREGATE_RC" -eq 1 ] && [ -n "$_PREGATE_OUT" ]; then
+    _PREGATE_LINTS="$(printf '%s\n' "$_PREGATE_OUT" | sed -n 's/^PREGATE \([a-z-]*\):.*/\1/p' | paste -sd, - 2>/dev/null)"  # pipe-ok: bounded finding block (one line per lint), far under a pipe buffer
+    [ -n "$_PREGATE_LINTS" ] || _PREGATE_LINTS="mechanical"
+    journal_append review_pregate_red pr "${PR:-}" slug "${SLUG:-}" lints "$_PREGATE_LINTS" \
+      reason "mechanical lint red — reviewer never spawned"
+    # Post the lint output to the PR (PR mode only, best-effort): a BLOCK the watcher will bounce must
+    # leave a readable trace on the PR, exactly as a model-authored BLOCK does. Never fatal.
+    if [ -n "${PR:-}" ]; then
+      gh pr comment "$PR" --body "🔧 **Mechanical pre-gate red** — the adversarial review was not dispatched for this commit. The deterministic lint set found a red this diff introduced:
+
+\`\`\`
+${_PREGATE_OUT}
+\`\`\`
+
+Fix these and push; the review runs automatically once the diff is mechanically clean." >/dev/null 2>&1 || true
+    fi
+    _teardown_reviewer
+    _emit_verdict "REVIEW: BLOCK — rule: mechanical lint (${_PREGATE_LINTS}) | why: the deterministic pre-review lint set found a red this diff introduced; no reviewer was dispatched | location: $(printf '%s\n' "$_PREGATE_OUT" | sed -n '2p')"
+    exit 1
+  fi
+fi
+
 # ── LOCAL (pre-PR) MODE ──────────────────────────────────────────────────────────────────────────
 # When invoked as `herd-review.sh --local <slug>`, review the worktree's LOCAL diff BEFORE any PR
 # exists (the LOCAL_REVIEW=pre-pr path). Same adversarial correctness prompt + PASS/BLOCK/INFRA-FAIL

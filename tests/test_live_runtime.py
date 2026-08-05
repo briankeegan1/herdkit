@@ -1975,7 +1975,7 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
         disp_r, disp_h = [], []
 
         class Stub(LiveGates):
-            def _dispatch_review(self, cand):
+            def _dispatch_review(self, cand, tier_model=""):
                 disp_r.append(cand.pr)
                 _marker_write(self.state.review_inflight_file(cand), os.getpid())
 
@@ -6029,6 +6029,209 @@ class TestBlockReasonComment(LiveCase):
         finally:
             LR.subprocess = orig
         self.assertEqual(res["outcomes"]["1"], "ESCALATE")
+
+
+class TestReviewFastPath(LiveCase):
+    """HERD-559 — the review fast path ON THE LIVE CORE: the mechanical-red pre-gate, the risk-tier
+    classification the engine port never carried across, and the latency telemetry.
+
+    Every lever here ships DORMANT, so each leg is asserted BOTH ways: on (the new behavior) and off
+    (byte-identical dispatch). The shared shell script is stubbed with a tiny fake so these stay pure
+    unit tests — scripts/herd/review-pregate.sh's own behavior is pinned by tests/test-review-pregate.sh.
+    """
+
+    class _Sub:
+        """subprocess stand-in: canned rc/stdout per argv[2] ('lint' | 'floor' | a gh call), and it
+        records every Popen so a test can assert a reviewer was NOT launched."""
+
+        DEVNULL = LR.subprocess.DEVNULL
+
+        class _Proc:
+            pid = 909
+
+        class _Done:
+            def __init__(self, rc, out):
+                self.returncode, self.stdout, self.stderr = rc, out, ""
+
+        def __init__(self, results):
+            self.results = results          # {"lint": (rc, out), "floor": (rc, ""), "gh": (rc, out)}
+            self.popens = []
+
+        def run(self, argv, **k):
+            key = "gh" if argv and argv[0] == "gh" else (argv[2] if len(argv) > 2 else "")
+            rc, out = self.results.get(key, (0, ""))
+            return self._Done(rc, out)
+
+        def Popen(self, *a, **k):
+            self.popens.append((a, k))
+            return self._Proc()
+
+    def _gates(self, config, results):
+        state = LiveState(state_dir=self.tmp)
+        journal = LiveJournal(self.jpath)
+        gates = LiveGates(self.tmp, state, journal, config=config)
+        sub = self._Sub(results)
+        return gates, state, sub
+
+    def _review(self, gates, sub, cand):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            return gates.review(cand)
+        finally:
+            LR.subprocess = orig
+
+    def _cand(self):
+        # cand.worktree must be a real directory for the pre-gate/floor probes to run at all.
+        wt = os.path.join(self.tmp, "wt"); os.makedirs(wt, exist_ok=True)
+        return LiveCandidate(11, "shaX", slug="feat-fast", worktree=wt)
+
+    def _script_present(self, gates):
+        """The probes require the shared script to EXIST; LiveGates resolves it under its home."""
+        p = os.path.join(self.tmp, "scripts", "herd")
+        os.makedirs(p, exist_ok=True)
+        open(os.path.join(p, "review-pregate.sh"), "w").close()
+        return gates
+
+    # ── leg 1: the mechanical-red pre-gate ────────────────────────────────────────────────────────
+    def test_pregate_red_blocks_without_dispatching_a_reviewer(self):
+        findings = "PREGATE pipe-safety: a producer piped into an early-exit consumer\n  scripts/herd/x.sh:3\n"
+        gates, state, sub = self._gates({"REVIEW_PREGATE": "on"}, {"lint": (1, findings)})
+        self._script_present(gates)
+        v = self._review(gates, sub, self._cand())
+        self.assertEqual(v, "BLOCK")
+        self.assertEqual(sub.popens, [])                       # NO reviewer process was launched
+        ev = [o for o in events(self.jpath) if o["event"] == "review_pregate_red"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["lints"], "pipe-safety")
+        self.assertEqual([o for o in events(self.jpath) if o["event"] == "review_dispatched"], [])
+        # Provenance: a deterministic lint refusal is NOT a model's correctness finding.
+        self.assertEqual(state.recorded_review(11, "shaX"), "BLOCK")
+        self.assertEqual(state.recorded_review_source(11, "shaX"), "pregate")
+
+    def test_pregate_skip_and_off_both_dispatch_as_today(self):
+        # rc 2 (the script could not attribute its findings) is treated exactly like clean: a pre-gate
+        # that is not sure must never bounce a builder onto a red it cannot fix.
+        for label, config, lint in (("skip", {"REVIEW_PREGATE": "on"}, (2, "")),
+                                    ("off", {}, (1, "PREGATE caps-sync: x\n"))):
+            with self.subTest(label):
+                self.setUp()
+                gates, state, sub = self._gates(config, {"lint": lint})
+                self._script_present(gates)
+                v = self._review(gates, sub, self._cand())
+                self.assertEqual(v, WAIT)                      # dispatched -> wait
+                self.assertEqual(len(sub.popens), 1)
+                self.assertEqual([o for o in events(self.jpath)
+                                  if o["event"] == "review_pregate_red"], [])
+
+    # ── leg 2: the risk tier + the mechanical floor ───────────────────────────────────────────────
+    def test_tiering_off_is_byte_identical(self):
+        # The lever off means no classification at all: no gh call, and the reviewer runs on the
+        # project default exactly as it did before this feature existed.
+        gates, state, sub = self._gates({"REVIEW_ESCALATE_GLOB": "^bin/"}, {})
+        self.assertEqual(gates._review_tier(self._cand()), ("STRONG", ""))
+
+    def test_tier_classification_matches_the_bash_contract(self):
+        cfg = {"REVIEW_TIERING": "on", "REVIEW_ESCALATE_GLOB": "^bin/",
+               "DOCS_ONLY_GLOB": r"[.](md|txt)", "REVIEW_MODEL_CHEAP": "cheap",
+               "REVIEW_MODEL_DOCS": "docs-model", "REVIEW_ESCALATE_MAXFILES": "3"}
+        cases = [
+            ("README.md\ntests/test-x.sh\n", ("SKIP", "")),          # docs/test-only -> no reviewer
+            ("bin/herd\n", ("STRONG", "")),                          # escalate glob wins
+            ("a.txt\nb.txt\n", ("DOCS", "docs-model")),              # every path matches DOCS_ONLY_GLOB
+            ("src/a.py\n", ("CHEAP", "cheap")),                      # small + low risk
+            ("a.py\nb.py\nc.py\nd.py\n", ("STRONG", "")),            # over REVIEW_ESCALATE_MAXFILES
+            ("", ("STRONG", "")),                                    # unreadable/empty diff fails SAFE
+        ]
+        for paths, want in cases:
+            with self.subTest(paths=paths):
+                gates, _, sub = self._gates(cfg, {"gh": (0, paths)})
+                orig = LR.subprocess
+                LR.subprocess = sub
+                try:
+                    self.assertEqual(gates._review_tier(self._cand()), want)
+                finally:
+                    LR.subprocess = orig
+
+    def test_unparseable_escalate_glob_fails_to_strong(self):
+        # A SAFETY glob that does not compile must never silently stop forcing the strong tier.
+        gates, _, sub = self._gates({"REVIEW_TIERING": "on", "REVIEW_ESCALATE_GLOB": "([unclosed",
+                                     "REVIEW_MODEL_CHEAP": "cheap"}, {"gh": (0, "src/a.py\n")})
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            self.assertEqual(gates._review_tier(self._cand()), ("STRONG", ""))
+        finally:
+            LR.subprocess = orig
+
+    def test_mech_floor_lowers_only_the_strong_default(self):
+        cfg = {"REVIEW_TIERING": "on", "REVIEW_MECH_FLOOR": "on", "REVIEW_MODEL_CHEAP": "cheap"}
+        gates, _, sub = self._gates(cfg, {"gh": (0, "templates/capabilities.tsv\n"), "floor": (0, "")})
+        self._script_present(gates)
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            self.assertEqual(gates._review_tier(self._cand()), ("CHEAP", "cheap"))
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(len([o for o in events(self.jpath) if o["event"] == "review_tier_floor"]), 1)
+
+    def test_mech_floor_never_fires_on_a_non_mechanical_diff(self):
+        cfg = {"REVIEW_TIERING": "on", "REVIEW_MECH_FLOOR": "on", "REVIEW_MODEL_CHEAP": "cheap"}
+        # rc 1 = not mechanical, rc 2 = undecidable; BOTH must leave the strong default alone.
+        for rc in (1, 2):
+            with self.subTest(rc=rc):
+                self.setUp()
+                gates, _, sub = self._gates(cfg, {"gh": (0, "src/a.py\n"), "floor": (rc, "")})
+                self._script_present(gates)
+                orig = LR.subprocess
+                LR.subprocess = sub
+                try:
+                    self.assertEqual(gates._review_tier(self._cand()), ("STRONG", ""))
+                finally:
+                    LR.subprocess = orig
+
+    def test_tier_model_is_pinned_into_the_reviewer_env(self):
+        # The tier's model must beat the project default AND be the value journaled — the HERD-353
+        # single-resolution-point invariant, extended to the tier.
+        # *.txt, not *.md: an all-.md diff hits the hardcoded docs/test-only SKIP before any tier,
+        # so the DOCS tier is only reachable through a doc format that SKIP does not cover.
+        cfg = {"REVIEW_TIERING": "on", "DOCS_ONLY_GLOB": r"[.]txt", "REVIEW_MODEL_DOCS": "docs-model"}
+        gates, _, sub = self._gates(cfg, {"gh": (0, "docs/x.txt\ndocs/y.txt\n")})
+        saved = os.environ.get("MODEL_REVIEW")
+        os.environ["MODEL_REVIEW"] = "opus-default"
+        try:
+            v = self._review(gates, sub, self._cand())
+        finally:
+            if saved is None:
+                os.environ.pop("MODEL_REVIEW", None)
+            else:
+                os.environ["MODEL_REVIEW"] = saved
+        self.assertEqual(v, WAIT)
+        rd = [o for o in events(self.jpath) if o["event"] == "review_dispatched"]
+        self.assertEqual(rd[0]["model"], "docs-model")
+        self.assertEqual(sub.popens[0][1]["env"].get("HERD_REVIEW_MODEL"), "docs-model")
+
+    # ── leg 3: latency telemetry ──────────────────────────────────────────────────────────────────
+    def test_review_latency_is_journaled_on_collect_and_off_is_a_no_op(self):
+        for config, want in ({}, 1), ({"REVIEW_LATENCY": "off"}, 0):
+            with self.subTest(config=config):
+                self.setUp()
+                gates, state, sub = self._gates(config, {})
+                cand = self._cand()
+                # A finished reviewer: a verdict file plus an inflight marker carrying a dispatch ts.
+                with open(state.review_result_file(cand), "w") as fh:
+                    fh.write("REVIEW: PASS\n")
+                _marker_write(state.review_inflight_file(cand), os.getpid())
+                self.assertEqual(self._review(gates, sub, cand), "PASS")
+                # off must journal NOTHING at all — the file may not even exist, which is itself the
+                # byte-identical proof, so a missing journal reads as zero events rather than an error.
+                lat = [o for o in (events(self.jpath) if os.path.exists(self.jpath) else [])
+                       if o["event"] == "review_latency"]
+                self.assertEqual(len(lat), want)
+                if want:
+                    self.assertEqual(lat[0]["verdict"], "PASS")
+                    self.assertGreaterEqual(int(lat[0]["secs"]), 0)
 
 
 if __name__ == "__main__":

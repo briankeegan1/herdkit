@@ -322,6 +322,13 @@ GATE_DISPATCH	sim	tests/test-sandbox-concurrency.sh
 GATE_STATUS	unit	tests/test-gate-status.sh
 GATE_STATUS_PENDING	unit	tests/test_live_runtime.py
 DELTA_REVIEW	unit	tests/test-delta-review.sh
+review-pregate.sh	unit	tests/test-review-pregate.sh
+REVIEW_PREGATE	unit	tests/test-review-pregate.sh
+REVIEW_MECH_FLOOR	unit	tests/test-review-pregate.sh
+REVIEW_MECH_FLOOR_MAXFILES	unit	tests/test-review-pregate.sh
+REVIEW_MECH_FLOOR_MAXLINES	unit	tests/test-review-pregate.sh
+REVIEW_TIERING	unit	tests/test-review-pregate.sh
+REVIEW_LATENCY	unit	tests/test-review-pregate.sh
 INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_MAX	sim	tests/test-sandbox-concurrency.sh
 INFRA_BREAKER_MAX	unit	tests/test_live_runtime.py

@@ -647,6 +647,57 @@ fi
 # DOCS_ONLY_GLOB is blank.
 : "${REVIEW_MODEL_DOCS:="claude-haiku-4-5"}"
 
+# ── Review fast path (HERD-559): pre-gate · mechanical floor · latency telemetry ──────────────────
+# Once the healthcheck gate is fast, the ~5 minutes of serial LLM review is what binds every PR.
+# Three composable levers cut it; all three are implemented ONCE in scripts/herd/review-pregate.sh
+# and consumed by the bash review dispatch leg, the live Python engine core, and herd-review.sh.
+#
+# REVIEW_PREGATE — off (default) | on. off → byte-inert: no lint runs before a review dispatch and
+# every (pr,sha) reaches the reviewer exactly as today. on → the cheap DETERMINISTIC lint set
+# (caps-sync, the config-manifest ghost/dead-key scan, journal-emission, pipe-safety, git-scope,
+# doc-drift — the SAME shared implementations both healthcheck profiles already run, never a new
+# rule) runs against the diff FIRST; a red bounces to the builder with the lint output, journals
+# review_pregate_red, and burns NO reviewer slot, so the adversarial reviewer only ever sees a
+# mechanically-clean diff. BASELINE-SUBTRACTED: a finding also present at the merge base is NOT this
+# diff's and never bounces anyone (the merge gate's suite is diff-scoped, so a lint red demonstrably
+# CAN sit unnoticed on the default branch). Any inability to compute that baseline SKIPS the pre-gate
+# entirely — a false pre-gate red would wedge a PR its builder cannot fix. Consumed by
+# agent-watch.sh, herd-review.sh and pysrc/herd/live_runtime.py.
+: "${REVIEW_PREGATE:="off"}"
+# REVIEW_MECH_FLOOR — off (default) | on. The small-mechanical-diff FLOOR on the review tiering: a
+# diff whose every changed file is a TSV row edit, a pure (100%-similarity) rename, or a version bump
+# — and which is small and matches no REVIEW_ESCALATE_GLOB path — has no correctness surface for an
+# adversarial reviewer, so it routes to $REVIEW_MODEL_CHEAP even when no tiering glob is configured.
+# Fails safe in ONE direction: any shape it cannot positively recognize keeps today's tier, and an
+# operator's REVIEW_ESCALATE_GLOB match is an absolute veto. off → no classification, byte-inert.
+: "${REVIEW_MECH_FLOOR:="off"}"
+# Floor ceilings: a diff bigger than either is never "small and mechanical" whatever its shape.
+: "${REVIEW_MECH_FLOOR_MAXFILES:="5"}"
+: "${REVIEW_MECH_FLOOR_MAXLINES:="40"}"
+# REVIEW_TIERING — off (default) | on. Activates the RISK-TIER classification (the
+# REVIEW_ESCALATE_GLOB / DOCS_ONLY_GLOB / REVIEW_MECH_FLOOR rules) inside the LIVE Python engine core.
+# The bash reference path in agent-watch.sh has always tiered on the globs alone and is unchanged by
+# this key; the engine port (HERD-306) never carried the tiering across, so on the live core every PR
+# dispatches $MODEL_REVIEW regardless of those globs. This key is the opt-in that turns the ported
+# classification on, deliberately ship-dormant: flipping it CHANGES which model reviews a PR (and,
+# for a docs/test-only diff, whether a reviewer runs at all), so it is the operator's call, not a
+# silent consequence of upgrading. off → the live core's dispatch is byte-identical to today's.
+: "${REVIEW_TIERING:="off"}"
+# REVIEW_LATENCY — on (default) | off. Journal a review_latency event (dispatch→verdict wall-clock,
+# with the tier and model that produced it) as each verdict is collected. Pure TELEMETRY: no gate, no
+# dispatch and no merge decision reads it — it exists so the review ceiling this whole fast path
+# attacks is MEASURED rather than estimated, which is why it ships ON rather than dormant. off is a
+# hard no-op: no event, byte-identical journals.
+: "${REVIEW_LATENCY:="on"}"
+# The live Python engine core resolves these from os.environ (a CHILD process sees only EXPORTED
+# vars — HERD-449), so every one of them must be exported here as well as set.
+export REVIEW_PREGATE REVIEW_MECH_FLOOR REVIEW_MECH_FLOOR_MAXFILES REVIEW_MECH_FLOOR_MAXLINES
+export REVIEW_TIERING REVIEW_LATENCY
+# The tier classification the live core now runs reads the operator's tiering keys directly, so they
+# must cross the same process boundary.
+export REVIEW_ESCALATE_GLOB REVIEW_ESCALATE_MAXFILES DOCS_ONLY_GLOB
+export REVIEW_MODEL_CHEAP REVIEW_MODEL_DOCS
+
 # ── Risk-scoped pre-PR local review (LOCAL_REVIEW=risk-scoped + LOCAL_REVIEW_GLOB, HERD-100) ──────
 # LOCAL_REVIEW=pre-pr makes EVERY builder run the cheap local adversarial correctness review before
 # it opens its PR. Journal analysis shows round-1 review BLOCKs cluster on the high-churn engine

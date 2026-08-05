@@ -173,6 +173,9 @@ class Store:
     def recorded_review_reason(self, pr, sha):
         return self._b.recorded_review_reason(pr, sha)
 
+    def recorded_review_source(self, pr, sha):
+        return self._b.recorded_review_source(pr, sha)
+
     def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         return self._b.record_review(pr, sha, verdict, source, reason)
 
@@ -394,6 +397,28 @@ class _FlatBackend:
         except Exception:
             return ""
         return reason
+
+    def recorded_review_source(self, pr, sha):
+        """The PROVENANCE field of the LAST matching row — ``reviewer`` | ``pregate`` |
+        ``skipped-low-risk`` | ``carried-forward`` — or ``""`` when there is no row (HERD-559).
+
+        Read by the walk so a verdict's journal says who actually produced it: a deterministic
+        pre-gate lint refusal and a model's correctness finding are both BLOCKs and must never be
+        indistinguishable in the record. A legacy row missing the field reads back ``reviewer``, which
+        is what every row written before provenance existed meant."""
+        path = self._p(".agent-watch-reviewed")
+        if not path or not os.path.isfile(path):
+            return ""
+        source = ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and f[1] == str(pr) and f[2] == str(sha):
+                        source = f[4] if len(f) >= 5 else "reviewer"
+        except Exception:
+            return ""
+        return source
 
     def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         path = self._p(".agent-watch-reviewed")
@@ -924,6 +949,15 @@ class _SqliteBackend:
             "SELECT reason FROM review_ledger WHERE pr=? AND sha=? ORDER BY rowid DESC LIMIT 1",
             (str(pr), str(sha))).fetchone()
         return (row[0] or "") if row else ""
+
+    def recorded_review_source(self, pr, sha):
+        """The PROVENANCE of this (pr, sha)'s verdict — see the flat backend's twin for the contract
+        (HERD-559). A row with a NULL source reads back ``reviewer``, matching the flat backend's
+        legacy-row rule; no row at all reads back ``""``."""
+        row = self._conn.execute(
+            "SELECT source FROM review_ledger WHERE pr=? AND sha=? ORDER BY rowid DESC LIMIT 1",
+            (str(pr), str(sha))).fetchone()
+        return (row[0] or "reviewer") if row else ""
 
     def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         self._conn.execute(
