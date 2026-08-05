@@ -608,6 +608,35 @@ ADOPT_FAILED_SEEN_LEDGER="$TREES/.agent-watch-adopt-failed-seen"
 # every scan, but the journal EVENT for that exact pair fires once. A SUCCESSFUL move needs no ledger
 # at all — the next scan finds the branch already checked out at the expected path and self-terminates.
 ADOPT_SELFHEAL_SEEN_LEDGER="$TREES/.agent-watch-adopt-selfheal-seen"
+# ADOPT_MISMATCH_SEEN_LEDGER (HERD-526) — dedupes the `adopt_slug_mismatch` ADVISORY per
+# (branch,stale-dir): the one mismatch shape the self-heal above deliberately REFUSES to fix itself,
+# because the slug-parity path it would move onto is ALREADY OCCUPIED (a stale twin dir, or the
+# hand-made `$TREES/<stripped> -> $TREES/feat-<stripped>` symlink operators used as a workaround for
+# GitHub issue #657). A live worktree is never auto-renamed out from under whatever occupies that
+# path — the mismatch is journaled LOUDLY, once, with the one-line fix, and left for a human.
+ADOPT_MISMATCH_SEEN_LEDGER="$TREES/.agent-watch-adopt-mismatch-seen"
+# Post-adopt DISCOVERY-VERIFICATION ledgers (HERD-526, GitHub issue #657) — `pr_adopted` claims success
+# the moment `git worktree add` returns, but the only thing that MATTERS is whether the adopted PR then
+# survives CANDIDATE DISCOVERY into classification (_branch_worktree_slug → _worktree_for_slug →
+# _pool_scoped, pysrc/herd/live_runtime.py). When the two sides disagreed about the slug, the failure
+# was silent in BOTH directions — no adopt_failed, no console row, nothing to tell "adopted and gating"
+# apart from "adopted and permanently ignored" (8 PRs sat CLEAN and ungated forever in emberglen-godot).
+# Slug UNITY (herd_branch_slug, the ONE slugifier both sides now use) makes that divergence impossible
+# by construction; this verification is the belt to that suspenders — it proves the invariant held on
+# THIS pool for THIS adopt, and says so out loud when it did not (a reaped worktree, a hand-moved dir,
+# a BRANCH_TEMPLATE changed under a live pool).
+#   • ADOPT_VERIFY_LEDGER — one "<pr>\t<sha>\t<branch>\t<slug>\t<dir>" row per successful adopt still
+#     awaiting that proof. Rows are enqueued AFTER each scan's verify pass, so every row is first
+#     checked on a LATER scan (the "next tick" the claim is about), and dropped the moment the
+#     worktree is discoverable.
+#   • ADOPT_ORPHAN_LEDGER — the console section, REWRITTEN whole from the rows that failed THIS scan's
+#     check (mirroring UNGATED_PR_LEDGER), so an operator's fix clears the row on the next scan.
+#   • ADOPT_ORPHAN_SEEN_LEDGER — dedupes `adopt_orphaned` per (pr,sha) exactly like the failure ledger
+#     above: the CHECK re-runs every scan, the journal EVENT fires once per commit.
+ADOPT_VERIFY_LEDGER="$TREES/.agent-watch-adopt-verify"
+ADOPT_ORPHAN_LEDGER="$TREES/.agent-watch-adopt-orphans"
+ADOPT_ORPHAN_SEEN_LEDGER="$TREES/.agent-watch-adopt-orphan-seen"
+ADOPT_ORPHAN_ROWS_LIMIT=5
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -737,6 +766,7 @@ SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
 UNGATED_PR_SECTION_ROWS=""  # HERD-460: the UNCONDITIONAL "ungated PRs" truth section rows (empty when none → render omits it)
+ADOPT_ORPHAN_SECTION_ROWS=""  # HERD-526: the "adopted but not discovered" alarm rows (empty unless an adopted PR failed its discovery proof → render omits it)
 ENGINE_DOWN_ROW=""     # HERD-306: the "engine down · manual intervention" alarm row set by the engine watchdog past a fault streak (empty while the Python engine is ticking)
 ENGINE_PAUSE_ROW=""    # HERD-347: the "⏸ engine paused by operator" banner set by _engine_tick_watchdog while ENGINE_PAUSE=on (empty — byte-identical console — while the lever is off/unset)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
@@ -2394,6 +2424,30 @@ _adopt_selfheal_failed_journaled() {
   awk -F'\t' -v b="$1" -v d="$2" '$1==b && $2==d{f=1} END{exit !f}' "$ADOPT_SELFHEAL_SEEN_LEDGER" 2>/dev/null
 }
 
+# _adopt_mismatch_journaled <branch> <dir> — true iff an `adopt_slug_mismatch` advisory for this exact
+# (branch,dir) was already journaled, so a mismatch nobody has fixed yet does not spam the journal
+# every scan. Mirrors _adopt_selfheal_failed_journaled; the CHECK still runs every scan (so the
+# console row below stays accurate), only the journal EVENT is deduped.
+_adopt_mismatch_journaled() {
+  [ -s "$ADOPT_MISMATCH_SEEN_LEDGER" ] || return 1
+  awk -F'\t' -v b="$1" -v d="$2" '$1==b && $2==d{f=1} END{exit !f}' "$ADOPT_MISMATCH_SEEN_LEDGER" 2>/dev/null
+}
+
+# _adopt_journal_slug_mismatch <branch> <actual-dir> <expected-dir> — the MIGRATION ADVISORY (HERD-526):
+# this branch is checked out at a pool dir that is NOT the one discovery resolves, and the self-heal
+# below cannot safely fix it because the expected path is already occupied. Journal it ONCE per
+# (branch,actual) with the one-line fix an operator can paste; NEVER auto-rename a live worktree onto
+# an occupied path.
+_adopt_journal_slug_mismatch() {
+  local _ajm_branch="$1" _ajm_actual="$2" _ajm_expected="$3"
+  _adopt_mismatch_journaled "$_ajm_branch" "$_ajm_actual" && return 0
+  journal_append adopt_slug_mismatch branch "$_ajm_branch" actual "$_ajm_actual" expected "$_ajm_expected" \
+    reason "expected slug-parity path already occupied — discovery reads $_ajm_expected, the branch lives at $_ajm_actual" \
+    fix "remove or rename $_ajm_expected, then: git -C $MAIN worktree move $_ajm_actual $_ajm_expected"
+  printf '%s\t%s\n' "$_ajm_branch" "$_ajm_actual" >> "$ADOPT_MISMATCH_SEEN_LEDGER" 2>/dev/null || true
+  return 0
+}
+
 # _adopt_self_heal_mismatch <branch> <expected-dir> <wt-porcelain> — HERD-377 leftover: an adopt from
 # BEFORE the slug-parity fix may have checked <branch> out at the WRONG path (the old unconditional
 # `tr '/' '-'` slug, e.g. TREES/feat-python-draft-pr-hold, instead of herd_branch_slug's
@@ -2414,7 +2468,15 @@ _adopt_self_heal_mismatch() {
   [ -n "$_ash_actual" ] || return 0                    # not checked out anywhere — nothing to heal
   [ "$_ash_actual" != "$_ash_expected" ] || return 0    # already at the right path
   [ "$(dirname "$_ash_actual")" = "$TREES" ] || return 0  # not a pool worktree (e.g. the main checkout) — never touch it
-  [ -e "$_ash_expected" ] && return 0                   # target occupied — never clobber, leave for a human
+  if [ -e "$_ash_expected" ]; then
+    # Target occupied — never clobber, never auto-rename a live worktree onto it. This is the ONE
+    # mismatch shape the self-heal cannot resolve on its own, and before HERD-526 it was a silent
+    # `return 0`: the branch kept living at a path discovery never reads, exactly the GH #657 shape
+    # (including the `$TREES/<stripped> -> $TREES/feat-<stripped>` symlink workaround, which occupies
+    # the expected path). Say it out loud instead, with the fix, and leave the trees alone.
+    _adopt_journal_slug_mismatch "$_ash_branch" "$_ash_actual" "$_ash_expected"
+    return 0
+  fi
   if git -C "$MAIN" worktree move "$_ash_actual" "$_ash_expected" >/dev/null 2>&1; then
     journal_append adopt_selfheal branch "$_ash_branch" from "$_ash_actual" to "$_ash_expected"
     return 0
@@ -2457,6 +2519,141 @@ _adopt_remote_pr() {
   fi
   journal_append pr_adopted pr "$_arp_pr" sha "$_arp_sha" branch "$_arp_branch" slug "$_arp_slug" dir "$_arp_dir"
   _adopt_pr_mark_adopted "$_arp_pr" "$_arp_sha"
+  # HERD-526: `pr_adopted` is a claim about git, not about the GATE. Enqueue the adopt for the DISCOVERY
+  # proof a later scan runs (_adopt_verify_scan) — the only evidence that this PR actually entered
+  # classification rather than being dropped as foreign to the pool.
+  _adopt_verify_enqueue "$_arp_pr" "$_arp_sha" "$_arp_branch" "$_arp_slug" "$_arp_dir"
+  return 0
+}
+
+# ── Post-adopt discovery verification (HERD-526, GitHub issue #657) ───────────────────────────────
+# CLOSE THE SILENCE: prove each successful adopt survives candidate discovery into classification, and
+# journal + render an alarm when it does not. See the ADOPT_VERIFY_LEDGER block above for the shape.
+
+# _adopt_verify_enqueue <pr> <sha> <branch> <slug> <dir> — append-only; one pending row per adopt.
+_adopt_verify_enqueue() {
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$ADOPT_VERIFY_LEDGER" 2>/dev/null || true
+}
+
+# _adopt_discoverable <slug> — the EXACT predicate candidate discovery applies to a candidate before it
+# may be classified: python's `_is_worktree(_worktree_for_slug(slug))` (live_runtime.py), i.e. is
+# $TREES/<slug> a real checked-out worktree. Mirrors its FAIL-SOFT too: with no pool configured
+# `_pool_scoped` skips the check entirely (byte-identical passthrough), so an unconfigured pool is
+# "discoverable" here rather than a fabricated alarm.
+_adopt_discoverable() {
+  local _ad_slug="${1:-}" _ad_dir
+  [ -n "${TREES:-}" ] || return 0
+  [ -n "$_ad_slug" ] || return 1
+  _ad_dir="$TREES/$_ad_slug"
+  [ -d "$_ad_dir" ] && [ -e "$_ad_dir/.git" ]
+}
+
+# _adopt_open_pr_numbers <prs-json> — space-separated numbers of every OPEN PR in the tick's roster,
+# used ONLY to prune pending verify rows for PRs that have since merged/closed (their worktree is
+# legitimately gone — that is convergence, not an orphan). Fail-soft: malformed JSON prints nothing,
+# which prunes everything rather than alarming on a roster we could not read.
+_adopt_open_pr_numbers() {
+  PRS_JSON="${1:-[]}" python3 -c '
+import os, sys, json
+try:
+    prs = json.loads(os.environ.get("PRS_JSON") or "[]")
+    if not isinstance(prs, list): raise ValueError
+except Exception:
+    sys.exit(0)
+print(" ".join(str(p.get("number")) for p in prs
+                if isinstance(p, dict) and p.get("number") is not None))
+' 2>/dev/null || true
+}
+
+# _adopt_journal_orphaned <pr> <sha> <branch> <adopted-dir> <expected-dir> — journal `adopt_orphaned`
+# ONCE per (pr,sha): this PR was adopted successfully, yet discovery finds no worktree where it looks,
+# so the PR is invisible to the gate and will sit CLEAN and ungated forever. The single loudest thing
+# the adopt leg can say.
+_adopt_journal_orphaned() {
+  local _ajo_pr="$1" _ajo_sha="$2" _ajo_branch="$3" _ajo_dir="$4" _ajo_expected="$5"
+  _adopt_orphan_journaled "$_ajo_pr" "$_ajo_sha" && return 0
+  journal_append adopt_orphaned pr "$_ajo_pr" sha "$_ajo_sha" branch "$_ajo_branch" \
+    dir "$_ajo_dir" expected "$_ajo_expected" \
+    reason "adopted but not discovered — no worktree at the path discovery resolves; the PR is never gated" \
+    fix "git -C $MAIN worktree add $_ajo_expected $_ajo_branch"
+  printf '%s\t%s\n' "$_ajo_pr" "$_ajo_sha" >> "$ADOPT_ORPHAN_SEEN_LEDGER" 2>/dev/null || true
+  return 0
+}
+
+# _adopt_orphan_journaled <pr> <sha> — true iff `adopt_orphaned` already fired for this exact (pr,sha).
+_adopt_orphan_journaled() {
+  [ -s "$ADOPT_ORPHAN_SEEN_LEDGER" ] || return 1
+  awk -F'\t' -v p="$1" -v s="$2" '$1==p && $2==s{f=1} END{exit !f}' "$ADOPT_ORPHAN_SEEN_LEDGER" 2>/dev/null
+}
+
+# _adopt_verify_scan <prs-json> — verify every PENDING adopt against the discovery predicate, then
+# REWRITE both ledgers: pending rows that now resolve are dropped (proof obtained, silent — the happy
+# path adds nothing to the console or the journal), rows for merged/closed PRs are pruned, and rows
+# that still do not resolve journal `adopt_orphaned` (once per (pr,sha)) and paint a console row.
+# Rewriting the console ledger whole means an operator's fix CLEARS the row on the next scan.
+#
+# The expected path is RE-DERIVED from the branch through herd_branch_slug — the same slugifier
+# discovery uses — rather than trusted from the ledger, so a BRANCH_TEMPLATE changed under a live pool
+# is caught too, not just a vanished directory.
+_adopt_verify_scan() {
+  [ -s "$ADOPT_VERIFY_LEDGER" ] || return 0
+  local _avs_open _avs_pending _avs_epoch _avs_keep="" _avs_rows=""
+  local _avs_pr _avs_sha _avs_branch _avs_slug _avs_dir _avs_expected_slug _avs_expected
+  _avs_open=" $(_adopt_open_pr_numbers "${1:-[]}") "
+  _avs_epoch="$(_console_now_epoch)"
+  _avs_pending="$(cat "$ADOPT_VERIFY_LEDGER" 2>/dev/null || true)"
+  while IFS=$'\t' read -r _avs_pr _avs_sha _avs_branch _avs_slug _avs_dir; do
+    [ -n "${_avs_pr:-}" ] || continue
+    case "$_avs_open" in *" $_avs_pr "*) : ;; *) continue ;; esac   # merged/closed → converged, not orphaned
+    _avs_expected_slug="$(herd_branch_slug "$_avs_branch")"
+    _avs_expected="$TREES/$_avs_expected_slug"
+    _adopt_discoverable "$_avs_expected_slug" && continue           # proven: it reaches classification
+    _adopt_journal_orphaned "$_avs_pr" "$_avs_sha" "$_avs_branch" "$_avs_dir" "$_avs_expected"
+    _avs_keep="${_avs_keep}${_avs_pr}"$'\t'"${_avs_sha}"$'\t'"${_avs_branch}"$'\t'"${_avs_slug}"$'\t'"${_avs_dir}"$'\n'
+    _avs_rows="${_avs_rows}${_avs_epoch}"$'\t'"${_avs_pr}"$'\t'"${_avs_branch}"$'\t'"${_avs_expected}"$'\n'
+  done <<EOF
+$_avs_pending
+EOF
+  printf '%s' "$_avs_keep" > "$ADOPT_VERIFY_LEDGER" 2>/dev/null || true
+  printf '%s' "$_avs_rows" > "$ADOPT_ORPHAN_LEDGER" 2>/dev/null || true
+  return 0
+}
+
+# _adopt_orphan_classify <line> — LOUD, always: an adopted-but-undiscovered PR is un-gated right now,
+# and stays that way until someone acts, so its row must never age out of the console.
+_adopt_orphan_classify() {
+  local _ao_epoch
+  IFS=$'\t' read -r _ao_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tloud' "${_ao_epoch:-}"
+}
+
+# _adopt_orphan_row <line>  ("<epoch>\t<pr>\t<branch>\t<expected-dir>") → one themed console row.
+# Fail-soft: a row missing its PR number renders nothing.
+_adopt_orphan_row() {
+  local _ao_epoch _ao_pr _ao_branch _ao_dir
+  IFS=$'\t' read -r _ao_epoch _ao_pr _ao_branch _ao_dir <<EOF
+$1
+EOF
+  [ -n "${_ao_pr:-}" ] || return 0
+  printf '    %s🚨%s %s#%s%s adopted but NOT discovered %s%s%s · no worktree at %s%s%s · never gated · git worktree add "%s" "%s"%s' \
+    "$C_RED" "$C_RESET" "$C_BOLD" "$_ao_pr" "$C_RESET" \
+    "$C_DIM" "${_ao_branch:-}" "$C_RESET" \
+    "$C_DIM" "${_ao_dir:-}" "$C_RESET" "${_ao_dir:-}" "${_ao_branch:-}" "$C_RESET"
+}
+
+# build_adopt_orphans — pure renderer of ADOPT_ORPHAN_LEDGER (written ONLY by _adopt_verify_scan, which
+# self-gates on ADOPT_REMOTE_PRS): empty ledger ⇒ ADOPT_ORPHAN_SECTION_ROWS stays empty ⇒ render omits
+# the section ⇒ a console with the lever off (or with every adopt verified) is byte-identical.
+build_adopt_orphans() {
+  ADOPT_ORPHAN_SECTION_ROWS=""
+  _adopt_remote_prs_enabled || return 0   # turning the lever off is a HARD no-op (mirrors build_orphan_prs)
+  [ -s "$ADOPT_ORPHAN_LEDGER" ] || return 0
+  local rows
+  rows="$(herd_console_section "$ADOPT_ORPHAN_LEDGER" "$ADOPT_ORPHAN_ROWS_LIMIT" \
+    _adopt_orphan_classify _adopt_orphan_row)"
+  [ -n "$rows" ] && ADOPT_ORPHAN_SECTION_ROWS="${rows}"$'\n'
   return 0
 }
 
@@ -2484,6 +2681,9 @@ _adopt_remote_prs_scan() {
     return 0
   fi
   local _ars_json="${1:-[]}" _ars_claimed="${2:-}" _ars_wt="${3:-}" _ars_out
+  # HERD-526: verify PRIOR scans' adopts against discovery FIRST — rows this scan enqueues are appended
+  # after this pass, so every adopt is first checked on a LATER scan (the "next tick" the proof is about).
+  _adopt_verify_scan "$_ars_json"
   _ars_out="$(PRS_JSON="$_ars_json" CLAIMED="$_ars_claimed" python3 -c '
 import os, sys, json
 try:
@@ -2649,6 +2849,13 @@ render() {
   # tick, so byte-identical when every open PR has a builder record.
   if [ -n "${UNGATED_PR_SECTION_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}ungated PRs${C_RESET}"$'\n'"${UNGATED_PR_SECTION_ROWS}"$'\n'
+  fi
+  # ADOPTED BUT NOT DISCOVERED (HERD-526, GH #657) — the LOUDEST of the three PR-visibility sections:
+  # unlike an orphan/ungated PR (which nothing has claimed yet), this one the engine ALREADY claimed to
+  # have adopted, and it is nonetheless invisible to the gate. Empty unless an adopt failed its
+  # discovery proof this scan, so the frame is byte-identical in the steady state.
+  if [ -n "${ADOPT_ORPHAN_SECTION_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}adopted · ungated${C_RESET}"$'\n'"${ADOPT_ORPHAN_SECTION_ROWS}"$'\n'
   fi
   # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
   # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
@@ -15813,6 +16020,11 @@ EOF
       _adopt_remote_prs_scan "$PRS_JSON" "$_orphan_claimed" "$WT"
     fi
   fi
+  # HERD-526 adopted-but-not-discovered alarm — a PURE renderer of the ledger the scan above writes
+  # (empty whenever ADOPT_REMOTE_PRS is off or every adopt has been verified), so it is called
+  # unconditionally and every tick, exactly like build_ungated_prs, and adds nothing to the frame
+  # until an adopt actually fails its discovery proof.
+  build_adopt_orphans
 
   # HERD-402 finish-stall scan observability — throttled to the ~60 s scan cadence, exactly like
   # adopt_scan above (HERD-388): the leg's own detection/action runs every tick inside the FEATS loop

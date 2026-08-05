@@ -19,6 +19,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="$HERE/../scripts/herd/agent-watch.sh"
+# Captured BEFORE sourcing the watcher (which reassigns HERE to its own dir) — the cross-language slug
+# parity check below imports the python engine from here.
+ADOPT_TEST_PYSRC="$HERE/../pysrc"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 PASS=0
@@ -45,7 +48,9 @@ fi
 if [ "$1" = "-C" ] && [ "$3" = "worktree" ] && [ "$4" = "add" ]; then
   dir="$5"; branch="$6"
   case "$branch" in *fail-worktree*) exit 1 ;; esac
-  mkdir -p "$dir" 2>/dev/null
+  # Mirror the real command closely enough for the DISCOVERY predicate (HERD-526): a checked-out
+  # worktree is a dir carrying a `.git` pointer file — exactly what python's _is_worktree tests.
+  mkdir -p "$dir" 2>/dev/null && printf 'gitdir: %s\n' "$dir/.git-real" > "$dir/.git" 2>/dev/null
   exit 0
 fi
 if [ "$1" = "-C" ] && [ "$3" = "worktree" ] && [ "$4" = "move" ]; then
@@ -75,6 +80,8 @@ export JOURNAL_FILE="$T/journal.jsonl"
 for fn in _adopt_remote_prs_enabled _adopt_pr_recorded _adopt_pr_mark_adopted _adopt_branch_checked_out \
           _adopt_failed_journaled _adopt_journal_failed _adopt_remote_pr _adopt_remote_prs_scan \
           _adopt_branch_worktree_dir _adopt_self_heal_mismatch herd_branch_slug \
+          _adopt_journal_slug_mismatch _adopt_verify_enqueue _adopt_discoverable \
+          _adopt_open_pr_numbers _adopt_journal_orphaned _adopt_verify_scan build_adopt_orphans \
           _watcher_tick_fields; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
@@ -83,7 +90,10 @@ pass
 reset_state() {
   : > "$GIT_CALL_LOG"
   : > "$JOURNAL_FILE"
-  rm -f "$ADOPT_PR_LEDGER" "$ADOPT_FAILED_SEEN_LEDGER"
+  rm -f "$ADOPT_PR_LEDGER" "$ADOPT_FAILED_SEEN_LEDGER" "$ADOPT_SELFHEAL_SEEN_LEDGER" \
+        "$ADOPT_MISMATCH_SEEN_LEDGER" "$ADOPT_VERIFY_LEDGER" "$ADOPT_ORPHAN_LEDGER" \
+        "$ADOPT_ORPHAN_SEEN_LEDGER"
+  ADOPT_ORPHAN_SECTION_ROWS=""
   rm -rf "${WORKTREES_DIR:?}"/* 2>/dev/null || true
 }
 
@@ -109,6 +119,12 @@ ADOPT_REMOTE_PRS=off PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
 [ ! -e "$ADOPT_PR_LEDGER" ] || fail "OFF must not write the adopt ledger"
 [ ! -s "$JOURNAL_FILE" ] || fail "OFF must not journal anything"
 [ ! -s "$GIT_CALL_LOG" ] || fail "OFF must never invoke git fetch/worktree add: $(cat "$GIT_CALL_LOG")"
+# HERD-526: the post-adopt verification leg is inside the SAME gate — off writes no verify/orphan
+# ledger and paints no console row, so the frame stays byte-identical.
+[ ! -e "$ADOPT_VERIFY_LEDGER" ] || fail "OFF must not write the post-adopt verify ledger"
+[ ! -e "$ADOPT_ORPHAN_LEDGER" ] || fail "OFF must not write the adopt-orphan console ledger"
+build_adopt_orphans
+[ -z "$ADOPT_ORPHAN_SECTION_ROWS" ] || fail "OFF must render no adopted-but-not-discovered rows"
 pass
 
 # _watcher_tick_fields must stay byte-identical (no isDraft) when the feature is off.
@@ -150,6 +166,48 @@ pass
   || fail "herd_branch_slug regression: must match branch_to_slug for the real HERD-377 branch"
 [ "$(herd_branch_slug "someuser:feature/x")" = "someuser:feature-x" ] \
   || fail "herd_branch_slug must fall back to flattening '/' when the branch does not fit BRANCH_TEMPLATE"
+pass
+
+# ── 3c. CROSS-LANGUAGE SLUG PARITY (HERD-526, GitHub issue #657) ───────────────────────────────────
+# The assertions above pin the bash slugifier to HARDCODED expectations, and tests/test_live_runtime.py
+# pins the python one to its own — so both could drift together onto DIFFERENT conventions and every
+# test would still pass. That divergence IS the bug: adoption named the worktree with the branch prefix
+# KEPT (feat/combat-log -> feat-combat-log) while discovery stripped it (-> combat-log), so
+# _worktree_for_slug pointed at nothing, _pool_scoped dropped the candidate as foreign, and 8 adopted
+# PRs sat CLEAN and ungated forever with `pr_adopted` already claiming success.
+#
+# This asserts the two implementations against EACH OTHER, over the branch shapes that exercise every
+# code path in both (default prefix, a NON-matching prefix, unprefixed, NESTED, dotted, a fork-style
+# ref, the empty branch) and under a non-default BRANCH_TEMPLATE — the property "one convention", not
+# "two matching constants".
+_py_slug() { PYTHONPATH="$ADOPT_TEST_PYSRC" python3 -c '
+import sys
+from herd.live_runtime import _branch_worktree_slug
+sys.stdout.write(_branch_worktree_slug(sys.argv[1]))
+' "$1"; }
+
+_assert_slug_parity() {
+  local _b="$1" _bash _py
+  _bash="$(herd_branch_slug "$_b")"
+  _py="$(_py_slug "$_b")" || fail "python slugifier crashed on branch '$_b'"
+  [ "$_bash" = "$_py" ] \
+    || fail "slug parity broken for branch '$_b' (BRANCH_TEMPLATE='${BRANCH_TEMPLATE:-feat/{slug\}}'): bash herd_branch_slug='$_bash' vs python _branch_worktree_slug='$_py'"
+}
+
+for _b in "feat/combat-log" "feat/x" "fix/x" "hotfix-1" "feat/a/b" "feat/x.y.z" "release/1.2.3" \
+          "someuser:feature/x" "HERD-346/live-slug-regression" "" "feat/" "feat"; do
+  _assert_slug_parity "$_b"
+done
+# Same property under a non-default template — both sides read BRANCH_TEMPLATE, so both must move together.
+for _tmpl in '{slug}' 'wip/{slug}' '{ref}/{slug}' 'feat/{slug}'; do
+  for _b in "feat/combat-log" "wip/thing" "a/b/c" "plain" "HERD-526/adopt-slug-unity"; do
+    BRANCH_TEMPLATE="$_tmpl" _assert_slug_parity "$_b"
+  done
+done
+unset BRANCH_TEMPLATE
+# And the convention itself is the STRIPPED one, for the exact branch shape GH #657 reported.
+[ "$(herd_branch_slug "feat/combat-log")" = "combat-log" ] \
+  || fail "GH #657: adoption must name the worktree 'combat-log', never the prefix-kept 'feat-combat-log'"
 pass
 
 # ── 4. A DRAFT orphan PR is never adopted, even though it is otherwise eligible ──────────────────────
@@ -363,6 +421,122 @@ grep -q '"event":"pr_adopted"' "$JOURNAL_FILE" || fail "live-loop-shape: pr_adop
 grep -q '"event":"adopt_scan"' "$JOURNAL_FILE" || fail "live-loop-shape: expected throttled adopt_scan summaries too"
 [ -d "$WORKTREES_DIR/live-orphan" ] || fail "live-loop-shape: expected the adopted worktree at the slug-parity path"
 unset ADOPT_REMOTE_PRS
+pass
+
+
+# ── 14. HERD-526 CLOSE THE SILENCE, happy path: an adopt that DOES survive discovery is proven silent.
+#        The verification runs on a LATER scan (rows are enqueued after the verify pass), drains the
+#        pending ledger, and adds NOTHING to the journal or the console — the steady state must stay
+#        byte-identical, or the alarm below is just noise operators learn to ignore. ────────────────
+reset_state
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
+[ -s "$ADOPT_VERIFY_LEDGER" ] || fail "a successful adopt must enqueue a pending discovery proof"
+grep -q "^$(printf '201\tsha201\tfeat/gizmo\tgizmo')" "$ADOPT_VERIFY_LEDGER" \
+  || fail "pending verify row malformed: $(cat "$ADOPT_VERIFY_LEDGER")"
+# The worktree the adopt leg created IS the path discovery resolves — that is the whole slug-unity claim.
+_adopt_discoverable "$(herd_branch_slug feat/gizmo)" || fail "the adopted worktree must satisfy the discovery predicate"
+# …and the claim proved END-TO-END, across the language boundary, against the REAL discovery code:
+# the worktree this scan actually created on disk is fed through python's own
+# _branch_worktree_slug → _worktree_for_slug → _pool_scoped. Before the fix this is exactly where the
+# candidate vanished — dropped as "foreign to this pool" — with pr_adopted already claiming success.
+PARITY_OUT="$(PYTHONPATH="$ADOPT_TEST_PYSRC" TREES="$WORKTREES_DIR" python3 -c '
+import sys
+from herd.live_runtime import (LiveCandidate, _branch_worktree_slug, _worktree_for_slug, _pool_scoped)
+branch = "feat/gizmo"
+slug = _branch_worktree_slug(branch)
+cand = LiveCandidate(pr=201, sha="sha201", slug=slug, worktree=_worktree_for_slug(slug))
+kept = _pool_scoped([cand])
+sys.stdout.write("%s|%s" % (len(kept), cand.worktree))
+')" || fail "python-side pool-scope check crashed"
+case "$PARITY_OUT" in
+  "1|$WORKTREES_DIR/gizmo") : ;;
+  *) fail "GH #657 regression: the adopted PR did NOT survive python's _pool_scoped — got '$PARITY_OUT' (expected '1|$WORKTREES_DIR/gizmo')" ;;
+esac
+: > "$JOURNAL_FILE"
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
+grep -q '"event":"adopt_orphaned"' "$JOURNAL_FILE" && fail "a verified adopt must never journal adopt_orphaned: $(cat "$JOURNAL_FILE")"
+[ ! -s "$ADOPT_VERIFY_LEDGER" ] || fail "a verified adopt must drain out of the pending ledger: $(cat "$ADOPT_VERIFY_LEDGER")"
+[ ! -s "$ADOPT_ORPHAN_LEDGER" ] || fail "a verified adopt must leave the orphan console ledger empty: $(cat "$ADOPT_ORPHAN_LEDGER")"
+ADOPT_REMOTE_PRS=on build_adopt_orphans
+[ -z "$ADOPT_ORPHAN_SECTION_ROWS" ] || fail "a verified adopt must render no console row: $ADOPT_ORPHAN_SECTION_ROWS"
+pass
+
+# ── 15. HERD-526 CLOSE THE SILENCE, the GH #657 shape: an adopt whose worktree is NOT where discovery
+#        looks. Reproduced by removing the adopted worktree after the fact (any cause — a reaped tree,
+#        a hand-moved dir, a slug convention that drifted apart again): the PR is invisible to the gate
+#        and would otherwise sit CLEAN and ungated FOREVER with no adopt_failed, no row, no signal. ──
+reset_state
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
+rm -rf "$WORKTREES_DIR/gizmo"                       # discovery now resolves a path nothing backs
+: > "$JOURNAL_FILE"
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
+grep -q '"event":"adopt_orphaned"' "$JOURNAL_FILE" || fail "an undiscoverable adopt must journal adopt_orphaned: $(cat "$JOURNAL_FILE")"
+grep -q '"pr":201' "$JOURNAL_FILE" || fail "adopt_orphaned missing pr:201: $(cat "$JOURNAL_FILE")"
+grep -q "$WORKTREES_DIR/gizmo" "$JOURNAL_FILE" || fail "adopt_orphaned must name the path discovery expects"
+grep -q '"fix":' "$JOURNAL_FILE" || fail "adopt_orphaned must carry the one-line fix"
+ADOPT_REMOTE_PRS=on build_adopt_orphans
+case "$ADOPT_ORPHAN_SECTION_ROWS" in
+  *"#201"*"adopted but NOT discovered"*) : ;;
+  *) fail "expected a console row for the un-discovered adopt, got: '$ADOPT_ORPHAN_SECTION_ROWS'" ;;
+esac
+# The journal EVENT is deduped per (pr,sha) — a still-broken adopt must not spam it every scan — while
+# the CHECK keeps running, so the console row stays on screen until the pool is actually fixed.
+first_orphan_lines="$(grep -c '"event":"adopt_orphaned"' "$JOURNAL_FILE")"
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
+[ "$(grep -c '"event":"adopt_orphaned"' "$JOURNAL_FILE")" = "$first_orphan_lines" ] \
+  || fail "adopt_orphaned must be deduped per (pr,sha), not re-journaled every scan"
+ADOPT_REMOTE_PRS=on build_adopt_orphans
+[ -n "$ADOPT_ORPHAN_SECTION_ROWS" ] || fail "the console row must persist while the adopt is still un-discovered"
+# Turning the lever off is a HARD no-op even with a populated ledger on disk (mirrors build_orphan_prs).
+ADOPT_REMOTE_PRS=off build_adopt_orphans
+[ -z "$ADOPT_ORPHAN_SECTION_ROWS" ] || fail "ADOPT_REMOTE_PRS=off must render no rows even with a populated ledger: $ADOPT_ORPHAN_SECTION_ROWS"
+# …and it CLEARS on the next scan once the worktree is back where discovery looks.
+mkdir -p "$WORKTREES_DIR/gizmo" && : > "$WORKTREES_DIR/gizmo/.git"
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
+ADOPT_REMOTE_PRS=on build_adopt_orphans
+[ -z "$ADOPT_ORPHAN_SECTION_ROWS" ] || fail "the console row must clear once the worktree is discoverable again: $ADOPT_ORPHAN_SECTION_ROWS"
+[ ! -s "$ADOPT_VERIFY_LEDGER" ] || fail "a healed adopt must drain out of the pending ledger"
+pass
+
+# ── 16. A pending proof for a PR that has since MERGED/CLOSED is pruned, never alarmed on: its
+#        worktree is legitimately gone: that is convergence, not an orphan. ──────────────────────────
+reset_state
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$PRS" "202" ""
+rm -rf "$WORKTREES_DIR/gizmo"
+: > "$JOURNAL_FILE"
+CLOSED_PRS='[{"number":202,"title":"fix leak","headRefName":"feat/leak","headRefOid":"sha202","isDraft":false}]'
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$CLOSED_PRS" "202" ""
+grep -q '"event":"adopt_orphaned"' "$JOURNAL_FILE" && fail "a merged/closed PR must never be reported as an adopt orphan: $(cat "$JOURNAL_FILE")"
+[ ! -s "$ADOPT_VERIFY_LEDGER" ] || fail "a merged/closed PR's pending proof must be pruned: $(cat "$ADOPT_VERIFY_LEDGER")"
+ADOPT_REMOTE_PRS=on build_adopt_orphans
+[ -z "$ADOPT_ORPHAN_SECTION_ROWS" ] || fail "a merged/closed PR must render no orphan row"
+pass
+
+# ── 17. HERD-526 MIGRATION ADVISORY: a prefix-kept leftover whose slug-parity twin path is ALREADY
+#        OCCUPIED (the `$TREES/<stripped> -> $TREES/feat-<stripped>` symlink operators hand-made as a
+#        GH #657 workaround, or a stale twin dir). The self-heal must NOT rename a live worktree onto
+#        an occupied path — it journals `adopt_slug_mismatch` LOUDLY, once, with the one-line fix. ───
+reset_state
+mkdir -p "$WORKTREES_DIR/feat-occupied-thing" "$WORKTREES_DIR/occupied-thing"
+OCCUPIED_WT="worktree $WORKTREES_DIR/feat-occupied-thing
+HEAD deadbeef
+branch refs/heads/feat/occupied-thing
+
+"
+OCCUPIED_PRS='[{"number":610,"title":"x","headRefName":"feat/occupied-thing","headRefOid":"sha610","isDraft":false}]'
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$OCCUPIED_PRS" "" "$OCCUPIED_WT" \
+  || fail "an unhealable slug mismatch must not abort the scan"
+grep -q 'worktree move' "$GIT_CALL_LOG" && fail "must NEVER move a live worktree onto an occupied path: $(cat "$GIT_CALL_LOG")"
+[ -d "$WORKTREES_DIR/feat-occupied-thing" ] || fail "the mismatched worktree must be left exactly where it is"
+grep -q '"event":"adopt_slug_mismatch"' "$JOURNAL_FILE" || fail "adopt_slug_mismatch not journaled: $(cat "$JOURNAL_FILE")"
+grep -q "$WORKTREES_DIR/occupied-thing" "$JOURNAL_FILE" || fail "adopt_slug_mismatch must name the path discovery expects"
+grep -q '"fix":' "$JOURNAL_FILE" || fail "adopt_slug_mismatch must carry the one-line fix"
+first_mismatch_lines="$(grep -c '"event":"adopt_slug_mismatch"' "$JOURNAL_FILE")"
+[ "$first_mismatch_lines" = "1" ] || fail "expected exactly one adopt_slug_mismatch, got $first_mismatch_lines"
+ADOPT_REMOTE_PRS=on PRS_LOOKUP_OK=1 _adopt_remote_prs_scan "$OCCUPIED_PRS" "" "$OCCUPIED_WT"
+[ "$(grep -c '"event":"adopt_slug_mismatch"' "$JOURNAL_FILE")" = "1" ] \
+  || fail "adopt_slug_mismatch must be deduped per (branch,dir), not re-journaled every scan"
+# A mismatch the self-heal CAN fix still heals silently — the advisory never displaces it (test 11).
 pass
 
 echo "ok — $PASS adopt-remote-PRs assertions passed"
