@@ -298,6 +298,52 @@ $table
 EOF
 }
 
+# ── The UNTAGGED-LEGACY question (HERD-524) ──────────────────────────────────────────────────────
+#
+# watcher_list_mains answers "is this pid a watcher main?" by the argv0 tag, and that is the ONLY
+# question any COUNTING or WARNING surface may ask (#636: a status warning that named script-path
+# matches told an operator to kill a healthy watcher). One seat legitimately needs a second question:
+# _stop_project_watcher's phase-2 leg reaps UNTAGGED legacy watchers — processes started before the
+# argv0 marker existed, which by definition carry no tag and are invisible to the listing above.
+#
+# That leg finds candidates with `pgrep -f agent-watch.sh`, which matches any process whose COMMAND LINE
+# merely CONTAINS the path: a coordinator's `bash -c '… agent-watch.sh …'` wrapper, a `tail -f` on the
+# log, an editor with the file open. It then SIGTERM/SIGKILLs what it matched, so a substring match is a
+# cross-kill hazard, not a cosmetic one. This predicate is the shared answer to "is this command line
+# actually EXECUTING agent-watch.sh?" — kept here, beside the identity check, so the next surface that
+# needs it cannot grow a third opinion.
+#
+# watcher_legacy_cmd <command-line> — success iff <command-line> runs agent-watch.sh as its script:
+# either argv0 IS the script (shebang exec), or argv0 is a shell whose first non-option word is the
+# script. A `-c` wrapper is REJECTED outright — its script is the inline string, and the path inside it
+# is text, which is precisely the false match #636 describes. Whitespace is split by parameter
+# expansion (never `for tok in $rest`), so a token containing a glob character can never be expanded
+# against the filesystem.
+watcher_legacy_cmd() {
+  local cmd="${1:-}" argv0 rest tok
+  [ -n "$cmd" ] || return 1
+  argv0="${cmd%%[[:space:]]*}"
+  case "$argv0" in agent-watch.sh|*/agent-watch.sh) return 0 ;; esac
+  case "${argv0##*/}" in bash|sh|zsh|dash|ksh|ash) ;; *) return 1 ;; esac
+  rest="${cmd#"$argv0"}"
+  while [ -n "$rest" ]; do
+    rest="${rest#"${rest%%[![:space:]]*}"}"          # drop leading whitespace
+    [ -n "$rest" ] || break
+    tok="${rest%%[[:space:]]*}"
+    rest="${rest#"$tok"}"
+    case "$tok" in
+      -c|--command) return 1 ;;                      # an inline-string wrapper is NOT a watcher
+      --) continue ;;
+      -*) continue ;;                                # a plain shell option (-x, -l, …)
+    esac
+    case "$tok" in
+      agent-watch.sh|*/agent-watch.sh) return 0 ;;
+      *) return 1 ;;                                 # the script it actually runs is something else
+    esac
+  done
+  return 1
+}
+
 # ── The reconciled SINGLETON INVARIANT (HERD-450) ────────────────────────────────────────────────
 #
 # watcher_list_mains answers "which pids are watcher mains". The INVARIANT this workspace actually
