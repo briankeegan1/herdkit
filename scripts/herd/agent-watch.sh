@@ -199,6 +199,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # byte-inert until CLAIM_RELEASE is opted in.
 # shellcheck source=/dev/null
 . "$HERE/herd-claim.sh"
+# GATE_SCALE (HERD-542) — sourced for its builder-count primitive, _sg_count_inflight_builders (git
+# worktrees under WORKTREES_DIR). Reused AS-IS so the watcher's fleet-size input can never diverge
+# from the lane-side spawn advisory's own count. Sourcing DEFINES functions only (its own entry point,
+# herd_spawn_gate_saturated, is never called from here); safe to source in lib mode.
+# shellcheck source=/dev/null
+. "$HERE/herd-spawn-gate.sh"
 # SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531) — the shared provenance-record library, sourced for its
 # READ half (herd_health_trust_check), which the health dispatch below consults before running a full
 # suite. Sourcing DEFINES functions only; byte-inert until HEALTH_TRUST_BUILDER is opted in.
@@ -756,14 +762,84 @@ if [ "${AGENT_WATCH_LIB:-}" != "1" ]; then
   esac
 fi
 
+# ── GATE_SCALE (HERD-542) — auto-scale review/health concurrency with the LIVE fleet size ────────
+# Internal ratio + ceiling-fallback constants — NOT config keys. GATE_SCALE is the single lever this
+# feature adds; the formula's ratio and the unreadable-cores fallback are implementation details of
+# that one lever, not separate knobs. One review/health slot per 2 live builders (ceil(builders/2));
+# a box whose core count cannot be read gets a conservative ceiling of 4.
+_GATE_SCALE_RATIO_DEN=2
+_GATE_SCALE_CORES_FALLBACK=4
+
+# _gate_scale_enabled — true iff GATE_SCALE resolves to "on". Unknown/empty → off (fail-safe), so a
+# typo can never silently arm scaling.
+_gate_scale_enabled() { [ "${GATE_SCALE:-off}" = "on" ]; }
+
+# _gate_scale_cores — logical core count for the scaling ceiling. GATE_SCALE_CORES_OVERRIDE is an
+# internal TEST SEAM (never a capabilities.tsv key, never read by production) so hermetic tests get a
+# deterministic ceiling without depending on the box that happens to run them. Production path: nproc
+# (Linux), else sysctl -n hw.ncpu (macOS); unreadable/non-numeric → the built-in fallback.
+_gate_scale_cores() {
+  local n="${GATE_SCALE_CORES_OVERRIDE:-}"
+  if [ -z "$n" ]; then n="$(command -v nproc >/dev/null 2>&1 && nproc 2>/dev/null || true)"; fi
+  if [ -z "$n" ]; then n="$(command -v sysctl >/dev/null 2>&1 && sysctl -n hw.ncpu 2>/dev/null || true)"; fi
+  case "$n" in ''|*[!0-9]*) printf '%s' "$_GATE_SCALE_CORES_FALLBACK" ;; *) printf '%s' "$n" ;; esac
+}
+
+# _gate_scale_builders — live builder count, via herd-spawn-gate.sh's OWN source (git worktrees under
+# WORKTREES_DIR — _sg_count_inflight_builders). Reused, never reimplemented, so this can never diverge
+# from the lane-side spawn advisory's own count. Unreadable git/worktree state → 0 (fail-soft: a bogus
+# 0 only ever pulls the scaled value DOWN toward the floor, never up past a fabricated ceiling).
+_gate_scale_builders() {
+  type _sg_count_inflight_builders >/dev/null 2>&1 || { printf '0'; return 0; }
+  _sg_count_inflight_builders 2>/dev/null || printf '0'
+}
+
+# _gate_scale_derive <configured-floor> — echo the EFFECTIVE cap under GATE_SCALE=on:
+# clamp(floor, ceil(builders / _GATE_SCALE_RATIO_DEN), cores-derived ceiling). floor is NEVER lowered
+# — an explicit operator value stays the minimum even on a box whose core ceiling is smaller than it.
+_gate_scale_derive() {
+  local floor="$1" builders ceiling scaled
+  case "$floor" in ''|*[!0-9]*) printf '%s' "$floor"; return 0 ;; esac
+  builders="$(_gate_scale_builders)"
+  case "$builders" in ''|*[!0-9]*) builders=0 ;; esac
+  ceiling="$(_gate_scale_cores)"
+  scaled=$(( (builders + _GATE_SCALE_RATIO_DEN - 1) / _GATE_SCALE_RATIO_DEN ))   # ceil(builders/den)
+  [ "$scaled" -gt "$ceiling" ] && scaled="$ceiling"
+  [ "$scaled" -lt "$floor" ] && scaled="$floor"
+  printf '%s' "$scaled"
+}
+
+_GATE_SCALE_LAST_SIG=""
+# _gate_scale_journal_once <review> <health> <builders> — journal `gate_scale` only when this triple
+# CHANGES from the last journaled value (module-level, per process) — a steady fleet never spams the
+# journal on every ~4s tick.
+_gate_scale_journal_once() {
+  local sig="r=$1 h=$2 b=$3"
+  [ "$sig" = "$_GATE_SCALE_LAST_SIG" ] && return 0
+  _GATE_SCALE_LAST_SIG="$sig"
+  journal_append gate_scale review "$1" health "$2" builders "$3"
+}
+
 # ── HERD-159: live numeric / cosmetic resolvers (gate keys fail strict; cosmetic fail soft) ─────
 # herd_numeric / herd_enum live in herd-config.sh. These thin wrappers keep every call site on a
 # SAFE integer (or a known on/off token) while still honoring a mid-process export — hermetic tests
 # set HEALTH_CONCURRENCY / CODEMAP_AUTOREFRESH AFTER sourcing this file. Warnings fire once per key
 # via _herd_val_warn_once so a tick loop never spams stderr.
-_review_conc()  { herd_numeric REVIEW_CONCURRENCY 2 || true; }
+# GATE_SCALE=off (the ship default) is a strict pass-through to herd_numeric — byte-identical to
+# before this key existed. GATE_SCALE=on runs the configured value through _gate_scale_derive as a
+# FLOOR (never lowered). Feeds BOTH the console (via build_gate_scale_note) and the LIVE Python engine
+# core (herd_engine_live_tick passes these same two values as an explicit env override per tick).
+_review_conc()  {
+  local _rc_floor; _rc_floor="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+  _gate_scale_enabled || { printf '%s' "$_rc_floor"; return 0; }
+  _gate_scale_derive "$_rc_floor"
+}
 _spawn_ahead()  { herd_numeric SPAWN_AHEAD 1 || true; }
-_health_conc()  { herd_numeric HEALTH_CONCURRENCY 1 || true; }
+_health_conc()  {
+  local _hc_floor; _hc_floor="$(herd_numeric HEALTH_CONCURRENCY 1)" || true
+  _gate_scale_enabled || { printf '%s' "$_hc_floor"; return 0; }
+  _gate_scale_derive "$_hc_floor"
+}
 # CODEMAP_AUTOREFRESH is cosmetic (post-merge map refresh, never a gate). Unrecognized values fail
 # soft toward ACTIVE (default true) so a typo never freezes the maps.
 _codemap_auto() {
@@ -3020,6 +3096,12 @@ render() {
   # so the console is byte-identical to before when the margin is not crossed or the lever is dormant.
   if [ -n "${HEALTH_HEADROOM_NOTE:-}" ]; then
     frame="${frame}  ${C_DIM}health headroom${C_RESET}"$'\n'"${HEALTH_HEADROOM_NOTE}"$'\n'
+  fi
+  # GATE SCALE (HERD-542) — the derived review/health caps when GATE_SCALE=on has scaled a value past
+  # its configured floor. Empty whenever GATE_SCALE=off (default) or scaling never moved a value, so
+  # the console is byte-identical to before when the lever is dormant or inert this tick.
+  if [ -n "${GATE_SCALE_NOTE:-}" ]; then
+    frame="${frame}  ${C_DIM}gate scale${C_RESET}"$'\n'"${GATE_SCALE_NOTE}"$'\n'
   fi
   # OPERATOR INBOX (HERD-184) — cross-seat comments needing the coordinator, just above the in-flight
   # rows (needs-you-adjacent). Empty unless OPERATOR_INBOX is on AND a comment has been surfaced, so
@@ -14206,6 +14288,27 @@ build_health_headroom_note() {
   fi
 }
 
+# build_gate_scale_note — GATE_SCALE (HERD-542) console row + once-per-change journal line. Derives
+# the effective review/health caps EXACTLY as _review_conc / _health_conc do (same floor + same
+# _gate_scale_derive), so the row on screen is provably the values the gate itself is using this tick
+# — never a separately-computed display number that could drift from the real one. Journals
+# `gate_scale review=N health=M builders=K` only when that triple changes. Renders a "scaled" row only
+# when scaling actually raised a value past its configured floor. Empty (byte-identical console, no
+# journal call) whenever GATE_SCALE=off — the ship default.
+build_gate_scale_note() {
+  GATE_SCALE_NOTE=""
+  _gate_scale_enabled || return 0
+  local _gsn_floor_r _gsn_floor_h _gsn_eff_r _gsn_eff_h _gsn_builders
+  _gsn_floor_r="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+  _gsn_floor_h="$(herd_numeric HEALTH_CONCURRENCY 1)" || true
+  _gsn_eff_r="$(_gate_scale_derive "$_gsn_floor_r")"
+  _gsn_eff_h="$(_gate_scale_derive "$_gsn_floor_h")"
+  _gsn_builders="$(_gate_scale_builders)"
+  _gate_scale_journal_once "$_gsn_eff_r" "$_gsn_eff_h" "$_gsn_builders"
+  { [ "$_gsn_eff_r" = "$_gsn_floor_r" ] && [ "$_gsn_eff_h" = "$_gsn_floor_h" ]; } && return 0
+  GATE_SCALE_NOTE="    ${C_DIM}review=${_gsn_eff_r} health=${_gsn_eff_h} · scaled${C_RESET} ${C_DIM}(builders=${_gsn_builders}, floor review=${_gsn_floor_r} health=${_gsn_floor_h})${C_RESET}"$'\n'
+}
+
 # _health_fail_detail <log> — the ONE line that best names why this suite failed. Every caller used to
 # fall back to `sed -n 1p` when the log carried no TAP 'not ok', which quotes healthcheck.sh's own
 # CLASSIFIER BANNER ("❌ CODE ERROR") — true, but content-free: it names no test, no file, no reason
@@ -16143,6 +16246,7 @@ _tick_render_reconcile() {
   build_watcher_singleton      # HERD-450: the duplicate-watcher / lock-drift row (empty unless violated)
   build_sweep_note
   build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
+  build_gate_scale_note       # HERD-542: derived review/health caps when GATE_SCALE=on has scaled them
 
   # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
   # claim "awaiting task"). On success, apply the configured watcher view (lens + filters). The view

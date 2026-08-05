@@ -707,6 +707,23 @@ fi
 # watcher's own `.health-inflight-*` markers, so the two accounting systems never collide). Default 2.
 # Non-numeric → 2 (resolved via herd_numeric, warns once, fails toward the safe default).
 : "${LOCAL_SUITE_CONCURRENCY:="2"}"
+# GATE_SCALE (HERD-542) — auto-scale REVIEW_CONCURRENCY / HEALTH_CONCURRENCY with the LIVE fleet
+# size so an operator never hand-tunes concurrency as builders come and go: off (default, ship-
+# dormant) | on (yolo posture adopts on — templates/postures.tsv). off → _review_conc / _health_conc
+# (agent-watch.sh) resolve exactly the configured values, byte-identical to before this key existed —
+# no derivation, no journal line, no console row, and herd_engine_live_tick (engine-version.sh) passes
+# the Python engine core those SAME unscaled values it always has. on → each watcher tick derives an
+# EFFECTIVE cap per gate: clamp(configured_floor, ceil(live_builder_count / 2), cores_ceiling), where
+# configured_floor is the value this key would resolve to with GATE_SCALE off (an explicit operator
+# value is a FLOOR scaling never lowers), live_builder_count reuses the EXACT source
+# herd-spawn-gate.sh's own spawn advisory reads (_sg_count_inflight_builders — git worktrees under
+# WORKTREES_DIR), and cores_ceiling is the box's logical core count (nproc / sysctl -n hw.ncpu;
+# unreadable → a built-in fallback of 4). This is not console-only: herd_engine_live_tick passes the
+# derived values as an explicit env override for that one Python tick, so GATE_SCALE actually moves
+# the LIVE gate, not just its display. FAIL-SOFT throughout: an unreadable builder/core count falls
+# back toward the configured floor, never a fabricated ceiling. Unknown value → off (fail safe).
+# Consumed by agent-watch.sh / engine-version.sh.
+: "${GATE_SCALE:="off"}"           # off (default) | on — see capabilities.tsv / agent-watch.sh
 # RESTART-SAFE INFLIGHT TIMEOUTS (HERD-185) — an in-flight review/health worker that outlives this many
 # seconds (age read from its on-disk dispatch marker, so ANY watcher instance — even one that restarted
 # mid-run — can enforce it) is SIGTERMed + reaped by the every-tick corpse sweep, freeing its slot. Well
