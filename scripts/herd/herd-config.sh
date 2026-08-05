@@ -192,7 +192,7 @@ DELETE_BRANCH_ON_MERGE REFIX_MAX_ROUNDS REFIX_COMPLETE_MIN HERD_REFIX_WAIT_TIMEO
 MERGE_RESULT_GATE MERGE_QUEUE HEALTH_CONCURRENCY REVIEW_CONCURRENCY WATCHER_SCOPE WATCHER_VIEW \
 WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL WATCHER_VIEW_STATUS \
 WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER GATE_STATUS GATE_STATUS_PENDING MERGE_FAIRNESS \
-MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN"
+MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN HEALTH_TRUST_BUILDER"
 
 # ── Engine-core key RESET (HERD-465): the FILE is authoritative, never inherited/stale env ─────────
 # WATCHER_SELF_RESTART (HERD-251) re-execs this very process in place, inheriting every var it had
@@ -762,9 +762,13 @@ fi
 # case — no record, stale sha, non-clean outcome, dirty tree, a record older than the commit, or a
 # record the watcher itself wrote — is a FULL re-run exactly as today (fail-closed). off (default) →
 # byte-identical: no record is written and none is read. An unrecognized value reads as off (a typo can
-# never arm a path that skips the authoritative suite). Consumed by health-trust.sh (sourced by
-# healthcheck.sh + agent-watch.sh).
-: "${HEALTH_TRUST_BUILDER:="off"}"   # HERD-531: trust a sha-matched builder-local heavy run — on | off
+# never arm a path that skips the authoritative suite). The WRITE side is scripts/herd/health-trust.sh
+# (sourced by healthcheck.sh, bash-only). HERD-555: the READ side lives in the Python engine core's
+# health dispatch (pysrc/herd/live_runtime.py, LiveGates.health) — the old bash reader
+# (agent-watch.sh:_healthcheck_gate) was dead code since the P5b port, its only caller never wired
+# into the live pipeline. A Python-core knob means this key is now in _HERD_ENGINE_CORE_KEYS below and
+# must stay `export`ed (HERD-449/465) — see env-export-lint.sh.
+: "${HEALTH_TRUST_BUILDER:="off"}"   # HERD-531/555: trust a sha-matched builder-local heavy run — on | off
 # HEALTH_SUITE_SCOPE (HERD-532) — DIFF-SCOPED test selection for the heavy suite: diff | full (default
 # full, ship-dormant). full → the healthcheck wrapper runs the whole curated set, byte-identical to
 # before. diff → it maps the worktree's changed paths to the tests that can actually cover them, via
@@ -921,7 +925,8 @@ export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
        WORK_UNIT_KIND MERGE_RESULT_GATE MERGE_QUEUE HEALTH_CONCURRENCY REVIEW_CONCURRENCY \
        WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \
        WATCHER_VIEW_STATUS WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER GATE_STATUS GATE_STATUS_PENDING \
-       MERGE_FAIRNESS MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN
+       MERGE_FAIRNESS MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN \
+       HEALTH_TRUST_BUILDER
 # Claude exec-hang probe (HERD-108) — some environments WEDGE `claude` on invocation (every exec hangs
 # before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
 # claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang
