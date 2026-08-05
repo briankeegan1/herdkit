@@ -91,6 +91,7 @@ Role summarized from each file's top-of-file comment.
 - `resolver-pane.sh` — THE shared resolver for the RESOLVER_PANE lever (HERD-286).
 - `retirement.sh` — RETIREMENT AS A RECONCILED INVARIANT (HERD-164).
 - `review-panel.sh` — THE shared resolver for the MIXED-VENDOR review panel (HERD-276).
+- `review-pregate.sh` — THE shared MECHANICAL-RED PRE-GATE + SMALL-MECHANICAL-DIFF FLOOR (HERD-559).
 - `scribe-step.sh` — queue/git/report mechanics for the backlog drainer. The scribe Claude
 - `scribe.sh` — scribe.sh "<backlog change>" — ENQUEUE a backlog change and make sure exactly ONE async
 - `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
@@ -238,7 +239,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `CREATE_SELFHEAL` → `create-retry.sh`
 - `DEAD_BUILDER_AUTORESPAWN` → `agent-watch.sh`
 - `DEAD_GRACE_MIN` → `agent-watch.sh`
-- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `config-viability.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `retirement.sh`, `status.sh`, `sweep.sh`
+- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `config-viability.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `retirement.sh`, `review-pregate.sh`, `status.sh`, `sweep.sh`
 - `DELETE_BRANCH_ON_MERGE` → `bin/herd`, `retirement.sh`, `git-pr.sh`
 - `DELTA_REVIEW` → `agent-watch.sh`
 - `DENY_PATHS` → `bin/herd`
@@ -343,17 +344,23 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
 - `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `engine-version.sh`, `herd-spawn-gate.sh`
-- `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`, `git-pr.sh`
+- `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`, `review-pregate.sh`, `git-pr.sh`
 - `REVIEW_ESCALATE_MAXFILES` → `posture-lint.sh`, `git-pr.sh`
 - `REVIEW_EVIDENCE_ESCALATE_ROUNDS` → `agent-watch.sh`
 - `REVIEW_INFLIGHT_TIMEOUT` → `agent-watch.sh`, `lifecycle.sh`, `sweep.sh`
+- `REVIEW_LATENCY` → `agent-watch.sh`
 - `REVIEW_LOG_KEEP` → `herd-review.sh`
+- `REVIEW_MECH_FLOOR` → `agent-watch.sh`, `review-pregate.sh`
+- `REVIEW_MECH_FLOOR_MAXFILES` → `review-pregate.sh`
+- `REVIEW_MECH_FLOOR_MAXLINES` → `review-pregate.sh`
 - `REVIEW_MODEL_CHEAP` → `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_MODEL_DOCS` → `agent-watch.sh`, `posture-lint.sh`
 - `REVIEW_MODEL_ESCALATED` → `agent-watch.sh`
 - `REVIEW_PANEL` → `herd-review.sh`
 - `REVIEW_PANEL_MODELS` → `bin/herd`, `herd-review.sh`, `review-panel.sh`
 - `REVIEW_PANEL_POLICY` → `herd-review.sh`, `review-panel.sh`
+- `REVIEW_PREGATE` → `agent-watch.sh`, `herd-review.sh`, `review-pregate.sh`
+- `REVIEW_TIERING` → —
 - `RUBRIC_FILE` → `herd-review.sh`
 - `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `herd-claim.sh`, `scribe-step.sh`, `status.sh`, `sweep.sh`, `tracker-state-sweep.sh`
 - `SCRIBE_LINGER_SECS` → `scribe-step.sh`, `scribe.sh`
