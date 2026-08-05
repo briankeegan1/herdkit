@@ -14298,7 +14298,13 @@ _health_progress() {
 # Pure read of the tailable log the health worker (bash or the Python engine) streams into; no state
 # mutation, so the render half can call it every tick.
 _health_inflight_note() {
-  local _hin_log="$1" _hin_prog _hin_src
+  local _hin_log="$1" _hin_prog _hin_src _hin_es
+  # HERD-546: an env-suspect marker (written by _health_worker before its solo re-run) takes
+  # precedence over the ordinary TAP/byte-count liveness clause — the operator sees WHY a run that
+  # already failed once is still in flight, not just that it is. Empty (byte-inert) whenever
+  # ENV_SUSPECT_TIMEOUT never fired for this run.
+  _hin_es="$(_health_env_suspect_marker "$_hin_log")"
+  if [ -n "$_hin_es" ]; then printf '%s' "$_hin_es"; return 0; fi
   _hin_prog="$(_health_progress "$_hin_log")"
   if [ -n "$_hin_prog" ]; then printf '%s' "$_hin_prog"; return 0; fi
   _hin_src="$(_health_progress_source "$_hin_log")"
@@ -14717,6 +14723,105 @@ EOF
   printf '^(%s)$' "$_hbf_alt"
 }
 
+# ── ENV-SUSPECT TIMEOUT CLASSIFICATION (HERD-546, HERD-539 leg 3) ──────────────────────────────────
+# A per-test TIMEOUT is a routine box-load symptom (a slow/contended runner tipping a marginal test
+# past its cap — the exact shape .herd/healthcheck.project.sh's own HERD-462 single-target tolerance
+# was written for), not a code bug. Before this, ANY run-1 failure — timeout included — rendered as a
+# bare "health-check · running" row while its solo retry (HERD-498's existing retry-before-red, below,
+# UNCHANGED) played out silently, so an operator watching the console had no way to tell "this might
+# just be load" from "this is a real red pending confirmation". ENV_SUSPECT_TIMEOUT=on (default off,
+# ship-dormant) makes that distinction visible: when run 1's failure is a per-test timeout AND this
+# box looks contended right now (loadavg1m >= HEALTH_LOAD_THRESHOLD, OR another HERD-529 local-suite
+# slot is live), the running row reads 'env-suspect · timeout under load · solo re-run queued' and the
+# shared red-ledger (HERD-539/PR #670's established <key>\t<class>\t<first-seen>\t<last-verified>\t
+# <why> row shape) gets a durable note. The retry-before-red VERDICT LOGIC below is not touched by any
+# of this: a solo pass still clears (FLAKY), a solo fail still reds (CODEERROR) — this only changes
+# what a still-pending retry renders and what gets journaled while it is in flight. off (default) →
+# byte-inert: no marker line, no ledger note, no journal event, the running row is unchanged.
+_env_suspect_enabled() {
+  case "$(printf '%s' "${ENV_SUSPECT_TIMEOUT:-off}" | tr '[:upper:]' '[:lower:]')" in
+    on|true|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _health_timeout_detail <text> — the matched line/fragment if <text> names a per-test TIMEOUT, empty
+# otherwise. Recognizes both TIMEOUT conventions the engine already produces/reads elsewhere: bats'
+# own TAP "# timeout after Ns" suffix (.herd/healthcheck.project.sh's _hk_bats_timeout_only,
+# BATS_TEST_TIMEOUT-driven) and scripts/ci/run-suite.sh's per-test-cap-ledger (HERD-478) "(TIMEOUT
+# after Ns)" suffix (what _main_health_ci_log_identity's "✗ <test>" lines carry) — so this reads true
+# regardless of which runner produced the failing detail.
+_health_timeout_detail() {
+  grep -m1 -E '# timeout after [0-9]+s|\(TIMEOUT after [0-9]+s\)' <<< "${1:-}" 2>/dev/null
+}
+
+# _health_loadavg_1m — the 1-minute load average, cross-platform (Linux /proc/loadavg; macOS/BSD
+# `sysctl -n vm.loadavg`), or empty when neither source is readable — callers treat empty as "unknown,
+# don't judge on it" (fail-soft), never as zero. HERD_FAKE_LOADAVG is a TEST SEAM (mirrors
+# HERD_FAKE_NOW/HERD_PID_STARTTIME_CMD) so a hermetic fixture can pin a value without the real box.
+_health_loadavg_1m() {
+  [ -n "${HERD_FAKE_LOADAVG:-}" ] && { printf '%s' "$HERD_FAKE_LOADAVG"; return 0; }
+  if [ -r /proc/loadavg ]; then
+    awk '{print $1}' /proc/loadavg 2>/dev/null
+    return 0
+  fi
+  if command -v sysctl >/dev/null 2>&1; then
+    sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}'
+    return 0
+  fi
+  return 0
+}
+
+# _health_sibling_suites_live — count of OTHER live cross-worktree local-suite slots right now
+# (HERD-529's `.local-suite-slot-*` pool under $TREES, the SAME pool healthcheck.sh's own
+# LOCAL_SUITE_CONCURRENCY acquire path writes into) — a heavy suite this box is ALSO running
+# concurrently with the one that just timed out. A lightweight pid-liveness read (kill -0), not the
+# full recycling-safe pid+start-time match healthcheck.sh's own _lss_marker_live uses for its
+# slot-GRANT decision — this is a display/classification heuristic, never a grant, so a rare
+# false-positive from a just-recycled pid only costs a mislabeled render, never a wrong gate outcome.
+_health_sibling_suites_live() {
+  local _hsl_n=0 _hsl_f _hsl_pid
+  { [ -n "${TREES:-}" ] && [ -d "$TREES" ]; } || { printf '0'; return 0; }
+  for _hsl_f in "$TREES"/.local-suite-slot-*; do
+    [ -e "$_hsl_f" ] || continue
+    case "$_hsl_f" in *.lock) continue ;; esac
+    _hsl_pid="$(sed -n '1p' "$_hsl_f" 2>/dev/null)"
+    case "$_hsl_pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$_hsl_pid" 2>/dev/null && _hsl_n=$((_hsl_n + 1))
+  done
+  printf '%s' "$_hsl_n"
+}
+
+# _health_load_high — true iff ENV_SUSPECT_TIMEOUT is on AND this box looks contended right now:
+# loadavg1m at/over HEALTH_LOAD_THRESHOLD (default 4), OR another HERD-529 local-suite slot is live.
+# Ship-dormant: always false while ENV_SUSPECT_TIMEOUT=off (default), so a timeout classifies exactly
+# as any other code error whenever this lever is untouched.
+_health_load_high() {
+  _env_suspect_enabled || return 1
+  local _hlh_load _hlh_threshold _hlh_siblings
+  _hlh_threshold="$(herd_numeric HEALTH_LOAD_THRESHOLD 4)"
+  case "$_hlh_threshold" in ''|*[!0-9]*) _hlh_threshold=4 ;; esac
+  _hlh_load="$(_health_loadavg_1m)"
+  case "$_hlh_load" in
+    ''|*[!0-9.]*) : ;;
+    *) awk -v l="$_hlh_load" -v t="$_hlh_threshold" 'BEGIN{exit !(l+0>=t+0)}' </dev/null && return 0 ;;
+  esac
+  _hlh_siblings="$(_health_sibling_suites_live)"
+  case "$_hlh_siblings" in ''|*[!0-9]*) _hlh_siblings=0 ;; esac
+  [ "$_hlh_siblings" -ge 1 ]
+}
+
+# _health_env_suspect_marker <log> — the fixed render fragment _health_worker appends to the live log
+# the moment it classifies run 1 as env-suspect, or empty when no such marker line is present. Read
+# back by _health_inflight_note so the "health-check · running" row can show it while the solo retry
+# (queued right after this marker is written) is still in flight.
+_HEALTH_ENV_SUSPECT_TEXT="env-suspect · timeout under load · solo re-run queued"
+_health_env_suspect_marker() {
+  [ -s "${1:-}" ] || return 0
+  grep -qm1 -F "[env-suspect] $_HEALTH_ENV_SUSPECT_TEXT" "$1" 2>/dev/null || return 0
+  printf '%s' "$_HEALTH_ENV_SUSPECT_TEXT"
+}
+
 # record_healthcheck <pr#> <slug> <attempt> <outcome> [failed-identity] — append one attempt to the
 # ledger. When the outcome is a code error, [failed-identity] carries WHICH test/step failed (from
 # _health_fail_identity) and is journaled as failed=<id> so a later FLAKY-collapsed offender is still
@@ -14771,6 +14876,7 @@ record_healthcheck() {
 _health_worker() {
   local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_profile="${4:-}"
   local _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line _hw_filter
+  local _hw_es_key="" _hw_es_timeout=""
   local _hw_args=("$_hw_dir")
   [ -n "$_hw_profile" ] && _hw_args+=("$_hw_profile")
   # BASELINE-AWARE GATE (HERD-190): hand healthcheck.sh the base checkout ($MAIN, the default-branch
@@ -14793,6 +14899,19 @@ _health_worker() {
   else
     _hw_notok="$(_health_fail_detail "$_hw_log")"; [ -n "$_hw_notok" ] || _hw_notok="$_hw_first"
     _hw_id="$(_health_fail_identity "$_hw_notok")"
+    # HERD-546 (HERD-539 leg 3): a per-test TIMEOUT observed while this box is under load is
+    # env-suspect, not a bare code red — note it into the shared red-ledger (PR #670's established
+    # row shape) and mark the live log so the running row below renders the queued solo re-run
+    # honestly, BEFORE that retry runs. The retry-before-red logic immediately below is UNCHANGED
+    # either way — this only changes what a still-pending retry renders and what gets journaled.
+    _hw_es_timeout="$(_health_timeout_detail "$_hw_notok")"
+    if [ -n "$_hw_es_timeout" ] && _health_load_high; then
+      _hw_es_key="env_suspect:$(basename "$_hw_dir")"
+      herd_red_ledger_note "$RED_LEDGER_FILE" "$_hw_es_key" env_suspect \
+        "timeout under load · solo re-run queued — ${_hw_es_timeout}"
+      printf '[env-suspect] %s\n' "$_HEALTH_ENV_SUSPECT_TEXT" >> "$_hw_log" 2>/dev/null || true
+      journal_append health_env_suspect dir "$(basename "$_hw_dir")" detail "$_hw_es_timeout"
+    fi
     # RETRY-BEFORE-RED (solo): re-run once into a sibling log, keeping the LATEST run as the live log.
     # Baseline-aware on the retry too (HERD-190), so an inherited-only failure still collapses to rc 0.
     # HERD-498: when run 1's failure carries a bats TAP identity, target the retry at EXACTLY that
@@ -14813,6 +14932,8 @@ _health_worker() {
     if [ "$_hw_rc2" -eq 0 ]; then
       rm -f "$_hw_log.retry" 2>/dev/null || true                 # transient — the passing retry is the truth
       _hw_line="FLAKY"$'\t'"$_hw_id"
+      # HERD-546: solo pass clears the env-suspect diagnosis too — no-op unless a row was actually noted.
+      [ -n "$_hw_es_key" ] && herd_red_ledger_clear "$RED_LEDGER_FILE" "$_hw_es_key" reverified
     else
       mv "$_hw_log.retry" "$_hw_log" 2>/dev/null || true         # the reproduced failure is the live log
       _hw_detail="$(_health_leak_guard_line "$_hw_log")"
@@ -14823,6 +14944,11 @@ _health_worker() {
       # keep the detail single-line + bounded so the "<verdict>\t<detail>" contract can't be broken.
       _hw_detail="$(printf '%s' "$_hw_detail" | tr '\t\n' '  ')"; _hw_detail="${_hw_detail:0:200}"
       _hw_line="CODEERROR"$'\t'"$_hw_detail"
+      # HERD-546: only a solo-run failure becomes a code red — the ledger note survives, refreshed to
+      # say so, as the diagnostic trail behind the now-ordinary CODEERROR row (byte-identical console:
+      # this is a ledger-only write, never a second row).
+      [ -n "$_hw_es_key" ] && herd_red_ledger_note "$RED_LEDGER_FILE" "$_hw_es_key" env_suspect \
+        "timeout under load · solo re-run also failed — ${_hw_detail}"
     fi
   fi
   printf '%s\n' "$_hw_line" > "$_hw_out.tmp.$$" 2>/dev/null && mv "$_hw_out.tmp.$$" "$_hw_out" 2>/dev/null || true
