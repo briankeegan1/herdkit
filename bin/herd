@@ -2795,6 +2795,18 @@ _config_ensure_local() {
 # model tiers, operator-posture opt-ins) so it never diverges the shared project baseline or dirties
 # the ff-only `herd update` pull. ZERO-SECRET: credentials live in .herd/secrets, never here.
 # Managed by `herd config set --local KEY VALUE`; `herd config list` shows each value's source.
+#
+# PRECEDENCE ACROSS A WORKTREE POOL (HERD-558): a builder's linked git worktree never receives THIS
+# file — `git worktree add` copies only tracked files, and this one is gitignored — so a worktree
+# resolves its OWN sibling config.local (if it happens to have one) first. For POLICY-class keys
+# (anything NOT scope=machine in templates/capabilities.tsv — HEALTHCHECK_CMD, MERGE_POLICY,
+# HUMAN_VERIFY_POLICY, concurrency caps, …) the MAIN checkout's copy of this file is then layered on
+# top as the OUTERMOST override, so an operator's `herd config set --local` here reaches every
+# worktree in the pool, not just this main checkout's own shell:
+#     committed .herd/config  <  worktree's own config.local  <  MAIN checkout's config.local (policy)
+# MACHINE-scoped keys (MODEL_*, HERD_DRIVER, WATCHER_VIEW*, …) are excluded from that outer layer —
+# worktree-local (or the baseline) keeps winning for them, since they hold per-seat state a MAIN
+# checkout's preference does not override.
 HDR
 }
 

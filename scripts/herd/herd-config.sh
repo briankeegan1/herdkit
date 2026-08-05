@@ -53,6 +53,28 @@ _herd_config_dup_keys() {
   ' "$_dk_file"
 }
 
+# _herd_config_file_keys <file> — print, once each in file order, EVERY key a shell-sourced config
+# file assigns (blank/comment lines skipped, an `export KEY=` prefix tolerated) — the same extraction
+# grammar _herd_config_dup_keys uses for its duplicate scan, but returning every key rather than only
+# the duplicated ones. Used by the cross-worktree main-checkout overlay (HERD-558) to discover which
+# keys a foreign config.local sets, WITHOUT sourcing it into the current shell wholesale (that overlay
+# only wants to adopt POLICY-class keys from it, never machine-scoped ones). Pure/read-only.
+_herd_config_file_keys() {
+  local _fk_file="${1:-}"
+  [ -n "$_fk_file" ] && [ -f "$_fk_file" ] || return 0
+  awk '
+    {
+      s = $0
+      sub(/^[ \t]+/, "", s)
+      if (s == "" || s ~ /^#/) next
+      sub(/^export[ \t]+/, "", s)
+      if (s !~ /^[A-Za-z_][A-Za-z0-9_]*=/) next
+      k = s; sub(/=.*/, "", k)
+      if (!seen[k]++) print k
+    }
+  ' "$_fk_file"
+}
+
 # _herd_config_warn_dupes <file> — emit ONE loud stderr WARNING when <file> has duplicate keys. Guarded
 # by an exported once-per-process marker so it fires at most once (and is spared in spawned children),
 # so it is never spammy across every command. A clean config re-checks cheaply and stays silent; the
@@ -260,6 +282,75 @@ if [ -f "$_HERD_CONFIG_LOCAL_FILE" ]; then
   . "$_HERD_CONFIG_LOCAL_FILE"
   _herd_config_warn_dupes "$_HERD_CONFIG_LOCAL_FILE"
 fi
+
+# ── Cross-worktree overlay: the MAIN checkout's config.local (HERD-558) ──────
+# Live failure this closes: `herd config set --local HEALTHCHECK_CMD=true` run in the MAIN checkout
+# only muted MAIN-checkout-context runs. `healthcheck.sh` resolves config from the TARGET WORKTREE's
+# .herd/ — and a linked worktree is a SEPARATE checkout that `git worktree add` never populates with
+# the main checkout's gitignored config.local (it copies only tracked files) — so the overlay block
+# just above finds no sibling config.local in the worktree and the operator's mute never reaches it.
+# 137 suite processes kept running post-"release" because the override took effect nowhere but the
+# main checkout's own shell.
+#
+# PRECEDENCE (mirrored in the config.local template header, bin/herd's _config_ensure_local):
+#     committed config  <  worktree's own config.local  <  MAIN checkout's config.local
+# — for POLICY-class keys only. A policy key is any config key NOT marked scope=machine in
+# templates/capabilities.tsv (HEALTHCHECK_CMD, MERGE_POLICY, HUMAN_VERIFY_POLICY, concurrency caps,
+# …): it governs how the gate/suite BEHAVES, so an operator flipping one from the main checkout means
+# it for every worktree that pool spawns, and it must reach them even though they never inherit the
+# gitignored file directly.
+#
+# MACHINE-scoped keys (MODEL_*, HERD_DRIVER, WATCHER_VIEW*, …) are deliberately EXCLUDED from this
+# outer layer — worktree-local (or the committed baseline, when the worktree sets nothing of its own)
+# keeps winning for them exactly as before this fix. Those keys hold per-seat/per-process state (a
+# builder pane's own model tier, its own driver); an operator's MAIN-checkout preference for "what I
+# run" is not a more correct answer than the worktree's own for "what THIS seat runs", so pulling them
+# from the main checkout would be an unjustified new override, not a bug fix.
+#
+# Only fires when resolving for a WORKTREE distinct from the main checkout — a run already IN the main
+# checkout sourced its own config.local in the block above, so this would be a no-op re-read of the
+# same file. The main checkout is resolved from the ALREADY-SOURCED, committed PROJECT_ROOT (the
+# canonical pointer to it) when that names a real directory; only when PROJECT_ROOT is unset does this
+# fall back to git's own notion of the main working tree (first entry of `git worktree list`, via
+# _herd_main_worktree, defined above) from the worktree's own checkout dir. NEVER guessed by
+# string-manipulating the worktree's path (e.g. stripping a "-trees/<slug>" suffix) — that breaks the
+# moment WORKTREES_DIR is renamed or a project nests its pool differently.
+_herd_wt_project_dir="$(dirname "$(dirname "$_HERD_CONFIG_FILE")")"
+_herd_main_checkout=""
+if [ -n "${PROJECT_ROOT:-}" ] && [ -d "$PROJECT_ROOT" ]; then
+  _herd_main_checkout="$PROJECT_ROOT"
+elif command -v git >/dev/null 2>&1; then
+  _herd_main_checkout="$(_herd_main_worktree "$_herd_wt_project_dir")"
+fi
+if [ -n "$_herd_main_checkout" ]; then
+  _herd_main_checkout_real="$(cd "$_herd_main_checkout" 2>/dev/null && pwd -P || printf '%s' "$_herd_main_checkout")"
+  _herd_wt_project_dir_real="$(cd "$_herd_wt_project_dir" 2>/dev/null && pwd -P || printf '%s' "$_herd_wt_project_dir")"
+  _herd_main_local="$_herd_main_checkout/.herd/config.local"
+  if [ "$_herd_main_checkout_real" != "$_herd_wt_project_dir_real" ] && [ -f "$_herd_main_local" ]; then
+    _herd_caps_file="${HERD_CAPABILITIES_FILE:-${HERDKIT_HOME:-$_HERD_REPO_DEFAULT}/templates/capabilities.tsv}"
+    while IFS= read -r _herd_mco_key; do
+      [ -n "$_herd_mco_key" ] || continue
+      _herd_mco_scope="project"
+      if [ -f "$_herd_caps_file" ]; then
+        _herd_mco_scope="$(awk -F'\t' -v k="$_herd_mco_key" \
+          '$2=="config" && $1==k { s=$6; gsub(/[[:space:]]+$/,"",s); print s; exit }' "$_herd_caps_file")"
+        [ "$_herd_mco_scope" = "machine" ] || _herd_mco_scope="project"
+      fi
+      # Machine-scoped: leave whatever the baseline/worktree-local overlay already resolved standing.
+      [ "$_herd_mco_scope" = "machine" ] && continue
+      _herd_mco_val="$(
+        set +eu 2>/dev/null || true
+        # shellcheck source=/dev/null
+        . "$_herd_main_local" 2>/dev/null || true
+        eval "printf '%s' \"\${${_herd_mco_key}-}\""
+      )"
+      eval "$_herd_mco_key=\"\$_herd_mco_val\""
+    done < <(_herd_config_file_keys "$_herd_main_local")
+    unset _herd_mco_key _herd_mco_scope _herd_mco_val
+  fi
+  unset _herd_main_checkout_real _herd_wt_project_dir_real _herd_main_local _herd_caps_file
+fi
+unset _herd_wt_project_dir _herd_main_checkout
 
 # ── Fallback defaults (generic; no project literals) ─────────────────────────
 # PROJECT_ROOT defaults to the repo that owns the .herd/config we just read (or, if none, the repo
