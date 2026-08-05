@@ -1164,6 +1164,85 @@ except Exception: pass
   return 0
 }
 
+# ── SHARE_LINKS worktree preparation — ONE implementation, every surface (HERD-535, GH #660) ──────
+#
+# SHARE_LINKS (from .herd/config) are the GITIGNORED shared dirs that live only in the main checkout —
+# a project's build/import caches (`node_modules`, `.venv`, `target`, `.godot`, …). `git worktree add`
+# checks out TRACKED files only, so a fresh worktree has none of them and its suite cannot import,
+# build, or run anything.
+#
+# EXTRACTED here from new-feature.sh, where this pass was lane-inline. The builder lanes ran it; the
+# ADOPT_REMOTE_PRS leg of agent-watch.sh — which creates worktrees with a bare `git worktree add` —
+# did not. Every adopted PR then red its healthcheck on missing caches (measured in emberglen-godot:
+# lane worktrees carry the 34-45MB `.godot/` cache, adopted ones carried none; 12/12 probes red,
+# `health_codeerror`) in a way indistinguishable from the branch breaking everything, so the autofix
+# rails bounced builders at phantom bugs. One implementation, both surfaces — never a second,
+# independently-invented preparation pass that can drift.
+#
+# herd_share_link_exposes_secrets <share> — the HERD-87 guard: true when <share> IS, CONTAINS, or SITS
+# UNDER `.herd/secrets`, the work tracker's API credentials. Builders run with tool permissions skipped,
+# so a symlink to `.herd` (which holds the secrets file) or to `.herd/secrets` itself would let a builder
+# read the key and mutate tracker state, violating "the coordinator owns all backlog/tracker updates".
+# Main-checkout filesystem permissions are out of scope; this closes only the provisioned-link vector.
+herd_share_link_exposes_secrets() {
+  local _sle_s="${1#./}"; _sle_s="${_sle_s%/}"     # normalize ./x and a trailing slash
+  case "$_sle_s" in
+    .herd/secrets|.herd/secrets/*) return 0 ;;     # the secrets file, or anything under it
+    ""|.|.herd) return 0 ;;                        # the repo root or the whole .herd dir contains it
+  esac
+  return 1
+}
+
+# herd_share_links_prepare <worktree-dir> [<repo-root>] — symlink every SHARE_LINKS dir from the main
+# checkout into <worktree-dir>. <repo-root> defaults to $PROJECT_ROOT.
+#
+# Sets HERD_SHARE_LINKS_COUNT to the number of links this pass actually CREATED — 0 when SHARE_LINKS is
+# empty, when every share was refused, or when none of them exist in the main checkout. That count is
+# the `links=N` an adoption journals, and the signal a caller uses to tell "prepared" from "there was
+# nothing to prepare". Because it sets a caller-visible variable, NEVER call this in a `$(…)` subshell.
+#
+# Returns 0 when every requested share was HANDLED — linked, skipped because it does not exist in the
+# main checkout, skipped because it is already present in the worktree, or refused by the secrets guard
+# — and 1 when a link could not be created (or the worktree/repo path is unusable). Refusing a dangerous
+# share is FAIL-SOFT and never fails the pass: the safe shares are still provisioned.
+#
+# CALLERS DECIDE what a failure means, which is why this function itself is neither fatal nor silent:
+# a lane treats it as fatal (never report success on a half-built worktree), the ADOPT_REMOTE_PRS leg
+# treats it as an unprepared-worktree marker so a cache-red is never painted as a plain code error.
+herd_share_links_prepare() {
+  local _slp_dir="${1:-}" _slp_repo="${2:-${PROJECT_ROOT:-}}" _slp_share _slp_target _slp_link _slp_rc=0
+  HERD_SHARE_LINKS_COUNT=0
+  [ -n "$_slp_dir" ] && [ -d "$_slp_dir" ] || return 1
+  [ -n "$_slp_repo" ] && [ -d "$_slp_repo" ] || return 1
+  # Unquoted on purpose: SHARE_LINKS is a SPACE-SEPARATED list of dirs.
+  # shellcheck disable=SC2086
+  for _slp_share in ${SHARE_LINKS:-}; do
+    if herd_share_link_exposes_secrets "$_slp_share"; then
+      printf '%s\n' "🚫 refusing SHARE_LINK '$_slp_share': it would expose .herd/secrets into the builder worktree (HERD-87)." >&2
+      printf '%s\n' "   Builders must never reach tracker credentials; the coordinator owns all tracker state. Skipping this link." >&2
+      continue
+    fi
+    _slp_target="$_slp_repo/$_slp_share"
+    _slp_link="$_slp_dir/$_slp_share"
+    if [ ! -e "$_slp_target" ]; then
+      printf '%s\n' "⚠️  skip symlink: $_slp_target does not exist in the main checkout." >&2
+      continue
+    fi
+    # Already provisioned (a re-run over an existing worktree, or the tree carries its own copy of the
+    # path) — never clobber what is already there, and never count it as work this pass did.
+    if [ -e "$_slp_link" ] || [ -L "$_slp_link" ]; then
+      continue
+    fi
+    if ! ln -s "$_slp_target" "$_slp_link" || [ ! -e "$_slp_link" ]; then
+      printf '%s\n' "❌ Failed to symlink $_slp_link -> $_slp_target" >&2
+      _slp_rc=1
+      continue
+    fi
+    HERD_SHARE_LINKS_COUNT=$((HERD_SHARE_LINKS_COUNT + 1))
+  done
+  return "$_slp_rc"
+}
+
 # herd_pretrust_worktree <dir> — mark a worktree as trusted for Claude Code so a builder agent
 # launched in it never stalls on the interactive "Do you trust the files in this folder?" gate and
 # dies with zero commits.

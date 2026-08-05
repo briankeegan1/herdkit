@@ -647,6 +647,17 @@ ADOPT_VERIFY_LEDGER="$TREES/.agent-watch-adopt-verify"
 ADOPT_ORPHAN_LEDGER="$TREES/.agent-watch-adopt-orphans"
 ADOPT_ORPHAN_SEEN_LEDGER="$TREES/.agent-watch-adopt-orphan-seen"
 ADOPT_ORPHAN_ROWS_LIMIT=5
+# ADOPT_UNPREPARED_LEDGER (HERD-535, GitHub issue #660) — one "<dir>\t<slug>\t<reason>" row per adopted
+# worktree that did NOT get the lane's SHARE_LINKS preparation. `git worktree add` checks out TRACKED
+# files only, so an adopted tree has none of the gitignored build/import caches (`node_modules`,
+# `.venv`, `target`, `.godot`) a lane worktree is handed at spawn — and a suite that cannot import
+# anything reds EVERY probe in a way indistinguishable from the branch breaking everything (12/12
+# probes, `health_codeerror`, in emberglen-godot), which then bounced builders at phantom bugs.
+# _adopt_prepare_worktree now runs the SAME pass the lanes run; this ledger is the record of the cases
+# where it could NOT (no SHARE_LINKS configured, or the pass failed), and it is what lets the health row
+# SAY SO — a red on an unprepared worktree is QUALIFIED as possibly-cache, never presented as a plain
+# code error. Rows are deduped per dir and cleared the moment a later prep for that dir succeeds.
+ADOPT_UNPREPARED_LEDGER="$TREES/.agent-watch-adopt-unprepared"
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -2567,6 +2578,100 @@ _adopt_self_heal_mismatch() {
   return 0
 }
 
+# ── Adopted-worktree PREPARATION (HERD-535, GitHub issue #660) ────────────────────────────────────
+# A lane worktree is never JUST `git worktree add`: new-feature.sh follows it with the SHARE_LINKS
+# symlink pass that gives the tree the gitignored build/import caches its suite needs. The adopt leg
+# skipped that pass entirely, so every adopted PR arrived at the gate with a checkout that could not
+# import, build, or run — 12/12 health probes red, `health_codeerror`, on a branch that was fine.
+#
+# The three functions below are the fix and its honesty rail:
+#   • _adopt_prepare_worktree — runs the ONE shared pass (herd_share_links_prepare, herd-config.sh) and
+#     journals `adopt_prepared … links=N` on success.
+#   • _adopt_unprepared_mark / _adopt_unprepared_note / _adopt_unprepared_clear — the ledger behind the
+#     health row's unprepared-worktree QUALIFIER, for the cases where preparation could not run.
+#
+# Fail-soft throughout: preparation never fails an adopt. An unprepared worktree is still adopted and
+# still gated — the difference is that its red is labelled as possibly-cache instead of code.
+
+# _adopt_unprepared_note <dir> <slug> — print the recorded reason this worktree is unprepared, or
+# return 1 when there is no row for it. Matches on EITHER key: the health row knows the worktree dir,
+# the console rows know the slug. An empty key never matches (it must not match every row).
+_adopt_unprepared_note() {
+  local _aun_dir="${1:-}" _aun_slug="${2:-}"
+  [ -s "$ADOPT_UNPREPARED_LEDGER" ] || return 1
+  awk -F'\t' -v d="$_aun_dir" -v s="$_aun_slug" \
+    '(d != "" && $1 == d) || (s != "" && $2 == s) { print $3; found = 1; exit } END { exit !found }' \
+    "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null
+}
+
+# _adopt_pr_ever_adopted <pr> — true iff ANY sha of this PR was adopted by this leg. _adopt_pr_recorded
+# answers the (pr,sha) once-guard question; this answers the DURABLE one ("is this an adopted PR at
+# all"), which is what the health-row qualifier needs: an adopted PR's sha moves every time its builder
+# pushes, but the worktree it was adopted into is the same one all the way through.
+#
+# It is also what keeps a stale unprepared row from ever mis-qualifying somebody ELSE's red: a merged
+# adopt's worktree is reaped and a later LANE worktree can be born at the very same path/slug, but it
+# carries a different PR — and a PR the adopt leg never adopted can never match this ledger.
+_adopt_pr_ever_adopted() {
+  local _apea_pr="${1:-}"
+  [ -n "$_apea_pr" ] || return 1
+  [ -s "$ADOPT_PR_LEDGER" ] || return 1
+  awk -F'\t' -v p="$_apea_pr" '$1 == p { found = 1; exit } END { exit !found }' "$ADOPT_PR_LEDGER" 2>/dev/null
+}
+
+# _adopt_unprepared_mark <dir> <slug> <reason> — append-only, deduped per dir.
+_adopt_unprepared_mark() {
+  local _aum_dir="${1:-}" _aum_slug="${2:-}" _aum_reason="${3:-}"
+  [ -n "$_aum_dir" ] || return 0
+  _adopt_unprepared_note "$_aum_dir" "" >/dev/null 2>&1 && return 0
+  printf '%s\t%s\t%s\n' "$_aum_dir" "$_aum_slug" "$_aum_reason" >> "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null || true
+  return 0
+}
+
+# _adopt_unprepared_clear <dir> — drop this worktree's row (a later prep succeeded, so the qualifier
+# must stop firing — a stale marker that outlives the condition is its own false signal).
+_adopt_unprepared_clear() {
+  local _auc_dir="${1:-}" _auc_keep
+  [ -n "$_auc_dir" ] || return 0
+  [ -s "$ADOPT_UNPREPARED_LEDGER" ] || return 0
+  _auc_keep="$(awk -F'\t' -v d="$_auc_dir" '$1 != d' "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null || true)"
+  if [ -n "$_auc_keep" ]; then
+    printf '%s\n' "$_auc_keep" > "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null || true
+  else
+    : > "$ADOPT_UNPREPARED_LEDGER" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# _adopt_prepare_worktree <pr> <sha> <branch> <slug> <dir> — the preparation pass itself. Always
+# returns 0 (preparation is never fatal to an adopt); the OUTCOME is what it journals:
+#   • links were made          → `adopt_prepared` with links=N, and any stale unprepared row cleared.
+#   • SHARE_LINKS empty, the pass failed, or nothing resolved → `adopt_unprepared` with the reason,
+#     plus a ledger row so the health row can qualify a red on this worktree.
+# SHARE_LINKS empty is deliberately UNPREPARED, not "prepared with 0 links": on a project that needs no
+# shared caches that is harmless, and on one that does it is exactly the misconfiguration that makes an
+# adopted PR red — either way the operator should be able to see it in the journal.
+_adopt_prepare_worktree() {
+  local _apw_pr="${1:-}" _apw_sha="${2:-}" _apw_branch="${3:-}" _apw_slug="${4:-}" _apw_dir="${5:-}"
+  local _apw_reason=""
+  if [ -z "${SHARE_LINKS:-}" ]; then
+    _apw_reason="SHARE_LINKS is empty — no shared build/import caches are configured for this project"
+  elif ! herd_share_links_prepare "$_apw_dir" "$MAIN"; then
+    _apw_reason="the SHARE_LINKS symlink pass failed for $_apw_dir"
+  elif [ "${HERD_SHARE_LINKS_COUNT:-0}" -eq 0 ]; then
+    _apw_reason="no SHARE_LINKS entry resolved to an existing dir in $MAIN"
+  else
+    journal_append adopt_prepared pr "$_apw_pr" sha "$_apw_sha" branch "$_apw_branch" \
+      slug "$_apw_slug" dir "$_apw_dir" links "${HERD_SHARE_LINKS_COUNT:-0}"
+    _adopt_unprepared_clear "$_apw_dir"
+    return 0
+  fi
+  journal_append adopt_unprepared pr "$_apw_pr" sha "$_apw_sha" branch "$_apw_branch" \
+    slug "$_apw_slug" dir "$_apw_dir" links 0 reason "$_apw_reason"
+  _adopt_unprepared_mark "$_apw_dir" "$_apw_slug" "$_apw_reason"
+  return 0
+}
+
 # _adopt_remote_pr <pr> <branch> <sha> — the mutating half: fetch the branch, then `git worktree add`
 # it into WORKTREES_DIR/<slug>, where <slug> is resolved by herd_branch_slug — the SAME slugifier
 # candidate discovery uses (branch_to_slug/_worktree_for_slug, pysrc/herd/live_runtime.py), so the
@@ -2597,6 +2702,10 @@ _adopt_remote_pr() {
     _adopt_journal_failed "$_arp_pr" "$_arp_sha" "$_arp_branch" "git worktree add failed"
     return 1
   fi
+  # HERD-535 / GH #660: the worktree exists but is BARE — run the SAME preparation the builder lanes
+  # run (herd_share_links_prepare), or record that we could not. Never fatal: an unprepared worktree is
+  # still an adopted, gated worktree — it is just one whose health red must be read differently.
+  _adopt_prepare_worktree "$_arp_pr" "$_arp_sha" "$_arp_branch" "$_arp_slug" "$_arp_dir"
   journal_append pr_adopted pr "$_arp_pr" sha "$_arp_sha" branch "$_arp_branch" slug "$_arp_slug" dir "$_arp_dir"
   _adopt_pr_mark_adopted "$_arp_pr" "$_arp_sha"
   # HERD-526: `pr_adopted` is a claim about git, not about the GATE. Enqueue the adopt for the DISCOVERY
@@ -11211,6 +11320,33 @@ _health_needs_you_row() {
   printf '%s' "    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hnr_sl}${C_RESET}${_hnr_pn} ${C_RED}needs you · health-check failed · ${_hnr_detail}${C_RESET}"$'\n'"       ${C_DIM}└─ fix in the worktree + push (auto-re-runs) · full suite: ${_hnr_log}${C_RESET}"
 }
 
+# _HEALTH_UNPREPARED_TAG / _health_qualify_unprepared <pr#> <worktree-dir> <slug> <detail>
+# (HERD-535, GitHub issue #660)
+#
+# An ADOPTED worktree that never got the lane's SHARE_LINKS preparation has none of the gitignored
+# build/import caches its suite needs, so EVERY probe reds — identically to the branch being broken.
+# That is the exact shape that bounced builders at phantom bugs in emberglen-godot. The remedy is not
+# to hide the red (the PR genuinely is not passing) but to stop presenting it as a plain CODE error:
+# echo <detail> with the unprepared-worktree marker appended.
+#
+# TWO conditions, both required, because a marker that fires on the wrong row is its own false signal:
+#   1. this PR was ADOPTED by the adopt leg (_adopt_pr_ever_adopted) — never a lane worktree's red, even
+#      when a lane is later born at the very path a reaped adopt once occupied, and
+#   2. that worktree carries a standing `adopt_unprepared` row.
+#
+# Byte-identical passthrough otherwise — which is every lane worktree, every prepared adopt, and the
+# whole console on a project that never turns ADOPT_REMOTE_PRS on.
+_HEALTH_UNPREPARED_TAG='unprepared worktree (adopted without SHARE_LINKS caches) — may be a missing-cache red, not a code error'
+
+_health_qualify_unprepared() {
+  local _hqu_pr="${1:-}" _hqu_dir="${2:-}" _hqu_slug="${3:-}" _hqu_detail="${4:-}"
+  if _adopt_pr_ever_adopted "$_hqu_pr" && _adopt_unprepared_note "$_hqu_dir" "$_hqu_slug" >/dev/null 2>&1; then
+    printf '%s' "${_hqu_detail} · ${_HEALTH_UNPREPARED_TAG}"
+    return 0
+  fi
+  printf '%s' "$_hqu_detail"
+}
+
 # _handle_health_codeerror <pr#> <slug> <headSha> <display-idx> <worktree-dir> <detail>
 # Called for EVERY reproduced healthcheck CODE ERROR — fresh from the collector or replayed from the
 # sha-cache — so the row stays truthful on every tick. Always sets DISPLAY[<idx>]; returns 0.
@@ -11234,6 +11370,13 @@ _handle_health_codeerror() {
     DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · ${_hhc_detail}${C_RESET}"
     return 0
   fi
+
+  # HERD-535 / GH #660: qualify the detail ONCE, here, before any row is painted or any bounce comment
+  # is written, so EVERY downstream surface (the needs-you row, the dry-run row, the budget-cap row, the
+  # PR comment the autofix rail posts) tells a human — and a builder — that this red may be the adopted
+  # worktree's missing caches rather than the diff. Applied AFTER the infra-cap and leak-guard branches
+  # above: both classify on the detail's own shape, and neither is a code-error row this can inform.
+  _hhc_detail="$(_health_qualify_unprepared "$_hhc_pr" "$_hhc_wt" "$_hhc_slug" "$_hhc_detail")"
 
   if ! _health_autofix_enabled || [ -n "${DRYRUN:-}" ]; then
     # OFF / dry-run: no bounce, no ledger write. Row truth still applies — a builder a HUMAN re-tasked
