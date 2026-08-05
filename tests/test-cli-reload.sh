@@ -226,24 +226,48 @@ grep -qi "herd init\|no .herd/config" <<< "$out" \
   || fail "reload should report missing .herd/config clearly"
 ok
 
+# A legacy (pre-argv0-marker) watcher shows in `ps` as `bash …/agent-watch.sh`. HERD-524 (#636): the
+# phase-2 leg finds its candidates with a `pgrep -f agent-watch.sh` SUBSTRING match and then SIGKILLs
+# them, so it now PROVES a candidate is executing the script before signalling it. The fixture must
+# therefore be a real one — a bare `sleep` that merely sits in the project root is a BYSTANDER (7b).
+# The script loops over short sleeps rather than `exec`ing one: the process must still READ as
+# `bash …/agent-watch.sh` when reload samples it, and a killed parent then orphans at most 1s of sleep.
+LEGACY_DIR="$T/legacy"; mkdir -p "$LEGACY_DIR"
+printf '#!/usr/bin/env bash\nwhile :; do sleep 1; done\n' > "$LEGACY_DIR/agent-watch.sh"
+chmod +x "$LEGACY_DIR/agent-watch.sh"
+
 # ── 7. Stray guard — OUR workspace: stray cwd == PROJECT_ROOT → killed ───────
 # A process whose current working directory IS our PROJECT_ROOT is treated as a stray
 # watcher belonging to this workspace and must be killed.
 P="$T/p7"; mkdir "$P"
 _make_project "$P" "reloadtest"
 P_REAL="$(cd "$P" && pwd -P)"
-# Start a sleep under the canonical PROJECT_ROOT so lsof -d cwd reports P_REAL.
-( cd "$P_REAL"; _bg_close_fds; exec sleep 9999 ) &
+# Start an untagged legacy watcher under the canonical PROJECT_ROOT so lsof -d cwd reports P_REAL.
+( cd "$P_REAL"; _bg_close_fds; exec bash "$LEGACY_DIR/agent-watch.sh" ) &
 STRAY_PID=$!
 _bg_track "$STRAY_PID"
-# pgrep stub will return STRAY_PID (as a stray not in the lockfile).
-( cd "$P" && FAKE_STRAY_PIDS="$STRAY_PID" HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
-  || { kill "$STRAY_PID" 2>/dev/null || true; fail "reload failed (stray-our test)"; }
+# … and a BYSTANDER in the very same directory: pgrep hands it over too (its command line would match
+# a substring scan just as a coordinator's `bash -c '… agent-watch.sh …'` wrapper does), but it is not
+# executing the script, so reload must leave it alone.
+( cd "$P_REAL"; _bg_close_fds; exec sleep 9999 ) &
+BYSTANDER_PID=$!
+_bg_track "$BYSTANDER_PID"
+# pgrep stub will return both (as strays not in the lockfile).
+( cd "$P" && FAKE_STRAY_PIDS="$STRAY_PID:$BYSTANDER_PID" HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
+  || { kill "$STRAY_PID" "$BYSTANDER_PID" 2>/dev/null || true; fail "reload failed (stray-our test)"; }
 sleep 0.3
 kill -0 "$STRAY_PID" 2>/dev/null \
   && { kill "$STRAY_PID" 2>/dev/null || true; fail "stray in OUR workspace was not killed"; } \
   || true
 ok
+
+# ── 7b. HERD-524 (#636): a bystander in OUR cwd that is NOT running the script survives ──────────
+if kill -0 "$BYSTANDER_PID" 2>/dev/null; then
+  kill "$BYSTANDER_PID" 2>/dev/null || true
+  ok   # bystander survived — the script-path guard worked
+else
+  fail "reload SIGKILLed a bystander process in the project root that was not executing agent-watch.sh"
+fi
 
 # ── 8. Stray guard — OTHER workspace: stray cwd != PROJECT_ROOT → NOT killed ─
 # A process whose cwd is a DIFFERENT directory must never be killed — this is the
@@ -252,8 +276,9 @@ P="$T/p8"; mkdir "$P"
 _make_project "$P" "reloadtest"
 OTHER="$T/other_project"; mkdir -p "$OTHER"
 OTHER_REAL="$(cd "$OTHER" && pwd -P)"
-# Start a sleep from OTHER_REAL (simulates another workspace's watcher).
-( cd "$OTHER_REAL"; _bg_close_fds; exec sleep 9999 ) &
+# Start an untagged legacy watcher from OTHER_REAL (simulates another workspace's watcher). It is a
+# REAL one, so the ONLY thing standing between it and a SIGKILL is the cwd guard this test asserts.
+( cd "$OTHER_REAL"; _bg_close_fds; exec bash "$LEGACY_DIR/agent-watch.sh" ) &
 OTHER_PID=$!
 _bg_track "$OTHER_PID"
 ( cd "$P" && FAKE_STRAY_PIDS="$OTHER_PID" HERD_RELOAD_SKIP_LAUNCH=1 bash "$HERD" reload >/dev/null 2>&1 ) \
@@ -963,11 +988,13 @@ kill "$YCWD" 2>/dev/null || true
 ok
 
 # ── 31. legacy UNTAGGED watcher (no argv0 marker) in our cwd is still reaped via the cwd fallback ─
-# Back-compat: a watcher started before the argv0 marker existed shows as a plain `sleep`/`bash`
-# with no herd-watch-* argv0. It must still be reaped when its cwd is our PROJECT_ROOT.
+# Back-compat: a watcher started before the argv0 marker existed shows as `bash …/agent-watch.sh` with
+# no herd-watch-* argv0. It must still be reaped when its cwd is our PROJECT_ROOT. HERD-524: the leg
+# proves the candidate is EXECUTING the script (a bystander in the same cwd is spared — test 7b), so
+# this fixture runs the real thing rather than a bare `sleep`.
 PX3="$T/px3"; mkdir "$PX3"; _make_project "$PX3" "projx"
 PX3_REAL="$(cd "$PX3" && pwd -P)"
-( cd "$PX3_REAL"; _bg_close_fds; exec sleep 9999 ) & LEGACY=$!   # untagged (argv0 == "sleep")
+( cd "$PX3_REAL"; _bg_close_fds; exec bash "$LEGACY_DIR/agent-watch.sh" ) & LEGACY=$!   # untagged (argv0 == "bash")
 _bg_track "$LEGACY"
 sleep 0.3
 ( cd "$PX3" && FAKE_STRAY_PIDS="$LEGACY" HERD_RELOAD_SIGTERM_POLLS=3 \

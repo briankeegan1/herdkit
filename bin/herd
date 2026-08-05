@@ -6246,9 +6246,19 @@ _stop_project_watcher() {
   while IFS= read -r stray; do
     [ -n "$stray" ] || continue
     [ "$stray" = "$lockpid" ] && continue  # already handled above
-    local sargv0; sargv0="$(ps -o command= -p "$stray" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+    local scmd sargv0
+    scmd="$(ps -o command= -p "$stray" 2>/dev/null | awk 'NR==1{print}' || true)"
+    sargv0="${scmd%%[[:space:]]*}"
     [ "$sargv0" = "$HERD_WATCH_ARGV0" ] && continue   # already reaped in phase 1 (our tagged watcher)
     case "$sargv0" in herd-watch-*) continue ;; esac  # FOREIGN tagged watcher — never touch
+    # HERD-524 (#636): `pgrep -f` matched the command line as a SUBSTRING, so this candidate list also
+    # holds every process that merely MENTIONS the script — a coordinator's `bash -c '… agent-watch.sh
+    # …'` wrapper, a tail on the log, an editor. This leg SIGTERM/SIGKILLs what it matches, so the
+    # candidate must be PROVEN to be executing the script; that proof is the shared watcher-exempt.sh
+    # predicate. If the shared lib is missing we skip the leg entirely rather than fall back to the
+    # substring: missing an untagged pre-2026 relic is recoverable, killing a bystander is not.
+    declare -f watcher_legacy_cmd >/dev/null 2>&1 || continue
+    watcher_legacy_cmd "$scmd" || continue
     local is_ours=0
     if command -v lsof >/dev/null 2>&1; then
       # flock case: watcher holds fd 9 on the lockfile — lsof shows it.
