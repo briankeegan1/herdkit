@@ -50,10 +50,11 @@ JOURNAL="$T/journal.jsonl"
 export JOURNAL_FILE="$JOURNAL"
 # shellcheck source=/dev/null
 . "$SCRIPT" || fail "sourcing herd-watch.sh (lib mode) failed"
-for fn in watch_wrapper_loop _watch_wrapper_is_stop_signal_rc _watch_wrapper_bound_capture; do
+for fn in watch_wrapper_loop _watch_wrapper_is_stop_signal_rc _watch_wrapper_bound_capture _watch_wrapper_lock_taken; do
   type "$fn" >/dev/null 2>&1 || fail "(1) $fn not defined after sourcing"
 done
 declare -f watcher_crashloop_active >/dev/null 2>&1 || fail "(1) watcher_crashloop_active (watcher-exempt.sh) not in scope"
+ORIG_LOCK="$HERD_WATCHER_LOCK"
 ok
 echo "PASS (1) wrapper helpers load in lib mode"
 
@@ -122,7 +123,130 @@ watcher_crashloop_active && fail "(3) a deliberate stop must never trip the cras
 ok
 [ ! -s "$JOURNAL" ] || fail "(3) a deliberate stop must never journal watcher_crashloop (got: $(cat "$JOURNAL"))"
 ok
-echo "PASS (3) deliberate stop signal (rc=143) ends the loop immediately, never fought, never journaled"
+echo "PASS (3) deliberate stop signal (rc=143, the narrow pre-trap-install window) ends the loop, never fought, never journaled"
+
+# ── (3b) THE REAL SHAPE (review fix): a REAL SIGTERM delivered to a stub that traps it exactly like
+# agent-watch.sh does (`trap '...; exit 1' INT TERM`) must ALSO be recognized as a deliberate stop —
+# rc 1, not 143. This is the actual code path `_stop_project_watcher` produces in production (it sends
+# a bare SIGTERM via `_watcher_term_verified`, and agent-watch.sh's own trap turns that into exit 1),
+# and the bug this case was written to catch: an earlier cut of _watch_wrapper_is_stop_signal_rc
+# recognized only 129/130/143 and therefore RESPAWNED right after a real stop — the exact
+# duplicate-watcher singleton race (HERD-266/450) this feature exists to prevent.
+reset
+STOPTRAP_STUB="$BIN/stop-trap-realistic.sh"
+COUNTER_3B="$T/attempts-3b"
+STOPTRAP_PIDFILE="$T/stoptrap-pid"
+rm -f "$STOPTRAP_PIDFILE"
+cat > "$STOPTRAP_STUB" <<EOF
+#!/usr/bin/env bash
+c=0; [ -f "$COUNTER_3B" ] && c=\$(cat "$COUNTER_3B")
+c=\$((c + 1)); printf '%s' "\$c" > "$COUNTER_3B"
+trap 'exit 1' INT TERM
+printf '%s' \$\$ > "$STOPTRAP_PIDFILE"
+# A SHORT-interval loop, not one long blocking \`sleep 100\` — bash famously does NOT interrupt a
+# trap-bearing process's CURRENT foreground wait() for a signal; the trap only runs once that
+# foreground command returns. A single 100s sleep would defer the trap for the full 100s (needing
+# SIGKILL to prove anything in a test), which is NOT how the real watcher behaves: agent-watch.sh's
+# own tick loop blocks in a 4s \`sleep\` between iterations, so a real SIGTERM is deferred for at most
+# ~4s, never effectively forever. This loop mirrors that shape.
+while :; do sleep 0.2; done
+EOF
+chmod +x "$STOPTRAP_STUB"
+export HERD_WATCH_CHILD_SCRIPT="$STOPTRAP_STUB"
+CAPTURE_3B="$T/capture-3b"; export HERD_WATCH_CRASH_CAPTURE="$CAPTURE_3B"
+
+( watch_wrapper_loop; echo "$?" > "$T/loop-rc-3b" ) &
+LOOP_PID=$!
+i=0
+while [ ! -f "$STOPTRAP_PIDFILE" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+[ -f "$STOPTRAP_PIDFILE" ] || fail "(3b) setup: the stub never reported its pid"
+CHILD_PID="$(cat "$STOPTRAP_PIDFILE")"
+kill -TERM "$CHILD_PID" 2>/dev/null || fail "(3b) setup: could not SIGTERM the stub"
+wait "$LOOP_PID" 2>/dev/null
+[ -f "$T/loop-rc-3b" ] || fail "(3b) the wrapper loop never finished"
+[ "$(cat "$T/loop-rc-3b")" = "0" ] \
+  || fail "(3b) a REAL SIGTERM against agent-watch.sh's own trap shape (rc=1) must return 0 (got $(cat "$T/loop-rc-3b"))"
+ok
+[ "$(cat "$COUNTER_3B")" = "1" ] \
+  || fail "(3b) a real deliberate SIGTERM (rc=1) must NEVER be respawned — this is the singleton-race bug (ran $(cat "$COUNTER_3B") times)"
+ok
+watcher_crashloop_active && fail "(3b) a real deliberate stop must never trip the crash-loop marker"
+ok
+echo "PASS (3b) a REAL SIGTERM against agent-watch.sh's actual INT/TERM trap shape (rc=1) is recognized as a deliberate stop — never respawned"
+
+# ── (3c) rc=1 with NO signal at all (the live-singleton-lock refusal shape, `_acquire_watcher_singleton
+# || exit 1`) must ALSO never respawn — "another main is already up" means the same thing as a stop.
+reset
+REFUSE_STUB="$BIN/singleton-refuse.sh"
+COUNTER_3C="$T/attempts-3c"
+cat > "$REFUSE_STUB" <<EOF
+#!/usr/bin/env bash
+c=0; [ -f "$COUNTER_3C" ] && c=\$(cat "$COUNTER_3C")
+c=\$((c + 1)); printf '%s' "\$c" > "$COUNTER_3C"
+echo "herd-watch: already running (pid 12345) — refusing duplicate" >&2
+exit 1
+EOF
+chmod +x "$REFUSE_STUB"
+export HERD_WATCH_CHILD_SCRIPT="$REFUSE_STUB"
+CAPTURE_3C="$T/capture-3c"; export HERD_WATCH_CRASH_CAPTURE="$CAPTURE_3C"
+rc=0
+watch_wrapper_loop || rc=$?
+[ "$rc" -eq 0 ] || fail "(3c) a bare exit 1 (singleton-refusal shape) must return 0 (got $rc)"
+ok
+[ "$(cat "$COUNTER_3C")" = "1" ] || fail "(3c) a singleton refusal must never be respawned (ran $(cat "$COUNTER_3C") times)"
+ok
+echo "PASS (3c) a bare exit 1 (the live-singleton-lock refusal shape) is never respawned"
+
+# ── (3d) rc=137 (128+SIGKILL, _watcher_term_verified's escalation) must also never respawn ──────────
+reset
+KILL_STUB="$BIN/sigkill-shape.sh"
+COUNTER_3D="$T/attempts-3d"
+cat > "$KILL_STUB" <<EOF
+#!/usr/bin/env bash
+c=0; [ -f "$COUNTER_3D" ] && c=\$(cat "$COUNTER_3D")
+c=\$((c + 1)); printf '%s' "\$c" > "$COUNTER_3D"
+exit 137
+EOF
+chmod +x "$KILL_STUB"
+export HERD_WATCH_CHILD_SCRIPT="$KILL_STUB"
+CAPTURE_3D="$T/capture-3d"; export HERD_WATCH_CRASH_CAPTURE="$CAPTURE_3D"
+rc=0
+watch_wrapper_loop || rc=$?
+[ "$rc" -eq 0 ] || fail "(3d) rc=137 (SIGKILL escalation shape) must return 0 (got $rc)"
+ok
+[ "$(cat "$COUNTER_3D")" = "1" ] || fail "(3d) rc=137 must never be respawned (ran $(cat "$COUNTER_3D") times)"
+ok
+echo "PASS (3d) rc=137 (the SIGKILL escalation shape) is never respawned"
+
+# ── (3e) belt-and-suspenders: a LIVE watcher already holds the lock → never respawn regardless of rc ─
+# Simulates a concurrent relaunch (another cmd_pane_watch/cmd_reload invocation) beating us to it in
+# the gap since our child died — even a genuine-looking crash exit code must not respawn on top of it.
+reset
+sleep 100 & OTHER_LIVE_WATCHER=$!
+OTHER_LOCK="$T/other-watcher.pid"
+printf '%s\n' "$OTHER_LIVE_WATCHER" > "$OTHER_LOCK"
+export HERD_WATCHER_LOCK="$OTHER_LOCK"
+CRASHY_STUB="$BIN/crashy-someone-else-alive.sh"
+COUNTER_3E="$T/attempts-3e"
+cat > "$CRASHY_STUB" <<EOF
+#!/usr/bin/env bash
+c=0; [ -f "$COUNTER_3E" ] && c=\$(cat "$COUNTER_3E")
+c=\$((c + 1)); printf '%s' "\$c" > "$COUNTER_3E"
+exit 7
+EOF
+chmod +x "$CRASHY_STUB"
+export HERD_WATCH_CHILD_SCRIPT="$CRASHY_STUB"
+CAPTURE_3E="$T/capture-3e"; export HERD_WATCH_CRASH_CAPTURE="$CAPTURE_3E"
+rc=0
+watch_wrapper_loop || rc=$?
+[ "$rc" -eq 0 ] || fail "(3e) a lock already held by another live watcher must return 0 (got $rc)"
+ok
+[ "$(cat "$COUNTER_3E")" = "1" ] \
+  || fail "(3e) must never respawn while another live watcher holds the lock (ran $(cat "$COUNTER_3E") times)"
+ok
+kill -9 "$OTHER_LIVE_WATCHER" 2>/dev/null || true
+export HERD_WATCHER_LOCK="$ORIG_LOCK"
+echo "PASS (3e) a live watcher already holding the lock is never doubled, regardless of the child's exit code"
 
 # ── (4) a slow failure resets the consecutive-fast counter ──────────────────────────────────────────
 reset
@@ -132,13 +256,16 @@ cat > "$SLOW_STUB" <<EOF
 #!/usr/bin/env bash
 c=0; [ -f "$COUNTER_4" ] && c=\$(cat "$COUNTER_4")
 c=\$((c + 1)); printf '%s' "\$c" > "$COUNTER_4"
-if [ "\$c" -eq 1 ]; then sleep 1.5; fi
+if [ "\$c" -eq 1 ]; then sleep 3; fi
 echo "attempt \$c" >&2
 exit 9
 EOF
 chmod +x "$SLOW_STUB"
 export HERD_WATCH_CHILD_SCRIPT="$SLOW_STUB"
 export HERD_WATCH_CRASHLOOP_N=2
+# A wide margin (3s sleep vs a 1s threshold) — $SECONDS is whole-second granularity, and a tighter
+# margin (e.g. 1.5s) flaked under load: process-spawn overhead alone can eat several hundred ms, and
+# a slow CI box can round the elapsed time across the threshold either way.
 export HERD_WATCH_CRASHLOOP_FAST_SECS=1
 CAPTURE_4="$T/capture-4"; export HERD_WATCH_CRASH_CAPTURE="$CAPTURE_4"
 

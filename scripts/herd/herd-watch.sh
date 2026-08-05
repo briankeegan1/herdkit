@@ -28,11 +28,18 @@
 #
 # on: this wrapper stops using `exec` (which REPLACES its own process image and can therefore never
 # observe how the child died) and instead runs agent-watch.sh as a supervised child in a loop:
-#   • a death that is a DELIBERATE STOP SIGNAL (SIGHUP/SIGINT/SIGTERM — rc 129/130/143) simply ends
-#     the wrapper. NEVER fought: `_stop_project_watcher` (cmd_pane_watch / cmd_reload / the sweep)
-#     expects the pane to go quiet and then drives its OWN verified relaunch — a wrapper that raced it
-#     with an unsolicited respawn would double-launch into the exact singleton race HERD-266/450 exist
-#     to prevent.
+#   • a death that is a DELIBERATE STOP simply ends the wrapper. NEVER fought:
+#     `_stop_project_watcher` (cmd_pane_watch / cmd_reload / the sweep) expects the pane to go quiet
+#     and then drives its OWN verified relaunch — a wrapper that raced it with an unsolicited respawn
+#     would double-launch into the exact singleton race HERD-266/450 exist to prevent. Recognized by
+#     exit code — rc 1 is the COMMON shape: agent-watch.sh's own `trap '...; exit 1' INT TERM`
+#     (installed so it can clean up the lockfile before dying) turns the bare SIGTERM
+#     `_watcher_term_verified` sends into a plain `exit 1`, NOT bash's bare 128+signal encoding; rc 1
+#     is ALSO what a live-singleton-lock refusal produces, and "another main is already up" means the
+#     same thing here — never respawn. rc 137 is the SIGKILL escalation (uncatchable, always this
+#     code); rc 129/130/143 cover the narrow pre-trap-install window. Belt-and-suspenders beyond exit
+#     codes entirely: if $HERD_WATCHER_LOCK already names a LIVE pid by the time a respawn would fork
+#     (a concurrent relaunch beat us to it), the wrapper also stops rather than doubling it.
 #   • a clean exit (rc 0) also just ends the wrapper — nothing to retry.
 #   • any OTHER nonzero death that survived less than HERD_WATCH_CRASHLOOP_FAST_SECS (default 5s)
 #     counts as FAST. Fewer than HERD_WATCH_CRASHLOOP_N (default 3) CONSECUTIVE fast deaths and the
@@ -86,11 +93,44 @@ _watch_wrapper_bound_capture() {
   fi
 }
 
-# _watch_wrapper_is_stop_signal_rc <rc> — true iff <rc> is bash's 128+signal encoding for a DELIBERATE
-# stop: SIGHUP=129, SIGINT=130, SIGTERM=143 — the shapes `_stop_project_watcher` / an operator's Ctrl-C
-# produce. See the header: the wrapper must never respawn over one of these.
+# _watch_wrapper_is_stop_signal_rc <rc> — true iff <rc> is a shape a DELIBERATE stop of the real
+# watcher produces. See the header: the wrapper must never respawn over one of these.
+#
+# HERD-548 review fix: the FIRST cut of this predicate recognized only bash's bare 128+signal
+# encoding (129/130/143 for SIGHUP/SIGINT/SIGTERM) — the shape a process with NO trap installed
+# produces. But agent-watch.sh installs `trap '_watcher_lock_cleanup; exit 1' INT TERM`
+# (agent-watch.sh, the watcher-lock section) SPECIFICALLY so it can clean up the lockfile before
+# dying, and that trap ends in a plain `exit 1` — NOT 130/143. `_watcher_term_verified` (bin/herd,
+# the ONE stop primitive `_stop_project_watcher` / `herd reload` / `herd pane watch` / the sweep all
+# route through) sends a bare SIGTERM first, so `1` is the REAL, common shape a deliberate stop
+# produces — the 128+signal codes only ever fire if a signal lands before agent-watch.sh reaches the
+# trap line (a narrow startup window). Recognizing only 129/130/143 therefore let the WRAPPER
+# MISREAD THE ORDINARY CASE as a crash and respawn RIGHT AFTER `_stop_project_watcher` had just
+# confirmed the old watcher dead — the exact duplicate-watcher singleton race (HERD-266/450) this
+# feature's own header claims it never fights.
+#   1   = agent-watch.sh's own INT/TERM trap (the common `_stop_project_watcher` SIGTERM shape) —
+#         ALSO the shape `_acquire_watcher_singleton || exit 1` produces on a live-lock refusal
+#         (another main is already up); both cases mean "do not respawn", identically, so both are
+#         folded into this one code.
+#   137 = 128+SIGKILL, `_watcher_term_verified`'s escalation when SIGTERM did not land in time —
+#         uncatchable, always exactly this code, never anything a trap could reshape.
+#   129/130/143 = the narrow pre-trap-install window above; kept for completeness.
 _watch_wrapper_is_stop_signal_rc() {
-  case "${1:-0}" in 129|130|143) return 0 ;; *) return 1 ;; esac
+  case "${1:-0}" in 1|129|130|137|143) return 0 ;; *) return 1 ;; esac
+}
+
+# _watch_wrapper_lock_taken — belt-and-suspenders beyond the exit-code shapes above: true iff
+# $HERD_WATCHER_LOCK currently names a LIVE pid. If a concurrent relaunch (another `cmd_pane_watch` /
+# `cmd_reload` invocation, another operator action) has ALREADY stood up a fresh watcher in the gap
+# since our child died — regardless of what exit code got us here — respawning now would double it.
+# Read fresh on every call, never cached, so it reflects the world exactly as of the instant before a
+# respawn would fork.
+_watch_wrapper_lock_taken() {
+  local lock="${HERD_WATCHER_LOCK:-}" p
+  [ -n "$lock" ] && [ -f "$lock" ] || return 1
+  p="$(cat "$lock" 2>/dev/null || true)"
+  case "$p" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$p" 2>/dev/null
 }
 
 # watch_wrapper_loop — the HERD-548 supervising loop. Runs $_WATCH_CHILD_SCRIPT to completion,
@@ -106,7 +146,18 @@ watch_wrapper_loop() {
   while :; do
     t0=$SECONDS
     : > "$capture" 2>/dev/null || true
-    bash "$child" 2> >(tee -a "$capture" >&2)
+    # Plain file redirection, deliberately NOT `2> >(tee … >&2)`: one fewer async subprocess/pipe in
+    # the path between a SIGTERM landing on the child and this loop observing its exit, and nothing
+    # here needs stderr mirrored live — the crash-loop trip below prints the full captured tail
+    # explicitly, which is the one place this file promises loud visibility. stdout (the actual
+    # render) is untouched either way. NOTE for anyone hermetically testing a deliberate-stop case
+    # against a stub child: bash does NOT interrupt a trap-bearing process's CURRENT foreground
+    # wait() for an already-blocking command — a stub that blocks in one long `sleep 100` defers its
+    # own INT/TERM trap for the full 100s (needing SIGKILL to prove anything within a test timeout).
+    # The real agent-watch.sh never does this: its tick loop blocks in a 4s `sleep` between
+    # iterations, so a real SIGTERM is deferred for at most ~4s — a stub proving this case must mirror
+    # that short-interval shape (see tests/test-watcher-crashloop-guard.sh case 3b), not a long sleep.
+    bash "$child" 2> "$capture"
     rc=$?
     elapsed=$(( SECONDS - t0 ))
     _watch_wrapper_bound_capture "$capture"
@@ -115,6 +166,9 @@ watch_wrapper_loop() {
       return 0
     fi
     if [ "$rc" -eq 0 ]; then
+      return 0
+    fi
+    if _watch_wrapper_lock_taken; then
       return 0
     fi
 
