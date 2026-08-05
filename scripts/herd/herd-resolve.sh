@@ -33,6 +33,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# shellcheck source=/dev/null
+. "$HERE/journal.sh"
 # Runtime driver shim: route the resolver agent launch through herd_driver_launch_agent so
 # HERD_DRIVER=headless spawns a detached resolver; herdr-claude emits the identical argv below.
 # HERD-150 P2: the shim resolves RESOLVER_MODEL's runtime driver from the (possibly qualified) ref and
@@ -58,6 +60,79 @@ fi
 if [ ! -e "$DIR/.git" ]; then
   echo "❌ $DIR exists but isn't a git worktree (no .git) — refusing to resolve there." >&2
   exit 1
+fi
+
+# 1.5 PREDECESSOR-WEDGE PRECHECK (HERD-553): a resolver that dies between staging a merge's conflict
+# resolution and committing it (killed mid-run, host restart, an OOM) leaves the NEXT resolver
+# dispatched onto this worktree wedged — it inherits an in-progress `git merge` it did not start, and
+# `git merge` itself refuses to run again ("fatal: You have not concluded your merge") no matter what
+# the fresh agent tries. Live case: PR #679 looped merge_refused 44x across three dispatched
+# resolvers, each choking on the same predecessor's half-finished merge, until a human hand-concluded
+# it. Screen for that state ONCE, before spawning anything, so a respawn is never handed a tree it
+# cannot use:
+#   • MERGE_HEAD present, ZERO unmerged index paths, ZERO conflict markers in what got staged → the
+#     predecessor finished resolving and just never reached `git commit` — FINISH its work (commit,
+#     run the checks, push) instead of asking a fresh agent to re-resolve conflicts that no longer
+#     exist (it would just find a clean `git merge` no-op and be confused why the tree is dirty).
+#   • MERGE_HEAD present with unmerged paths remaining (or a staged file that still carries a literal
+#     conflict marker) → the predecessor died mid-resolution: the merge is unsalvageable state, not a
+#     resolvable conflict — abort it so the fresh resolve below starts from a clean, un-merging tree.
+#   • no MERGE_HEAD → the ordinary case, byte-identical to before this precheck existed.
+if git -C "$DIR" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1; then
+  _wedge_unmerged="$(git -C "$DIR" diff --name-only --diff-filter=U 2>/dev/null || true)"
+  _wedge_markers=""
+  if [ -z "$_wedge_unmerged" ]; then
+    _wedge_staged="$(git -C "$DIR" diff --cached --name-only 2>/dev/null || true)"
+    while IFS= read -r _wedge_f; do
+      [ -n "$_wedge_f" ] || continue
+      _wedge_blob="$(git -C "$DIR" show ":$_wedge_f" 2>/dev/null || true)"
+      if grep -qE '^(<{7}( |$)|={7}$|>{7}( |$)|\|{7} )' <<< "$_wedge_blob"; then
+        _wedge_markers=1
+        break
+      fi
+    done <<EOF_WEDGE_STAGED
+$_wedge_staged
+EOF_WEDGE_STAGED
+  fi
+
+  if [ -z "$_wedge_unmerged" ] && [ -z "$_wedge_markers" ]; then
+    # Fully staged, never committed — conclude the predecessor's merge instead of re-resolving.
+    echo "🔧 resolve·$SLUG: MERGE_HEAD with a fully-staged resolution and no conflict markers — a predecessor resolver died before committing; concluding it instead of re-resolving." >&2
+    # herd-scope-ok: a merge commit has no meaningful pathspec — it must commit exactly what the
+    # predecessor staged (the whole INDEX, already verified above to be zero unmerged paths and zero
+    # conflict markers), which is precisely what an ordinary `git merge` conclude does by hand.
+    if git -C "$DIR" commit --no-edit >/dev/null 2>&1; then
+      command -v journal_append >/dev/null 2>&1 && journal_append resolver_concluded_predecessor \
+        component resolver slug "$SLUG" pr "${HERD_RESOLVE_PR:--}" sha "${HERD_RESOLVE_SHA:--}"
+      _wedge_checks_ok=1
+      [ -n "$SMOKE_CMD" ] && { bash -c "$SMOKE_CMD" || _wedge_checks_ok=0; }
+      [ "$_wedge_checks_ok" = 1 ] && { bash "$HERE/healthcheck.sh" "$DIR" || _wedge_checks_ok=0; }
+      if [ "$_wedge_checks_ok" = 1 ]; then
+        if git -C "$DIR" push >/dev/null 2>&1; then
+          [ -n "${HERD_RESOLVE_RESULT_FILE:-}" ] && { printf 'RESOLVE: DONE\n' > "$HERD_RESOLVE_RESULT_FILE" 2>/dev/null || true; }
+          command -v journal_append >/dev/null 2>&1 && journal_append resolver_concluded_predecessor \
+            component resolver slug "$SLUG" pr "${HERD_RESOLVE_PR:--}" sha "${HERD_RESOLVE_SHA:--}" status pushed
+          echo "✅ resolve·$SLUG: concluded the predecessor's merge, checks green, pushed — nothing left for an agent to do." >&2
+          exit 0
+        fi
+        echo "⚠️  resolve·$SLUG: concluded + checks green but 'git push' failed — falling through to a fresh resolver agent to retry." >&2
+      else
+        echo "⚠️  resolve·$SLUG: concluded the predecessor's merge but the smoke/healthcheck gate failed — falling through to a fresh resolver agent to fix forward." >&2
+      fi
+    else
+      echo "⚠️  resolve·$SLUG: MERGE_HEAD looked fully staged but committing it failed — aborting and dispatching a fresh resolve instead." >&2
+      git -C "$DIR" merge --abort >/dev/null 2>&1 || true
+      command -v journal_append >/dev/null 2>&1 && journal_append resolver_wedge_aborted \
+        component resolver slug "$SLUG" pr "${HERD_RESOLVE_PR:--}" sha "${HERD_RESOLVE_SHA:--}" reason commit_failed
+    fi
+  else
+    # Still conflicted (or a stray marker survived staging) — unsalvageable; abort clean and re-resolve.
+    git -C "$DIR" merge --abort >/dev/null 2>&1 || true
+    command -v journal_append >/dev/null 2>&1 && journal_append resolver_wedge_aborted \
+      component resolver slug "$SLUG" pr "${HERD_RESOLVE_PR:--}" sha "${HERD_RESOLVE_SHA:--}" \
+      reason "${_wedge_markers:+conflict_markers}${_wedge_markers:-unmerged_paths}"
+    echo "🔧 resolve·$SLUG: MERGE_HEAD with unresolved conflicts left by a predecessor resolver — aborted the stuck merge; dispatching a fresh resolve." >&2
+  fi
 fi
 
 # 2. The resolver agent's opening prompt. The STANDARD resolver task — fixed, not free-form: the
