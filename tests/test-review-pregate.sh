@@ -248,6 +248,37 @@ step="$(REVIEW_PREGATE=on _review_gate_step 501 "$SLUG" "$SHA")"
 [ "$(review_verdict_source 501 "$SHA")" = "pregate" ] || fail "(2b) provenance must be 'pregate', never 'reviewer'"
 ok
 
+# (2b') the lint output survives for the bounce. It is read by _handle_block_verdict on a LATER tick,
+# and every per-(pr,sha) review artifact is swept by _discard_stale_reviews, which decides staleness
+# from the LAST dash-segment of the filename — so a name whose sha is not last is deleted on the very
+# next tick, silently degrading every mechanical bounce to the generic "read the full review" prompt
+# for a review that was never written. Pin both halves: the file exists, and a same-sha sweep keeps it.
+[ -s "$(_review_lint_file 501 "$SHA")" ] || fail "(2b') the pre-gate must persist its lint output for the bounce"
+_discard_stale_reviews 501 "$SHA"
+[ -s "$(_review_lint_file 501 "$SHA")" ] || fail "(2b') a same-sha sweep must KEEP the lint output"
+grep -q 'PREGATE caps-sync' "$(_review_lint_file 501 "$SHA")" || fail "(2b') the persisted output must be the findings"
+_discard_stale_reviews 501 "some-other-sha"
+[ -e "$(_review_lint_file 501 "$SHA")" ] && fail "(2b') a NEW head sha must sweep the stale lint output"
+ok
+
+# (2b'') the ledger REASON names the lint that actually fired. `herd approve why` and the PR comment
+# both read this string, and a generic "mechanical" would tell an operator nothing about which rule
+# refused the diff — the same silent degradation the findings-through-a-subshell bug produced.
+ledger_reason() { awk -v p="$1" -v s="$2" '$2==p && $3==s{r=""; for(i=6;i<=NF;i++) r=r $i " "} END{print r}' "$REVIEW_STATE" 2>/dev/null; }
+grep -q 'caps-sync' <<< "$(ledger_reason 501 "$SHA")" \
+  || fail "(2b'') the ledger reason must name the lint that fired: $(ledger_reason 501 "$SHA")"
+ok
+
+# (2b''') the auto-refix PROVENANCE gate accepts `pregate`. That gate exists to stop a verdict with no
+# actionable finding from waking a builder; a pre-gate red carries the literal lint output, so it must
+# pass. Asserted through the row it would otherwise paint ("blocked without a reviewer finding"), with
+# no agent present — so the call ends in the ordinary no-pane escalation, never the provenance refusal.
+DISPLAY=()
+REVIEW_AUTOFIX=true _handle_block_verdict 501 dirty "$SHA" 0
+grep -q 'without a reviewer finding' <<< "${DISPLAY[0]:-}" \
+  && fail "(2b''') a pregate BLOCK must clear the provenance gate (got: ${DISPLAY[0]:-})"
+ok
+
 # (2c-off) with REVIEW_PREGATE off (the DEFAULT), the SAME dirty diff reviews exactly as today.
 SLUG=dirtyoff; D="$WORKTREES_DIR/$SLUG"; init_fixture "$D"; add_caps_violation "$D"
 SHA="$(gc "$D" rev-parse HEAD)"
