@@ -11,7 +11,9 @@
 # What this asserts:
 #   (A) EVERY render path renders when the file is ABSENT, and leaves the git tree CLEAN:
 #       herd init → clean; delete + herd render → regenerated, clean; delete + herd upgrade →
-#       regenerated, clean. The ignore line is written once and is idempotent.
+#       regenerated, clean. The ignore line is written once and is idempotent — and (HERD-519 leg c)
+#       it lands in the CHECKOUT-LOCAL .git/info/exclude, never in the COMMITTED .gitignore, so a
+#       fresh clone's first render leaves the tree clean instead of dirtying a tracked file.
 #   (B) MIGRATION — a project that still TRACKS the render is untracked by `herd upgrade`: no tracked
 #       copy survives, the file on disk is untouched, and the deletion is staged for the operator.
 #   (C) The shared derived-files list (scripts/herd/derived-files.sh) follows COORDINATOR_CMD, and its
@@ -57,8 +59,13 @@ _herd "$P" init >/dev/null 2>&1 || fail "A: herd init failed"
 [ -f "$P/$SKILL_REL" ] || fail "A1: init did not render the skill"
 ok "A1 init renders the skill"
 
-grep -qxF "$SKILL_REL" "$P/.gitignore" || fail "A2: init did not gitignore the render"
-ok "A2 init gitignores the render"
+# HERD-519 leg (c): the ignore entry is CHECKOUT-LOCAL. The render must be ignored by git, via
+# .git/info/exclude — and the COMMITTED .gitignore must not have been touched for it.
+git -C "$P" check-ignore -q "$SKILL_REL" || fail "A2: init did not ignore the render at all"
+grep -qxF "$SKILL_REL" "$P/.git/info/exclude" || fail "A2: the ignore entry is not in .git/info/exclude"
+{ [ -f "$P/.gitignore" ] && grep -qxF "$SKILL_REL" "$P/.gitignore"; } \
+  && fail "A2: the render's ignore entry was written to the COMMITTED .gitignore (it must be checkout-local)"
+ok "A2 init ignores the render via .git/info/exclude, leaving the committed .gitignore alone"
 
 # Commit init's own output so the ONLY thing that could dirty the tree is the render.
 git -C "$P" add -A && git -C "$P" commit -q -m init
@@ -84,14 +91,54 @@ grep -q "$SKILL_REL" <<< "$(git -C "$P" status --porcelain)" \
 ok "A5 herd upgrade regenerates an absent skill without dirtying the tree with it"
 
 # The ignore line is written ONCE, however many renders run (idempotent).
-[ "$(grep -cxF "$SKILL_REL" "$P/.gitignore")" -eq 1 ] || fail "A6: the ignore line was appended more than once"
-ok "A6 the gitignore entry is idempotent across renders"
+[ "$(grep -cxF "$SKILL_REL" "$P/.git/info/exclude")" -eq 1 ] \
+  || fail "A6: the exclude line was appended more than once"
+ok "A6 the .git/info/exclude entry is idempotent across renders"
+
+# HERD-519 leg (c), the incident this fixes: a FRESH CLONE of a project renders on first use and must
+# stay CLEAN. The clone carries the committed .gitignore but NOT the source checkout's info/exclude.
+C="$T/clone"
+git clone -q "$P" "$C" || fail "A7: clone failed"
+git -C "$C" config user.email t@t.local; git -C "$C" config user.name t
+[ -z "$(git -C "$C" status --porcelain)" ] || fail "A7: the fresh clone was dirty before rendering"
+_herd "$C" render >/dev/null 2>&1 || fail "A7: herd render failed in a fresh clone"
+[ -f "$C/$SKILL_REL" ] || fail "A7: herd render did not render into the fresh clone"
+[ -z "$(git -C "$C" status --porcelain)" ] \
+  || fail "A7: the first render DIRTIED a fresh clone: $(git -C "$C" status --porcelain)"
+grep -qxF "$SKILL_REL" "$C/.git/info/exclude" || fail "A7: the clone's exclude entry was not written"
+ok "A7 a fresh clone's first render leaves git status EMPTY (the entry lands in .git/info/exclude)"
+
+# NO CHURN for a project that already carries the line in its COMMITTED .gitignore (every project
+# initialised before HERD-519): the line stays, and nothing is duplicated into info/exclude.
+L="$T/legacy-ignore"; _mkrepo "$L"
+_herd "$L" init >/dev/null 2>&1 || fail "A8: herd init failed"
+printf '%s\n' "$SKILL_REL" >> "$L/.gitignore"          # the pre-HERD-519 committed shape
+: > "$L/.git/info/exclude"
+git -C "$L" add -A && git -C "$L" commit -q -m "legacy: committed ignore line"
+_herd "$L" render >/dev/null 2>&1 || fail "A8: herd render failed on a legacy-ignore project"
+[ "$(grep -cxF "$SKILL_REL" "$L/.gitignore")" -eq 1 ] \
+  || fail "A8: the committed ignore line was removed or duplicated"
+grep -qxF "$SKILL_REL" "$L/.git/info/exclude" \
+  && fail "A8: the entry was duplicated into info/exclude although .gitignore already covers it"
+[ -z "$(git -C "$L" status --porcelain)" ] || fail "A8: render dirtied a legacy-ignore project"
+ok "A8 a project whose committed .gitignore already carries the line is left untouched"
+
+# NO COVERAGE LOST where there is no repo: `herd init` legitimately runs in a plain directory (the
+# operator may `git init` later), which has no checkout-local surface — the entry falls back to the
+# .gitignore exactly as before, and there is no tracked file to dirty.
+N="$T/nogit"; mkdir -p "$N"
+_herd "$N" init >/dev/null 2>&1 || fail "A9: herd init failed in a non-git directory"
+grep -qxF "$SKILL_REL" "$N/.gitignore" \
+  || fail "A9: a non-git init lost the ignore entry entirely: $(cat "$N/.gitignore" 2>/dev/null)"
+ok "A9 a non-git directory still gets the entry, in .gitignore (no checkout-local surface exists)"
 
 # ── B. migration: a project still TRACKING the render is untracked by `herd upgrade` ───────────────
 M="$T/legacy"; _mkrepo "$M"
 _herd "$M" init >/dev/null 2>&1 || fail "B: herd init failed"
-# Recreate the pre-migration world: force the render into the index and drop the ignore line.
+# Recreate the pre-migration world: force the render into the index and drop the ignore entry from
+# BOTH surfaces (the committed .gitignore, as before, and the checkout-local exclude of HERD-519).
 grep -vxF "$SKILL_REL" "$M/.gitignore" > "$M/.gitignore.new" && mv "$M/.gitignore.new" "$M/.gitignore"
+: > "$M/.git/info/exclude"
 git -C "$M" add -A -f && git -C "$M" commit -q -m "legacy: tracked render"
 git -C "$M" ls-files --error-unmatch -- "$SKILL_REL" >/dev/null 2>&1 || fail "B: fixture did not track the render"
 
@@ -103,8 +150,10 @@ ok "B1 upgrade untracks a tracked render"
 [ -f "$M/$SKILL_REL" ] || fail "B2: upgrade deleted the render from disk (it must survive as the local artifact)"
 ok "B2 the on-disk render survives the migration"
 
-grep -qxF "$SKILL_REL" "$M/.gitignore" || fail "B3: upgrade did not restore the ignore line"
-ok "B3 upgrade re-adds the gitignore entry"
+grep -qxF "$SKILL_REL" "$M/.git/info/exclude" || fail "B3: upgrade did not restore the ignore entry"
+{ [ -f "$M/.gitignore" ] && grep -qxF "$SKILL_REL" "$M/.gitignore"; } \
+  && fail "B3: the restored entry went into the COMMITTED .gitignore (it must be checkout-local)"
+ok "B3 upgrade re-adds the ignore entry to .git/info/exclude"
 
 # The deletion is STAGED (D in the index), so the operator commits one migration commit.
 grep -q "^D  $SKILL_REL" <<< "$(git -C "$M" status --porcelain)" || fail "B4: the index deletion was not staged"
