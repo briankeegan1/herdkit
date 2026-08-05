@@ -120,14 +120,197 @@ print("ok" if g >= m else "bad")
   return 0
 }
 
+# ═════════════════════════════════════════════════════════════════════════════
+# herdr client/server PROTOCOL MISMATCH advice (HERD-521)
+#
+# The field failure this exists for: herdr is a CLIENT talking to a long-lived SERVER over a socket.
+# When the two speak different protocol revisions (real case: server 0.7.5 / protocol 17 vs CLI
+# 0.8.0 / protocol 19, after a `brew upgrade` that replaced the binary while the old server kept
+# running), the server rejects EVERY socket command — `tab list` included — so the probe below fails
+# and, with it, every lane AND coordinator.sh. The pre-HERD-521 diagnostic said only "your herdr
+# looks broken or incompatible… upgrade/repair herdr", which is true but not ACTIONABLE: the operator
+# had to hand-discover that the fix is either restarting the server or side-loading a matching client
+# release (`herdr update --handoff`, the session-preserving in-place upgrade, is DISABLED for
+# Homebrew installs — the exact install shape most operators have).
+#
+# So on a failed probe we PARSE what the installed herdr will tell us — `herdr status --json` names
+# BOTH sides (version + protocol + a `compatible` flag), and the server's own rejection text names
+# the two protocol revisions ("client protocol 19 is newer than server protocol 17; …") — and print
+# a concrete remediation block naming both versions.
+#
+# ADVICE ONLY: nothing here downloads, installs, or restarts anything.
+# FAIL-SOFT: anything unparseable (no status subcommand, garbled text, server simply not running)
+# yields NO advice, and the caller degrades to the pre-HERD-521 message byte-for-byte.
+
+# _herd_herdr_mismatch_facts [observed-text] — gather what the installed herdr can tell us about a
+# client/server skew. Echoes ONE pipe-delimited line:
+#     <client-version>|<client-protocol>|<server-version>|<server-protocol>|<yes|no>|<direction>
+# (direction: client-newer | client-older | empty). Every field may be empty — the caller decides
+# whether there is enough to advise on. Sources, best first: `herdr status --json` (authoritative:
+# names both sides plus `compatible`), the server's rejection text on stderr (older herdr has no
+# `status --json`), and `herdr --version` for the client. Assumes the herdr probe has ALREADY failed,
+# so the extra read-only calls only ever run on a path that is broken anyway. python3 always exits 0
+# and every capture carries `|| true`, so this is safe under a caller's `set -euo pipefail`; a
+# missing/ancient python3 yields an empty line, i.e. no advice.
+_herd_herdr_mismatch_facts() {
+  local observed="${1:-}" status_json err_txt ver_txt
+  status_json="$(herdr status --json 2>/dev/null || true)"
+  err_txt="$(herdr tab list 2>&1 || true)"
+  ver_txt="$(herdr --version 2>/dev/null || true)"
+  HERD_MM_STATUS="$status_json" HERD_MM_ERR="$err_txt
+$observed" HERD_MM_VER="$ver_txt" python3 -c '
+import json, os, re
+st  = os.environ.get("HERD_MM_STATUS", "")
+err = os.environ.get("HERD_MM_ERR", "")
+ver = os.environ.get("HERD_MM_VER", "")
+
+def clean(v):
+    # The fields ride a pipe-delimited line into shell and land in operator-facing text, so keep
+    # them to a short, boring token set no matter how garbled the source string was.
+    s = re.sub(r"[^A-Za-z0-9.+_-]", "", str(v or ""))
+    return s[:40]
+
+cv = cp = sv = sp = ""
+mismatch = False
+direction = ""
+try:
+    d = json.loads(st)
+except Exception:
+    d = None
+if isinstance(d, dict):
+    c, s = d.get("client"), d.get("server")
+    if isinstance(c, dict):
+        cv, cp = clean(c.get("version")), clean(c.get("protocol"))
+    if isinstance(s, dict):
+        # Only trust the server block when it reports a LIVE server — a stopped server is a
+        # different failure with a different fix, and must not be advertised as a skew.
+        if s.get("running") is not False and str(s.get("status") or "") != "not running":
+            sv, sp = clean(s.get("version")), clean(s.get("protocol"))
+        if s.get("compatible") is False:
+            mismatch = True
+if not cv:
+    m = re.search(r"([0-9]+(?:\.[0-9]+){1,3})", ver)
+    if m:
+        cv = clean(m.group(1))
+# The server rejection text, e.g. "client protocol 19 is newer than server protocol 17; restart the
+# Herdr server before using this command." — the only source an ancient herdr gives us.
+m = re.search(r"client protocol\s+([0-9]+)\s+is\s+(older|newer)\s+than\s+server protocol\s+([0-9]+)", err, re.I)
+if m:
+    cp = cp or clean(m.group(1))
+    sp = sp or clean(m.group(3))
+    direction = "client-older" if m.group(2).lower() == "older" else "client-newer"
+    mismatch = True
+if re.search(r"protocol[ _-]?mismatch", err, re.I):
+    mismatch = True
+if re.search(r"protocol", err, re.I) and re.search(r"mismatch|older than|newer than|needs protocol|speaks protocol|incompatible", err, re.I):
+    mismatch = True
+if cv and sv and cv != sv:
+    mismatch = True
+if cp and sp and cp != sp:
+    mismatch = True
+if not direction and cp.isdigit() and sp.isdigit():
+    direction = "client-newer" if int(cp) > int(sp) else ("client-older" if int(cp) < int(sp) else "")
+print("|".join([cv, cp, sv, sp, "yes" if mismatch else "no", direction]))
+' 2>/dev/null || true
+}
+
+# _herd_herdr_side_desc <version> <protocol> — one human phrase naming one side of the handshake.
+_herd_herdr_side_desc() {
+  local v="${1:-}" p="${2:-}"
+  if [ -n "$v" ] && [ -n "$p" ]; then printf 'herdr %s (protocol %s)' "$v" "$p"
+  elif [ -n "$v" ];               then printf 'herdr %s (protocol unknown)' "$v"
+  elif [ -n "$p" ];               then printf 'herdr (version unknown, protocol %s)' "$p"
+  else                                 printf 'herdr (version unknown)'
+  fi
+}
+
+# _herd_herdr_mismatch_advice [observed-text] — print the UNINDENTED remediation block on stdout and
+# return 0, or print NOTHING and return 1 when the skew cannot be named. Callers indent it to their
+# own report style (preflight: 2 spaces under a stderr header; doctor: 6, under its ⚠ row).
+#
+# The bar for printing: a mismatch signal AND both sides identified by at least a version or a
+# protocol. Anything less and the honest answer is the old generic message — a block that says
+# "client unknown vs server unknown" would be worse than what it replaced.
+_herd_herdr_mismatch_advice() {
+  local facts cv cp sv sp mm dir client_desc server_desc bin resolved="" brewish=0
+  facts="$(_herd_herdr_mismatch_facts "${1:-}" || true)"
+  [ -n "$facts" ] || return 1
+  IFS='|' read -r cv cp sv sp mm dir <<< "$facts"
+  [ "${mm:-no}" = "yes" ] || return 1
+  { [ -n "$cv" ] || [ -n "$cp" ]; } || return 1
+  { [ -n "$sv" ] || [ -n "$sp" ]; } || return 1
+
+  client_desc="$(_herd_herdr_side_desc "$cv" "$cp")"
+  server_desc="$(_herd_herdr_side_desc "$sv" "$sp")"
+  bin="$(command -v herdr 2>/dev/null || true)"
+  [ -n "$bin" ] && resolved="$(_herd_doctor_realpath "$bin" 2>/dev/null || printf '%s' "$bin")"
+  # Homebrew install detection (path-based — `brew list` is far too slow for a diagnostic path):
+  # the caveat below applies to every install, but naming it as YOURS when it is saves a wasted
+  # `herdr update --handoff` attempt.
+  case "${resolved:-}" in
+    */Cellar/*|/opt/homebrew/*|/home/linuxbrew/*) brewish=1 ;;   # */Cellar/* covers /usr/local too
+  esac
+
+  printf 'client: %s%s\n' "$client_desc" "${bin:+   [$bin]}"
+  printf 'server: %s   (the running herdr server this socket talks to)\n' "$server_desc"
+  echo   'The server rejects EVERY socket command while these disagree (tab list/create, pane split,'
+  echo   'agent start), so no lane -- and no coordinator -- can run until they match.'
+  echo   'Fix, pick one (nothing here is fetched or installed for you):'
+  if [ "$dir" = "client-older" ]; then
+    printf '  1. Run a herdr CLIENT that matches the running server%s: download that release from\n' "${sv:+ ($sv)}"
+    echo   '     https://herdr.dev and put it first on PATH. This keeps the live session intact.'
+    printf '  2. Or restart the SERVER so it comes back on this client'\''s build%s:\n' "${cv:+ ($cv)}"
+    echo   '       herdr server stop     then relaunch herdr (running panes/agents are lost).'
+  else
+    printf '  1. Restart the SERVER so it comes back on this client'\''s build%s -- both sides then match:\n' "${cv:+ ($cv)}"
+    echo   '       herdr server stop     then relaunch herdr (running panes/agents are lost).'
+    printf '  2. Or run a herdr CLIENT that matches the running server%s: download that release from\n' "${sv:+ ($sv)}"
+    echo   '     https://herdr.dev and put it first on PATH. This keeps the live session intact.'
+  fi
+  if [ "$brewish" -eq 1 ]; then
+    printf '  Homebrew caveat: this client resolves to a Homebrew install (%s), and\n' "$resolved"
+    echo   '  `herdr update --handoff` (the in-place, session-preserving upgrade) is DISABLED for'
+    echo   '  Homebrew installs -- upgrade with `brew update && brew upgrade herdr`, then restart the'
+    echo   '  session, or side-load a matching release binary per option above.'
+  else
+    echo   '  Homebrew caveat: `herdr update --handoff` (the in-place, session-preserving upgrade) is'
+    echo   '  DISABLED for Homebrew installs -- a brew-installed herdr upgrades with'
+    echo   '  `brew update && brew upgrade herdr`, then restart the session.'
+  fi
+  return 0
+}
+
+# _herd_herdr_mismatch_stderr — render the already-computed _HERD_HERDR_MISMATCH_ADVICE as the
+# preflight's fatal diagnostic on stderr. ONE renderer for both failure branches of the probe below
+# (non-zero exit, and an error envelope that arrives as a shape skew) so their wording can never
+# drift. Returns 1 having printed NOTHING when there is no advice — the caller then falls through to
+# its pre-HERD-521 message unchanged.
+_herd_herdr_mismatch_stderr() {
+  [ -n "${_HERD_HERDR_MISMATCH_ADVICE:-}" ] || return 1
+  local mm_line
+  {
+    echo "herdr client/server PROTOCOL MISMATCH -- the server rejected \`herdr tab list\`."
+    while IFS= read -r mm_line; do printf '  %s\n' "$mm_line"; done <<< "$_HERD_HERDR_MISMATCH_ADVICE"
+    echo "  (bypass this check in tests/CI: HERD_SKIP_PREFLIGHT=1)"
+  } >&2
+  return 0
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # _herd_herdr_contract_probe — assumes `herdr` is already on PATH. Runs the read-only
 # `herdr tab list` and validates the JSON shape every lane parses (top-level result.tabs ARRAY).
 # On any failure writes an actionable diagnostic to stderr and returns 1; silent + 0 on success.
 # Shared by herd_preflight (fatal guard) and herd_doctor (one-pass report).
+#
+# HERD-521: on a failure it ALSO leaves the rendered (unindented) protocol-mismatch advice in the
+# global _HERD_HERDR_MISMATCH_ADVICE — empty when the skew was not identifiable — so herd_doctor can
+# re-render the SAME finding in its own style without paying for a second round of herdr probes.
 _herd_herdr_contract_probe() {
   local out diag brand; brand="$(_herd_brand)"
+  _HERD_HERDR_MISMATCH_ADVICE=""
   if ! out="$(herdr tab list 2>/dev/null)"; then
+    _HERD_HERDR_MISMATCH_ADVICE="$(_herd_herdr_mismatch_advice || true)"
+    _herd_herdr_mismatch_stderr && return 1
     {
       echo "herdr CLI contract check failed."
       echo "  expected: a read-only \`herdr tab list\` to succeed and emit JSON"
@@ -159,6 +342,11 @@ print("OK")
   case "$diag" in
     OK*) return 0 ;;
     *)
+      # A rejected call can also come back as a SUCCESSFUL exit carrying an error envelope on stdout
+      # ({"error":{"code":"protocol_mismatch",…}}), which lands here as a shape skew rather than a
+      # non-zero exit — so try the same mismatch parse, feeding it what we actually observed.
+      _HERD_HERDR_MISMATCH_ADVICE="$(_herd_herdr_mismatch_advice "$out" || true)"
+      _herd_herdr_mismatch_stderr && return 1
       {
         echo "herdr CLI contract check failed (JSON shape skew)."
         echo "  expected: \`herdr tab list\` JSON with a top-level result.tabs array"
@@ -497,9 +685,22 @@ herd_doctor() {
   # herdr — presence, then (only if present) its JSON contract, since a version-skewed herdr fails
   # every lane parse cryptically. Reuse the exact preflight probe (its verbose stderr is suppressed
   # here; the doctor prints its own one-line verdict).
+  #
+  # HERD-521: when that failure is a client/server PROTOCOL MISMATCH the probe leaves its parsed
+  # remediation in _HERD_HERDR_MISMATCH_ADVICE (both versions named + the fixes), which is rendered
+  # here INSTEAD of the generic "upgrade/repair herdr" line — a mismatch is not a broken install and
+  # "upgrade herdr" is often the wrong move (restarting the server is usually the fix). When nothing
+  # was identifiable the advice is empty and this section stays byte-identical to before.
   if _herd_doctor_recommend herdr "$os" 'launch the control room (coordinator) & drive panes'; then
     if _herd_herdr_contract_probe 2>/dev/null; then
       printf '  \xe2\x9c\x93 herdr JSON contract\n'
+    elif [ -n "${_HERD_HERDR_MISMATCH_ADVICE:-}" ]; then
+      printf '  \xe2\x9a\xa0 herdr client/server PROTOCOL MISMATCH \xe2\x80\x94 the server rejected `herdr tab list`; every socket command (and every lane) fails until they match\n'
+      local _mm_line
+      while IFS= read -r _mm_line; do
+        printf '      %s\n' "$_mm_line"
+      done <<< "$_HERD_HERDR_MISMATCH_ADVICE"
+      warn=$((warn+1))
     else
       printf '  \xe2\x9a\xa0 herdr JSON contract \xe2\x80\x94 `herdr tab list` failed or its JSON shape has skewed\n'
       printf '      fix: upgrade/repair herdr to a version %s lanes can parse\n' "$brand"
