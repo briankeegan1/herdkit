@@ -7682,6 +7682,16 @@ _main_health_autofix_spawn_enabled() {
   [ "$(printf '%s' "${MAIN_HEALTH_AUTOFIX:-off}" | tr '[:upper:]' '[:lower:]')" = "spawn" ]
 }
 
+# _main_health_claim_required_on — mirrors herd-claim.sh's own CLAIM_REQUIRED gate verbatim (HERD-543):
+# the dedup-before-spawn check below is meaningless noise when the rest of the engine claims nothing,
+# so it stays inert on the SAME truthy set / SAME default-off posture as every other spawn's own claim.
+_main_health_claim_required_on() {
+  case "$(printf '%s' "${CLAIM_REQUIRED:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # _main_health_ci_gate_enabled — true iff MAIN_HEALTH_CI_GATE opts in (HERD-434). Default OFF
 # (ship-dormant), same truthy-token leniency as its MAIN_HEALTH_* siblings. Gates ONLY whether
 # _main_health_ci_leg makes its `gh run list` probe — decoupled from MAIN_HEALTH_TICK (which stays
@@ -8348,6 +8358,80 @@ _main_health_ci_identity_persist() {
   printf '%s\x1f%s\x1f%s\x1f%s\n' "$_cip_sha" "$_cip_since" "$_cip_local" "$_cip_id" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
 }
 
+# _main_health_open_ref_for_identity <identity> — HERD-543: the LOOKUP half of "file-then-claim like
+# every other spawn". Loosely matches an OPEN tracker item against this failing identity by searching
+# the active backend's OPEN list for the SAME concrete test/source-file token
+# _main_health_slug_identity already derives for the slug/branch (so a human-filed item titled, say,
+# "Fix main red: test-cli-config.sh flake" matches exactly as readily as one this engine filed itself).
+# Prints the resolved ref on stdout — for an API backend (linear/github) the "#<id>" prefix of the
+# FIRST matching line, else the matched token itself (the file backend's own claim/state ops already
+# do a title-substring match on exactly this kind of token, so the token doubles as a valid ref there)
+# — or nothing when no OPEN item matches. Sourced/subshelled with the SAME namespace + secrets
+# discipline _reconcile_via_ref uses so the _backend_* helpers never leak into the watcher. Fully
+# fail-soft: no token, no backend file, no list_open op, or an unreachable backend all print nothing —
+# never blocks or fails the caller.
+_main_health_open_ref_for_identity() {
+  local _oi_id="${1:-}" _oi_tok _oi_bdir _oi_bfile _oi_list _oi_line _oi_ref
+  [ -n "$_oi_id" ] || return 0
+  _oi_tok="$(_main_health_slug_identity "$_oi_id")"
+  [ -n "$_oi_tok" ] || return 0
+  _oi_bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+  _oi_bfile="$_oi_bdir/${SCRIBE_BACKEND:-file}.sh"
+  [ -f "$_oi_bfile" ] || return 0
+  _oi_list="$(
+    _secrets="$MAIN/.herd/secrets"
+    # shellcheck source=/dev/null
+    [ -f "$_secrets" ] && . "$_secrets"
+    # shellcheck source=/dev/null
+    . "$_oi_bfile" 2>/dev/null || exit 0
+    command -v _backend_list_open >/dev/null 2>&1 || exit 0
+    cd "$MAIN" 2>/dev/null || true
+    _backend_list_open 2>/dev/null
+  )"
+  [ -n "$_oi_list" ] || return 0
+  _oi_line="$(printf '%s\n' "$_oi_list" | grep -iF -- "$_oi_tok" 2>/dev/null | head -1)"  # pipe-ok: bounded list of open items, far under a pipe buffer
+  [ -n "$_oi_line" ] || return 0
+  case "$_oi_line" in
+    '#'*) _oi_ref="${_oi_line#\#}"; _oi_ref="${_oi_ref%% *}" ;;
+    *)    _oi_ref="$_oi_tok" ;;
+  esac
+  printf '%s' "$_oi_ref"
+}
+
+# _main_health_dedup_ref <identity> — HERD-543: the CLAIM half of "file-then-claim like every other
+# spawn", run BEFORE this leg ever files a scribe item or enqueues a builder. Live evidence
+# 2026-08-05: the engine auto-enqueued repair main-red-2f86b7f4-test-cli-config-sh while the
+# coordinator had ALREADY claimed+spawned the same repair (HERD-538) through its own pick-and-spawn
+# flow — off this engine's radar entirely, because the spawn leg used to thread the raw failing-test
+# STRING as HERD_ITEM_REF instead of ever resolving/claiming the real tracker id, so herd-quick.sh's
+# own later claim (herd-claim.sh) could never see the collision. This closes that gap: resolve an
+# OPEN item loosely matching (_main_health_open_ref_for_identity) and, only when CLAIM_REQUIRED is on
+# (byte-identical off — mirrors herd-claim.sh's own gate exactly), claim it synchronously via the SAME
+# _herd_claim_dispatch every lane's herd_claim_or_abort uses, BEFORE any worktree/agent/queue-intent
+# exists.
+#
+# Prints the resolved ref on stdout and returns 0 — EMPTY when CLAIM_REQUIRED is off, no match was
+# found, or the claim came back UNREACHABLE (fail-soft: proceed exactly as if no match existed, never
+# hard-block a solo operator on a backend hiccup) — or a NON-EMPTY ref when we just claimed it (CLAIMED)
+# or already owned it ourselves (SELF, e.g. a re-tick on our own prior claim). Returns 3 with nothing
+# printed when the match is ALREADY claimed by someone else — the caller's cue to back off before
+# filing or enqueueing a duplicate.
+_main_health_dedup_ref() {
+  local _dr_id="${1:-}" _dr_existing _dr_who _dr_parsed _dr_result
+  [ -n "$_dr_id" ] || return 0
+  _main_health_claim_required_on || return 0
+  _dr_existing="$(_main_health_open_ref_for_identity "$_dr_id")"
+  [ -n "$_dr_existing" ] || return 0
+  _dr_who="$(_herd_claim_identity)"; [ -n "$_dr_who" ] || _dr_who="unknown-operator"
+  _dr_parsed="$(_herd_claim_dispatch "$_dr_existing" "$_dr_who")"
+  _dr_result="${_dr_parsed%%$'\t'*}"
+  case "$_dr_result" in
+    CLAIMED|SELF) printf '%s' "$_dr_existing"; return 0 ;;
+    ALREADY)      return 3 ;;
+    *)            return 0 ;;   # UNREACHABLE — fail soft, proceed as if no match existed
+  esac
+}
+
 # _main_health_autofix <pr#> <sha> <identity> <detail> [kind=local|ci] [ci-run-id] — MAIN_HEALTH_AUTOFIX
 # (default off, ship-dormant). On a REPRODUCED red whose identity is honest, enqueue ONE scribe item
 # citing the failing test and journal that we did. MAIN_HEALTH_AUTOFIX=spawn (HERD-476) additionally
@@ -8400,34 +8484,55 @@ _main_health_autofix() {
     *) journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result skipped reason store-unavailable
        return 0 ;;
   esac
-  # First line is the tracker TITLE (the backend takes it verbatim) — keep it short; body carries context.
-  _main_health_scribe "MAIN RED: fix ${_af_id}
+  # HERD-543: file-then-claim like every other spawn — BEFORE ever filing a scribe item or enqueueing
+  # a builder, resolve+claim an OPEN tracker item that already loosely matches this identity (only
+  # meaningful for the spawn leg: file-only MAIN_HEALTH_AUTOFIX=on never spawns a builder, so it has
+  # nothing to double-build and would only wedge a claim it can never release). A rc=3 ALREADY means
+  # someone else — e.g. the coordinator's own pick-and-spawn flow — already owns this exact repair;
+  # back off before filing or enqueueing a duplicate.
+  local _af_ref="$_af_id" _af_dedup_rc=0
+  if _main_health_autofix_spawn_enabled; then
+    _af_ref="$(_main_health_dedup_ref "$_af_id")"; _af_dedup_rc=$?
+    if [ "$_af_dedup_rc" -eq 3 ]; then
+      journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result dedup_claimed
+      return 0
+    fi
+    [ -n "$_af_ref" ] || _af_ref="$_af_id"
+  fi
+  # Reuse: an OPEN item already matched and we just claimed it above — file no redundant duplicate.
+  if [ "$_af_ref" = "$_af_id" ]; then
+    # First line is the tracker TITLE (the backend takes it verbatim) — keep it short; body carries context.
+    _main_health_scribe "MAIN RED: fix ${_af_id}
 The default branch is RED at sha ${_af_sha} (landed as PR #${_af_pr}).
 Failing test: ${_af_detail}
 Add a 🔜 item to fix it. Do not close it until main-health goes green."
-  journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result enqueued
-  _main_health_autofix_spawn "$_af_pr" "$_af_sha" "$_af_id" "$_af_detail"
+  fi
+  journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result enqueued ref "$_af_ref"
+  _main_health_autofix_spawn "$_af_pr" "$_af_sha" "$_af_id" "$_af_detail" "$_af_ref"
   return 0
 }
 
-# _main_health_autofix_spawn <pr#> <sha> <identity> <detail> — the MAIN_HEALTH_AUTOFIX=spawn increment
-# (HERD-476). Called ONLY from the branch of _main_health_autofix that just WON the shared-pool claim
-# (never on a dedup/skip/store-unavailable), so it fires AT MOST ONCE per distinct honest identity while
-# main is red — the exact invariant the file-only scribe enqueue above already relies on. A no-op
-# (return 0, no journal) whenever MAIN_HEALTH_AUTOFIX is 'on' rather than the literal 'spawn' — 'on'
-# stays file-only, unchanged.
+# _main_health_autofix_spawn <pr#> <sha> <identity> <detail> [ref] — the MAIN_HEALTH_AUTOFIX=spawn
+# increment (HERD-476). Called ONLY from the branch of _main_health_autofix that just WON the
+# shared-pool claim (never on a dedup/skip/store-unavailable), so it fires AT MOST ONCE per distinct
+# honest identity while main is red — the exact invariant the file-only scribe enqueue above already
+# relies on. A no-op (return 0, no journal) whenever MAIN_HEALTH_AUTOFIX is 'on' rather than the
+# literal 'spawn' — 'on' stays file-only, unchanged.
 #
 # Dispatches through the SAME durable spawn queue the coordinator's own spawn.sh enqueues to (drained by
 # _drain_spawn_queue → herd-quick.sh) — a TRACKED + CLAIMED quick-lane build, not a bespoke launch path:
-# HERD_ITEM_REF carries the failing identity as the spawn's tracker ref, so the builder's PR carries a
-# 'Refs:' line and, when CLAIM_REQUIRED is on, herd-claim.sh attempts an atomic claim on it before any
-# worktree/agent is created — exactly the two guarantees "tracked+claimed" names. (A ref that does not
-# yet resolve to a real tracker item — the scribe item filed above is itself created ASYNCHRONOUSLY by
-# the drainer — degrades no worse than any other untracked spawn: merge-time reconcile falls back to its
-# existing fuzzy slug/title match, per agent-watch.sh's own _reconcile_via_ref contract.) The slug embeds
-# the SHA, never just the identity, so a LATER regression of the same test — which _main_health_fix_clear
-# re-arms for filing once main goes green — gets its own fresh worktree instead of colliding with one
-# still sitting from a prior cycle.
+# HERD_ITEM_REF carries <ref> (HERD-543: the REAL tracker id _main_health_dedup_ref already resolved
+# and claimed, when the caller found+claimed an OPEN item loosely matching this identity; else the same
+# raw failing identity string as before — <ref> defaults to <identity> so a caller passing only 4 args
+# is byte-identical), so the builder's PR carries a 'Refs:' line and, when CLAIM_REQUIRED is on,
+# herd-claim.sh attempts an atomic (self-)claim on it before any worktree/agent is created — exactly the
+# two guarantees "tracked+claimed" names. (A ref that does not yet resolve to a real tracker item — a
+# freshly scribe-filed item is created ASYNCHRONOUSLY by the drainer — degrades no worse than any other
+# untracked spawn: merge-time reconcile falls back to its existing fuzzy slug/title match, per
+# agent-watch.sh's own _reconcile_via_ref contract.) The slug embeds the SHA, never just the identity,
+# so a LATER regression of the same test — which _main_health_fix_clear re-arms for filing once main
+# goes green — gets its own fresh worktree instead of colliding with one still sitting from a prior
+# cycle.
 #
 # RISK, spelled out because this is the one path in the whole MAIN_HEALTH_AUTOFIX feature that writes
 # code unattended: the builder still goes through the ordinary pipeline (its own light healthcheck, then
@@ -8435,7 +8540,7 @@ Add a 🔜 item to fix it. Do not close it until main-health goes green."
 # merging. Fully fail-soft: a missing spawn.sh, or a non-zero enqueue, is journaled and never blocks or
 # fails the tick — the scribe file above has already happened by the time this runs.
 _main_health_autofix_spawn() {
-  local _as_pr="$1" _as_sha="$2" _as_id="$3" _as_detail="$4" _as_slug _as_out _as_rc=0
+  local _as_pr="$1" _as_sha="$2" _as_id="$3" _as_detail="$4" _as_ref="${5:-$3}" _as_slug _as_out _as_rc=0
   _main_health_autofix_spawn_enabled || return 0
   if [ ! -f "$HERE/spawn.sh" ]; then
     journal_append main_health_autofix_spawn pr "$_as_pr" sha "$_as_sha" failed "$_as_id" result skipped reason no-spawn-sh
@@ -8449,7 +8554,7 @@ _main_health_autofix_spawn() {
   _as_slug="main-red-${_as_sha:0:8}-$(_main_health_slug_identity "$_as_id" \
     | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed -e 's/-\{2,\}/-/g' -e 's/^-//' -e 's/-$//' | cut -c1-40)"
   _as_slug="${_as_slug%-}"
-  _as_out="$(HERD_ITEM_REF="$_as_id" bash "$HERE/spawn.sh" "$_as_slug" quick \
+  _as_out="$(HERD_ITEM_REF="$_as_ref" bash "$HERE/spawn.sh" "$_as_slug" quick \
     "Fix the reproduced MAIN RED regression. The default branch failed at sha ${_as_sha} (landed as PR #${_as_pr}). Failing test: ${_as_detail}. Diagnose and fix ${_as_id} so main-health goes green; do not touch unrelated code." \
     2>&1)"; _as_rc=$?
   if [ "$_as_rc" -eq 0 ]; then
