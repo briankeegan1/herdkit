@@ -111,12 +111,35 @@ _herd_read_project_config() {
     PROJECT_ROOT=""; WORKTREES_DIR=""; WORKSPACE_NAME=""; DEFAULT_BRANCH=""; HERD_REPO=""
     # shellcheck source=/dev/null
     . "$cfg" 2>/dev/null || exit 1
+    # HERD-518: overlay the per-user/per-machine config.local on top of the baseline we just sourced —
+    # same baseline-first/overlay-second order as the main loader's config.local block above. On a
+    # CLONED project, this is where a collaborator overrides the original author's committed
+    # PROJECT_ROOT for THIS machine, without touching the committed baseline.
+    local overlay="$path/.herd/config.local"
+    if [ -f "$overlay" ]; then
+      # shellcheck source=/dev/null
+      . "$overlay" 2>/dev/null || true
+    fi
     # Apply the SAME fallbacks the main loader does. Written as explicit `-n` guards (the vars are
     # pre-initialised to "" just above), NOT the colon-equals defaulting idiom: the caps-sync gate
     # greps THIS file for that form as its "new config key" heuristic, so using it here would
     # false-trip it — the same reason the main-loader PROJECT_ROOT fallback below deliberately avoids
     # colon-equals.
     [ -n "$PROJECT_ROOT" ]   || PROJECT_ROOT="$path"
+    # HERD-518: a config cloned from another machine still carries the ORIGINAL author's absolute
+    # PROJECT_ROOT, which never exists here. When neither the baseline nor the overlay resolved a
+    # PROJECT_ROOT that exists on THIS machine but the argument path does, localize to it — and carry
+    # a WORKTREES_DIR that was itself derived from that foreign root along with it, so it doesn't keep
+    # pointing at a path that can never exist here either. Fail-soft: a foreign-but-real path (e.g. a
+    # shared mount) is left alone, and this never fires when the overlay already resolved a real path.
+    if [ ! -d "$PROJECT_ROOT" ] && [ -d "$path" ]; then
+      printf 'herdkit: localizing PROJECT_ROOT for %s (committed %s does not exist here)\n' \
+        "$path" "$PROJECT_ROOT" >&2
+      case "$WORKTREES_DIR" in
+        "$PROJECT_ROOT"*) WORKTREES_DIR="$path${WORKTREES_DIR#"$PROJECT_ROOT"}" ;;
+      esac
+      PROJECT_ROOT="$path"
+    fi
     [ -n "$WORKTREES_DIR" ]  || WORKTREES_DIR="${PROJECT_ROOT}-trees"
     [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="origin/main"
     [ -n "$WORKSPACE_NAME" ] || WORKSPACE_NAME="$(basename "$PROJECT_ROOT")"
