@@ -1038,6 +1038,34 @@ case "$_hc_tcl_rc" in
      exit 1 ;;
 esac
 
+# 5f. inert-lever guard (HERD-556) — a config key documented in templates/capabilities.tsv must have
+# a consumer the shipped engine can actually REACH. HEALTH_PANE and HEALTH_TRUST_BUILDER were both
+# silent no-ops for weeks — set, defaulted, documented and unit-tested, yet inert, because their only
+# consumers hung off `_healthcheck_gate`, defined-but-never-called since the P5b port moved dispatch
+# into pysrc. ONE implementation shared with the builder's light pre-PR gate
+# (scripts/herd/lever-reachability-lint.sh), so the two gates can never disagree.
+lrch_note="lever-reachability: clean"
+HERD_LEVER_REACHABILITY_SKIP_REASON=""
+if [ -f scripts/herd/lever-reachability-lint.sh ]; then
+  . scripts/herd/lever-reachability-lint.sh
+  _hc_lrch_errs="$(herd_lever_reachability_lint ".")"; _hc_lrch_rc=$?
+else
+  _hc_lrch_errs=""; _hc_lrch_rc=2
+  HERD_LEVER_REACHABILITY_SKIP_REASON="scripts/herd/lever-reachability-lint.sh not present"
+fi
+case "$_hc_lrch_rc" in
+  0) lrch_note="lever-reachability: clean" ;;
+  2) lrch_note="lever-reachability: skipped ($HERD_LEVER_REACHABILITY_SKIP_REASON)" ;;
+  *) lrch_note="lever-reachability: INERT LEVER"
+     if [ -n "$ONELINE" ]; then
+       echo "lever-reachability: $(printf '%s' "$_hc_lrch_errs" | grep -E '^(LEVER-UNREACHABLE|EXEMPT-MALFORMED|STALE-EXEMPT)' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
+     else
+       echo "LEVER-REACHABILITY: a capabilities.tsv config key's only consumers sit in bash functions the entrypoints never reach (wire the consumer onto a live path, or record it in tests/lever-reachability-exempt.tsv with its reason)"
+       printf '%s\n' "$_hc_lrch_errs" | grep -E '^(LEVER-UNREACHABLE|EXEMPT-MALFORMED|STALE-EXEMPT)' || printf '%s\n' "$_hc_lrch_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 6. no-new-hardcoded-claude lint (HERD-177, driver portability P5) — the engine tree may not grow a
 # NEW hardcoded `claude`/claude-specific invocation OUTSIDE the driver seam (templates/drivers/*.driver
 # + scripts/herd/driver.sh). A ratchet against .herd/claude-hardcode-baseline.tsv (the grandfathered P1
@@ -1058,5 +1086,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $eexp_note; $tcl_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $eexp_note; $tcl_note; $lrch_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $chl_note"; }
 exit 0

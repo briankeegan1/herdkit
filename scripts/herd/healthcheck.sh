@@ -176,6 +176,17 @@ else
   herd_env_export_lint() { return 2; }
 fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# inert-lever guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/lever-reachability-lint.sh"
+[ -f "$DIR/scripts/herd/lever-reachability-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/lever-reachability-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_LEVER_REACHABILITY_SKIP_REASON="lever-reachability-lint.sh not present"
+  herd_lever_reachability_lint() { return 2; }
+fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # test-cap-ledger guard (rc 2), never break the healthcheck it is a part of.
 # Prefer the tree-under-test's copy when present (HERD-309).
 _HERD_LINT_SRC="$HERE/test-cap-ledger.sh"
@@ -775,6 +786,22 @@ EOF
   if [ "$eexp_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ env-export — $(printf '%s' "$eexp_errs" | head -1) set but not exported";  # pipe-ok: head in a command substitution; status not gated
     else echo "❌ ENV-EXPORT: a config key the Python engine core reads from os.environ is set but not \`export\`ed by herd-config.sh (the child tick process never sees it)"; printf '%s\n' "$eexp_errs"; fi
+    exit 1
+  fi
+
+  # inert-lever guard (HERD-556) — a config key documented in templates/capabilities.tsv must have a
+  # consumer the shipped engine can actually REACH. HEALTH_PANE and HEALTH_TRUST_BUILDER were both
+  # silent no-ops: set, defaulted, documented, unit-tested — and inert, because their only consumers
+  # hung off `_healthcheck_gate`, defined-but-never-called since the P5b port moved dispatch into
+  # pysrc. The SAME lint the heavy gate runs (scripts/herd/lever-reachability-lint.sh). Same red
+  # semantics as caps-sync / env-export. A deliberately-unreachable lever opts out in
+  # tests/lever-reachability-exempt.tsv, with its reason. Skipped (never red) when the lint is absent
+  # or the tree has no engine capability surface.
+  local lrch_errs lrch_rc
+  lrch_errs="$(herd_lever_reachability_lint ".")"; lrch_rc=$?
+  if [ "$lrch_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ lever-reachability — $(printf '%s' "$lrch_errs" | grep -E '^(LEVER-UNREACHABLE|EXEMPT-MALFORMED|STALE-EXEMPT)' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ LEVER-REACHABILITY: a capabilities.tsv config key's only consumers sit in bash functions the entrypoints never reach (wire the consumer onto a live path, or record it in tests/lever-reachability-exempt.tsv with its reason)"; printf '%s\n' "$lrch_errs" | grep -E '^(LEVER-UNREACHABLE|EXEMPT-MALFORMED|STALE-EXEMPT)' || printf '%s\n' "$lrch_errs"; fi
     exit 1
   fi
 
