@@ -231,6 +231,11 @@ EXEMPT_NAMES = {
                            # bin/herd's `herd notes` and agent-watch.sh already read it.
     "DEPS_FILE", "DEP_STATES_FILE",
     "DEP_WATCHER_LIB", "DRYRUN",
+    "GATE_SCALE_CORES_OVERRIDE",  # HERD-565: agent-watch.sh's _gate_scale_cores test seam (PR #679) —
+                                   # a deterministic core-count ceiling for the hermetic gate-scale sim,
+                                   # never read in production and never an operator knob, the same shape
+                                   # as WATCHER_RESURRECT_LIB/DEP_WATCHER_LIB below. The knob this
+                                   # feature actually adds is GATE_SCALE, which IS in capabilities.tsv
     "HEALTHCHECK_PROGRESS_LOG",  # HERD-494: set by agent-watch.sh's health worker as an env prefix
                                  # around its healthcheck.sh invocation (a dogfood-only knob, same
                                  # framing as HEALTHCHECK_BATS_FILTER/HEALTHCHECK_SUITE_WORKERS —
