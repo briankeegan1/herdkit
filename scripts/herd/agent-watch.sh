@@ -10210,10 +10210,20 @@ EOF
 # journal-audit.sh which replays a BOUNDED journal window for invariant violations (merge without
 # reap; *_dispatched with no terminal past family TTL; refix_bounce without wake_result; stale MAIN
 # RED; pushed=no never followed by yes; known-fixture slugs), journals `journal_audit` events
-# (component=audit), and appends operator-inbox rows. ADVISORY ONLY — never gates, never mutates.
+# (component=audit), and appends operator-inbox rows. ADVISORY by default — never gates, never merges.
 # BEST-EFFORT + ship-dormant: byte-inert when JOURNAL_AUDIT=off (default); fail-soft on empty/short
 # journal; can never fail or slow a tick. Points the inbox ledger at THIS watcher's $INBOX_LEDGER so
 # build_operator_inbox surfaces findings when OPERATOR_INBOX is on.
+#
+# HERD-544: THIS SWEEP IS ALSO WHERE HEALING DISPATCHES. With JOURNAL_AUDIT_ACT=on (a second, also
+# ship-dormant lever the child re-reads from .herd/config), the auditor maps each finding class to ONE
+# bounded rail — free a held gate slot, re-deliver a lost refix bounce, arm the main-health re-verify,
+# run the retirement invariant — and auto-files a dedup-keyed item for any class no rail owns. Two
+# properties keep that safe HERE, on the watcher's own tick:
+#   • DRYRUN returns above, so a dry tick still acts on nothing;
+#   • the auditor caps how many findings it acts on per sweep and bounds each rail with `timeout`, so
+#     a wedged rail can delay this sweep by seconds, never hold the tick loop open indefinitely.
+# Actions are journaled `audit_acted class=… result=…`, at most once per finding key across all seats.
 _sweep_journal_audit() {
   [ -n "$DRYRUN" ] && return 0
   case "$(printf '%s' "${JOURNAL_AUDIT:-off}" | tr '[:upper:]' '[:lower:]')" in
