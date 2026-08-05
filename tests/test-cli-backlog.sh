@@ -17,12 +17,15 @@ pass(){ PASS=$((PASS+1)); }
 # Build a temp project whose config selects SCRIBE_BACKEND=github. A stub `gh` on PATH logs its
 # args and returns a canned `issue list` JSON, so we assert that `herd backlog` sourced the github
 # backend and printed _backend_list_open's parsed lines — without touching the network.
+# HERD-534 / GH #651: also sets a DIFFERENT HERD_REPO to prove it never leaks into the backlog op —
+# only TRACKER_REPO (the project's own work-tracker repo) may route it.
 P1="$T/proj-github"
 mkdir -p "$P1/.herd"
 cat > "$P1/.herd/config" <<EOF
 PROJECT_ROOT="$P1"
 SCRIBE_BACKEND="github"
-HERD_REPO="acme/widgets"
+TRACKER_REPO="acme/widgets"
+HERD_REPO="briankeegan1/herdkit"
 EOF
 
 GHLOG="$T/gh.log"
@@ -41,7 +44,9 @@ out="$( cd "$P1" && PATH="$T/bin:$PATH" bash "$HERD" backlog )" || fail "herd ba
 grep -q "^#7 first open issue$" <<< "$out" || fail "github backlog missing '#7 first open issue' ($out)"
 grep -q "^#9 second open issue$" <<< "$out" || fail "github backlog missing '#9 second open issue'"
 grep -q -- "issue list -R acme/widgets --state open" "$GHLOG" \
-  || fail "herd backlog did not invoke the github backend's 'gh issue list --state open' on HERD_REPO"
+  || fail "herd backlog did not invoke the github backend's 'gh issue list --state open' on TRACKER_REPO"
+grep -q -- "-R briankeegan1/herdkit" "$GHLOG" \
+  && fail "herd backlog leaked HERD_REPO (-R briankeegan1/herdkit) into a tracker op — the HERD-534 contamination bug"
 pass
 
 # ── Case 2: file backend — `herd backlog` greps the configured BACKLOG_FILE ──────────────────────

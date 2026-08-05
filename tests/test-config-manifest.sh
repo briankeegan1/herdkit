@@ -244,6 +244,10 @@ EXEMPT_NAMES = {
     "REF_UNPARSED_FILE",  # assigned in agent-watch.sh (its ref-unparsed console ledger path), read in
                            # work-units/git-pr.sh's _reconcile_ref_unparsed_alarm — the mirror-direction
                            # cross-file contract (HERD-537) of PRS_LOOKUP_OK above, not a .herd/config knob
+    "RED_LEDGER_FILE",  # assigned in agent-watch.sh (the shared red-row ledger's path, HERD-539), read
+                         # in work-units/git-pr.sh's _reconcile_ref_unparsed_alarm — the SAME
+                         # cross-file ledger-path contract as REF_UNPARSED_FILE just above, not a
+                         # .herd/config knob (the actual knob is RED_LEDGER, which IS in capabilities.tsv)
     "RESEARCH_HEARTBEAT", "RESEARCH_INBOX", "RESEARCH_MODEL", "RESEARCH_QUEUE",
     "RESEARCH_REPORTS", "RESEARCH_TAB", "RESEARCH_TREES", "RESOLVER_MODEL", "ROOT",
     "SCRIBE_BACKEND_DIR", "SCRIBE_MODEL", "SCRIBE_TAB", "SLUG", "SPAWN_HOLDS", "STATES_FILE",

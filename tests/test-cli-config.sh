@@ -85,6 +85,46 @@ run() {
   set -e
 }
 
+# ── watcher-restart expectation (HERD-519 leg (a), PR #658) ──────────────────
+# A watcher-affecting `herd config set` applies the change one of TWO ways, and which one is a
+# property of the ENVIRONMENT, not of the key: with a live watcher for this project it restarts it;
+# with none it SKIPS the restart and narrates that (a restart can only re-apply a key to a process
+# that exists, and spawning one nobody asked for is the hang this guard removed). These fixtures never
+# plant a watcher, so the skip is the normal expectation here — but a real watcher for a same-named
+# workspace on this machine would flip it, so the assertion PROBES the env rather than assuming it.
+#
+# _watcher_alive <project-root> — success iff a process carries THIS project's watcher argv0
+# (herd-watch-<slug>, the slug sanitized exactly as scripts/herd/herd-config.sh derives it): the same
+# identity scripts/herd/watcher-exempt.sh enumerates and `herd config set` consults, and the one
+# tests/test-config-set-watcher-skip.sh plants a decoy under for its live-watcher leg.
+_watcher_alive() {
+  local ws slug
+  ws="$(sed -n 's/^WORKSPACE_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$1/.herd/config" | tail -1)"
+  slug="$(printf '%s' "$ws" | tr -c 'A-Za-z0-9_-' '-')"
+  [ -n "$slug" ] || slug="project"
+  ps -eo command= 2>/dev/null | awk -v m="herd-watch-$slug" '$1 == m { f = 1 } END { exit !f }'
+}
+
+# _probe_watcher <project-root> — record that liveness into $WATCHER_PRE. It MUST be sampled BEFORE
+# the set: the restart leg STOPS the watcher it found, so a probe taken afterwards reports "none" even
+# on the leg that restarted one, and the assertion would demand the wrong summary.
+WATCHER_PRE=0
+_probe_watcher() { WATCHER_PRE=0; _watcher_alive "$1" && WATCHER_PRE=1; return 0; }
+
+# _assert_watcher_apply <label> — assert the summary the watcher-key set just printed ($OUT), on
+# whichever of the two legs $WATCHER_PRE says this environment is on.
+_assert_watcher_apply() {
+  local label="$1"
+  if [ "$WATCHER_PRE" -eq 1 ]; then
+    grep -qi 'restarting the watcher' <<< "$OUT" || fail "$label did NOT run the reload/restart path ($OUT)"
+    grep -qi 'watcher restarted' <<< "$OUT"      || fail "$label missing the restart summary ($OUT)"
+  else
+    grep -qi 'restart is SKIPPED' <<< "$OUT"     || fail "$label missing the no-live-watcher skip summary ($OUT)"
+    grep -qi 'takes effect when the watcher next starts' <<< "$OUT" \
+      || fail "$label skip summary does not say when the value takes effect ($OUT)"
+  fi
+}
+
 # ══ 1. list prints keys+values and masks the secret-shaped key ════════════════
 P="$T/p1"; mkdir "$P"; _make_project "$P"
 run "$P" config list
@@ -143,12 +183,13 @@ run "$P" config set MY_SECRET_TOKEN hunter2
 { [ "$RC" -ne 0 ] && grep -qi 'secret-shaped' <<< "$OUT"; } || fail "secret-shaped key set not refused ($OUT)"
 ok
 
-# ══ 8. a WATCHER key set triggers the restart path (herd reload) ══════════════
-# pgrep stub returns no watcher + HERD_RELOAD_SKIP_LAUNCH=1 ⇒ the reload runs hermetically.
+# ══ 8. a WATCHER key set goes down the watcher-apply path ═════════════════════
+# HERD_RELOAD_SKIP_LAUNCH=1 + the pgrep/herdr stubs keep the restart leg hermetic if this env has a
+# live watcher; with none (the normal case here) the restart is skipped — see _assert_watcher_apply.
+_probe_watcher "$P"
 run "$P" config set REVIEW_CONCURRENCY 4
 [ "$RC" -eq 0 ]                                   || fail "watcher-key set failed ($OUT)"
-grep -qi 'herd reload' <<< "$OUT" || fail "watcher-key set did NOT run the reload/restart path ($OUT)"
-grep -qi 'watcher restarted' <<< "$OUT" || fail "watcher-key set missing the restart summary ($OUT)"
+_assert_watcher_apply "watcher-key set"
 run "$P" config get REVIEW_CONCURRENCY
 [ "$OUT" = "4" ]                                  || fail "watcher-key value not persisted ($OUT)"
 ok
@@ -177,10 +218,10 @@ ok
 # so a set must go through the restart path — re-rendering the skill alone would leave the running
 # watcher on the old value.
 P4="$T/p4"; mkdir "$P4"; _make_project "$P4"
+_probe_watcher "$P4"
 run "$P4" config set BACKLOG_FILE TODO.md
 [ "$RC" -eq 0 ]                                   || fail "watcher-consumed BACKLOG_FILE set failed ($OUT)"
-grep -qi 'herd reload' <<< "$OUT" || fail "BACKLOG_FILE set did NOT restart the watcher ($OUT)"
-grep -qi 'watcher restarted' <<< "$OUT" || fail "BACKLOG_FILE set missing restart summary ($OUT)"
+_assert_watcher_apply "watcher-consumed BACKLOG_FILE set"
 ok
 
 # ══ 12. shell-safety: values with shell-active chars are rejected; get == shell-sourced ═
@@ -311,9 +352,10 @@ ok
 # key's SIDE EFFECTS: SCRIBE_BACKEND is requires=watcher in the shipped manifest, so an accepted set
 # must still restart the watcher and still emit the #139 stale-drainer warning. A domain that blocked
 # typos but also suppressed the apply path would be a worse bug than the one it fixes.
+_probe_watcher "$P9"
 run_real "$P9" config set SCRIBE_BACKEND github
 [ "$RC" -eq 0 ]                                   || fail "shipped manifest refused the valid SCRIBE_BACKEND=github ($OUT)"
-grep -qi 'herd reload' <<< "$OUT" || fail "accepted watcher-key set did NOT run the restart path ($OUT)"
+_assert_watcher_apply "accepted SCRIBE_BACKEND set"
 grep -qi 'stale' <<< "$OUT" || fail "accepted SCRIBE_BACKEND flip lost the stale-drainer warning ($OUT)"
 run_real "$P9" config get SCRIBE_BACKEND
 [ "$OUT" = "github" ]                             || fail "valid SCRIBE_BACKEND not persisted (got '$OUT')"

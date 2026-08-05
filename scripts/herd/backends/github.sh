@@ -6,18 +6,24 @@
 # "open" is the live `gh issue list --state open`. Like the changelog/API backends the agent
 # does NOT edit any file — scribe-step.sh dispatches the request text here via the add-item path.
 #
-# Sourced from scribe-step.sh after herd-config.sh (so $HERD_REPO is in scope) with $REPO as CWD.
+# Sourced from scribe-step.sh after herd-config.sh (so $TRACKER_REPO is in scope) with $REPO as CWD.
 # Implements the same three-op contract as backends/file.sh:
 #   _backend_add_item REQ_ID TEXT     — gh issue create; sets _BACKEND_RESULT=DONE|NOCHANGE
 #   _backend_mark_shipped SLUG PR_URL — gh issue close + linking comment
 #   _backend_list_open                — gh issue list --state open, one "#<n> <title>" line each
-# plus OPTIONAL planned-work markers (HERD-52 / HERD-244): _backend_queue_item /
+# plus OPTIONAL _backend_list_open_rich (LEG B, HERD-534 / GH #652) — the same open set as a
+# state+description TSV for `herd backlog --rich`, matching backends/linear.sh's rich TSV shape — and
+# planned-work markers (HERD-52 / HERD-244): _backend_queue_item /
 # _backend_unqueue_item / _backend_list_queued — a 📌 comment naming who sequenced the item after
 # what, and (HERD-244) setting/clearing the issue ASSIGNEE so the plan is visible in every GitHub
 # client, not only via `herd backlog queued`.
 #
-# Repo selection: $HERD_REPO (<owner>/<repo>) when configured, else gh falls back to the current
-# repo's default. Requires the GitHub CLI (`gh`); degrades with a clear error if it is absent.
+# Repo selection (HERD-534 / GH #651): $TRACKER_REPO (<owner>/<repo>) when configured, else gh falls
+# back to resolving the current repo from the CWD's `origin` remote. This backend NEVER reads
+# $HERD_REPO — that key is reserved exclusively for report/triage cross-repo escalation (herd report,
+# oss-triage.sh); an earlier version of this file injected -R $HERD_REPO here, which meant a project
+# with HERD_REPO configured had its OWN work-tracker operations silently target that OTHER repo
+# instead of its own. Requires the GitHub CLI (`gh`); degrades with a clear error if it is absent.
 
 _github_require_gh() {
     command -v gh >/dev/null 2>&1 || {
@@ -47,10 +53,12 @@ _backend_tw_journal() {
 
 _gh() {
     # Run a `gh <noun> <verb> …` command with the configured repo flag injected right after the
-    # verb. When $HERD_REPO is empty, gh uses the current repo's default. Keeping the -R injection
-    # here means every op targets the same repo without each call repeating the conditional.
-    if [ -n "${HERD_REPO:-}" ]; then
-        gh "$1" "$2" -R "$HERD_REPO" "${@:3}"
+    # verb. When $TRACKER_REPO is empty, gh uses the current repo's default (its CWD `origin`
+    # remote). Keeping the -R injection here means every op targets the same repo without each call
+    # repeating the conditional. HERD-534 / GH #651: this reads TRACKER_REPO, never HERD_REPO — the
+    # latter is reserved exclusively for report/triage escalation (herd report, oss-triage.sh).
+    if [ -n "${TRACKER_REPO:-}" ]; then
+        gh "$1" "$2" -R "$TRACKER_REPO" "${@:3}"
     else
         gh "$@"
     fi
@@ -212,8 +220,42 @@ for it in data:
     print("#%s %s" % (it.get("number", ""), it.get("title", "")))' 2>/dev/null || true
 }
 
+_backend_list_open_rich() {
+    # OPTIONAL rich variant of _backend_list_open (LEG B, HERD-534 / GH #652): the plain op above
+    # stays the cross-backend contract and is byte-identical. Emits one TAB-separated line per open
+    # issue, matching backends/linear.sh's _backend_list_open_rich SHAPE exactly:
+    #   #<number> \t <state-type> \t <state-name> \t <title> \t <desc-snippet> \t <assignee> \t <url>
+    # GitHub issues carry no workflow-state concept beyond open/closed (already filtered to open
+    # here), so state-type/state-name are always empty — backlog-view.sh's rich renderer buckets an
+    # unrecognized/empty state-type into its default "🔜 queued" group, the same as any other
+    # backend with no started/unstarted distinction. The description snippet is the issue BODY
+    # fetched in the SAME `gh issue list --json` call (no extra per-issue round-trip), whitespace-
+    # flattened (newlines/tabs → spaces, so the TSV shape can never be corrupted by body content) and
+    # capped at ~180 chars — shorter than linear's 280 cap since a github issue body is often a full
+    # request/bug-report paste, not a short Linear description. Assignee is the first assignee's
+    # login (github allows multiple; the first is the one the plan-marker/claim ops already treat as
+    # canonical). Consumed by `herd backlog --rich`; callers unaware of this op keep using
+    # _backend_list_open unchanged.
+    _github_require_gh
+    _gh issue list --state open --json number,title,body,assignees,url 2>/dev/null \
+      | python3 -c 'import sys, json
+try: data = json.load(sys.stdin)
+except Exception: data = []
+def flat(s):
+    return " ".join((s or "").split())
+for it in data:
+    desc = flat(it.get("body"))
+    if len(desc) > 180:
+        desc = desc[:179].rstrip() + "…"
+    assignees = it.get("assignees") or []
+    assignee = flat(assignees[0].get("login", "")) if assignees else ""
+    url = flat(it.get("url") or "")
+    print("#%s\t%s\t%s\t%s\t%s\t%s\t%s" % (it.get("number", ""), "", "",
+                                            flat(it.get("title")), desc, assignee, url))' 2>/dev/null || true
+}
+
 _backend_item_state() {
-    # $1 = <link-name>#<id> — caller has resolved the link; HERD_REPO is already set.
+    # $1 = <link-name>#<id> — caller has resolved the link; TRACKER_REPO is already set.
     # Resolves via the SAME shared scoped lookup the writer ops use (_github_resolve_issue: a numeric
     # slug directly, else an open-issue title search), then queries the issue state and sets
     # ITEM_STATE=open|closed. GitHub issues have no native in-progress state; OPEN maps to open,
@@ -433,8 +475,8 @@ _backend_unqueue_item() {
     num="$(_github_resolve_issue "$ref")"
     if [ -z "$num" ]; then return 0; fi
     # Comments via REST so we get stable numeric ids for DELETE. Fail-soft on any transport miss.
-    if [ -n "${HERD_REPO:-}" ]; then
-        resp="$(gh api "repos/$HERD_REPO/issues/$num/comments" 2>/dev/null)" || resp="[]"
+    if [ -n "${TRACKER_REPO:-}" ]; then
+        resp="$(gh api "repos/$TRACKER_REPO/issues/$num/comments" 2>/dev/null)" || resp="[]"
     else
         resp="$(gh api "repos/{owner}/{repo}/issues/$num/comments" 2>/dev/null)" || resp="[]"
     fi
@@ -448,8 +490,8 @@ for c in d:
         print(c.get("id", ""))' 2>/dev/null)"
     for id in $ids; do
         [ -n "$id" ] || continue
-        if [ -n "${HERD_REPO:-}" ]; then
-            if gh api -X DELETE "repos/$HERD_REPO/issues/comments/$id" >/dev/null 2>&1; then
+        if [ -n "${TRACKER_REPO:-}" ]; then
+            if gh api -X DELETE "repos/$TRACKER_REPO/issues/comments/$id" >/dev/null 2>&1; then
                 deleted=$((deleted + 1))
             fi
         else
@@ -479,8 +521,8 @@ for it in d:
     if n is not None: print(n)' 2>/dev/null)" || return 0
     for n in $nums; do
         [ -n "$n" ] || continue
-        if [ -n "${HERD_REPO:-}" ]; then
-            resp="$(gh api "repos/$HERD_REPO/issues/$n/comments" 2>/dev/null)" || resp="[]"
+        if [ -n "${TRACKER_REPO:-}" ]; then
+            resp="$(gh api "repos/$TRACKER_REPO/issues/$n/comments" 2>/dev/null)" || resp="[]"
         else
             resp="$(gh api "repos/{owner}/{repo}/issues/$n/comments" 2>/dev/null)" || resp="[]"
         fi
