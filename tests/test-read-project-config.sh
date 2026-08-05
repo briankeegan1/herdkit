@@ -65,6 +65,47 @@ for p in "$P1" "$P2"; do
 done
 pass
 
+# ── 6. HERD-518: foreign committed PROJECT_ROOT + a config.local override → resolves to the overlay
+# value, byte-identical to a same-machine config (no localization note on stderr).
+P4="$T/delta"; mkdir -p "$P4/.herd"
+FOREIGN4="$T/no-such-original-machine/delta"
+cat > "$P4/.herd/config" <<EOF
+WORKSPACE_NAME=delta-ws
+PROJECT_ROOT=$FOREIGN4
+EOF
+cat > "$P4/.herd/config.local" <<EOF
+PROJECT_ROOT=$P4
+EOF
+row="$(read_one "$P4" 2>"$T/stderr4")"
+[ "$row" = "$(printf 'delta-ws\t%s\t%s\t%s\t' "$P4" "$P4-trees" "origin/main")" ] \
+  || fail "(6) foreign-root + overlay row mismatch: $row"
+[ ! -s "$T/stderr4" ] || fail "(6) overlay already resolved a real path but a localization note was printed: $(cat "$T/stderr4")"
+pass
+
+# ── 7. HERD-518: foreign committed PROJECT_ROOT, no overlay → resolves to the ARGUMENT path (with a
+# one-line stderr note), and a WORKTREES_DIR derived from the foreign root is carried along with it.
+P5="$T/epsilon"; mkdir -p "$P5/.herd"
+FOREIGN5="$T/no-such-original-machine/epsilon"
+cat > "$P5/.herd/config" <<EOF
+WORKSPACE_NAME=epsilon-ws
+PROJECT_ROOT=$FOREIGN5
+WORKTREES_DIR=$FOREIGN5-pool
+EOF
+row="$(read_one "$P5" 2>"$T/stderr5")"
+[ "$row" = "$(printf 'epsilon-ws\t%s\t%s\t%s\t' "$P5" "$P5-pool" "origin/main")" ] \
+  || fail "(7) foreign-root-no-overlay row mismatch: $row"
+[ -s "$T/stderr5" ] || fail "(7) no localization note printed for an unresolvable foreign PROJECT_ROOT"
+grep -q "$FOREIGN5" "$T/stderr5" || fail "(7) localization note missing the foreign path: $(cat "$T/stderr5")"
+pass
+
+# ── 8. HERD-518: an EXISTING committed PROJECT_ROOT resolves unchanged — byte-identical to
+# today's behaviour even though a config.local overlay is also present (regression guard for (1)/(2)).
+row="$(read_one "$P1" 2>"$T/stderr1")"
+[ "$row" = "$(printf 'alpha-ws\t%s\t%s\t%s\t%s' "$P1" "$T/alpha-pool" "origin/trunk" "acme/alpha")" ] \
+  || fail "(8) existing committed path changed behaviour: $row"
+[ ! -s "$T/stderr1" ] || fail "(8) localization note printed for an existing committed path: $(cat "$T/stderr1")"
+pass
+
 # ── 5. fleet.sh no longer sources .herd/config directly (routes through the seam) ─────────────────
 # Blank comment lines, then look for a `.`/`source` of a .herd/config anchored at a statement boundary
 # (the same shape the seam-conformance config-source rule uses).

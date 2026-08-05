@@ -207,11 +207,30 @@ EOF
 
 # ── Watcher liveness ─────────────────────────────────────────────────────────────────────────────
 
+# THE SHARED IDENTITY CHECK, even standalone (HERD-524). `herd status`'s duplicate-watcher warning tells
+# the operator to kill processes, so the ONE question "is this pid a watcher main?" must be answered by
+# the ONE shared check (scripts/herd/watcher-exempt.sh, HERD-266) on EVERY path into this file — never by
+# a private re-implementation and never by a script-path match. bin/herd sources that file before this
+# one (the idempotent HERD_WATCHER_EXEMPT_LIB guard makes this a no-op there); a STANDALONE source (the
+# hermetic tests, a cron one-liner) had only the private pgrep fallback below, which knows the argv0 tag
+# but NOT the fork exemptions — a second answer to the same question, which is exactly the drift HERD-266
+# reconciled away. Pull the shared check in from our own directory instead. Fail-soft: a missing file
+# leaves the fallback in place, never an error.
+if ! declare -f watcher_list_mains >/dev/null 2>&1; then
+  _status_lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || _status_lib_dir=""
+  if [ -n "${_status_lib_dir:-}" ] && [ -f "$_status_lib_dir/watcher-exempt.sh" ]; then
+    # shellcheck source=/dev/null
+    . "$_status_lib_dir/watcher-exempt.sh" 2>/dev/null || true
+  fi
+  unset _status_lib_dir
+fi
+
 # _status_watcher_pids — one PID per line for THIS project's live watcher MAIN(s). Prefers bin/herd's
 # _list_project_watchers, then watcher-exempt.sh's watcher_list_mains directly (both are the SAME
 # shared check: lockfile ∪ exact herd-watch-<slug> argv0, minus the canonical watcher's own forks);
 # falls back to a self-contained argv0-EXACT pgrep so status.sh still works sourced standalone with
-# neither in scope. READ-ONLY: it only reads the lockfile + ps/pgrep, never signals anything.
+# neither in scope (only reachable when watcher-exempt.sh is missing outright — see the source above).
+# READ-ONLY: it only reads the lockfile + ps/pgrep, never signals anything.
 _status_watcher_pids() {
   if declare -f _list_project_watchers >/dev/null 2>&1; then
     _list_project_watchers 2>/dev/null || true
@@ -236,6 +255,66 @@ _status_watcher_count() {
   local pids="${1:-}"
   [ -n "$pids" ] || { printf 0; return 0; }
   printf '%s\n' "$pids" | grep -c . 2>/dev/null || printf 0
+}
+
+# _status_pid_alive <pid> [table] — is <pid> a live process RIGHT NOW? (HERD-524)
+#
+# `kill -0` asks the KERNEL, which is the only authority that cannot be stale — every process-table
+# snapshot is already history by the time it is parsed, and the whole bug this answers (#636) is a pid
+# that was gone before the warning naming it reached the terminal.
+#
+# THE SEAM. When $HERD_SWEEP_PS_CMD plants a SYNTHETIC process table (the hermetic tests), its pids are
+# fictional and the kernel would call every one of them dead. Liveness then comes from that same table —
+# one seam, one truth, so the listing and this re-verification can never describe two different machines.
+# Callers may pass a table they already sampled, so a whole re-verification pass costs ONE sample.
+_status_pid_alive() {
+  local pid="${1:-}" table="${2:-}" p
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if [ -n "${HERD_SWEEP_PS_CMD:-}" ]; then
+    if [ -z "$table" ]; then
+      if declare -f watcher_ps_table >/dev/null 2>&1; then table="$(watcher_ps_table 2>/dev/null || true)"
+      else table="$("$HERD_SWEEP_PS_CMD" 2>/dev/null || true)"; fi
+    fi
+    while IFS=$' \t' read -r p _; do
+      [ "$p" = "$pid" ] && return 0
+    done <<EOF
+$table
+EOF
+    return 1
+  fi
+  kill -0 "$pid" 2>/dev/null
+}
+
+# _status_watcher_live_pids <pids> — the subset of <pids> that is STILL alive, one per line, in the
+# given order. ONE table sample for the whole pass (see _status_pid_alive's seam note).
+_status_watcher_live_pids() {
+  local pids="${1:-}" table="" pid
+  [ -n "$pids" ] || return 0
+  if [ -n "${HERD_SWEEP_PS_CMD:-}" ]; then
+    if declare -f watcher_ps_table >/dev/null 2>&1; then table="$(watcher_ps_table 2>/dev/null || true)"
+    else table="$("$HERD_SWEEP_PS_CMD" 2>/dev/null || true)"; fi
+  fi
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    _status_pid_alive "$pid" "$table" || continue
+    printf '%s\n' "$pid"
+  done <<EOF
+$pids
+EOF
+}
+
+# _status_pid_intersect <a> <b> — the pids present in BOTH lists, one per line, in <a>'s order.
+# The persistence check's core operation: "the SAME main survived the sample", not "SOME main did".
+_status_pid_intersect() {
+  local a="${1:-}" b="${2:-}" keep pid
+  [ -n "$a" ] && [ -n "$b" ] || return 0
+  keep=" $(printf '%s' "$b" | tr '\n' ' ') "
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    case "$keep" in *" $pid "*) printf '%s\n' "$pid" ;; esac
+  done <<EOF
+$a
+EOF
 }
 
 # _status_dup_sleep — pause one inter-sample gap. $HERD_STATUS_DUP_SLEEP is a test seam; a value that
@@ -265,13 +344,23 @@ _status_dup_sleep() {
 # process table:
 #   • HANDOFF — a WATCHER_SELF_RESTART exec is in flight. Both generations are legitimate; the window
 #     is TTL-bounded and closes itself. Never alarm inside it.
-#   • PERSISTENCE — re-sample. A real duplicate is a long-lived process and survives every sample; a
-#     fork the exemptions could not attribute (its parent already reaped, its gate child not yet
-#     exec'd) is gone within a sample or two. We alarm only when EVERY sample still sees >1 main.
-# On success it PRINTS the pids of the LAST sample — the mains that actually survived every check, and
-# so the only ones the operator should be told to stop. The caller must render those, never the first
-# sample's: re-reading the list after verification (as an earlier revision did) can catch a shrunk
-# sample and print a nonsensical '⚠ 1 watcher mains alive (pids 12345)'.
+#   • PERSISTENCE — re-sample, and INTERSECT. A real duplicate is a long-lived process: the SAME pid is
+#     in every sample. A tick fork the exemptions could not attribute (its parent already reaped, its
+#     gate child not yet exec'd) is gone within a sample or two — but the tick loop forks CONTINUOUSLY,
+#     so a fresh, different fork is very likely alive at the next sample too. HERD-524 (#636): counting
+#     ">1 main in every sample" therefore alarmed on a healthy control room whose only real watcher was
+#     7512, naming a DIFFERENT transient each time ('pids 7512 781304', ten minutes later 'pids 7512
+#     794193') — both already gone when the operator ran `ps` on them. A pid must survive EVERY sample
+#     to survive this check.
+#   • STILL-ALIVE AT RENDER — the surviving pids are re-verified with `kill -0` immediately before they
+#     are printed. Even an intersected pid can exit during the last sample gap, and the warning's remedy
+#     line tells a human (or an autonomous coordinator) to kill what it names; naming a dead pid invites
+#     killing the one healthy watcher instead. A pid that vanished between scan and render drops out
+#     silently, and if that leaves ≤1 main there is no alarm at all.
+# On success it PRINTS the pids that survived every check — the only ones the operator should be told to
+# stop. The caller must render those, never the first sample's: re-reading the list after verification
+# (as an earlier revision did) can catch a shrunk sample and print a nonsensical '⚠ 1 watcher mains
+# alive (pids 12345)'.
 # Returns 0 (alarm — verified real, surviving pids on stdout), 1 (do not alarm). Read-only.
 # HERD_STATUS_DUP_SAMPLES / HERD_STATUS_DUP_SLEEP are test seams; the defaults cost ~0.6s and only on
 # the already-suspect path.
@@ -282,14 +371,17 @@ _status_dup_verified() {
   fi
   case "$samples" in ''|*[!0-9]*|0) samples=3 ;; esac
   # The caller's sample is sample 1; it already showed > 1 main. Re-sample until we have `samples` of
-  # them, and let the LAST one carry the pids we print.
+  # them, keeping only the pids EVERY sample agrees on.
   while [ "$i" -lt "$samples" ]; do
     _status_dup_sleep
-    pids="$(_status_watcher_pids)"
-    # The extra main is already gone ⇒ it was a transient fork, not a duplicate.
+    pids="$(_status_pid_intersect "$pids" "$(_status_watcher_pids)")"
+    # The extra main did not survive this sample ⇒ it was a transient fork, not a duplicate.
     [ "$(_status_watcher_count "$pids")" -gt 1 ] || return 1
     i=$(( i + 1 ))
   done
+  # Last gate, at render time: only pids that are STILL alive are named.
+  pids="$(_status_watcher_live_pids "$pids")"
+  [ "$(_status_watcher_count "$pids")" -gt 1 ] || return 1
   printf '%s\n' "$pids"
 }
 

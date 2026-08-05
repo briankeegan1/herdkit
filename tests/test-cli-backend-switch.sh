@@ -39,6 +39,7 @@ case "$1 ${2:-}" in
   "auth status")  [ "${GH_FAKE_AUTH_FAIL:-0}" = "1" ] && exit 1 || exit 0 ;;
   "issue list")   printf '%s' "${GH_FAKE_LIST:-[]}" ;;
   "issue create") exit 0 ;;
+  "repo view")    printf '%s' "${GH_FAKE_REPO_VIEW:-acme/widgets}" ;;
 esac
 exit 0
 FAKE
@@ -125,13 +126,16 @@ EOF
 
 run_switch(){ ( cd "$P" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" CURL_FAKE_LOG="$CURLLOG" "$@" bash "$HERD" backend switch "${ARGS[@]}" </dev/null 2>&1 ); }
 
-# ── Case 1: file → github --migrate ─────────────────────────────────────────────────────────────
+# ── Case 1: file → github --migrate --yes ───────────────────────────────────────────────────────
 # The target repo ALREADY has: issue #7 whose title merely CONTAINS an old item's title (the
 # review-gate substring false-skip repro — it must NOT suppress migration) and issue #8 whose
 # title EXACTLY equals an old item's normalized title (a true duplicate — it MUST be skipped).
+# HERD-534 / GH #651: a github migration now REQUIRES --yes (or an interactive y/yes) to actually
+# file anything, and prints the resolved destination repo first — see Case 1b for the refusal path.
 export GH_FAKE_LIST='[{"number":7,"title":"Fix the wiring the feedback loop crash"},{"number":8,"title":"add a dark-mode toggle"}]'
+export GH_FAKE_REPO_VIEW="acme/widgets"
 : > "$GHLOG"
-ARGS=(github --migrate)
+ARGS=(github --migrate --yes)
 out="$(run_switch)" || fail "file→github switch exited non-zero: $out"
 grep -q 'SCRIBE_BACKEND="github"' "$P/.herd/config" || fail "config was not flipped to github"
 grep -q "issue create" "$GHLOG" || fail "migration did not create issues via gh"
@@ -140,9 +144,38 @@ grep -q "wiring the feedback loop (migrated from file)" "$GHLOG" \
 grep -q "add a dark-mode toggle (migrated from file)" "$GHLOG" && fail "exact-duplicate item must be SKIPPED, not re-created"
 grep -q "1 already present" <<<"$out" || fail "skip count for the exact duplicate missing from output ($out)"
 grep -q "already done" "$GHLOG" && fail "✅ shipped item must NOT be migrated"
-unset GH_FAKE_LIST
+grep -q "github migration destination: acme/widgets" <<<"$out" \
+  || fail "--yes migration must still print the resolved destination repo ($out)"
 grep -q "FROZEN ARCHIVE" "$P/BACKLOG.md" || fail "BACKLOG.md missing the frozen-archive banner"
 [ "$(grep -c 'FROZEN ARCHIVE' "$P/BACKLOG.md")" = "1" ] || fail "banner must be stamped exactly once"
+pass
+
+# ── Case 1b: HERD-534 / GH #651 — a github migration WITHOUT --yes, run non-interactively, must
+#    print the resolved destination repo but file NOTHING; the backend switch itself still lands
+#    (SCRIBE_BACKEND flips), only the migration replay is withheld. Fresh project so item 1's already-
+#    migrated backlog doesn't confuse the dedup/skip counters.
+P1B="$T/proj1b"; mkdir -p "$P1B/.herd" "$T/trees1b"
+cat > "$P1B/.herd/config" <<EOF
+PROJECT_ROOT="$P1B"
+WORKSPACE_NAME="testws1b"
+SCRIBE_BACKEND="file"
+BACKLOG_FILE="BACKLOG.md"
+WORKTREES_DIR="$T/trees1b"
+EOF
+cat > "$P1B/BACKLOG.md" <<'EOF'
+# proj1b — backlog
+## Next
+- 🔜 add a dark-mode toggle
+EOF
+: > "$GHLOG"
+out1b="$( cd "$P1B" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" GH_FAKE_REPO_VIEW="acme/widgets" \
+            bash "$HERD" backend switch github --migrate </dev/null 2>&1 )" \
+  || fail "file→github switch (no --yes) exited non-zero: $out1b"
+grep -q 'SCRIBE_BACKEND="github"' "$P1B/.herd/config" || fail "config was not flipped to github ($out1b)"
+grep -q "github migration destination: acme/widgets" <<<"$out1b" \
+  || fail "migration without --yes must still print the resolved destination repo ($out1b)"
+grep -q "issue create" "$GHLOG" && fail "migration without --yes must file NOTHING ($out1b)"
+unset GH_FAKE_LIST GH_FAKE_REPO_VIEW
 pass
 
 # ── Case 2: same-backend re-run is a no-op ──────────────────────────────────────────────────────

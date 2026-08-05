@@ -119,6 +119,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # marker this file writes (watcher_handoff_begin/_clear). Defines functions + one constant; idempotent.
 # shellcheck source=/dev/null
 . "$HERE/watcher-exempt.sh"
+# SHARED `Refs:` PARSER (HERD-522) — THE one implementation of "given a PR body, print its explicit
+# tracker ref", plus the silent-miss probe the reconcile alarms on. Sourced BEFORE stale-dup-gate.sh
+# and work-units/git-pr.sh because both call into it; defines two functions + one python snippet
+# (HERD_PR_REF_PY, which sweep.sh prepends to its own driver), and sourcing it twice is a no-op.
+# shellcheck source=/dev/null
+. "$HERE/pr-ref.sh"
 # STALE-DUPLICATE gate (HERD-188) — the pre-merge check that HOLDS a PR re-implementing already-shipped
 # work (duplicate item ref) or sitting on a stale base. Sourcing DEFINES functions only (no CLI); the
 # gate is default-on but provable-only + fail-soft, so it never false-holds. Disabled by STALE_DUP_DETECT=off.
@@ -467,6 +473,12 @@ CI_CHECKS_STATE="$TREES/.agent-watch-ci-checks"
 # the console, never a silent correction.
 TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
 TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
+# UNPARSEABLE-REF alarm surface (HERD-522, GH #637). One "<epoch>\t<pr>\t<line>" row per merged PR
+# whose body MENTIONED `refs:` yet yielded no parseable tracker id — the shape that used to reconcile
+# silently to nothing (emberglen-godot PR #125's `## Refs: EMG-111` heading: item left open, no
+# warning anywhere). Written once per PR by _reconcile_ref_unparsed_alarm at merge-time reconcile and
+# rendered by build_ref_unparsed. Empty on every healthy repo, so the console is byte-identical.
+REF_UNPARSED_FILE="$TREES/.agent-watch-ref-unparsed"
 # Post-merge reconcile ledger (HERD-232). The post-merge hook chain used to be merge-EVENT-driven: only
 # the seat whose own do_merge landed a PR ever ran it. _sweep_merged_prs re-derives those obligations
 # from the world (recently-MERGED PRs) instead, so a foreign-seat merge, a gh-UI merge, or a watcher
@@ -567,6 +579,15 @@ ORPHAN_PR_ROWS_LIMIT=5    # most-recent orphan rows rendered (display bound; the
 # console when every open PR has a builder record.
 UNGATED_PR_LEDGER="$TREES/.agent-watch-ungated-prs"
 UNGATED_PR_ROWS_LIMIT=5
+# TEAMMATE PRESENCE on those ungated rows (HERD-527, GH #639 phase 1). An ungated PR is not always an
+# ORPHAN: on a two-operator project (WATCHER_SCOPE=all) it is routinely a TEAMMATE'S PR, actively being
+# built in their worktree on their machine — and the row above nudges "enable ADOPT_REMOTE_PRS or git
+# worktree add to adopt", which is precisely the wrong advice for it. Under TEAM_PRESENCE=on the
+# throttled presence scan REWRITES this ledger with one "<pr>\t<item-id>\t<assignee>" row per ungated PR
+# whose tracker item is IN PROGRESS and ASSIGNED, and _ungated_pr_row renders those rows attributed
+# instead (adopt nudge suppressed). Rewritten whole per scan, so it self-corrects the moment the item
+# closes, is unassigned, or the PR stops being ungated. Off (default) → never written, never read.
+TEAM_PRESENCE_LEDGER="$TREES/.agent-watch-team-presence"
 # Adopt-remote-PRs ledgers (HERD-369), sibling of the orphan-PR ledger above. Under ADOPT_REMOTE_PRS=on
 # the tick's ADOPT leg (built on top of the SAME orphan diff) attempts `git fetch` + `git worktree add`
 # per orphan PR. TWO separate ledgers, ADVISED (herd-advise.sh) against conflating "succeeded" with
@@ -587,6 +608,35 @@ ADOPT_FAILED_SEEN_LEDGER="$TREES/.agent-watch-adopt-failed-seen"
 # every scan, but the journal EVENT for that exact pair fires once. A SUCCESSFUL move needs no ledger
 # at all — the next scan finds the branch already checked out at the expected path and self-terminates.
 ADOPT_SELFHEAL_SEEN_LEDGER="$TREES/.agent-watch-adopt-selfheal-seen"
+# ADOPT_MISMATCH_SEEN_LEDGER (HERD-526) — dedupes the `adopt_slug_mismatch` ADVISORY per
+# (branch,stale-dir): the one mismatch shape the self-heal above deliberately REFUSES to fix itself,
+# because the slug-parity path it would move onto is ALREADY OCCUPIED (a stale twin dir, or the
+# hand-made `$TREES/<stripped> -> $TREES/feat-<stripped>` symlink operators used as a workaround for
+# GitHub issue #657). A live worktree is never auto-renamed out from under whatever occupies that
+# path — the mismatch is journaled LOUDLY, once, with the one-line fix, and left for a human.
+ADOPT_MISMATCH_SEEN_LEDGER="$TREES/.agent-watch-adopt-mismatch-seen"
+# Post-adopt DISCOVERY-VERIFICATION ledgers (HERD-526, GitHub issue #657) — `pr_adopted` claims success
+# the moment `git worktree add` returns, but the only thing that MATTERS is whether the adopted PR then
+# survives CANDIDATE DISCOVERY into classification (_branch_worktree_slug → _worktree_for_slug →
+# _pool_scoped, pysrc/herd/live_runtime.py). When the two sides disagreed about the slug, the failure
+# was silent in BOTH directions — no adopt_failed, no console row, nothing to tell "adopted and gating"
+# apart from "adopted and permanently ignored" (8 PRs sat CLEAN and ungated forever in emberglen-godot).
+# Slug UNITY (herd_branch_slug, the ONE slugifier both sides now use) makes that divergence impossible
+# by construction; this verification is the belt to that suspenders — it proves the invariant held on
+# THIS pool for THIS adopt, and says so out loud when it did not (a reaped worktree, a hand-moved dir,
+# a BRANCH_TEMPLATE changed under a live pool).
+#   • ADOPT_VERIFY_LEDGER — one "<pr>\t<sha>\t<branch>\t<slug>\t<dir>" row per successful adopt still
+#     awaiting that proof. Rows are enqueued AFTER each scan's verify pass, so every row is first
+#     checked on a LATER scan (the "next tick" the claim is about), and dropped the moment the
+#     worktree is discoverable.
+#   • ADOPT_ORPHAN_LEDGER — the console section, REWRITTEN whole from the rows that failed THIS scan's
+#     check (mirroring UNGATED_PR_LEDGER), so an operator's fix clears the row on the next scan.
+#   • ADOPT_ORPHAN_SEEN_LEDGER — dedupes `adopt_orphaned` per (pr,sha) exactly like the failure ledger
+#     above: the CHECK re-runs every scan, the journal EVENT fires once per commit.
+ADOPT_VERIFY_LEDGER="$TREES/.agent-watch-adopt-verify"
+ADOPT_ORPHAN_LEDGER="$TREES/.agent-watch-adopt-orphans"
+ADOPT_ORPHAN_SEEN_LEDGER="$TREES/.agent-watch-adopt-orphan-seen"
+ADOPT_ORPHAN_ROWS_LIMIT=5
 # Only truthy values enable dry-run. Treat "0"/""/"false"/"no" as live.
 case "${AGENT_WATCH_DRYRUN:-}" in 1|true|yes|on) DRYRUN=1 ;; *) DRYRUN="" ;; esac
 
@@ -711,10 +761,12 @@ LANDED=""
 BLOCKED=""
 RECONCILE_PENDING=""    # HERD-438: "reconcile pending" section rows (empty when nothing is mid-flight)
 TRACKER_DRIFT=""
+REF_UNPARSED_ROWS=""    # HERD-522: the "unlinked merges" section rows (empty when every merged PR's Refs: parsed)
 SPAWN_HOLDS=""
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
 UNGATED_PR_SECTION_ROWS=""  # HERD-460: the UNCONDITIONAL "ungated PRs" truth section rows (empty when none → render omits it)
+ADOPT_ORPHAN_SECTION_ROWS=""  # HERD-526: the "adopted but not discovered" alarm rows (empty unless an adopted PR failed its discovery proof → render omits it)
 ENGINE_DOWN_ROW=""     # HERD-306: the "engine down · manual intervention" alarm row set by the engine watchdog past a fault streak (empty while the Python engine is ticking)
 ENGINE_PAUSE_ROW=""    # HERD-347: the "⏸ engine paused by operator" banner set by _engine_tick_watchdog while ENGINE_PAUSE=on (empty — byte-identical console — while the lever is off/unset)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
@@ -914,6 +966,54 @@ build_tracker_drift() {
   local rows
   rows="$(herd_console_section_tracker "$TRACKER_HEAL_FILE" 3 _tracker_heal_row)"
   [ -n "$rows" ] && TRACKER_DRIFT="${rows}"$'\n'
+  return 0
+}
+
+# ── Unlinked merges (HERD-522, GH #637) ───────────────────────────────────────────────────────────
+# The console half of the silent-miss alarm. _reconcile_ref_unparsed_alarm (work-units/git-pr.sh)
+# writes one ledger row per merged PR whose body MENTIONED `refs:` yet parsed to no tracker id; these
+# two functions render it. Nothing here scans or writes — a pure renderer, like build_tracker_drift.
+
+# _ref_unparsed_classify <line>  ("<epoch>\t<pr>\t<line>")
+#   Prints "<epoch>\tloud". Always LOUD, so the row NEVER ages out of the display: the merge already
+#   landed and the tracker item is already sitting open, so time passing makes it worse, not stale.
+#   The one thing that clears it is an operator relinking the item — there is no automatic cure, which
+#   is exactly the fact this alarm exists to state out loud. Bounded by construction: one row per PR
+#   (the alarm dedupes on the ledger) and the ledger is tail-kept at CONSOLE_LEDGER_MAX on write.
+_ref_unparsed_classify() {
+  local _ru_epoch
+  IFS=$'\t' read -r _ru_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tloud' "${_ru_epoch:-}"
+}
+
+# _ref_unparsed_row <line>  ("<epoch>\t<pr>\t<line>") → one loud console row quoting the offending
+#   line, so the operator can see WHY it did not parse without opening the PR. Fail-soft: a row with
+#   no PR number renders nothing.
+_ref_unparsed_row() {
+  local _ru_epoch _ru_pr _ru_line hhmm
+  IFS=$'\t' read -r _ru_epoch _ru_pr _ru_line <<EOF
+$1
+EOF
+  [ -n "${_ru_pr:-}" ] || return 0
+  hhmm="$(epoch_to_hhmm "${_ru_epoch:-0}")"
+  printf '    %s🔗%s %s#%s%s %sunlinked%s %s"%s" parsed to no ref · %s%s' \
+    "$C_RED" "$C_RESET" "$C_BOLD" "$_ru_pr" "$C_RESET" \
+    "$C_RED" "$C_RESET" "$C_DIM" "${_ru_line:-}" "$hhmm" "$C_RESET"
+}
+
+# build_ref_unparsed — the "unlinked merges" section: the newest 3 alarm rows, newest first. Empty
+# (REF_UNPARSED_ROWS="") whenever the ledger is absent or empty — which is every repo where every
+# merged PR's `Refs:` line parsed — so render() omits the section entirely and the console is
+# byte-identical to before HERD-522. Carries NO config gate, deliberately: a merge that silently
+# failed to link its tracker item is a correctness fact, not a preference (same posture as the
+# HERD-460 "ungated PRs" section).
+build_ref_unparsed() {
+  REF_UNPARSED_ROWS=""
+  local rows
+  rows="$(herd_console_section "$REF_UNPARSED_FILE" 3 _ref_unparsed_classify _ref_unparsed_row)"
+  [ -n "$rows" ] && REF_UNPARSED_ROWS="${rows}"$'\n'
   return 0
 }
 
@@ -1936,12 +2036,28 @@ EOF
 
 # _ungated_pr_row <line>  ("<epoch>\t<pr>\t<title>\t<branch>") → one themed console row. Fail-soft: a
 # row missing its PR number renders nothing (drops out of the section).
+#
+# HERD-527: when the TEAM_PRESENCE cache attributes this PR to a teammate who is mid-build on their own
+# machine, the row says so and the adopt nudge is SUPPRESSED — "adopt this" is exactly the wrong advice
+# for a PR someone else is actively building. With TEAM_PRESENCE off (default) the cache is always
+# empty, the lookup returns nothing, and this prints the pre-HERD-527 bytes verbatim.
 _ungated_pr_row() {
-  local _ug_epoch _ug_pr _ug_title _ug_branch
+  local _ug_epoch _ug_pr _ug_title _ug_branch _ug_who
   IFS=$'\t' read -r _ug_epoch _ug_pr _ug_title _ug_branch <<EOF
 $1
 EOF
   [ -n "${_ug_pr:-}" ] || return 0
+  _ug_who="$(_team_presence_lookup "$_ug_pr")"
+  if [ -n "$_ug_who" ]; then
+    local _ug_id _ug_assignee
+    IFS=$'\t' read -r _ug_id _ug_assignee <<EOF
+$_ug_who
+EOF
+    printf '    %s🔓%s %s#%s%s %s %s%s · ungated here · %s building %s on their machine%s' \
+      "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
+      "$C_DIM" "${_ug_branch:-}" "$_ug_assignee" "$_ug_id" "$C_RESET"
+    return 0
+  fi
   printf '    %s🔓%s %s#%s%s %s %s%s · ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree add to adopt%s' \
     "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
     "$C_DIM" "${_ug_branch:-}" "$C_RESET"
@@ -2013,11 +2129,220 @@ for pr in prs:
 # _ungated_prs_scan.
 build_ungated_prs() {
   UNGATED_PR_SECTION_ROWS=""
+  # HERD-527: load the presence attributions ONCE per render, not once per row — herd_console_section
+  # runs _ungated_pr_row in a command-substitution SUBSHELL, which inherits this global, so every row's
+  # lookup is an in-memory string match against a cache read at most once a tick. Empty (and so a pure
+  # no-op) whenever TEAM_PRESENCE is off — that is what keeps the off-path byte-identical.
+  _team_presence_load
   [ -s "$UNGATED_PR_LEDGER" ] || return 0
   local rows
   rows="$(herd_console_section "$UNGATED_PR_LEDGER" "$UNGATED_PR_ROWS_LIMIT" \
     _ungated_pr_classify _ungated_pr_row)"
   [ -n "$rows" ] && UNGATED_PR_SECTION_ROWS="${rows}"$'\n'
+  return 0
+}
+
+# ── Teammate presence on the ungated rows (HERD-527, GitHub issue #639 phase 1) ───────────────────
+# THE DEFECT (grounded: emberglen-godot, two operators). The watcher discovers work through LOCAL git
+# worktrees, so every PR a TEAMMATE is building on THEIR machine lands in the unconditional ungated
+# section above and is labelled "ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree
+# add to adopt". Under WATCHER_SCOPE=all — the team posture — that is not merely uninformative, it is
+# actively wrong: adopting a branch someone else is mid-build on is the last thing an operator should
+# do. The console says "nobody is on this" about work that is very much being done.
+#
+# THE FIX, PHASE 1 — REUSE THE CLAIM MACHINERY, ADD NO CHANNEL. The tracker ALREADY carries who-is-
+# building: a claim sets the item's assignee AND moves it to in-progress (HERD-50 / HERD-244), and every
+# PR body carries `Refs: <id>` (HERD-522). Those two facts join to exactly the missing sentence. So this
+# leg invents no presence protocol, opens no socket, writes NOTHING anywhere (least of all the tracker —
+# a builder/watcher that mutates item state corrupts the queue): it is a pure READ that resolves
+# ungated PR → tracker item → (state, assignee), and re-words the row when the answer is
+# "in-progress, assigned".
+#
+# WHAT PHASE 2 IS NOT: a real presence channel (heartbeats, a per-seat liveness feed) and a view toggle
+# are deliberately OUT of scope here — the tracker join answers the grounded complaint with zero new
+# moving parts, and a channel should only be built once that proves insufficient.
+#
+# COST. Two reads per SCAN (not per 4 s repaint): one `gh pr list --json number,body` and one backend
+# roster call, both on the ~60 s cadence the adopt leg already uses. Their result is a ledger the repaint
+# reads from memory. Zero reads when TEAM_PRESENCE is off, and zero when nothing is ungated.
+
+# _team_presence_enabled — true iff TEAM_PRESENCE opts in. Default OFF; any unrecognized value reads as
+# off (fail toward the byte-identical console), mirroring _adopt_remote_prs_enabled.
+_team_presence_enabled() {
+  case "$(printf '%s' "${TEAM_PRESENCE:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _TEAM_PRESENCE_CACHE — this render's in-memory copy of $TEAM_PRESENCE_LEDGER ("<pr>\t<id>\t<assignee>"
+# rows). Always EMPTY when the feature is off, so _team_presence_lookup is a single string test on the
+# off-path and _ungated_pr_row's pre-HERD-527 branch is the only one that can be taken.
+_TEAM_PRESENCE_CACHE=""
+
+# _team_presence_load — refresh _TEAM_PRESENCE_CACHE from the ledger, once per render pass. Fail-soft:
+# an absent/unreadable ledger simply yields an empty cache (today's rows).
+_team_presence_load() {
+  _TEAM_PRESENCE_CACHE=""
+  _team_presence_enabled || return 0
+  [ -s "$TEAM_PRESENCE_LEDGER" ] || return 0
+  _TEAM_PRESENCE_CACHE="$(cat "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true)"
+  return 0
+}
+
+# _team_presence_lookup <pr#> → "<item-id>\t<assignee>" when this tick's cache attributes that PR to a
+# teammate mid-build, else nothing. Pure in-memory; never touches the network or the tracker.
+_team_presence_lookup() {
+  local _tp_pr="${1:-}" _tp_line _tp_num _tp_id _tp_who
+  [ -n "$_tp_pr" ] || return 0
+  [ -n "$_TEAM_PRESENCE_CACHE" ] || return 0
+  while IFS=$'\t' read -r _tp_num _tp_id _tp_who; do
+    [ "$_tp_num" = "$_tp_pr" ] || continue
+    [ -n "${_tp_id:-}" ] && [ -n "${_tp_who:-}" ] || continue
+    printf '%s\t%s' "$_tp_id" "$_tp_who"
+    return 0
+  done <<EOF
+$_TEAM_PRESENCE_CACHE
+EOF
+  return 0
+}
+
+# _team_presence_roster — the ACTIVE backend's rich open-item roster, one TSV line per open item:
+#   "#<id>\t<state-type>\t<state-name>\t<title>\t<desc>\t<assignee>\t<url>"
+# Sourced in a SUBSHELL (secrets + backend), exactly the _reconcile_via_ref / _inbox_scan discipline, so
+# the _backend_* helpers never leak into the watcher namespace. This is the SAME op `herd backlog --rich`
+# reads — the one existing seam that already returns state AND assignee for every open item in ONE call,
+# which is why the whole scan costs one tracker round-trip regardless of how many PRs are ungated.
+# OPTIONAL by contract: a backend that does not define it (file, github, changelog) prints nothing, and
+# so does an unreachable/unauthenticated one — both land on the same fail-soft "today's rows" path.
+_team_presence_roster() {
+  local _tp_bdir _tp_bfile
+  _tp_bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+  _tp_bfile="$_tp_bdir/${SCRIBE_BACKEND:-file}.sh"
+  [ -f "$_tp_bfile" ] || return 0
+  (
+    _tp_secrets="$MAIN/.herd/secrets"
+    # shellcheck source=/dev/null
+    [ -f "$_tp_secrets" ] && . "$_tp_secrets"
+    # shellcheck source=/dev/null
+    . "$_tp_bfile" 2>/dev/null || exit 0
+    command -v _backend_list_open_rich >/dev/null 2>&1 || exit 0
+    cd "$MAIN" 2>/dev/null || exit 0
+    _backend_list_open_rich 2>/dev/null || true
+  )
+}
+
+# _team_presence_resolve <ungated-ledger-text> <bodies-json> <roster-tsv> → the attribution rows
+# ("<pr>\t<item-id>\t<assignee>"), one per ungated PR that resolves to an IN-PROGRESS, ASSIGNED item.
+# PURE: no network, no file, no clock — everything it needs is in its three arguments, which is what
+# makes the join directly testable without a tracker or a gh.
+#
+# Resolution order per PR, first hit wins:
+#   1. the PR body's `Refs: <id>` line, via the SHARED parser (HERD_PR_REF_PY, HERD-522) — the same
+#      decoration-tolerant rules the merge-time reconcile uses, so a heading/bold/list-item ref resolves
+#      here exactly as it does there.
+#   2. a TOKEN-EXACT branch-name match: an id from the roster that appears in the branch delimited by
+#      non-alphanumerics (`feat/herd-527-teammate` → HERD-527). Deliberately token-exact and
+#      case-insensitive rather than substring: `HERD-5` must never claim `feat/herd-52-x`. This covers a
+#      teammate's PR that predates the Refs convention, or one opened by hand.
+# A ref that resolves to no OPEN roster row (done/canceled, another team, a typo) attributes nothing.
+#
+# IN PROGRESS is read from the roster's state TYPE — the machine key, never the human label, so a team
+# that renamed "In Progress" to "Cooking" still reads correctly: `started` (Linear) / `indeterminate`
+# (Jira). An item that is in progress but UNASSIGNED attributes nothing either: "someone is building
+# this" without a name is not the sentence this feature exists to print.
+_team_presence_resolve() {
+  UNGATED="${1:-}" BODIES="${2:-[]}" ROSTER="${3:-}" python3 -c '
+import os, sys, json
+'"$HERD_PR_REF_PY"'
+import re
+IN_PROGRESS = ("started", "indeterminate")   # Linear state type · Jira statusCategory key
+def _norm(s):
+    """UPPERCASE, every run of non-alphanumerics collapsed to a single "-", edges stripped."""
+    return re.sub(r"^-+|-+$", "", re.sub(r"[^0-9A-Za-z]+", "-", (s or "").upper()))
+# roster: id (upper) -> assignee, for OPEN items that are in-progress AND assigned
+roster = {}
+for line in (os.environ.get("ROSTER") or "").splitlines():
+    f = line.split("\t")
+    if len(f) < 6:
+        continue
+    ident = f[0].lstrip("#").strip()
+    if not ident or f[1].strip().lower() not in IN_PROGRESS:
+        continue
+    assignee = " ".join(f[5].split())
+    if not assignee:
+        continue
+    roster[ident.upper()] = (ident, assignee)
+if not roster:
+    sys.exit(0)
+try:
+    bodies = json.loads(os.environ.get("BODIES") or "[]")
+    if not isinstance(bodies, list):
+        raise ValueError
+except Exception:
+    bodies = []          # unreadable body roster → the branch-name path alone (fail-soft, never a crash)
+body_by_pr = {}
+for pr in bodies:
+    if isinstance(pr, dict) and pr.get("number") is not None:
+        body_by_pr[str(pr.get("number"))] = pr.get("body") or ""
+for line in (os.environ.get("UNGATED") or "").splitlines():
+    f = line.split("\t")
+    if len(f) < 2:
+        continue
+    num = f[1].strip()
+    if not num:
+        continue
+    branch = f[3] if len(f) > 3 else ""
+    hit = roster.get((pr_ref_from_body(body_by_pr.get(num, "")) or "").upper())
+    if hit is None and branch:
+        # Normalize BOTH sides to "-"-joined alphanumeric tokens, then require the id to sit on token
+        # boundaries: `feat/herd-527-teammate` -> FEAT-HERD-527-TEAMMATE contains HERD-527, while
+        # `feat/herd-52-x` -> FEAT-HERD-52-X does NOT (the boundary after 52 kills the prefix match).
+        slug = _norm(branch)
+        for key, cand in roster.items():
+            nkey = _norm(key)
+            if nkey and re.search(r"(?:^|-)" + re.escape(nkey) + r"(?:-|$)", slug):
+                hit = cand
+                break
+    if hit is None:
+        continue
+    print("%s\t%s\t%s" % (num, hit[0], hit[1]))
+' 2>/dev/null || true
+}
+
+# _team_presence_scan — the throttled leg: REWRITE $TEAM_PRESENCE_LEDGER from live tracker state.
+# Self-gates on TEAM_PRESENCE; off (default) never runs, never creates the ledger.
+#
+# FAIL-SOFT CONTRACT, one rule, so the console can never lie: the ledger is ONLY ever the product of a
+# COMPLETE successful resolution. Any incomplete step — a `gh` error/timeout, no python3, a backend that
+# cannot be sourced, a tracker that is down or exposes no rich roster op, a roster with nobody
+# in-progress-and-assigned — leaves the ledger EMPTY, and every ungated PR renders exactly TODAY's row.
+# The one exception is a failed `gh` BODIES fetch, which returns early WITHOUT touching the ledger:
+# that mirrors _ungated_prs_scan's PRS_LOOKUP_OK discipline (a transient network blip is not evidence,
+# and the branch-name path would otherwise silently become the only resolver for a tick). Stale
+# attribution never accumulates: the ledger is rewritten whole on every scan.
+_team_presence_scan() {
+  _team_presence_enabled || return 0
+  # Nothing ungated → nothing to attribute. Cheapest possible exit: no gh, no tracker call.
+  if [ ! -s "$UNGATED_PR_LEDGER" ]; then
+    : > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true
+    return 0
+  fi
+  local _tp_ungated _tp_bodies _tp_rc=0 _tp_roster _tp_rows
+  _tp_ungated="$(cat "$UNGATED_PR_LEDGER" 2>/dev/null || true)"
+  [ -n "$_tp_ungated" ] || { : > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true; return 0; }
+  # PR BODIES — the tick's own roster (PRS_JSON) deliberately does NOT carry `body`: adding it would
+  # inflate every tick's fetch (and the env it is threaded through) for every operator, on or off. One
+  # extra list call on the ~60 s scan cadence keeps the hot path untouched.
+  _tp_bodies="$(_gh_timeout team_presence_bodies pr list --json number,body 2>/dev/null)" || _tp_rc=$?
+  [ "$_tp_rc" -eq 0 ] || return 0       # transient fetch failure → keep last known, retry next scan
+  _tp_roster="$(_team_presence_roster)"
+  _tp_rows="$(_team_presence_resolve "$_tp_ungated" "${_tp_bodies:-[]}" "$_tp_roster")"
+  if [ -n "$_tp_rows" ]; then
+    printf '%s\n' "$_tp_rows" > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true
+  else
+    : > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -2099,6 +2424,30 @@ _adopt_selfheal_failed_journaled() {
   awk -F'\t' -v b="$1" -v d="$2" '$1==b && $2==d{f=1} END{exit !f}' "$ADOPT_SELFHEAL_SEEN_LEDGER" 2>/dev/null
 }
 
+# _adopt_mismatch_journaled <branch> <dir> — true iff an `adopt_slug_mismatch` advisory for this exact
+# (branch,dir) was already journaled, so a mismatch nobody has fixed yet does not spam the journal
+# every scan. Mirrors _adopt_selfheal_failed_journaled; the CHECK still runs every scan (so the
+# console row below stays accurate), only the journal EVENT is deduped.
+_adopt_mismatch_journaled() {
+  [ -s "$ADOPT_MISMATCH_SEEN_LEDGER" ] || return 1
+  awk -F'\t' -v b="$1" -v d="$2" '$1==b && $2==d{f=1} END{exit !f}' "$ADOPT_MISMATCH_SEEN_LEDGER" 2>/dev/null
+}
+
+# _adopt_journal_slug_mismatch <branch> <actual-dir> <expected-dir> — the MIGRATION ADVISORY (HERD-526):
+# this branch is checked out at a pool dir that is NOT the one discovery resolves, and the self-heal
+# below cannot safely fix it because the expected path is already occupied. Journal it ONCE per
+# (branch,actual) with the one-line fix an operator can paste; NEVER auto-rename a live worktree onto
+# an occupied path.
+_adopt_journal_slug_mismatch() {
+  local _ajm_branch="$1" _ajm_actual="$2" _ajm_expected="$3"
+  _adopt_mismatch_journaled "$_ajm_branch" "$_ajm_actual" && return 0
+  journal_append adopt_slug_mismatch branch "$_ajm_branch" actual "$_ajm_actual" expected "$_ajm_expected" \
+    reason "expected slug-parity path already occupied — discovery reads $_ajm_expected, the branch lives at $_ajm_actual" \
+    fix "remove or rename $_ajm_expected, then: git -C $MAIN worktree move $_ajm_actual $_ajm_expected"
+  printf '%s\t%s\n' "$_ajm_branch" "$_ajm_actual" >> "$ADOPT_MISMATCH_SEEN_LEDGER" 2>/dev/null || true
+  return 0
+}
+
 # _adopt_self_heal_mismatch <branch> <expected-dir> <wt-porcelain> — HERD-377 leftover: an adopt from
 # BEFORE the slug-parity fix may have checked <branch> out at the WRONG path (the old unconditional
 # `tr '/' '-'` slug, e.g. TREES/feat-python-draft-pr-hold, instead of herd_branch_slug's
@@ -2119,7 +2468,15 @@ _adopt_self_heal_mismatch() {
   [ -n "$_ash_actual" ] || return 0                    # not checked out anywhere — nothing to heal
   [ "$_ash_actual" != "$_ash_expected" ] || return 0    # already at the right path
   [ "$(dirname "$_ash_actual")" = "$TREES" ] || return 0  # not a pool worktree (e.g. the main checkout) — never touch it
-  [ -e "$_ash_expected" ] && return 0                   # target occupied — never clobber, leave for a human
+  if [ -e "$_ash_expected" ]; then
+    # Target occupied — never clobber, never auto-rename a live worktree onto it. This is the ONE
+    # mismatch shape the self-heal cannot resolve on its own, and before HERD-526 it was a silent
+    # `return 0`: the branch kept living at a path discovery never reads, exactly the GH #657 shape
+    # (including the `$TREES/<stripped> -> $TREES/feat-<stripped>` symlink workaround, which occupies
+    # the expected path). Say it out loud instead, with the fix, and leave the trees alone.
+    _adopt_journal_slug_mismatch "$_ash_branch" "$_ash_actual" "$_ash_expected"
+    return 0
+  fi
   if git -C "$MAIN" worktree move "$_ash_actual" "$_ash_expected" >/dev/null 2>&1; then
     journal_append adopt_selfheal branch "$_ash_branch" from "$_ash_actual" to "$_ash_expected"
     return 0
@@ -2162,6 +2519,141 @@ _adopt_remote_pr() {
   fi
   journal_append pr_adopted pr "$_arp_pr" sha "$_arp_sha" branch "$_arp_branch" slug "$_arp_slug" dir "$_arp_dir"
   _adopt_pr_mark_adopted "$_arp_pr" "$_arp_sha"
+  # HERD-526: `pr_adopted` is a claim about git, not about the GATE. Enqueue the adopt for the DISCOVERY
+  # proof a later scan runs (_adopt_verify_scan) — the only evidence that this PR actually entered
+  # classification rather than being dropped as foreign to the pool.
+  _adopt_verify_enqueue "$_arp_pr" "$_arp_sha" "$_arp_branch" "$_arp_slug" "$_arp_dir"
+  return 0
+}
+
+# ── Post-adopt discovery verification (HERD-526, GitHub issue #657) ───────────────────────────────
+# CLOSE THE SILENCE: prove each successful adopt survives candidate discovery into classification, and
+# journal + render an alarm when it does not. See the ADOPT_VERIFY_LEDGER block above for the shape.
+
+# _adopt_verify_enqueue <pr> <sha> <branch> <slug> <dir> — append-only; one pending row per adopt.
+_adopt_verify_enqueue() {
+  printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" >> "$ADOPT_VERIFY_LEDGER" 2>/dev/null || true
+}
+
+# _adopt_discoverable <slug> — the EXACT predicate candidate discovery applies to a candidate before it
+# may be classified: python's `_is_worktree(_worktree_for_slug(slug))` (live_runtime.py), i.e. is
+# $TREES/<slug> a real checked-out worktree. Mirrors its FAIL-SOFT too: with no pool configured
+# `_pool_scoped` skips the check entirely (byte-identical passthrough), so an unconfigured pool is
+# "discoverable" here rather than a fabricated alarm.
+_adopt_discoverable() {
+  local _ad_slug="${1:-}" _ad_dir
+  [ -n "${TREES:-}" ] || return 0
+  [ -n "$_ad_slug" ] || return 1
+  _ad_dir="$TREES/$_ad_slug"
+  [ -d "$_ad_dir" ] && [ -e "$_ad_dir/.git" ]
+}
+
+# _adopt_open_pr_numbers <prs-json> — space-separated numbers of every OPEN PR in the tick's roster,
+# used ONLY to prune pending verify rows for PRs that have since merged/closed (their worktree is
+# legitimately gone — that is convergence, not an orphan). Fail-soft: malformed JSON prints nothing,
+# which prunes everything rather than alarming on a roster we could not read.
+_adopt_open_pr_numbers() {
+  PRS_JSON="${1:-[]}" python3 -c '
+import os, sys, json
+try:
+    prs = json.loads(os.environ.get("PRS_JSON") or "[]")
+    if not isinstance(prs, list): raise ValueError
+except Exception:
+    sys.exit(0)
+print(" ".join(str(p.get("number")) for p in prs
+                if isinstance(p, dict) and p.get("number") is not None))
+' 2>/dev/null || true
+}
+
+# _adopt_journal_orphaned <pr> <sha> <branch> <adopted-dir> <expected-dir> — journal `adopt_orphaned`
+# ONCE per (pr,sha): this PR was adopted successfully, yet discovery finds no worktree where it looks,
+# so the PR is invisible to the gate and will sit CLEAN and ungated forever. The single loudest thing
+# the adopt leg can say.
+_adopt_journal_orphaned() {
+  local _ajo_pr="$1" _ajo_sha="$2" _ajo_branch="$3" _ajo_dir="$4" _ajo_expected="$5"
+  _adopt_orphan_journaled "$_ajo_pr" "$_ajo_sha" && return 0
+  journal_append adopt_orphaned pr "$_ajo_pr" sha "$_ajo_sha" branch "$_ajo_branch" \
+    dir "$_ajo_dir" expected "$_ajo_expected" \
+    reason "adopted but not discovered — no worktree at the path discovery resolves; the PR is never gated" \
+    fix "git -C $MAIN worktree add $_ajo_expected $_ajo_branch"
+  printf '%s\t%s\n' "$_ajo_pr" "$_ajo_sha" >> "$ADOPT_ORPHAN_SEEN_LEDGER" 2>/dev/null || true
+  return 0
+}
+
+# _adopt_orphan_journaled <pr> <sha> — true iff `adopt_orphaned` already fired for this exact (pr,sha).
+_adopt_orphan_journaled() {
+  [ -s "$ADOPT_ORPHAN_SEEN_LEDGER" ] || return 1
+  awk -F'\t' -v p="$1" -v s="$2" '$1==p && $2==s{f=1} END{exit !f}' "$ADOPT_ORPHAN_SEEN_LEDGER" 2>/dev/null
+}
+
+# _adopt_verify_scan <prs-json> — verify every PENDING adopt against the discovery predicate, then
+# REWRITE both ledgers: pending rows that now resolve are dropped (proof obtained, silent — the happy
+# path adds nothing to the console or the journal), rows for merged/closed PRs are pruned, and rows
+# that still do not resolve journal `adopt_orphaned` (once per (pr,sha)) and paint a console row.
+# Rewriting the console ledger whole means an operator's fix CLEARS the row on the next scan.
+#
+# The expected path is RE-DERIVED from the branch through herd_branch_slug — the same slugifier
+# discovery uses — rather than trusted from the ledger, so a BRANCH_TEMPLATE changed under a live pool
+# is caught too, not just a vanished directory.
+_adopt_verify_scan() {
+  [ -s "$ADOPT_VERIFY_LEDGER" ] || return 0
+  local _avs_open _avs_pending _avs_epoch _avs_keep="" _avs_rows=""
+  local _avs_pr _avs_sha _avs_branch _avs_slug _avs_dir _avs_expected_slug _avs_expected
+  _avs_open=" $(_adopt_open_pr_numbers "${1:-[]}") "
+  _avs_epoch="$(_console_now_epoch)"
+  _avs_pending="$(cat "$ADOPT_VERIFY_LEDGER" 2>/dev/null || true)"
+  while IFS=$'\t' read -r _avs_pr _avs_sha _avs_branch _avs_slug _avs_dir; do
+    [ -n "${_avs_pr:-}" ] || continue
+    case "$_avs_open" in *" $_avs_pr "*) : ;; *) continue ;; esac   # merged/closed → converged, not orphaned
+    _avs_expected_slug="$(herd_branch_slug "$_avs_branch")"
+    _avs_expected="$TREES/$_avs_expected_slug"
+    _adopt_discoverable "$_avs_expected_slug" && continue           # proven: it reaches classification
+    _adopt_journal_orphaned "$_avs_pr" "$_avs_sha" "$_avs_branch" "$_avs_dir" "$_avs_expected"
+    _avs_keep="${_avs_keep}${_avs_pr}"$'\t'"${_avs_sha}"$'\t'"${_avs_branch}"$'\t'"${_avs_slug}"$'\t'"${_avs_dir}"$'\n'
+    _avs_rows="${_avs_rows}${_avs_epoch}"$'\t'"${_avs_pr}"$'\t'"${_avs_branch}"$'\t'"${_avs_expected}"$'\n'
+  done <<EOF
+$_avs_pending
+EOF
+  printf '%s' "$_avs_keep" > "$ADOPT_VERIFY_LEDGER" 2>/dev/null || true
+  printf '%s' "$_avs_rows" > "$ADOPT_ORPHAN_LEDGER" 2>/dev/null || true
+  return 0
+}
+
+# _adopt_orphan_classify <line> — LOUD, always: an adopted-but-undiscovered PR is un-gated right now,
+# and stays that way until someone acts, so its row must never age out of the console.
+_adopt_orphan_classify() {
+  local _ao_epoch
+  IFS=$'\t' read -r _ao_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tloud' "${_ao_epoch:-}"
+}
+
+# _adopt_orphan_row <line>  ("<epoch>\t<pr>\t<branch>\t<expected-dir>") → one themed console row.
+# Fail-soft: a row missing its PR number renders nothing.
+_adopt_orphan_row() {
+  local _ao_epoch _ao_pr _ao_branch _ao_dir
+  IFS=$'\t' read -r _ao_epoch _ao_pr _ao_branch _ao_dir <<EOF
+$1
+EOF
+  [ -n "${_ao_pr:-}" ] || return 0
+  printf '    %s🚨%s %s#%s%s adopted but NOT discovered %s%s%s · no worktree at %s%s%s · never gated · git worktree add "%s" "%s"%s' \
+    "$C_RED" "$C_RESET" "$C_BOLD" "$_ao_pr" "$C_RESET" \
+    "$C_DIM" "${_ao_branch:-}" "$C_RESET" \
+    "$C_DIM" "${_ao_dir:-}" "$C_RESET" "${_ao_dir:-}" "${_ao_branch:-}" "$C_RESET"
+}
+
+# build_adopt_orphans — pure renderer of ADOPT_ORPHAN_LEDGER (written ONLY by _adopt_verify_scan, which
+# self-gates on ADOPT_REMOTE_PRS): empty ledger ⇒ ADOPT_ORPHAN_SECTION_ROWS stays empty ⇒ render omits
+# the section ⇒ a console with the lever off (or with every adopt verified) is byte-identical.
+build_adopt_orphans() {
+  ADOPT_ORPHAN_SECTION_ROWS=""
+  _adopt_remote_prs_enabled || return 0   # turning the lever off is a HARD no-op (mirrors build_orphan_prs)
+  [ -s "$ADOPT_ORPHAN_LEDGER" ] || return 0
+  local rows
+  rows="$(herd_console_section "$ADOPT_ORPHAN_LEDGER" "$ADOPT_ORPHAN_ROWS_LIMIT" \
+    _adopt_orphan_classify _adopt_orphan_row)"
+  [ -n "$rows" ] && ADOPT_ORPHAN_SECTION_ROWS="${rows}"$'\n'
   return 0
 }
 
@@ -2189,6 +2681,9 @@ _adopt_remote_prs_scan() {
     return 0
   fi
   local _ars_json="${1:-[]}" _ars_claimed="${2:-}" _ars_wt="${3:-}" _ars_out
+  # HERD-526: verify PRIOR scans' adopts against discovery FIRST — rows this scan enqueues are appended
+  # after this pass, so every adopt is first checked on a LATER scan (the "next tick" the proof is about).
+  _adopt_verify_scan "$_ars_json"
   _ars_out="$(PRS_JSON="$_ars_json" CLAIMED="$_ars_claimed" python3 -c '
 import os, sys, json
 try:
@@ -2294,6 +2789,14 @@ render() {
   if [ -n "${TRACKER_DRIFT:-}" ]; then
     frame="${frame}  ${C_DIM}tracker healed${C_RESET}"$'\n'"${TRACKER_DRIFT}"$'\n'
   fi
+  # UNLINKED MERGES (HERD-522, GH #637) — merged PRs whose `refs:` line parsed to no tracker id, so
+  # the reconcile linked nothing and the item is still open. Sits directly under "tracker healed"
+  # because it is the same subject seen from the other side: what the tracker sweep CANNOT heal,
+  # because there is no ref to heal by. Empty on every repo where every merged PR's ref parsed, so
+  # the console is byte-identical when this never fires.
+  if [ -n "${REF_UNPARSED_ROWS:-}" ]; then
+    frame="${frame}  ${C_RED}unlinked merges${C_RESET}"$'\n'"${REF_UNPARSED_ROWS}"$'\n'
+  fi
   if [ -n "${SPAWN_HOLDS:-}" ]; then
     frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
   fi
@@ -2346,6 +2849,13 @@ render() {
   # tick, so byte-identical when every open PR has a builder record.
   if [ -n "${UNGATED_PR_SECTION_ROWS:-}" ]; then
     frame="${frame}  ${C_DIM}ungated PRs${C_RESET}"$'\n'"${UNGATED_PR_SECTION_ROWS}"$'\n'
+  fi
+  # ADOPTED BUT NOT DISCOVERED (HERD-526, GH #657) — the LOUDEST of the three PR-visibility sections:
+  # unlike an orphan/ungated PR (which nothing has claimed yet), this one the engine ALREADY claimed to
+  # have adopted, and it is nonetheless invisible to the gate. Empty unless an adopt failed its
+  # discovery proof this scan, so the frame is byte-identical in the steady state.
+  if [ -n "${ADOPT_ORPHAN_SECTION_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}adopted · ungated${C_RESET}"$'\n'"${ADOPT_ORPHAN_SECTION_ROWS}"$'\n'
   fi
   # RETIRING (HERD-164) — slugs whose worktree is already gone but whose tab/agent/ledger has not
   # converged yet (the ones that can't appear among the worktree-derived in-flight rows). Empty when
@@ -3213,6 +3723,56 @@ _retire_reviewer_pane() {
   rm -f "$reg" 2>/dev/null || true
 }
 
+# _close_review_viewer_tab <slug> [reason] — retire the STANDALONE review·<slug> viewer tab by
+# SLUG-LABELED lookup (HERD-523 leg 2 / issue #634).
+#
+# The leak this closes: when herd-review.sh falls back to a standalone review·<slug> tab, the ONLY
+# record of that tab is a line appended to $TREES/.herd-tabs. Both teardown paths key on that registry
+# — merge teardown (herd_teardown_slug) and the orphan sweep's allowlist model — so a registration
+# write that fails leaves the tab live, unregistered, and therefore PERMANENTLY un-sweepable: no rail
+# can even see it. (herd-review.sh now journals that failed write rather than swallowing it, but a
+# journal line does not close a tab.)
+#
+# So teardown must not depend on the registry at all. This closes the tab the way _purge_stale_review_tab
+# already does on re-dispatch — by asking herdr for the tab LABELED for this slug — which works with an
+# EMPTY .herd-tabs. The registry row is still dropped afterwards when one exists, so a successful
+# registration never lingers as a stale row.
+#
+# LABEL MATCH, tightened: _purge_stale_review_tab uses a bare startswith("review·<slug>"), which on a
+# prefix-colliding pair (slug "auth" vs "auth-retry") would also match the OTHER slug's tab. There it
+# is bounded — that path is about to recreate the tab it just closed — but here we close on someone
+# else's verdict, so the match is anchored: the exact label, or the label followed by a space (the
+# "review·<slug> ✅" decorated form). Never a bare prefix.
+#
+# FAIL-SOFT + byte-quiet: no herdr, no matching tab, or a close hiccup ⇒ no output, no journal line —
+# the overwhelmingly common case (the reviewer ran as a split INSIDE the builder's tab, so there is no
+# viewer tab at all) is a silent no-op. Dry-run inert.
+_close_review_viewer_tab() {
+  local _crv_slug="${1:-}" _crv_reason="${2:-verdict-consumed}" _crv_ws _crv_tab
+  [ -z "${DRYRUN:-}" ] || return 0
+  [ -n "$_crv_slug" ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  # Headless is panes-as-a-view: there are no tabs at all, so there is nothing to look up or close —
+  # skip BEFORE the control-room reads, the same shape every driver pane seam uses.
+  _herd_driver_is_headless && return 0
+  _crv_ws="$(herd_resolve_workspace_id 2>/dev/null || true)"
+  _crv_tab="$(herdr tab list ${_crv_ws:+--workspace "$_crv_ws"} 2>/dev/null | SLUG="$_crv_slug" python3 -c '
+import sys, json, os
+want = "review·" + os.environ.get("SLUG", "")
+try:
+    tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
+    print(next((t["tab_id"] for t in tabs
+                if (t.get("label", "") == want or t.get("label", "").startswith(want + " "))), ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  [ -n "${_crv_tab:-}" ] || return 0
+  herdr tab close "$_crv_tab" >/dev/null 2>&1 || true
+  journal_append review_viewer_tab_closed slug "$_crv_slug" tab "$_crv_tab" reason "$_crv_reason"
+  # Drop the allowlist row when the registration DID land; a no-op when it never did (the leak case).
+  _herd_tabs_drop_row "$TREES/.herd-tabs" "$_crv_tab"
+}
+
 # _sweep_reviewer_registry — one-shot STARTUP reconcile of the dispatch registry against live
 # pids/panes (HERD-113 requirement 3). For each (pr,sha) row: a still-alive poller is a genuinely live
 # reviewer → left untouched (a later dispatch ADOPTS it). A dead poller whose PANE still exists is an
@@ -3746,6 +4306,12 @@ _review_gate_step() {
     # an INFRA-FAIL reviewer that already tore down its own pane).
     rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
     _retire_reviewer_pane "$pr" "$sha" verdict-consumed
+    # …and the STANDALONE viewer tab, if this review ran on the fallback placement (HERD-523 leg 2 /
+    # issue #634). _retire_reviewer_pane only ever retires the pane the DISPATCH REGISTRY names — the
+    # split inside the builder's tab — so a fallback dispatch's whole tab survived verdict consumption
+    # and was reaped only if its .herd-tabs row had landed. This closes it by slug label instead, so
+    # teardown holds with an EMPTY registry. Byte-quiet no-op in the common split placement.
+    _close_review_viewer_tab "$slug" verdict-consumed
     echo "$_rgs_echo"; return 0
   fi
 
@@ -5599,66 +6165,12 @@ record_reconcile() {
   printf '%s %s %s %s\n' "$(date +%s)" "$1" "$2" "$3" >> "$RECONCILE_STATE"
 }
 
-# HERD_PR_REF_PY — THE ONE implementation of "given a PR body, print its explicit `Refs:` value".
-# Every surface that reads a PR's tracker ref reuses this snippet rather than re-deriving the rules,
-# per the invariance-first doctrine (docs/multi-seat-doctrine.md): merge-time reconcile
-# (_reconcile_pr_ref, below) and the sweep's retroactive-linkage leg (sweep.sh) both parse the same
-# bytes, and a faithful copy in the second place is a copy that drifts. Same shape as
-# backends/linear.sh's _LINEAR_PICK_STATE_PY: a python function definition, prepended to whichever
-# driver the caller needs (one body on stdin, or a whole `gh pr list` array).
-#
-# The rules, in one place:
-#   • STRIP HTML COMMENT BLOCKS FIRST. `gh pr view --json body` returns raw markdown with `<!-- … -->`
-#     intact — GitHub does not strip them from a classic PULL_REQUEST_TEMPLATE.md. An example `Refs:`
-#     buried in the template's own comment would otherwise poison every untracked PR.
-#   • The FIRST `Refs:` line, case-insensitive, anchored at line start; first whitespace-delimited
-#     token after the colon.
-#   • STRIP TRAILING PUNCTUATION. `Refs: HERD-267,` and `Refs: HERD-267.` are the same ref as
-#     `Refs: HERD-267`. Without this the sweep's shape test reads `267,` as "not an identifier" and
-#     declares — with no lookup at all — that the item was never minted.
-#   • A template PLACEHOLDER (`<…>`, none, n/a, na) is NOT a ref.
-HERD_PR_REF_PY='
-import re
-_PR_REF_PLACEHOLDER = {"", "none", "n/a", "na"}
-def pr_ref_from_body(body):
-    body = re.sub(r"<!--.*?-->", "", body or "", flags=re.DOTALL)
-    for line in body.splitlines():
-        m = re.match(r"^\s*refs:\s*(\S+)", line, re.IGNORECASE)
-        if not m:
-            continue
-        ref = m.group(1).rstrip(".,;:!)]}")
-        if ref.startswith("<") or ref.lower() in _PR_REF_PLACEHOLDER:
-            return ""
-        return ref
-    return ""
-'
-
-# herd_pr_ref_from_body — read a PR body on stdin, print its `Refs:` value (empty when there is none).
-# The shell-side entry point to HERD_PR_REF_PY.
-#
-# NO-PYTHON3 FALLBACK. python3 is a hard engine dep, but this function sits on the merge tail, and the
-# pre-HERD-267 code degraded to a grep/sed pass rather than silently dropping every explicit ref onto
-# the fuzzy path. That degradation is preserved: the comment strip is what needs python (a multi-line
-# regex), so without it we grep the RAW body — the line-start anchor and the placeholder guard are
-# still a partial defense, exactly as before.
-herd_pr_ref_from_body() {
-  local body ref
-  body="$(cat)"
-  if command -v python3 >/dev/null 2>&1; then
-    ref="$(printf '%s' "$body" | python3 -c "$HERD_PR_REF_PY"'
-import sys
-sys.stdout.write(pr_ref_from_body(sys.stdin.read()))' 2>/dev/null)" && { printf '%s' "$ref"; return 0; }
-  fi
-  # Degraded path: same rules, minus the HTML-comment strip.
-  ref="$(printf '%s\n' "$body" \
-    | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
-    | head -n1 \
-    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//; s/[.,;:!)}]+$//' 2>/dev/null || true)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
-  case "$ref" in
-    ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;
-  esac
-  printf '%s' "$ref"
-}
+# THE `Refs:` PARSER — moved to scripts/herd/pr-ref.sh (HERD-522), sourced near the top of this file
+# alongside the other shared libraries. HERD_PR_REF_PY (the python snippet sweep.sh prepends to its
+# own `gh pr list` driver), herd_pr_ref_from_body and herd_pr_ref_unparsed_line all live there now,
+# as ONE implementation the reconcile, the sweep, the stale-dup gate and the tracker-state sweep
+# every one of them share. This is a MOVE, not a rewrite of the call sites: both names resolve at
+# CALL time exactly as before.
 
 # _reconcile_pr_ref — moved to work-units/git-pr.sh (HERD-398, Phase 3 work-unit extraction).
 
@@ -14989,6 +15501,7 @@ _tick_render_reconcile() {
   build_reconcile_pending
   build_blocked
   build_tracker_drift
+  build_ref_unparsed        # HERD-522: merged PRs whose `refs:` line parsed to nothing (empty when none)
   build_spawn_holds
   build_engine_note
   build_engine_seat_note   # HERD-308: the dual-engine HALT/coexistence row (empty unless a mismatch)
@@ -15481,6 +15994,19 @@ EOF
   # (zero extra gh). Renders whenever an open PR carries no builder/worktree record and the adopt leg
   # has not (yet, or ever will) picked it up — see _ungated_prs_scan's header comment.
   _ungated_prs_scan "$PRS_JSON" "$_orphan_claimed"
+
+  # HERD-527 (GH #639 phase 1) teammate presence — throttled to the ~60 s scan cadence (two network
+  # reads: PR bodies + the backend's rich roster), exactly like adopt_scan above. It runs BETWEEN the
+  # scan and the render because it reads the ledger the scan just rewrote and writes the attribution
+  # cache build_ungated_prs reads. Self-gates on TEAM_PRESENCE; off (default) is byte-inert — no gh, no
+  # backend call, no ledger, and _ungated_pr_row's attribution branch is unreachable.
+  if _team_presence_enabled; then
+    _TEAM_PRESENCE_SCAN_TICK=$((_TEAM_PRESENCE_SCAN_TICK + 1))
+    if [ "$_TEAM_PRESENCE_SCAN_TICK" -ge "$_TEAM_PRESENCE_SCAN_INTERVAL" ]; then
+      _TEAM_PRESENCE_SCAN_TICK=0
+      _team_presence_scan
+    fi
+  fi
   build_ungated_prs
 
   # HERD-369 adopt remote PRs — throttled to the ~60 s scan cadence (network + git mutation, unlike
@@ -15494,6 +16020,11 @@ EOF
       _adopt_remote_prs_scan "$PRS_JSON" "$_orphan_claimed" "$WT"
     fi
   fi
+  # HERD-526 adopted-but-not-discovered alarm — a PURE renderer of the ledger the scan above writes
+  # (empty whenever ADOPT_REMOTE_PRS is off or every adopt has been verified), so it is called
+  # unconditionally and every tick, exactly like build_ungated_prs, and adds nothing to the frame
+  # until an adopt actually fails its discovery proof.
+  build_adopt_orphans
 
   # HERD-402 finish-stall scan observability — throttled to the ~60 s scan cadence, exactly like
   # adopt_scan above (HERD-388): the leg's own detection/action runs every tick inside the FEATS loop
@@ -16046,6 +16577,10 @@ _FINISH_STALL_SCAN_INTERVAL=15   # HERD-402: finish_stall_scan journal summary e
                                   # emission is throttled, the leg's own detection/action still runs
                                   # every tick (see the FEATS loop's _reconcile_finish_stall call)
 _FINISH_STALL_SCAN_TICK=$_FINISH_STALL_SCAN_INTERVAL  # primed so the FIRST enabled tick emits, then every interval
+_TEAM_PRESENCE_SCAN_INTERVAL=15  # HERD-527: teammate-presence resolve every ~60 s (15 × 4 s sleep) —
+                                  # the two tracker/gh reads never ride the 4 s repaint; the repaint
+                                  # renders from the ledger those reads leave behind
+_TEAM_PRESENCE_SCAN_TICK=$_TEAM_PRESENCE_SCAN_INTERVAL  # primed so the FIRST enabled tick scans, then every interval
 
 # ENGINE WATCHDOG state (HERD-306) — the resident supervisor's fault memory across ticks. There is no
 # bash action-pass fallback anymore: _engine_tick_watchdog runs the sole (Python) engine core, RETRIES

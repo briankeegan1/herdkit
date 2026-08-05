@@ -370,7 +370,10 @@ if [ -n "$HOOK_CMD" ]; then
     "reason": "rate_limit",
     "message": os.environ["HERD_SIM_BANNER"],
   }))')"
-  printf '%s' "$HOOK_EVENT" | bash -c "$HOOK_CMD"
+  # HERD-525: the generated command resolves its sentinel dir from $CLAUDE_PROJECT_DIR/$PWD at
+  # RUNTIME (no absolute path baked in at generate time) — run it with cwd == the worktree, exactly
+  # as Claude Code invokes a project-level hook, so it lands at $WT/.herd-limit-sentinel.
+  (cd "$WT" && printf '%s' "$HOOK_EVENT" | bash -c "$HOOK_CMD")
   info "hook command: $HOOK_CMD"
 fi
 set_agent "$SLUG" idle "$PANE"    # the parked session has ENDED (not working)
@@ -492,7 +495,8 @@ except Exception:
     pass
 PY
 )"
-[ -n "$NEG_HOOK_CMD" ] && printf '%s' "$RESET" | bash -c "$NEG_HOOK_CMD"
+# HERD-525: run with cwd == the worktree so the runtime PWD-fallback resolves to $NEG_WT.
+[ -n "$NEG_HOOK_CMD" ] && (cd "$NEG_WT" && printf '%s' "$RESET" | bash -c "$NEG_HOOK_CMD")
 _claude_before_neg="$(wc -l < "$CLAUDE_INVOCATION_LOG" | tr -d ' ')"
 export HERD_NOW_EPOCH="$NOW0"
 _neg_detected=no

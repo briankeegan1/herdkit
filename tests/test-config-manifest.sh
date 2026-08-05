@@ -241,12 +241,18 @@ EXEMPT_NAMES = {
     "PRS_LOOKUP_OK",  # assigned in work-units/git-pr.sh's _prs_fetch_tick, read in agent-watch.sh — a
                        # deliberate cross-file contract (HERD-398) between the git-pr adapter and the
                        # watcher tick, mirroring PRS_JSON above, not a .herd/config knob
+    "REF_UNPARSED_FILE",  # assigned in agent-watch.sh (its ref-unparsed console ledger path), read in
+                           # work-units/git-pr.sh's _reconcile_ref_unparsed_alarm — the mirror-direction
+                           # cross-file contract (HERD-537) of PRS_LOOKUP_OK above, not a .herd/config knob
     "RESEARCH_HEARTBEAT", "RESEARCH_INBOX", "RESEARCH_MODEL", "RESEARCH_QUEUE",
     "RESEARCH_REPORTS", "RESEARCH_TAB", "RESEARCH_TREES", "RESOLVER_MODEL", "ROOT",
     "SCRIBE_BACKEND_DIR", "SCRIBE_MODEL", "SCRIBE_TAB", "SLUG", "SPAWN_HOLDS", "STATES_FILE",
     "TAB", "TEMPLATES_DIR", "TMPDIR", "TRACKER_DRIFT", "TREES", "TSWEEP_LIMIT", "WPANE",
     "WT",  # agent-watch.sh: git worktree list --porcelain for this tick
     "HOSTNAME",  # bash shell built-in (set by the shell, never a .herd/config knob)
+    "CLAUDE_PROJECT_DIR",  # HERD-525: Claude Code exports this into every hook's environment (the
+                            # project root); herd_write_ratelimit_hook's generated command reads it at
+                            # HOOK RUNTIME to resolve the sentinel path portably — never a .herd/config knob.
 }
 def exempt(k, declared, file_locals):
     if k in declared:        # already declared → not a ghost

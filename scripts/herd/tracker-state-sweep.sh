@@ -87,6 +87,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # with the watcher's builder-notes ledger. Defines functions + constants only.
 # shellcheck source=/dev/null
 . "$HERE/console-section.sh"
+# THE shared `Refs:` parser (HERD-522) — this sweep is the merge-time reconcile's BACKSTOP, so reading
+# a ref even slightly differently from it is the one drift that would make the backstop miss exactly
+# what the primary path missed. Defines HERD_PR_REF_PY + two functions; sourcing is idempotent.
+# shellcheck source=/dev/null
+. "$HERE/pr-ref.sh"
 REPO="$PROJECT_ROOT"
 
 _tsweep_die() { echo "tracker-state-sweep: $1" >&2; exit "${2:-1}"; }
@@ -132,11 +137,12 @@ _tsweep_backend_supported() {
 
 # ── data source: recently-merged PRs with their Refs ──────────────────────────
 # _merged_refs — "<pr#>\t<ref>" per line, one per recently-merged PR that carries an explicit
-# `Refs: <id>` line. The ref is extracted with the SAME defenses as agent-watch's _reconcile_pr_ref:
-# HTML comment blocks are stripped first (a PR-template example 'Refs:' lives inside a comment and
-# would otherwise poison the extractor), then the first line-anchored `Refs:` token is taken, and
-# template placeholders (<...>, none, n/a) are dropped. Best-effort + fail-soft: no gh / offline /
-# body-less all yield fewer (or zero) lines, never a hard error.
+# `Refs: <id>` line. The ref is extracted by the SHARED parser (pr-ref.sh's HERD_PR_REF_PY, HERD-522)
+# — not a local re-derivation of its defenses, which is what this used to be: HTML comment blocks
+# stripped first (a PR-template example 'Refs:' lives inside a comment and would otherwise poison the
+# extractor), the first decoration-tolerant `Refs:` token taken, template placeholders (<...>, none,
+# n/a) dropped. Best-effort + fail-soft: no gh / offline / body-less all yield fewer (or zero) lines,
+# never a hard error.
 #
 # CRITICAL: PR bodies are MULTI-LINE. We take the RAW JSON array (gh --json, NO -q) and parse it with
 # python's json.load — NOT a jq `\(.number)\t\(.body)` template piped line-by-line, which spills each
@@ -153,25 +159,18 @@ _merged_refs() {
     json="$(cd "$REPO" && gh pr list --state merged --limit "$LIMIT" --json number,body 2>/dev/null)" || return 0
   fi
   [ -n "$json" ] || return 0
-  printf '%s' "$json" | python3 -c '
-import sys, re, json
+  printf '%s' "$json" | python3 -c "$HERD_PR_REF_PY"'
+import sys, json
 try:
     prs = json.load(sys.stdin)
 except Exception:
     prs = []
 for pr in prs if isinstance(prs, list) else []:
-    num  = pr.get("number")
-    body = pr.get("body") or ""
+    num = pr.get("number")
     if num is None:
         continue
-    body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)   # strip template comments first
-    ref = ""
-    for ln in body.splitlines():
-        m = re.match(r"\s*[Rr][Ee][Ff][Ss]:\s*(\S+)", ln)      # first line-anchored Refs: token
-        if m:
-            ref = m.group(1)
-            break
-    if ref and not (ref.startswith("<") or ref.lower() in ("none", "n/a", "na")):
+    ref = pr_ref_from_body(pr.get("body") or "")
+    if ref:
         print("%s\t%s" % (num, ref))
 ' 2>/dev/null || true
 }
@@ -230,21 +229,23 @@ _tsweep_ref_backend_mismatch() {
   return 0
 }
 
-# _tsweep_gh_evidence REF — best-effort, READ-ONLY: when HERD_REPO names a repo and gh is on PATH,
+# _tsweep_gh_evidence REF — best-effort, READ-ONLY: when TRACKER_REPO names a repo and gh is on PATH,
 # looks up the bare numeric ref as a github issue purely to record found-state EVIDENCE in the
 # unresolvable journal event's detail. Never a resolution path — mixing github's numbering into a
 # non-github backend's heal would risk resolving the WRONG item if a numeric id ever collides with a
 # real local one (the latent hazard above). Fail-soft: prints nothing on any absence/error.
-# HERD_REPO is NOT set by this script — it is the existing config key herd-config.sh already sources
-# above (default EMPTY: `: "${HERD_REPO:=""}"`), the same one the github backend uses for its own
-# issue ops. This function adds no new required input: on a project that has it configured, the
-# evidence lookup fires for free; everywhere else it stays silently empty (fail-soft), exactly as
-# before this function existed.
+# TRACKER_REPO is NOT set by this script — it is the existing config key herd-config.sh already
+# sources above (default EMPTY: `: "${TRACKER_REPO:=""}"`), the SAME one the github backend uses for
+# its own issue ops (HERD-534: this used to read HERD_REPO — the report/triage escalation key, never
+# this project's own tracker repo — so a project with HERD_REPO configured but a non-github
+# SCRIBE_BACKEND had this evidence lookup silently probe a STRANGER's repo). This function adds no new
+# required input: on a project that has TRACKER_REPO configured, the evidence lookup fires for free;
+# everywhere else it stays silently empty (fail-soft), exactly as before this function existed.
 _tsweep_gh_evidence() {
   local num="${1#\#}"
-  [ -n "${HERD_REPO:-}" ] || return 0
+  [ -n "${TRACKER_REPO:-}" ] || return 0
   command -v gh >/dev/null 2>&1 || return 0
-  gh issue view "$num" -R "$HERD_REPO" --json state 2>/dev/null \
+  gh issue view "$num" -R "$TRACKER_REPO" --json state 2>/dev/null \
     | python3 -c 'import sys, json
 try: print(json.load(sys.stdin).get("state", "").lower())
 except Exception: pass' 2>/dev/null || true

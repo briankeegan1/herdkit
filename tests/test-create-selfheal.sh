@@ -647,7 +647,12 @@ ok; echo "PASS (16) linear's tri-state probe: missing / exists / UNPROVEN are th
 
 # ══ (17) THE Refs: EXTRACTOR IS ONE IMPLEMENTATION, SHARED ═══════════════════════════════════════
 # sweep.sh must not carry a second copy of merge-time reconcile's parser (docs/multi-seat-doctrine.md).
-grep -q 'HERD_PR_REF_PY' "$HERE/../scripts/herd/agent-watch.sh" || fail "(17) the shared extractor is gone"
+# HERD-522 moved that parser out of agent-watch.sh into its own module (scripts/herd/pr-ref.sh) and
+# folded the OTHER two copies — stale-dup-gate.sh and tracker-state-sweep.sh — into it as well; the
+# full unification is proven by tests/test-pr-ref-parse.sh. This check keeps sweep.sh's half honest.
+grep -q 'HERD_PR_REF_PY' "$HERE/../scripts/herd/pr-ref.sh" || fail "(17) the shared extractor is gone"
+grep -q 'pr-ref.sh' "$HERE/../scripts/herd/agent-watch.sh" \
+  || fail "(17) agent-watch.sh no longer sources the shared Refs: extractor"
 grep -q 'HERD_PR_REF_PY' "$HERE/../scripts/herd/sweep.sh" \
   || fail "(17) sweep.sh no longer reuses the shared Refs: extractor"
 grep -q 'refs:' "$HERE/../scripts/herd/sweep.sh" \

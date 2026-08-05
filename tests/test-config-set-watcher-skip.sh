@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# test-config-set-watcher-skip.sh — hermetic proof of HERD-519 leg (a): the watcher-restart
+# side-effect of `herd config set` is CONDITIONAL on a watcher existing, and BOUNDED when one does.
+#
+# THE DEFECT. A watcher-affecting `config set` called cmd_reload unconditionally. With no control room
+# running, reload's rebuild leg reaches the pane/socket surface (`herdr workspace list`), which blocks
+# without bound when the herdr server is gone or wedged — so the command sat there forever printing
+# nothing, and (if it ever got past) relaunched a headless watcher nobody asked for. It is the loudest
+# paper cut on a fresh collaborator clone (epic HERD-517).
+#
+# What this asserts:
+#   (A) NO LIVE WATCHER → the restart is SKIPPED: rc=0, promptly, with a one-line note; the KEY still
+#       lands in .herd/config; the coordinator skill is still re-rendered; cmd_reload never runs.
+#   (B) A LIVE WATCHER (planted under this workspace's argv0, the shared watcher-exempt.sh identity)
+#       → the restart STILL runs and still stops that watcher. The lever is not a blanket off-switch.
+#   (C) A WEDGED pane surface → the restart is stopped at the bound (HERD_CONFIG_RELOAD_TIMEOUT) and
+#       the failure is LOUD but NON-FATAL: rc=0, a warning naming the un-restarted watcher, and the
+#       value still written.
+#   (D) A NON-watcher key is untouched by all of this (byte-identical no-op path).
+#
+# Fully hermetic: temp git repos, stub herdr/pgrep on PATH, no network, no real daemon. The only
+# processes it creates are its own `sleep` decoys, planted under this fixture's unique argv0.
+# Run:  bash tests/test-config-set-watcher-skip.sh
+set -uo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+HERD="$HERE/../bin/herd"
+[ -f "$HERD" ] || { echo "FAIL: missing $HERD" >&2; exit 1; }
+
+T="$(mktemp -d)"; trap 'rm -rf "$T"; _reap_decoys' EXIT
+PASS=0
+fail() { echo "FAIL: $1" >&2; exit 1; }
+ok()   { PASS=$((PASS + 1)); echo "PASS: $1"; }
+
+DECOYS=""
+_reap_decoys() { local p; for p in $DECOYS; do kill -9 "$p" 2>/dev/null || true; done; }
+
+# ── stubs on PATH ────────────────────────────────────────────────────────────────────────────────
+BIN="$T/bin"; mkdir -p "$BIN"
+# pgrep: `-P` (children of a pid) delegates to the REAL pgrep so the bounded-reload descendant kill is
+# exercised faithfully; every other form — the engine's `pgrep -f agent-watch.sh` legacy-stray scan —
+# returns only planted pids, so no real process on this machine is ever a candidate.
+cat > "$BIN/pgrep" <<'STUB'
+#!/usr/bin/env bash
+if [ "${1:-}" = "-P" ]; then
+  [ -x /usr/bin/pgrep ] && exec /usr/bin/pgrep -P "${2:-}"
+  exit 1
+fi
+IFS=':' read -ra pids <<< "${FAKE_STRAY_PIDS:-}"
+for p in "${pids[@]}"; do [ -n "$p" ] && printf '%s\n' "$p"; done
+exit 0
+STUB
+chmod +x "$BIN/pgrep"
+# herdr: absent-by-default (exit 1). The wedged-surface leg swaps in a HANGING one.
+printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
+export PATH="$BIN:$PATH"
+
+# ── capabilities manifest (stub): one watcher-affecting key, one plain key ───────────────────────
+CAPS="$T/capabilities.tsv"
+{
+  printf 'name\tkind\tdescription\twhen_to_surface\trequires\tscope\tgovernance\tvalue_shape\n'
+  printf 'WORKSPACE_NAME\tconfig\tProject label\tAlways required\twatcher\t\t\tfree\n'
+  printf 'REVIEW_CONCURRENCY\tconfig\tMax parallel reviews\tRaise for throughput\twatcher\t\t\tnumeric\n'
+  printf 'SCRIBE_BACKEND\tconfig\tWork-tracker backend\tSet for a tracker\t\t\t\tfree\n'
+} > "$CAPS"
+export HERD_CAPABILITIES_FILE="$CAPS"
+
+# _make_project <dir> <workspace> — a committed hermetic repo with a minimal .herd/config.
+_make_project() {
+  local r="$1" ws="$2" r_real
+  mkdir -p "$r"; git -C "$r" init -q -b main
+  git -C "$r" config user.email t@t.local; git -C "$r" config user.name t
+  git -C "$r" commit -q --allow-empty -m base
+  r_real="$(cd "$r" && pwd -P)"
+  mkdir -p "$r/.herd" "$r/trees"
+  cat > "$r/.herd/config" <<CFG
+# .herd/config — HERD-519 leg (a) fixture
+HERD_VERSION=1
+PROJECT_ROOT="$r_real"
+WORKTREES_DIR="$r_real/trees"
+DEFAULT_BRANCH="origin/main"
+WORKSPACE_NAME="$ws"
+SCRIBE_BACKEND="file"
+REVIEW_CONCURRENCY="2"
+CFG
+}
+
+# _run <dir> <args...> — run the CLI in <dir>, capturing output + rc + elapsed seconds.
+_run() {
+  local r="$1"; shift
+  local t0=$SECONDS
+  OUT="$( cd "$r" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 FAKE_STRAY_PIDS="" \
+            bash "$HERD" "$@" 2>&1 )"
+  RC=$?
+  ELAPSED=$((SECONDS - t0))
+}
+
+# _plant_watcher <workspace-slug> — a decoy process carrying THIS workspace's watcher argv0, which is
+# exactly the identity scripts/herd/watcher-exempt.sh enumerates. Echoes its pid. The decoy's own
+# stdout/stderr go to /dev/null: it outlives this function, and a child holding the command
+# substitution's pipe open would block the caller until the decoy exits.
+_plant_watcher() {
+  bash -c "exec -a herd-watch-$1 sleep 300" >/dev/null 2>&1 &
+  local p=$!
+  # Give the exec a moment to land in the process table under its new argv0.
+  local i=0
+  while [ "$i" -lt 25 ]; do
+    grep -q "herd-watch-$1" <<< "$(ps -o command= -p "$p" 2>/dev/null)" && break
+    sleep 0.2; i=$((i + 1))
+  done
+  printf '%s' "$p"
+}
+
+# ══ (A) no live watcher → SKIP the restart, promptly, with the note ═════════════════════════════
+P="$T/nowatcher"; _make_project "$P" "hk519-none"
+_run "$P" config set REVIEW_CONCURRENCY 5
+[ "$RC" -eq 0 ] || fail "(A) config set on a watcher key returned rc=$RC with no watcher running: $OUT"
+[ "$ELAPSED" -lt 30 ] || fail "(A) config set took ${ELAPSED}s — it must return promptly, not hang"
+ok "A1 config set on a watcher key with no watcher returns rc=0 promptly (${ELAPSED}s)"
+
+grep -qi 'no live watcher' <<< "$OUT" || fail "(A) no note explaining the skipped restart: $OUT"
+grep -qi 'skipped' <<< "$OUT"         || fail "(A) the note does not say the restart was SKIPPED: $OUT"
+ok "A2 the skip is narrated in one line naming the reason"
+
+grep -qi 'rebuilding the control room' <<< "$OUT" \
+  && fail "(A) herd reload ran anyway — the restart was not skipped: $OUT"
+ok "A3 cmd_reload never runs when no watcher exists"
+
+grep -qE '^[[:space:]]*REVIEW_CONCURRENCY="5"' "$P/.herd/config" \
+  || fail "(A) the key did not land in .herd/config: $(grep REVIEW_CONCURRENCY "$P/.herd/config")"
+ok "A4 the key still lands in .herd/config (only the restart is skipped)"
+
+[ -f "$P/.claude/commands/coordinator.md" ] \
+  || fail "(A) the coordinator skill was not re-rendered on the skip path"
+ok "A5 the coordinator skill is still re-rendered (a local write, no socket)"
+
+# ══ (B) a live watcher → the restart STILL runs, and still stops it ═════════════════════════════
+Q="$T/watcher"; _make_project "$Q" "hk519-live"
+WPID="$(_plant_watcher hk519-live)"; DECOYS="$DECOYS $WPID"
+kill -0 "$WPID" 2>/dev/null || fail "(B) the planted decoy watcher did not start"
+OUT="$( cd "$Q" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 FAKE_STRAY_PIDS="" \
+          HERD_RELOAD_SKIP_LAUNCH=1 HERD_RELOAD_SIGTERM_POLLS=15 \
+          bash "$HERD" config set REVIEW_CONCURRENCY 7 2>&1 )"; RC=$?
+[ "$RC" -eq 0 ] || fail "(B) config set failed with a live watcher (rc=$RC): $OUT"
+grep -qi 'restarting the watcher' <<< "$OUT" \
+  || fail "(B) the restart did not run although a watcher was alive: $OUT"
+grep -qi 'no live watcher' <<< "$OUT" \
+  && fail "(B) the skip note fired although a watcher was alive: $OUT"
+ok "B1 a live watcher still triggers the restart (the skip is not a blanket off-switch)"
+
+_i=0; while [ "$_i" -lt 25 ] && kill -0 "$WPID" 2>/dev/null; do sleep 0.2; _i=$((_i + 1)); done
+kill -0 "$WPID" 2>/dev/null && fail "(B) the live watcher was not stopped by the restart"
+ok "B2 the restart actually stops the live watcher"
+
+# ══ (C) a WEDGED pane surface → bounded, loud, non-fatal ═══════════════════════════════════════
+# The herdr stub now HANGS, reproducing the wedged socket that caused the original hang. The bound is
+# set to 1s; HERD_RELOAD_SKIP_LAUNCH=fallback keeps the herdr path live while making a real headless
+# watcher spawn impossible even if the bound were broken.
+printf '#!/usr/bin/env bash\nsleep 120\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
+W="$T/wedged"; _make_project "$W" "hk519-wedge"
+WPID2="$(_plant_watcher hk519-wedge)"; DECOYS="$DECOYS $WPID2"
+t0=$SECONDS
+OUT="$( cd "$W" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 FAKE_STRAY_PIDS="" \
+          HERD_RELOAD_SKIP_LAUNCH=fallback HERD_RELOAD_SIGTERM_POLLS=15 \
+          HERD_CONFIG_RELOAD_TIMEOUT=1 \
+          bash "$HERD" config set REVIEW_CONCURRENCY 9 2>&1 )"; RC=$?
+ELAPSED=$((SECONDS - t0))
+printf '#!/usr/bin/env bash\nexit 1\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
+[ "$RC" -eq 0 ] || fail "(C) a wedged reload made config set FATAL (rc=$RC) — it must warn, not die: $OUT"
+[ "$ELAPSED" -lt 60 ] || fail "(C) the bound did not hold — config set took ${ELAPSED}s against a wedged herdr"
+ok "C1 a wedged pane surface is bounded (${ELAPSED}s) and non-fatal (rc=0)"
+
+grep -qi 'did not finish within' <<< "$OUT" || fail "(C) the timeout was not reported loudly: $OUT"
+grep -qi "herd reload" <<< "$OUT" || fail "(C) the warning does not tell the operator how to finish: $OUT"
+ok "C2 the timeout warns loudly and names the manual follow-up"
+
+grep -qE '^[[:space:]]*REVIEW_CONCURRENCY="9"' "$W/.herd/config" \
+  || fail "(C) the key was lost when the restart timed out"
+ok "C3 the value is written even when the restart is abandoned"
+
+# ══ (D) a NON-watcher key is untouched by any of this ══════════════════════════════════════════
+D="$T/plain"; _make_project "$D" "hk519-plain"
+_run "$D" config set SCRIBE_BACKEND changelog
+[ "$RC" -eq 0 ] || fail "(D) a plain key set failed: $OUT"
+grep -qi 'no live watcher' <<< "$OUT" && fail "(D) the watcher note leaked onto a non-watcher key: $OUT"
+grep -qi 'restarting the watcher' <<< "$OUT" && fail "(D) a non-watcher key restarted the watcher: $OUT"
+grep -qi 'no watcher restart or skill re-render required' <<< "$OUT" \
+  || fail "(D) the non-watcher path's narration changed: $OUT"
+ok "D1 a non-watcher key keeps its byte-identical no-op path"
+
+echo "ALL PASS ($PASS checks)"
