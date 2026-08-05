@@ -79,6 +79,7 @@ Role summarized from each file's top-of-file comment.
 - `posture-lint.sh` — the CONFIG-POSTURE DOCTOR (HERD-154): a deterministic, no-LLM, report-only lint
 - `pr-ref.sh` — THE ONE implementation of "given a PR body, print its explicit `Refs:` value" (HERD-522).
 - `push-gate.sh` — the shared helper for the PUSH_GATE=human hold convention (HERD-123).
+- `red-ledger.sh` — THE shared RED-ROW LEDGER + RECHECK-CADENCE helper (HERD-539).
 - `research-get.sh` — research-get.sh <id> — coordinator helper to fetch a research finding by its REQ_ID (the id
 - `research-step.sh` — queue/report mechanics for the READ-ONLY research drainer. The researcher
 - `research.sh` — research.sh "<question>" — ENQUEUE a READ-ONLY repo research question and make sure exactly
@@ -140,7 +141,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `herd-claim.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -171,6 +172,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `oss-triage.sh` → `herd-config.sh`
 - `posture-lint.sh` → `merge-policy.sh`
 - `push-gate.sh` → `herd-config.sh`, `journal.sh`
+- `red-ledger.sh` → `console-section.sh`
 - `research-get.sh` → `herd-config.sh`
 - `research-step.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `research.sh` → `burst.sh`, `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
@@ -314,6 +316,8 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`
+- `RED_LEDGER` → `red-ledger.sh`
+- `RED_ROW_RECHECK_MINS` → `agent-watch.sh`
 - `REFIX_COMPLETE_MIN` → —
 - `REFIX_MAX_ROUNDS` → `agent-watch.sh`
 - `RESEARCH_POLL` → `research-step.sh`
@@ -348,6 +352,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `STORE_BACKEND` → —
 - `SWEEP_AUTO` → `bin/herd`, `sweep.sh`
 - `TASK_PANE_VIEW` → `herd-feature.sh`, `herd-quick.sh`
+- `TEAM_PRESENCE` → `agent-watch.sh`
 - `TOKEN_MODE` → `bin/herd`
 - `TRACKED_SPAWNS` → `bin/herd`
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
