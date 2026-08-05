@@ -815,6 +815,21 @@ except Exception:
     pass
 ' 2>/dev/null || true)"
 
+    # DELIVERED ≠ EXECUTED (HERD-523 / issue #633): herd_driver_launch_agent returning a pane id only
+    # proves the reviewer invocation was DELIVERED. The money-bets incident (2026-08-04) is the same
+    # family as the spawn stall PR #635 fixed: the command sat in the pane unexecuted, so the reviewer
+    # never ran and the gate burned its whole HERD_REVIEW_AGENT_TIMEOUT window before falling through
+    # here anyway. herd_review_wake_verify polls the roster for this reviewer, retries ONCE in THIS
+    # SAME pane (never a fresh tab), and on a verified stall closes the stalled pane and returns 1 —
+    # so we fall through to the standalone viewer tab NOW instead of 30 minutes from now. It returns 0
+    # (and this stays byte-identical to the pre-HERD-523 path) whenever verification is skipped:
+    # HERD_REVIEW_WAKE_VERIFY=off, the headless driver, or a roster that cannot report agent status.
+    if [ -n "${ROOT:-}" ] && ! herd_review_wake_verify "$SLUG" "$ROOT" "$AGENT_TASK"; then
+      # The verifier already closed the stalled pane and journaled review_wake_result; drop the pane id
+      # so the fallback below opens the viewer tab and NOTHING references the dead split.
+      ROOT=""
+    fi
+
     if [ -n "${ROOT:-}" ]; then
       TAB="$_builder_tab"
       _AGENT_PANE_MODE=1
@@ -849,7 +864,24 @@ except Exception:
       herdr pane run "$ROOT" "tail -f '$LOG'" >/dev/null 2>&1 || true
     fi
     # Register in the sweep allowlist so only engine-created tabs are ever swept.
-    [ -n "${TAB:-}" ] && printf 'review·%s %s review\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null || true
+    # NOT best-effort-silent any more (HERD-523 leg 3 / issue #634): this registry row is what the
+    # orphan sweep's ALLOWLIST model keys on, so a write that fails — unwritable $WORKTREES_DIR, a full
+    # disk, a $WORKTREES_DIR that does not exist — used to leave the tab live and UNREGISTERED, i.e.
+    # permanently un-sweepable and invisible, with a bare `|| true` swallowing the only evidence. The
+    # tab is still created (registration is not a gate on the review), but the failure is now a
+    # JOURNALED event + a loud stderr line, so the leak is diagnosable instead of silent. Teardown
+    # itself no longer depends on this row landing — agent-watch.sh's verdict-consumption path closes
+    # the viewer tab by slug-labeled lookup (leg 2) — so this is forensics, not the last line of defense.
+    if [ -n "${TAB:-}" ]; then
+      if printf 'review·%s %s review\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null; then
+        :
+      else
+        journal_append tab_registry_write_failed component herd-review slug "$SLUG" tab "$TAB" \
+          registry "$WORKTREES_DIR/.herd-tabs" kind review
+        printf '⚠️  herd-review: could not register tab %s (review·%s) in %s — the sweep allowlist will not know about this tab.\n' \
+          "$TAB" "$SLUG" "$WORKTREES_DIR/.herd-tabs" >&2
+      fi
+    fi
   fi
 fi
 

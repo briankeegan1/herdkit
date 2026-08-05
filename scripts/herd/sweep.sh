@@ -1044,8 +1044,9 @@ _SWEEP_RELINK_UNPROVEN=0
 
 # _sweep_relink_pr_rows — one "<number>\t<url>\t<ref>" row per recently-merged PR that carries a
 # `Refs:` line, ref-less PRs omitted. The ref extraction is NOT re-implemented here: it reuses
-# agent-watch.sh's HERD_PR_REF_PY, the same snippet merge-time reconcile parses with, so the two
-# surfaces cannot drift apart on HTML-comment stripping, placeholders, or trailing punctuation.
+# HERD_PR_REF_PY from the shared parser (scripts/herd/pr-ref.sh, in scope via agent-watch.sh's lib
+# sourcing), the same snippet merge-time reconcile parses with, so the two surfaces cannot drift apart
+# on HTML-comment stripping, markdown decoration, placeholders, or trailing punctuation.
 # HERD_RELINK_PR_JSON is the hermetic seam (a file holding the same JSON `gh pr list` returns), so
 # the test never touches the network.
 _sweep_relink_pr_rows() {

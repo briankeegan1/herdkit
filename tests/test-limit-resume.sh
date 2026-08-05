@@ -308,13 +308,70 @@ HERD_LIMIT_HOOK=off herd_write_ratelimit_hook "$WT_OFF"
 [ ! -f "$WT_OFF/.claude/settings.json" ] || fail "6: HERD_LIMIT_HOOK=off must not write a hook"
 ok
 
+extract_hook_cmd() {
+  python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print([h["command"] for e in d["hooks"]["StopFailure"] if e.get("matcher")=="rate_limit" for h in e["hooks"]][0])' "$1"
+}
+
+# ── (6-portable) HERD-525 / GH #638: the generated command carries NO baked-in absolute path ─────
+HOOK_CMD="$(extract_hook_cmd "$S")"
+case "$HOOK_CMD" in
+  *"$T"*) fail "6-portable: hook command must not embed the generate-time worktree path (got: $HOOK_CMD)" ;;
+esac
+ok
+case "$HOOK_CMD" in
+  *'CLAUDE_PROJECT_DIR'*) ;;
+  *) fail "6-portable: hook command must resolve the sentinel dir from \$CLAUDE_PROJECT_DIR at runtime (got: $HOOK_CMD)" ;;
+esac
+ok
+
+# Executing the hook command from a FAKE repo root (a plain cd, no CLAUDE_PROJECT_DIR set — the
+# harness-agnostic fallback) writes the sentinel AT THAT ROOT, not at the worktree that generated it.
+WT_FAKE="$T/fake-repo-root"; mkdir -p "$WT_FAKE"
+(cd "$WT_FAKE" && printf '%s' '{"reason":"usage limit reached"}' | bash -c "$HOOK_CMD")
+[ -f "$WT_FAKE/.herd-limit-sentinel" ] || fail "6-portable: PWD-fallback execution must write the sentinel at the fake repo root"
+ok
+[ -f "$WT_H/.herd-limit-sentinel" ] && fail "6-portable: PWD-fallback execution must NOT also write at the original generate-time worktree"
+ok
+
+# CLAUDE_PROJECT_DIR, when set, wins over $PWD (the real Claude Code hook environment).
+WT_PROJ="$T/claude-project-dir-target"; mkdir -p "$WT_PROJ"
+(cd "$T" && printf '%s' '{"reason":"usage limit reached"}' | CLAUDE_PROJECT_DIR="$WT_PROJ" bash -c "$HOOK_CMD")
+[ -f "$WT_PROJ/.herd-limit-sentinel" ] || fail "6-portable: CLAUDE_PROJECT_DIR must steer the sentinel write"
+ok
+[ -f "$T/.herd-limit-sentinel" ] && fail "6-portable: CLAUDE_PROJECT_DIR set must NOT fall back to \$PWD"
+ok
+
+# ── (6-converge) regenerating over an OLD-STYLE absolute-path hook converges once, then is byte-stable
+WT_OLD="$T/wt-old-style"; mkdir -p "$WT_OLD/.claude"
+python3 - "$WT_OLD" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+old_cmd = "python3 -c 'pass' > '%s/.herd-limit-sentinel' 2>/dev/null || : > '%s/.herd-limit-sentinel'" % (root, root)
+data = {"hooks": {"StopFailure": [{"matcher": "rate_limit", "hooks": [{"type": "command", "command": old_cmd}]}]}}
+with open(os.path.join(root, ".claude", "settings.json"), "w", encoding="utf-8") as f:
+    json.dump(data, f)
+PY
+herd_write_ratelimit_hook "$WT_OLD"
+S_OLD="$WT_OLD/.claude/settings.json"
+CMD_AFTER_1="$(extract_hook_cmd "$S_OLD")"
+case "$CMD_AFTER_1" in
+  *"$WT_OLD"*) fail "6-converge: old absolute-path hook must be replaced by the portable form (got: $CMD_AFTER_1)" ;;
+esac
+ok
+CONTENT_AFTER_1="$(cat "$S_OLD")"
+herd_write_ratelimit_hook "$WT_OLD"
+CONTENT_AFTER_2="$(cat "$S_OLD")"
+[ "$CONTENT_AFTER_1" = "$CONTENT_AFTER_2" ] || fail "6-converge: regeneration after convergence must be byte-stable"
+ok
+
 # 6-writer (HERD-155 F3): the hook COMMAND must extract the banner TEXT from a JSON stdin blob, NOT
 # write the raw blob (whose stray numeric fields would misparse as a reset time). Execute the exact
-# command the writer installed against realistic stdin and inspect what lands in the sentinel.
-HOOK_CMD="$(python3 -c 'import json,sys
-d=json.load(open(sys.argv[1]))
-print([h["command"] for e in d["hooks"]["StopFailure"] if e.get("matcher")=="rate_limit" for h in e["hooks"]][0])' "$S")"
-printf '%s' '{"session_id":"abc","transcript_path":"/x.jsonl","reason":"Claude usage limit reached. Your limit will reset at 7:30pm.","n_tokens":48213}' | bash -c "$HOOK_CMD"
+# command the writer installed (from the worktree it targets, so the PWD fallback resolves there)
+# against realistic stdin and inspect what lands in the sentinel.
+run_hook() { (cd "$WT_H" && bash -c "$HOOK_CMD"); }
+printf '%s' '{"session_id":"abc","transcript_path":"/x.jsonl","reason":"Claude usage limit reached. Your limit will reset at 7:30pm.","n_tokens":48213}' | run_hook
 SENT="$WT_H/.herd-limit-sentinel"
 grep -q "reset at 7:30pm" "$SENT" || fail "6-writer: the sentinel must capture the reset banner text (got: $(cat "$SENT"))"
 ok
@@ -325,7 +382,7 @@ export HERD_NOW_EPOCH=1000000
 [ -n "$(_parse_reset_epoch "$(cat "$SENT")")" ] || fail "6-writer: the captured banner must parse to a reset epoch"
 ok
 # A blob with NO limit/reset phrase → empty sentinel (still marks the hit → unknown-wait), never a stray digit.
-printf '%s' '{"session_id":"9999999999","n_tokens":42,"stop_hook_active":true}' | bash -c "$HOOK_CMD"
+printf '%s' '{"session_id":"9999999999","n_tokens":42,"stop_hook_active":true}' | run_hook
 [ ! -s "$SENT" ] || fail "6-writer: a reset-less blob must yield an EMPTY sentinel, not a numeric field (got: $(cat "$SENT"))"
 ok
 unset HERD_NOW_EPOCH

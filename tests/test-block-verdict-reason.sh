@@ -42,6 +42,21 @@ ok(){ PASS=$((PASS+1)); echo "PASS $1"; }
 # starts asking the network for the reason fails loudly instead of hanging.
 mkdir -p "$T/bin"
 printf '#!/bin/sh\necho "gh was invoked" >&2\nexit 127\n' > "$T/bin/gh"; chmod +x "$T/bin/gh"
+# herdr stub (HERD-523): collecting a verdict in _review_gate_step now also retires the standalone
+# review·<slug> viewer tab by slug-labeled lookup, so the verdict-consumption path consults the control
+# room. This test asserts LOCAL ledger/journal state only and must never reach a LIVE herdr — the
+# daemon-hermeticity guard (.herd/healthcheck.project.sh) reds exactly that. Empty rosters ⇒ no tab to
+# find, so every assertion below is unchanged.
+cat > "$T/bin/herdr" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "workspace list") printf '{"result":{"workspaces":[]}}\n' ;;
+  "tab list")       printf '{"result":{"tabs":[]}}\n' ;;
+  *)                printf '{}\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$T/bin/herdr"
 export PATH="$T/bin:$PATH" NO_COLOR=1
 
 BLOCK_LINE='REVIEW: BLOCK — rule: unchecked nil deref | why: cand.sha may be empty on an adopted PR | location: live_runtime.py:3120'

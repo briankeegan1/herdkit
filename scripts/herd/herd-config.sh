@@ -111,12 +111,35 @@ _herd_read_project_config() {
     PROJECT_ROOT=""; WORKTREES_DIR=""; WORKSPACE_NAME=""; DEFAULT_BRANCH=""; HERD_REPO=""
     # shellcheck source=/dev/null
     . "$cfg" 2>/dev/null || exit 1
+    # HERD-518: overlay the per-user/per-machine config.local on top of the baseline we just sourced —
+    # same baseline-first/overlay-second order as the main loader's config.local block above. On a
+    # CLONED project, this is where a collaborator overrides the original author's committed
+    # PROJECT_ROOT for THIS machine, without touching the committed baseline.
+    local overlay="$path/.herd/config.local"
+    if [ -f "$overlay" ]; then
+      # shellcheck source=/dev/null
+      . "$overlay" 2>/dev/null || true
+    fi
     # Apply the SAME fallbacks the main loader does. Written as explicit `-n` guards (the vars are
     # pre-initialised to "" just above), NOT the colon-equals defaulting idiom: the caps-sync gate
     # greps THIS file for that form as its "new config key" heuristic, so using it here would
     # false-trip it — the same reason the main-loader PROJECT_ROOT fallback below deliberately avoids
     # colon-equals.
     [ -n "$PROJECT_ROOT" ]   || PROJECT_ROOT="$path"
+    # HERD-518: a config cloned from another machine still carries the ORIGINAL author's absolute
+    # PROJECT_ROOT, which never exists here. When neither the baseline nor the overlay resolved a
+    # PROJECT_ROOT that exists on THIS machine but the argument path does, localize to it — and carry
+    # a WORKTREES_DIR that was itself derived from that foreign root along with it, so it doesn't keep
+    # pointing at a path that can never exist here either. Fail-soft: a foreign-but-real path (e.g. a
+    # shared mount) is left alone, and this never fires when the overlay already resolved a real path.
+    if [ ! -d "$PROJECT_ROOT" ] && [ -d "$path" ]; then
+      printf 'herdkit: localizing PROJECT_ROOT for %s (committed %s does not exist here)\n' \
+        "$path" "$PROJECT_ROOT" >&2
+      case "$WORKTREES_DIR" in
+        "$PROJECT_ROOT"*) WORKTREES_DIR="$path${WORKTREES_DIR#"$PROJECT_ROOT"}" ;;
+      esac
+      PROJECT_ROOT="$path"
+    fi
     [ -n "$WORKTREES_DIR" ]  || WORKTREES_DIR="${PROJECT_ROOT}-trees"
     [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH="origin/main"
     [ -n "$WORKSPACE_NAME" ] || WORKSPACE_NAME="$(basename "$PROJECT_ROOT")"
@@ -766,6 +789,7 @@ fi
 : "${OPERATOR_INBOX:="off"}"     # HERD-184: cross-seat OPERATOR INBOX — on → the watcher surfaces NEW comments by OTHER authors (PR comments on open PRs this seat authors/gates + tracker comments on items this seat claimed, via the active SCRIBE_BACKEND's optional comment reader) as a 'operator inbox' console section + one notify-once per comment. off (default) → byte-inert: no reader runs, no fetch, no section, every console byte identical to before. ADDITIVE + FAIL-SOFT (missing/api error = empty inbox, never a red row); never touches a gate/merge
 : "${ORPHAN_PR_ROWS:="off"}"     # HERD-330: ORPHAN-PR advisory console section — on → the watcher renders an 'orphan PRs' section listing each OPEN PR in the tick's ALREADY-fetched roster (PRS_JSON) that no live builder worktree in this workspace owns (a collaborator/main-checkout PR the worktree-gated watcher never adopts), so an ungated PR is visible instead of silently ignored. DYNAMIC discovery: recomputed every tick from live state, self-correcting the instant a worktree adopts (or the PR closes). Zero extra gh (reads the tick's existing discovery). Renders via the shared bounded-section helper (console-section.sh). off (default) → byte-inert: no scan, no ledger, no section, every console byte identical to before. ADVISORY + FAIL-SOFT — never gates, never merges, never a red row. Consumed by agent-watch.sh
 : "${ADOPT_REMOTE_PRS:="off"}"   # HERD-369: auto-ADOPT ungated remote PRs into the worktree pool — on → builds ON TOP of the ORPHAN_PR_ROWS (HERD-330) open-PR-vs-pool diff (same already-fetched roster, zero extra gh): on a throttled ~60s cadence, for each OPEN, NON-DRAFT orphan PR whose branch is not already checked out ANYWHERE (this pool, the main checkout, or a stray manual worktree), `git fetch` + `git worktree add` its branch into WORKTREES_DIR so the worktree-gated watcher discovers and gates it the VERY NEXT tick instead of sitting ungated until a human hand-runs `git worktree add` (grounded: PRs #462/#463 sat ~16-18h on 2026-07-13, #478 ~18h on 2026-07-15). A SUCCESSFUL adopt is sha-keyed once-guarded ($WORKTREES_DIR/.agent-watch-adopted-prs) so a re-tick never re-adopts; a FAILURE (transient network blip, momentary ref lock) is never once-guarded and retries every scan — only the `adopt_failed` journal event is deduped per (pr,sha) ($WORKTREES_DIR/.agent-watch-adopt-failed-seen), never a red row. Never adopts a draft. Multi-seat: keyed off observed GitHub PR state each tick; `git worktree add` is naturally exclusive per branch. off (default) → byte-inert: no scan, no fetch, no worktree add, no ledger, every console byte identical to before. INDEPENDENT of ORPHAN_PR_ROWS — either works without the other. Consumed by agent-watch.sh
+: "${TEAM_PRESENCE:="off"}"      # HERD-527 (GH #639 phase 1): TEAMMATE BUILDER VISIBILITY on the ungated-PR rows — on | off (default off, ship-dormant). The watcher discovers work via LOCAL git worktrees, so a teammate's actively-being-built PR renders in the unconditional 'ungated PRs' section as 'ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree add to adopt' — an adopt nudge that is exactly WRONG when another operator is mid-build on their own machine (grounded: emberglen-godot, two operators, WATCHER_SCOPE=all). on → on a throttled ~60 s cadence the watcher resolves each UNGATED PR to its tracker item (the shared `Refs:` parser, HERD-522, with a token-exact branch-name fallback), reads that item's live state + assignee through the active SCRIBE_BACKEND's OPTIONAL rich roster op (_backend_list_open_rich — ONE call per scan, cached in a ledger and reused by every 4 s repaint), and for an item that is IN PROGRESS *and* ASSIGNED renders 'ungated here · <assignee> building <id> on their machine' instead, SUPPRESSING the adopt nudge on that row. REUSES the existing claim machinery (a claim sets assignee + in-progress, HERD-50/HERD-244) — no new presence channel, no new write, no tracker mutation. off (default) → byte-inert: no gh, no backend call, no ledger, every console byte identical to before. ADVISORY + FAIL-SOFT — an unreachable tracker, a backend with no rich op, or an unparseable body leaves TODAY's row; it never gates, never merges, never a red row. Consumed by agent-watch.sh
 : "${OSS_TRIAGE:="off"}"         # HERD-255 / HERD-168 part 1/3: OSS auto-triage — on → `herd triage` lists open issues on HERD_REPO, enqueues a research-lane request per NEW issue (classify bug/feature/question/duplicate + draft reply/labels), and writes a ranked shortlist report for human approval. off (default) → byte-inert: no gh, no research enqueue, no report files. NEVER auto-posts (no issue comment/close/label). FAIL-SOFT (missing HERD_REPO / gh error → empty shortlist, never a hard red). Consumed by scripts/herd/oss-triage.sh
 : "${JOURNAL_AUDIT:="off"}"      # HERD-238: journal-driven self-audit (the gap-finder) — on | off (default off, ship-dormant). on → the watcher runs journal-audit.sh on the tracker/housekeeping sweep cadence, replaying a BOUNDED journal window for invariant violations (merge without reap; *_dispatched with no terminal past family TTL; refix_bounce without refix_wake_result; MAIN RED older than TTL; pushed=no never followed by pushed=yes; known-fixture slugs). Findings → operator-inbox rows (source=audit) + journal_audit events (component=audit). ADVISORY ONLY — never gates, never mutates. off (default) → byte-inert: no journal read, no write, no inbox. FAIL-SOFT on empty/short journal. Consumed by agent-watch.sh via journal-audit.sh
 : "${LIFECYCLE_CONTRACTS:="off"}" # HERD-193: the SUPERVISED-PROCESS CONTRACT — on | off (default off, ship-dormant). on → every spawned agent population records the four lifecycle properties at spawn (OWNER: which component spawned it · DEADLINE: the max lifetime after which it is presumed hung, REUSED from that population's existing timeout — REVIEW_INFLIGHT_TIMEOUT / HEALTH_INFLIGHT_TIMEOUT / DRAINER_HEARTBEAT_TIMEOUT · LIVENESS: a pid or a heartbeat file · RETIRE: the existing owner an expiry routes to), and a per-tick watcher sweep journals lifecycle_spawn / lifecycle_retire / lifecycle_expired and appends an operator-inbox row for anything past deadline. OBSERVABILITY-ONLY: it never kills, never gates, never merges — teardown stays with each population's existing owner (gate corpse sweep, drainer reclaim, stall detector, resolver escalation). off (default) → byte-inert: no record written, no journal event, no inbox row, no sweep read. FAIL-SOFT throughout. Consumed by agent-watch.sh, scribe.sh, research.sh via lifecycle.sh
@@ -1244,6 +1268,20 @@ PY
 # (starting fresh from {}). Best-effort: any failure warns but returns 0 so it never aborts worktree
 # creation — the fallback banner-scrape still catches the limit hit if the hook is absent.
 #
+# HERD-525 / GH #638: the SENTINEL PATH embedded in the generated hook command is resolved AT HOOK
+# RUNTIME, never baked in at generate time. A prior version embedded this worktree's `pwd -P` (an
+# absolute, machine-specific path) directly into the hook command string written into
+# .claude/settings.json; in a two-operator repo (e.g. macOS vs WSL checkouts of the SAME commit) that
+# committed file then ping-pongs between each operator's absolute path forever, and on whichever
+# machine the OTHER operator's path is checked out, the hook writes to a path that doesn't exist on
+# that box — auto-resume silently degrades to the banner-scrape fallback. The generated command
+# instead computes the sentinel path from `$CLAUDE_PROJECT_DIR` (the project root Claude Code exports
+# into every hook's environment) with a `$PWD` fallback for harnesses that don't set it — ONE portable
+# form for both the main checkout and any worktree, so the generated file is byte-identical no matter
+# which machine or checkout produced it. Regenerating over an old-style absolute hook converges it to
+# this portable form once (the merge below replaces a mismatched `rate_limit` entry's command) and is
+# then byte-stable on every subsequent call.
+#
 # NOTE: the exact hook event name / rate-limit matcher is Claude-Code-version-dependent; the watcher
 # does NOT rely on it firing (the banner-scrape fallback covers hookless environments). Disable with
 # HERD_LIMIT_HOOK=off.
@@ -1255,13 +1293,11 @@ herd_write_ratelimit_hook() {
   local _rh_abs
   _rh_abs="$(cd "$_rh_dir" 2>/dev/null && pwd -P)" || _rh_abs="$_rh_dir"
   local _rh_settings="$_rh_abs/.claude/settings.json"
-  local _rh_sentinel="$_rh_abs/.herd-limit-sentinel"
   mkdir -p "$_rh_abs/.claude" 2>/dev/null || return 0
-  if ! HERD_RH_SETTINGS="$_rh_settings" HERD_RH_SENTINEL="$_rh_sentinel" python3 - <<'PY'
+  if ! HERD_RH_SETTINGS="$_rh_settings" python3 - <<'PY'
 import json, os, shlex, sys, tempfile
 
 path = os.environ["HERD_RH_SETTINGS"]
-sentinel = os.environ["HERD_RH_SENTINEL"]
 
 # The hook command. HERD-155 F3: a StopFailure/rate_limit hook's stdin is the harness EVENT — a JSON
 # blob (session_id, transcript_path, a reason/message, …), NOT the bare reset banner. The old `cat >`
@@ -1279,8 +1315,14 @@ if not out:
     out = (m.group(0) if m else "").strip()
 sys.stdout.write(out)
 '''
-q_sentinel = "'" + sentinel.replace("'", "'\\''") + "'"
-cmd = "python3 -c %s > %s 2>/dev/null || : > %s" % (shlex.quote(_extract), q_sentinel, q_sentinel)
+# HERD-525: the sentinel's DIRECTORY is resolved by the shell AT HOOK RUNTIME — never baked in here —
+# so the same generated command is byte-identical whichever worktree/machine/checkout produced it.
+# CLAUDE_PROJECT_DIR is the project root Claude Code exports into every hook's environment; $PWD is
+# the fallback for a harness that doesn't set it (hook commands run with cwd == the project root).
+q_sentinel = '"$_herd_rl_dir/.herd-limit-sentinel"'
+cmd = "_herd_rl_dir=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; python3 -c %s > %s 2>/dev/null || : > %s" % (
+    shlex.quote(_extract), q_sentinel, q_sentinel,
+)
 entry = {"matcher": "rate_limit", "hooks": [{"type": "command", "command": cmd}]}
 
 data = {}

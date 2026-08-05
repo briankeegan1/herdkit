@@ -26,6 +26,13 @@
 #   (d) a marker-owned gate worker                  → exempt from the listing (HERD-185/217/237/245)
 #   (e) sweep.sh's DETECTION-only gate-child guard spares a reparented fork that the LISTING keeps
 #   (f) the alarm's persistence re-sample: a main that vanishes between samples never alarms
+#   (h) HERD-524 (#636): a DECOY whose command line merely CONTAINS the watcher script path but which
+#       lacks the argv0 tag is NEVER counted; the real tagged pid still is
+#   (i) HERD-524 (#636): a ROTATING transient — a DIFFERENT untracked tagged fork alive at every sample —
+#       never alarms. Every sample sees "2 mains", but no single pid survives them all
+#   (j) HERD-524 (#636): a candidate that dies between the last scan and the render drops out silently
+#   (k) HERD-524: watcher_legacy_cmd — the shared "is this command line EXECUTING agent-watch.sh?"
+#       predicate the untagged-legacy KILL leg must pass a candidate through
 #   (g) THE SAFETY RAIL (PR #387 review): a lock-absent STRAY that has dispatched a gate worker is
 #       STILL listed. watcher_list_mains feeds _stop_project_watcher's SIGTERM loop, not just the
 #       status count, and the gate-child guard cannot tell such a stray from a reparented fork — on
@@ -57,7 +64,8 @@ export HERD_WATCHER_LOCK="$TREESDIR/.watcher-wxws.pid"
 # shellcheck source=/dev/null
 . "$REPO/scripts/herd/status.sh"
 
-for fn in watcher_list_mains watcher_pid_exempt watcher_handoff_active _status_dup_verified; do
+for fn in watcher_list_mains watcher_pid_exempt watcher_handoff_active watcher_legacy_cmd \
+          _status_dup_verified _status_pid_alive _status_watcher_live_pids _status_pid_intersect; do
   declare -f "$fn" >/dev/null 2>&1 || fail "(0) $fn not defined after sourcing"
 done
 ok; echo "PASS (0) the shared check + the status alarm helpers load"
@@ -90,6 +98,10 @@ printf '%s %s %s bash scripts/herd/healthcheck.sh /w/tree\n'    "$HCPID"       "
 printf '%s 1 %s herd-watch-wxws bash agent-watch.sh\n'          "$MARKED_REAL" "$MARKED_REAL"
 printf '%s 1 %s herd-watch-wxws bash agent-watch.sh\n'          "$ORPHAN"      "$ORPHAN"
 printf '900001 1 900001 herd-watch-otherws bash agent-watch.sh\n'
+# HERD-524 (#636) DECOYS — command lines that CONTAIN the watcher script path but carry NO argv0 tag:
+# a coordinator's own 'bash -c' wrapper (the report's own example) and a tail on the watcher log.
+printf '900010 1 900010 bash -c herd status; pgrep -af /w/scripts/herd/agent-watch.sh\n'
+printf '900011 1 900011 tail -f /w/trees/agent-watch.sh.log\n'
 EOF
   chmod +x "$1"
 }
@@ -170,6 +182,102 @@ HERD_SWEEP_PS_CMD="$T/ps-vanishing" HERD_STATUS_DUP_SAMPLES=3 HERD_STATUS_DUP_SL
   _status_dup_verified "$FIRST" >/dev/null \
   && fail "(f) a main that vanished after the first sample still alarmed — the console cries wolf"
 ok; echo "PASS (f) the alarm re-samples: a vanishing transient main never reds the console"
+
+# ── (h) HERD-524 (#636): a script-path DECOY is never counted; the tagged pid still is ───────────
+# The report: 'pgrep -af herd-watch|agent-watch' matches a coordinator's OWN 'bash -c' wrapper, because
+# the wrapper's command line CONTAINS the path. Only the argv0 tag distinguishes a watcher, and the
+# count must key on nothing else — the warning it feeds tells a human to kill what it names.
+grep -qx 900010 <<< "$MAINS" \
+  && fail "(h) a 'bash -c' wrapper whose command line CONTAINS the watcher script path was counted as a watcher main"
+grep -qx 900011 <<< "$MAINS" \
+  && fail "(h) a 'tail -f' on the watcher log was counted as a watcher main (script-path match, not argv0)"
+grep -qx "$CANON" <<< "$MAINS" || fail "(h) the real argv0-tagged watcher stopped being counted"
+ok; echo "PASS (h) a script-path decoy is not a watcher main; the argv0-tagged pid is"
+
+# ── (i) HERD-524 (#636): a ROTATING transient never alarms ──────────────────────────────────────
+# THE REPORTED BUG. The tick loop forks CONTINUOUSLY, so "more than one main in every sample" is not
+# evidence of a duplicate: emberglen-godot saw '2 watcher mains alive (pids 7512 781304)' and, ten
+# minutes later, '(pids 7512 794193)' — a healthy control room with exactly one watcher (7512) and a
+# DIFFERENT short-lived fork alive at each sample. Only pid IDENTITY across samples can tell the two
+# apart, so the check intersects the samples instead of counting them.
+cat > "$T/ps-rotating" <<EOF
+#!/usr/bin/env bash
+n=0; [ -f "$T/ps-rot-calls" ] && n="\$(cat "$T/ps-rot-calls")"
+printf '%s\n' "\$(( n + 1 ))" > "$T/ps-rot-calls"
+printf '%s 1 %s herd-watch-wxws bash agent-watch.sh --watch\n' "$CANON" "$CANON"
+# a NEW untracked tagged fork every sample (ppid 1 ⇒ neither marker-owned nor a child of the lock)
+printf '%s 1 %s herd-watch-wxws bash agent-watch.sh\n' "\$(( 781304 + n ))" "\$(( 781304 + n ))"
+exit 0
+EOF
+chmod +x "$T/ps-rotating"
+ROT="$(HERD_SWEEP_PS_CMD="$T/ps-rotating" watcher_list_mains)"
+[ "$(printf '%s\n' "$ROT" | grep -c .)" -eq 2 ] || fail "(i) fixture: every sample should show 2 mains"
+HERD_SWEEP_PS_CMD="$T/ps-rotating" HERD_STATUS_DUP_SAMPLES=3 HERD_STATUS_DUP_SLEEP=0 \
+  _status_dup_verified "$ROT" >/dev/null \
+  && fail "(i) a rotating transient fork alarmed — the #636 false red: every sample sees 2 mains, but \
+no single pid survives them all, and the operator is told to kill a pid that is already gone"
+ok; echo "PASS (i) a different transient fork at every sample never alarms (#636)"
+
+# ── (j) HERD-524 (#636): a pid that dies between the last scan and the render drops out ─────────
+# Even an intersected pid can exit during the final sample gap. The warning names pids an operator (or
+# an autonomous coordinator) is told to kill, so each survivor is re-verified ALIVE immediately before
+# it is printed; when that leaves ≤1 main there is no warning at all. Call budget: this test's own
+# watcher_list_mains is table call 1, the two re-samples are 2 and 3, the liveness re-verify is 4.
+_plant_dying() {   # $1 = destination, $2 = the call number from which ORPHAN is GONE (0 = never)
+  cat > "$1" <<EOF
+#!/usr/bin/env bash
+n=0; [ -f "$T/ps-dying-calls" ] && n="\$(cat "$T/ps-dying-calls")"
+n=\$(( n + 1 )); printf '%s\n' "\$n" > "$T/ps-dying-calls"
+printf '%s 1 %s herd-watch-wxws bash agent-watch.sh --watch\n' "$CANON" "$CANON"
+if [ "$2" -eq 0 ] || [ "\$n" -lt "$2" ]; then
+  printf '%s 1 %s herd-watch-wxws bash agent-watch.sh\n' "$ORPHAN" "$ORPHAN"
+fi
+exit 0
+EOF
+  chmod +x "$1"
+}
+# CONTROL — the same fixture with a pid that never dies MUST still alarm (this rail may not go silent).
+_plant_dying "$T/ps-dying" 0
+: > "$T/ps-dying-calls"
+LIVE="$(HERD_SWEEP_PS_CMD="$T/ps-dying" watcher_list_mains)"
+SURV="$(HERD_SWEEP_PS_CMD="$T/ps-dying" HERD_STATUS_DUP_SAMPLES=3 HERD_STATUS_DUP_SLEEP=0 \
+  _status_dup_verified "$LIVE")" \
+  || fail "(j) control: a persistent duplicate stopped alarming — the rail went silent"
+grep -qx "$ORPHAN" <<< "$SURV" || fail "(j) control: the surviving duplicate was not reported: '$SURV'"
+# … and the same duplicate, gone by the render (call 4), alarms NOT AT ALL.
+_plant_dying "$T/ps-dying" 4
+printf '0\n' > "$T/ps-dying-calls"
+DYING="$(HERD_SWEEP_PS_CMD="$T/ps-dying" watcher_list_mains)"
+[ "$(printf '%s\n' "$DYING" | grep -c .)" -eq 2 ] || fail "(j) fixture: the first scan should see 2 mains"
+HERD_SWEEP_PS_CMD="$T/ps-dying" HERD_STATUS_DUP_SAMPLES=3 HERD_STATUS_DUP_SLEEP=0 \
+  _status_dup_verified "$DYING" >/dev/null \
+  && fail "(j) a candidate that died between the last scan and the render was still named — an \
+operator following the remedy line kills the one healthy watcher"
+# The liveness helper itself: a pid absent from the (synthetic) table is not alive, a listed one is.
+[ "$(HERD_SWEEP_PS_CMD="$T/ps-dying" _status_watcher_live_pids "$CANON"$'\n'"$ORPHAN")" = "$CANON" ] \
+  || fail "(j) _status_watcher_live_pids kept a pid the process table no longer holds"
+ok; echo "PASS (j) a pid that dies between scan and render drops out silently (control still alarms)"
+
+# ── (k) HERD-524: the shared untagged-legacy predicate (a KILL path's proof) ────────────────────
+# _stop_project_watcher's phase-2 leg finds UNTAGGED legacy watchers with 'pgrep -f agent-watch.sh' —
+# a SUBSTRING match over the whole command line — and then SIGTERM/SIGKILLs what it matched. Every
+# candidate must first be proven to be EXECUTING the script.
+watcher_legacy_cmd "bash /w/scripts/herd/agent-watch.sh --watch" \
+  || fail "(k) an untagged legacy watcher was not recognized — phase 2 would stop reaping relics"
+watcher_legacy_cmd "/bin/bash -x /w/scripts/herd/agent-watch.sh" \
+  || fail "(k) a shell option before the script path defeated the predicate"
+watcher_legacy_cmd "/w/scripts/herd/agent-watch.sh --watch" \
+  || fail "(k) a shebang-exec'd watcher (argv0 IS the script) was not recognized"
+watcher_legacy_cmd "bash -c herd status; pgrep -af /w/scripts/herd/agent-watch.sh" \
+  && fail "(k) a 'bash -c' wrapper MENTIONING the script path passed as a legacy watcher — this leg kills what it matches"
+watcher_legacy_cmd "tail -f /w/trees/agent-watch.sh.log" \
+  && fail "(k) a tail on the watcher log passed as a legacy watcher"
+watcher_legacy_cmd "bash /w/scripts/herd/healthcheck.sh /w/tree # agent-watch.sh" \
+  && fail "(k) a DIFFERENT script whose command line mentions agent-watch.sh passed"
+watcher_legacy_cmd "" && fail "(k) an empty command line passed (a pid that exited between scan and ps)"
+grep -q 'watcher_legacy_cmd "$scmd" || continue' "$REPO/bin/herd" \
+  || fail "(k) _stop_project_watcher's legacy leg no longer routes candidates through the shared predicate"
+ok; echo "PASS (k) the untagged-legacy KILL leg proves a candidate executes the script (no substring match)"
 
 # ── (e) sweep's DETECTION-only gate-child guard ────────────────────────────────────────────────
 # sweep_stray_watchers = watcher_list_mains, minus the lockfile pid, minus the gate-child heuristic.

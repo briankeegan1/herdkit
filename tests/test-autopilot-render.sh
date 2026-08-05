@@ -80,9 +80,14 @@ cmp -s "$T/first.md" "$P/$AUTO_REL" || fail "A4: re-render is not byte-identical
 ok "A4 herd render regenerates the absent autopilot skill byte-identically"
 
 # ── B. per-machine derived artifact: gitignored, untracked, and on the shared derived list ─────────
-grep -qxF "$AUTO_REL" "$P/.gitignore" || fail "B1: the autopilot render is not gitignored"
-[ "$(grep -cxF "$AUTO_REL" "$P/.gitignore")" -eq 1 ] || fail "B1: the ignore line was appended more than once"
-ok "B1 the render is gitignored, and the ignore line is idempotent across renders"
+# HERD-519 leg (c): the ignore entry is CHECKOUT-LOCAL (.git/info/exclude), never the committed
+# .gitignore — a per-machine artifact must not dirty a tracked file on a fresh clone's first render.
+git -C "$P" check-ignore -q "$AUTO_REL" || fail "B1: the autopilot render is not ignored"
+[ "$(grep -cxF "$AUTO_REL" "$P/.git/info/exclude")" -eq 1 ] \
+  || fail "B1: the exclude line is missing or was appended more than once"
+{ [ -f "$P/.gitignore" ] && grep -qxF "$AUTO_REL" "$P/.gitignore"; } \
+  && fail "B1: the ignore entry was written to the COMMITTED .gitignore"
+ok "B1 the render is ignored via .git/info/exclude, and the entry is idempotent across renders"
 
 git -C "$P" add -A && git -C "$P" commit -q -m init
 git -C "$P" ls-files --error-unmatch -- "$AUTO_REL" >/dev/null 2>&1 \
