@@ -1528,7 +1528,17 @@ def _total_health_inflight(state_dir):
 _HEALTH_WORKER_SH = r'''
 set -u
 hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"; nonce="$7"
-_run() { HERD_BASELINE_DIR="$base" HERD_BASELINE_CACHE="$cache" bash "$hc" "$dir" > "$1" 2>&1; }
+# HERD-533: hand healthcheck.sh a per-attempt progress companion ("$1.progress") via
+# HEALTHCHECK_PROGRESS_LOG (HERD-494's convention — agent-watch.sh's bash worker sets the same var).
+# healthcheck.sh tees the suite's raw output there AS IT RUNS, so an operator tailing it sees real
+# progress instead of the 0-byte black box this log used to sit at for the suite's whole runtime.
+# Truncated fresh per attempt (run 1 and the solo retry each get their own), and additive only: the
+# actual $log this function writes below is unchanged (same command, same redirect, same verdict).
+_run() {
+  : > "$1.progress" 2>/dev/null || true
+  HERD_BASELINE_DIR="$base" HERD_BASELINE_CACHE="$cache" HEALTHCHECK_PROGRESS_LOG="$1.progress" \
+    bash "$hc" "$dir" > "$1" 2>&1
+}
 _run "$log"; rc=$?
 first="$(sed -n '1p' "$log" 2>/dev/null)"
 if [ "$rc" -eq 0 ]; then
@@ -1537,10 +1547,11 @@ else
   notok="$(grep -m1 -iE 'not ok' "$log" 2>/dev/null)"; [ -n "$notok" ] || notok="$first"
   _run "$log.retry"; rc2=$?
   if [ "$rc2" -eq 0 ]; then
-    rm -f "$log.retry" 2>/dev/null || true
+    rm -f "$log.retry" "$log.retry.progress" 2>/dev/null || true
     d="$(printf '%s' "$notok" | tr '\t\n' '  ')"; line="FLAKY"$'\t'"${d:0:200}"
   else
     mv "$log.retry" "$log" 2>/dev/null || true
+    mv "$log.retry.progress" "$log.progress" 2>/dev/null || true
     d="$(grep -m1 -iE 'not ok' "$log" 2>/dev/null)"; [ -n "$d" ] || d="$notok"
     d="$(printf '%s' "$d" | tr '\t\n' '  ')"; line="CODEERROR"$'\t'"${d:0:200}"
   fi

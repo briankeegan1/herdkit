@@ -352,10 +352,21 @@ run_heavy() {
   if [ -z "$HEALTHCHECK_CMD" ]; then run_light; return; fi
   # Resolve the command relative to the worktree (it's a committed project file).
   local out rc
+  # HERD-533 STREAM: the previous shape captured the WHOLE suite's output into $out via a bare
+  # command substitution, so nothing reached our own stdout — and thus the dispatch log the async
+  # health worker redirects healthcheck.sh's stdout into — until the suite fully exited (a ~9-minute
+  # black box: the tailable log sat at 0 bytes the whole run). HEALTHCHECK_PROGRESS_LOG (HERD-494's
+  # convention: the async worker sets it to a per-run companion path) lets us ALSO tee the command's
+  # raw output there AS IT RUNS, independent of the $out capture below, so a `tail -f` on that path
+  # shows real progress instead of nothing. Purely additive: $out/$rc are computed EXACTLY as before
+  # (tee is a transparent passthrough of the same bytes; `pipefail`, scoped to this one subshell via
+  # the command substitution, keeps $HEALTHCHECK_CMD's — not tee's — exit code). With the env var
+  # unset (every caller except the async worker) the tee target is /dev/null: byte-identical.
+  [ -n "${HEALTHCHECK_PROGRESS_LOG:-}" ] && { : > "$HEALTHCHECK_PROGRESS_LOG"; } 2>/dev/null
   if [ -n "$ONELINE" ]; then
-    out="$(bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --oneline" 2>&1)"; rc=$?
+    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
   else
-    out="$(bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR'" 2>&1)"; rc=$?
+    out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR'" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
   fi
   # BASELINE-AWARE GATE (HERD-190): a CODE error whose failing tests ALL already fail on the base
   # (origin/main) is INHERITED, not introduced by this change — surface it as a tolerated ⚠️ (exit 0)
