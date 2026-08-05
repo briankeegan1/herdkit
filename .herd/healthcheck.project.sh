@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # .herd/healthcheck.project.sh — herdkit's OWN health command (the dogfood gate).
 # Called by scripts/herd/healthcheck.sh for the heavy profile:
-#     .herd/healthcheck.project.sh <worktree-dir> [--oneline]
+#     .herd/healthcheck.project.sh <worktree-dir> [--heavy] [--oneline]
 #
 # herdkit has no app — health = the scripts are syntactically sound and the tests pass:
 #   1) bash -n over every engine + CLI script               (always available; the hard gate)
@@ -12,9 +12,14 @@
 # is one KNOWN env-only bats failure (HERD-187): the project-mode codemap test failing because the real
 # repo can't be resolved as the ENGINE tree (a mis-pointed .herd/config PROJECT_ROOT) → exit 2. Every
 # other outcome is 0 or 1; a genuine code error is NEVER downgraded to 2.
+#
+# herdkit runs the SAME full suite regardless of profile (no light/heavy split of its own), so --heavy
+# (HERD-551: now forwarded by the wrapper as $2) is accepted and ignored. --oneline is detected
+# anywhere in argv (not pinned to $2) so it still works with --heavy occupying that slot.
 set -u
-DIR="${1:?usage: healthcheck.project.sh <worktree-dir> [--oneline]}"
-ONELINE=""; [ "${2:-}" = "--oneline" ] && ONELINE=1
+DIR="${1:?usage: healthcheck.project.sh <worktree-dir> [--heavy] [--oneline]}"
+ONELINE=""
+for _hk_arg in "$@"; do [ "$_hk_arg" = "--oneline" ] && ONELINE=1; done
 cd "$DIR" 2>/dev/null || { echo "no such dir: $DIR"; exit 1; }
 
 # Resolve python3 ONCE (mirrors scripts/herd/healthcheck.sh) instead of calling bare `python3` in the

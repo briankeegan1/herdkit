@@ -5,18 +5,25 @@
 # Copy this to .herd/healthcheck.project.sh in your project and make it answer ONE question:
 # "is the change in this worktree healthy?" Called as:
 #
-#     .herd/healthcheck.project.sh <worktree-dir> [--oneline]
+#     .herd/healthcheck.project.sh <worktree-dir> [--heavy] [--oneline]
 #
 # CONTRACT — exit codes are load-bearing (the watcher reads them):
 #   0 = clean (or only a tolerated data/env issue)
 #   1 = a real CODE error  → the watcher will NOT merge
 #   2 = a data/env issue   → tolerated, treated as clean, surfaced as a ⚠️
 #
+# PROFILE (HERD-551): the wrapper always forwards --heavy as $2 for a heavy run. If your project
+# has its OWN light/heavy split (extra slow probes you only want to pay for here), branch on it —
+# and if you skip your heavy probes anyway (missing tool, env cap, …) print a line starting with
+# the literal marker "HEAVY-SKIPPED: <why>" so the wrapper hard-fails instead of reporting clean on
+# unchecked work. A script that ignores $2 (like this example) runs identically either way.
+#
 # This example is a Python web/app project that runs the test suite. Swap the body for whatever
 # proves health in YOUR project (boot a server + probe /health, `npm test`, `cargo test`, …).
 set -u
-DIR="${1:?usage: healthcheck.project.sh <worktree-dir> [--oneline]}"
-ONELINE=""; [ "${2:-}" = "--oneline" ] && ONELINE=1
+DIR="${1:?usage: healthcheck.project.sh <worktree-dir> [--heavy] [--oneline]}"
+ONELINE=""
+for _hk_arg in "$@"; do [ "$_hk_arg" = "--oneline" ] && ONELINE=1; done
 cd "$DIR" 2>/dev/null || { echo "no such dir: $DIR"; exit 1; }
 
 PY="./.venv/bin/python"; [ -x "$PY" ] || PY="$(command -v python3)"

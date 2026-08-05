@@ -15,9 +15,12 @@
 #                          few lines — the minimal "every doc looks like a doc" convention.
 # Swap/extend this for your own docs conventions (a stricter template, markdownlint/vale if you
 # install them, a link checker that also verifies internal anchors).
+# The wrapper forwards --heavy as $2 (HERD-551) — see templates/healthcheck.project.sh's header for
+# the full profile/HEAVY-SKIPPED contract.
 set -u
-DIR="${1:?usage: healthcheck.docs.sh <worktree-dir> [--oneline]}"
-ONELINE=""; [ "${2:-}" = "--oneline" ] && ONELINE=1
+DIR="${1:?usage: healthcheck.docs.sh <worktree-dir> [--heavy] [--oneline]}"
+ONELINE=""
+for _hk_arg in "$@"; do [ "$_hk_arg" = "--oneline" ] && ONELINE=1; done
 cd "$DIR" 2>/dev/null || { echo "no such dir: $DIR"; exit 1; }
 
 if git rev-parse --git-dir >/dev/null 2>&1; then
