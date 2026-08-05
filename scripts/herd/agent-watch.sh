@@ -3242,6 +3242,9 @@ _close_review_viewer_tab() {
   [ -z "${DRYRUN:-}" ] || return 0
   [ -n "$_crv_slug" ] || return 0
   command -v herdr >/dev/null 2>&1 || return 0
+  # Headless is panes-as-a-view: there are no tabs at all, so there is nothing to look up or close —
+  # skip BEFORE the control-room reads, the same shape every driver pane seam uses.
+  _herd_driver_is_headless && return 0
   _crv_ws="$(herd_resolve_workspace_id 2>/dev/null || true)"
   _crv_tab="$(herdr tab list ${_crv_ws:+--workspace "$_crv_ws"} 2>/dev/null | SLUG="$_crv_slug" python3 -c '
 import sys, json, os
