@@ -696,6 +696,17 @@ fi
 # fed; 0 → strict no-surplus. Advisory only: --force / HERD_FORCE_SPAWN=1 bypasses it. Non-numeric → 1.
 : "${SPAWN_AHEAD:="1"}"
 : "${HEALTH_CONCURRENCY:="1"}"   # max healthcheck suites the watcher runs at once (default 1: serialize — all feature worktrees share one git object store, so overlapping suites race on shared .git locks and paint false-red)
+# LOCAL_SUITE_CONCURRENCY (HERD-529) — max HEAVY healthcheck suites this BOX runs at once, across ALL
+# worktrees and ALL callers (builder-local `scripts/herd/healthcheck.sh --heavy` runs AND the
+# watcher's own dispatch) — a distinct, wider ceiling than HEALTH_CONCURRENCY, which only serializes
+# the watcher's OWN dispatch loop and has no visibility into a builder running the heavy suite locally
+# ahead of its own PR. GROUNDED 2026-08-05: an 8-builder fleet ran up to 8 simultaneous builder-local
+# heavy suites (box saturation, a tolerated-as-DATA/ENV 1800s bats timeout that actually meant the
+# suite asserted nothing that run). Enforced in scripts/herd/healthcheck.sh's run_heavy() via a
+# cross-worktree slot pool under $WORKTREES_DIR, namespaced `.local-suite-slot-*` (distinct from the
+# watcher's own `.health-inflight-*` markers, so the two accounting systems never collide). Default 2.
+# Non-numeric → 2 (resolved via herd_numeric, warns once, fails toward the safe default).
+: "${LOCAL_SUITE_CONCURRENCY:="2"}"
 # RESTART-SAFE INFLIGHT TIMEOUTS (HERD-185) — an in-flight review/health worker that outlives this many
 # seconds (age read from its on-disk dispatch marker, so ANY watcher instance — even one that restarted
 # mid-run — can enforce it) is SIGTERMed + reaped by the every-tick corpse sweep, freeing its slot. Well

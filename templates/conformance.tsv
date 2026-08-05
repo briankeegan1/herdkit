@@ -304,6 +304,8 @@ SPAWN_AHEAD	unit	tests/test-spawn-rate-match.sh
 HEALTH_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 HEALTH_CONCURRENCY	sim	tests/test-gate-reconciler-chaos-sim.sh
 HEALTH_CONCURRENCY	unit	tests/test_live_runtime.py
+LOCAL_SUITE_CONCURRENCY	unit	tests/test-local-suite-slot.sh
+LOCAL_SUITE_CONCURRENCY	unit	tests/test-suite-parallel-wiring.sh
 REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_TIMEOUT_HEADROOM	sim	scripts/herd/sim/sandbox-suite-timeout-headroom-sim.sh
