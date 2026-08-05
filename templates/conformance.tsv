@@ -204,6 +204,7 @@ retirement.sh	sim	scripts/herd/sim/retirement-invariant-sim.sh
 caps-sync-lint.sh	unit	tests/test-caps-sync-light.sh
 console-section.sh	unit	tests/test-console-rows-ageout.sh
 console-section.sh	unit	tests/test-tracker-heal-supersede.sh
+pr-ref.sh	unit	tests/test-pr-ref-parse.sh
 watcher-exempt.sh	unit	tests/test-watcher-exempt.sh
 context-guard.sh	unit	tests/test-context-guard.sh
 suite-shard.sh	unit	tests/test-suite-shard.sh

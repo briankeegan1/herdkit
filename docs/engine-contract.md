@@ -319,6 +319,7 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `merge_refused_escalated` | pr, sha, slug, count, reason | port `live_runtime.py:LiveTick._walk` (HERD-352 — loud needs-you row after N refusals) |
 | `main_health` | pr, sha, result(green\|red) | `agent-watch.sh:5420` / red `:5494` |
 | `reconcile` | pr, slug, sha, ref, resolution(explicit-ref\|fuzzy) | `agent-watch.sh:4591` |
+| `reconcile_ref_unparsed` | pr, line | `work-units/git-pr.sh:_reconcile_ref_unparsed_alarm` (HERD-522/GH #637 — a merged PR body that MENTIONS `refs:` and yields no tracker id. The reconcile falls through to the fuzzy path either way; this is the record that the fall-through was a MISS, not a ref-less PR. Emitted once per PR, ledgered to `.agent-watch-ref-unparsed` and rendered as the loud "unlinked merges" console section, `agent-watch.sh:build_ref_unparsed`) |
 | `reap` | pr, slug, sha, reason | `agent-watch.sh:5278` |
 | `cost` | component, pr, slug, model, in, out, cache_read, cache_write, usd, msgs, unpriced | `cost.sh:424` |
 | `pr_restale` / `pr_starvation` | pr, sha, slug, kind (+ lap count) | `agent-watch.sh:3371`–`:3374` |

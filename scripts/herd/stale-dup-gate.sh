@@ -54,6 +54,13 @@
 # shellcheck source=/dev/null
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/derived-files.sh"
 
+# THE shared `Refs:` parser (HERD-522). Sourced by absolute path off THIS file, exactly like
+# derived-files.sh above, so the gate stays self-sufficient for the tests that source it directly —
+# and so the duplicate check can never read a ref differently from merge-time reconcile. Sourcing is
+# idempotent; agent-watch.sh has usually pulled it in already.
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/pr-ref.sh"
+
 # stale_dup_enabled — the master lever. STALE_DUP_DETECT=off disables the gate entirely; any other
 # value (default "on") leaves it active. Kept as a function so callers read one obvious predicate.
 stale_dup_enabled() {
@@ -61,26 +68,17 @@ stale_dup_enabled() {
 }
 
 # stale_dup_extract_ref — read a PR body on stdin; print the explicit 'Refs: <ID>' tracker ref, or
-# nothing. MIRRORS agent-watch.sh:_reconcile_pr_ref so the duplicate check reads refs identically to
-# the reconcile path: HTML comment blocks are stripped FIRST (a PR-template example 'Refs:' lives in a
-# `<!-- … -->` block and would otherwise poison the extractor), then the first line-anchored 'Refs:'
-# token is taken, and template placeholders ('<...>' / none / n/a) are rejected. Fail-soft: any failure
-# prints nothing. python3 is a hard engine dependency; a fallback keeps the anchor+placeholder defense
-# even if it is somehow absent.
+# nothing. HERD-522: this is now a one-line DELEGATION to the shared parser (pr-ref.sh) instead of a
+# second copy of its rules. It used to say it "MIRRORS agent-watch.sh:_reconcile_pr_ref" — and the
+# mirror had already cracked (it never stripped trailing punctuation, so `Refs: HERD-267,` read as a
+# different ref here than at the reconcile). The name is kept because tests/test-stale-dup-detect.sh
+# and the readers below call it, and because "the ref THIS gate compares on" is a meaningful local
+# concept even when its implementation is shared. Fail-soft: any failure prints nothing.
 stale_dup_extract_ref() {
-  local body ref
+  local body
   body="$(cat 2>/dev/null || true)"
   [ -n "$body" ] || return 0
-  body="$(printf '%s' "$body" | python3 -c 'import sys,re
-sys.stdout.write(re.sub(r"<!--.*?-->", "", sys.stdin.read(), flags=re.DOTALL))' 2>/dev/null || printf '%s' "$body")"
-  ref="$(printf '%s\n' "$body" \
-    | grep -iE '^[[:space:]]*Refs:[[:space:]]*[^[:space:]]' \
-    | head -n1 \
-    | sed -E 's/^[[:space:]]*[Rr][Ee][Ff][Ss]:[[:space:]]*//; s/[[:space:]].*$//' 2>/dev/null || true)"  # pipe-ok: head in a command or process substitution; pipeline status not gated
-  case "$ref" in
-    ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;
-  esac
-  printf '%s' "$ref"
+  printf '%s' "$body" | herd_pr_ref_from_body
 }
 
 # _stale_dup_this_ref <pr#> — extract the ref THIS PR carries. Honors the HERD_STALE_DUP_BODY_FILE
@@ -107,21 +105,15 @@ _stale_dup_merged_refs() {
   fi
   [ -n "$ref" ] || return 0
   gh pr list --state merged --search "${ref} in:body" --limit 100 \
-    --json number,body 2>/dev/null | python3 -c '
-import sys, json, re
+    --json number,body 2>/dev/null | python3 -c "$HERD_PR_REF_PY"'
+import sys, json
 try:
     prs = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-marker = re.compile(r"^[ \t]*Refs:[ \t]*(\S+)", re.IGNORECASE | re.MULTILINE)
 for p in prs or []:
-    body = p.get("body") or ""
-    body = re.sub(r"<!--.*?-->", "", body, flags=re.DOTALL)
-    m = marker.search(body)
-    if not m:
-        continue
-    r = m.group(1)
-    if r.startswith("<") or r.lower() in ("none", "n/a", "na"):
+    r = pr_ref_from_body(p.get("body") or "")
+    if not r:
         continue
     print("%s\t%s" % (p.get("number", ""), r))
 ' 2>/dev/null || true
