@@ -25,44 +25,20 @@ git -C "$REPO" fetch -q "$HERD_REMOTE"
 git -C "$REPO" worktree add "$DIR" -b "$BRANCH" "$DEFAULT_BRANCH"
 
 # SHARE_LINKS (from .herd/config) are gitignored shared dirs that live only in the main checkout
-# (e.g. "data .venv") — symlink each into the worktree so the app/tooling can run here. A worktree
-# missing a required link silently can't run anything, so treat a failed/broken link as fatal: we
-# never report success on a half-built worktree. Empty SHARE_LINKS → a pure code-only worktree.
-link_or_die() {
-  local target="$1" link="$2"
-  if [ ! -e "$target" ]; then
-    echo "⚠️  skip symlink: $target does not exist in the main checkout." >&2
-    return 0
-  fi
-  if ! ln -s "$target" "$link" || [ ! -e "$link" ]; then
-    echo "❌ Failed to symlink $link -> $target — worktree at $DIR is unusable." >&2
-    exit 1
-  fi
-}
-# Secrets-isolation guard (HERD-87): a SHARE_LINK must never expose .herd/secrets — the tracker's
-# workspace API credentials — into a builder worktree. Builders run --dangerously-skip-permissions,
-# so a symlink to .herd (which holds secrets) or to .herd/secrets itself would let a builder read the
-# API key and mutate tracker state, violating "the coordinator owns all backlog/tracker updates".
-# Refuse any share that IS, CONTAINS, or SITS UNDER the secrets path — loudly, then skip it (fail-soft:
-# the worktree is still built; only the dangerous link is dropped). main-checkout filesystem perms are
-# out of scope; this closes only the lane-provisioned vector.
-_SECRETS_REL=".herd/secrets"
-share_exposes_secrets() {
-  local s="${1#./}"; s="${s%/}"   # normalize ./x and trailing slash
-  case "$s" in
-    "$_SECRETS_REL"|"$_SECRETS_REL"/*) return 0 ;;  # the secrets file, or anything under it
-    ""|.|.herd) return 0 ;;                         # the repo root or the whole .herd dir contains it
-  esac
-  return 1
-}
-for share in $SHARE_LINKS; do
-  if share_exposes_secrets "$share"; then
-    echo "🚫 refusing SHARE_LINK '$share': it would expose .herd/secrets into the builder worktree (HERD-87)." >&2
-    echo "   Builders must never reach tracker credentials; the coordinator owns all tracker state. Skipping this link." >&2
-    continue
-  fi
-  link_or_die "$REPO/$share" "$DIR/$share"
-done
+# (e.g. "node_modules .venv") — symlink each into the worktree so the app/tooling can run here. ONE
+# shared implementation (herd_share_links_prepare, herd-config.sh), which the ADOPT_REMOTE_PRS leg of
+# agent-watch.sh calls too, so an ADOPTED worktree is prepared exactly like a lane one (HERD-535 /
+# GH #660 — the divergence is what red-flagged every adopted PR's healthcheck on missing caches). It carries
+# the HERD-87 secrets guard as well: a share that would expose .herd/secrets is refused loudly and
+# skipped, fail-soft, and the worktree is still built.
+#
+# A worktree missing a required link silently can't run anything, so the LANE treats a failed link as
+# FATAL: we never report success on a half-built worktree. Empty SHARE_LINKS → a pure code-only
+# worktree (nothing linked, still a success).
+if ! herd_share_links_prepare "$DIR" "$REPO"; then
+  echo "❌ SHARE_LINKS provisioning failed — worktree at $DIR is unusable." >&2
+  exit 1
+fi
 
 # Pre-trust the worktree for Claude Code so a builder agent launched here doesn't stall on the
 # interactive "Do you trust the files in this folder?" gate and die with zero commits. Trust is
