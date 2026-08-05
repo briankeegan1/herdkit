@@ -18,14 +18,27 @@
 #         2 = the glob matched ZERO tests/test-*.sh — a typo / wrong dir / empty suite. The caller
 #             MUST fail LOUDLY on 2 so a glob mistake can never silently pass an empty suite.
 #
+# DIFF-SCOPED SELECTION (HERD-532): when $HERD_SUITE_SCOPE_TESTS is non-empty it is a whitespace-
+# separated ALLOW-LIST of basenames — discovery registers only those. It is set by the project
+# healthcheck wrapper under HEALTH_SUITE_SCOPE=diff, computed by scripts/herd/suite-shard.sh's
+# herd_suite_tests_for_diff (which fails CLOSED to the full curated set for any diff it cannot map,
+# and always unions in the always-run core). This is an intersection with — never a widening of —
+# the exempt/bespoke rules below: a scoped name that is exempt or bespoke is still skipped here.
+# UNSET (every caller except that wrapper under the non-default scope) is byte-identical to before.
+#
 # Grep the exempt FILE directly (never `producer | grep -q`) so a large exempt list cannot EPIPE
 # under a caller's `set -o pipefail` (the HERD-297 shape that once misclassified a wired test).
 herd_bats_discover() {
   local _d="${1:-}" _exempt="${2:-}" _bespoke="${3:-}" _f _base _matched=0 _out=""
+  local _scope="${HERD_SUITE_SCOPE_TESTS:-}"
   for _f in "$_d"/test-*.sh; do
     [ -e "$_f" ] || continue            # nullglob-off guard: no match → literal string → skip
     _matched=1
     _base="$(basename "$_f")"
+    # scoped: an allow-list is in force and this file is not on it → not part of THIS run's selection.
+    if [ -n "$_scope" ]; then
+      case " $_scope " in *" $_base "*) : ;; *) continue ;; esac
+    fi
     # bespoke: handled by a hand-written @test block → skip so it is not run twice.
     case " $_bespoke " in *" $_base "*) continue ;; esac
     # exempt: deliberately out of the gate. Whole-line (-x) match ignores '#' comments/header rows.

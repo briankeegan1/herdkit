@@ -199,6 +199,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # byte-inert until CLAIM_RELEASE is opted in.
 # shellcheck source=/dev/null
 . "$HERE/herd-claim.sh"
+# SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531) — the shared provenance-record library, sourced for its
+# READ half (herd_health_trust_check), which the health dispatch below consults before running a full
+# suite. Sourcing DEFINES functions only; byte-inert until HEALTH_TRUST_BUILDER is opted in.
+# shellcheck source=scripts/herd/health-trust.sh
+. "$HERE/health-trust.sh"
 
 # ── The gh availability guard (HERD-237) ──────────────────────────────────────────────────────────
 # EVERY `gh` call on the tick path runs through _gh_timeout. Grounding (audit 2026-07-09, G4): the
@@ -7908,9 +7913,13 @@ _main_health_worker() {
     printf '5\tsandbox unavailable: worktree add refused\n' > "$_mw_wtmp" 2>/dev/null && mv "$_mw_wtmp" "$_mw_out" 2>/dev/null || true
     return 0
   fi
-  bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
+  # HERD-531: stamp provenance=watcher on the main-health run too. It executes in a THROWAWAY detached
+  # worktree, so its record could never satisfy the worktree match anyway — but stamping it keeps the
+  # invariant absolute ("only a builder's own pre-PR run authors builder-local evidence") rather than
+  # leaving it to depend on a sandbox path that happens not to collide.
+  HERD_HEALTH_PROVENANCE=watcher bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log" 2>&1; _mw_rc=$?
   if [ "$_mw_rc" -eq 1 ]; then
-    bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log.retry" 2>&1; _mw_rc=$?
+    HERD_HEALTH_PROVENANCE=watcher bash "$HERD_HEALTHCHECK_BIN" "$_mw_dir" --heavy > "$_mw_log.retry" 2>&1; _mw_rc=$?
     mv "$_mw_log.retry" "$_mw_log" 2>/dev/null || true
   fi
   git -C "$MAIN" worktree remove --force "$_mw_dir" >/dev/null 2>&1 || true
@@ -14486,8 +14495,20 @@ record_healthcheck() {
 # eventual full-log write) can never clobber each other's bytes — see the file-offset note in the
 # HERD-494 PR description; each is a fresh O_APPEND open, so every write lands at the CURRENT
 # end-of-file rather than at a stale, per-fd offset.
+#
+# HERD-531 <profile>: an OPTIONAL 4th argument ("--light") passed straight through to healthcheck.sh,
+# set by _healthcheck_gate ONLY when the candidate's exact head sha already carries a CLEAN heavy
+# provenance record from the builder's own pre-PR run (see scripts/herd/health-trust.sh). Empty —
+# every other dispatch — is byte-identical to before: healthcheck.sh runs its own --auto profile
+# selection and this candidate gets the full heavy suite. Both the first run and the solo retry use
+# the SAME profile, so a trusted smoke that reds still retries as a smoke rather than silently
+# escalating mid-verdict. Every invocation below also stamps HERD_HEALTH_PROVENANCE=watcher so the
+# record healthcheck.sh writes for this run can never later be read as builder-local evidence.
 _health_worker() {
-  local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line _hw_filter
+  local _hw_dir="$1" _hw_out="$2" _hw_log="$3" _hw_profile="${4:-}"
+  local _hw_rc _hw_first _hw_notok _hw_id _hw_rc2 _hw_notok2 _hw_detail _hw_line _hw_filter
+  local _hw_args=("$_hw_dir")
+  [ -n "$_hw_profile" ] && _hw_args+=("$_hw_profile")
   # BASELINE-AWARE GATE (HERD-190): hand healthcheck.sh the base checkout ($MAIN, the default-branch
   # tree) + a sha-keyed cache dir so a candidate whose failures ALL already fail on the base is
   # surfaced as an inherited ⚠️ (rc 0 → CLEAN) instead of a merge-blocking code error — no fix-PR
@@ -14500,8 +14521,8 @@ _health_worker() {
   # watcher's OWN environment can never silently narrow the FIRST run (only _health_bats_retry_filter,
   # below, may ever arm it, and only for the solo retry).
   HEALTHCHECK_PROGRESS_LOG="$_hw_log" HEALTHCHECK_BATS_FILTER= \
-    HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
-    bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log" 2>&1; _hw_rc=$?
+    HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" HERD_HEALTH_PROVENANCE=watcher \
+    bash "$HERD_HEALTHCHECK_BIN" "${_hw_args[@]}" >> "$_hw_log" 2>&1; _hw_rc=$?
   _hw_first="$(sed -n '1p' "$_hw_log" 2>/dev/null)"
   if [ "$_hw_rc" -eq 0 ]; then
     case "$_hw_first" in "⚠️"*) _hw_line=$'CLEAN\tdataenv' ;; *) _hw_line=$'CLEAN\tclean' ;; esac
@@ -14518,12 +14539,12 @@ _health_worker() {
     : > "$_hw_log.retry" 2>/dev/null || true
     if [ -n "$_hw_filter" ]; then
       HEALTHCHECK_PROGRESS_LOG="$_hw_log.retry" HEALTHCHECK_BATS_FILTER="$_hw_filter" \
-        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
-        bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
+        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" HERD_HEALTH_PROVENANCE=watcher \
+        bash "$HERD_HEALTHCHECK_BIN" "${_hw_args[@]}" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
     else
       HEALTHCHECK_PROGRESS_LOG="$_hw_log.retry" HEALTHCHECK_BATS_FILTER= \
-        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" \
-        bash "$HERD_HEALTHCHECK_BIN" "$_hw_dir" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
+        HERD_BASELINE_DIR="$MAIN" HERD_BASELINE_CACHE="$TREES" HERD_HEALTH_PROVENANCE=watcher \
+        bash "$HERD_HEALTHCHECK_BIN" "${_hw_args[@]}" >> "$_hw_log.retry" 2>&1; _hw_rc2=$?
     fi
     if [ "$_hw_rc2" -eq 0 ]; then
       rm -f "$_hw_log.retry" 2>/dev/null || true                 # transient — the passing retry is the truth
@@ -14704,6 +14725,24 @@ _healthcheck_gate() {
     return 0
   fi
 
+  # SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531): before paying for a ~20-60 min heavy suite, ask
+  # whether this EXACT head sha was already proven clean by the builder's own pre-PR heavy run in this
+  # very worktree. When it was, run the LIGHT profile as a smoke instead of the full re-run — the
+  # suite that matters already ran, on the same commit, from the same clean tree. EVERY other case (no
+  # record, stale sha, non-clean outcome, dirty tree, a record older than the commit, a record the
+  # watcher itself authored, or the lever off) leaves _hg_profile empty and dispatches the full suite
+  # exactly as before. The verdict/ledger/cache machinery below is untouched either way: a trusted
+  # dispatch still produces a real CLEAN/FLAKY/CODEERROR verdict from a real run, so a smoke that reds
+  # still blocks the merge.
+  local _hg_profile="" _hg_prov=""
+  if _hg_prov="$(herd_health_trust_check "$TREES" "$_hg_sha" "$_hg_dir")"; then
+    _hg_profile="--light"
+    journal_append health_trusted pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" \
+      provenance "$_hg_prov" profile light
+  else
+    _hg_prov=""
+  fi
+
   # LEAK-GUARD SNAPSHOT POINT (HERD-54): the suite's tab-leak-guard snapshots the workspace BEFORE it
   # runs, so proactively close any stale resolve·<slug> tab first. Fail-soft; a live resolver is spared.
   _sweep_stale_resolve_tabs
@@ -14718,11 +14757,18 @@ _healthcheck_gate() {
   # stale-sha kill reap the WHOLE suite subtree as one group (HERD-283), and it also keeps a reload's
   # `kill -- -<watcher-pgid>` from ever reaching a live suite. Live health pids stay exempted from
   # _list_project_watchers (HERD-217/245) so reload never SIGTERMs them as "stray watchers" either.
-  _bg_health_worker _health_worker "$_hg_dir" "$_hg_disp" "$_hg_log"
+  _bg_health_worker _health_worker "$_hg_dir" "$_hg_disp" "$_hg_log" "$_hg_profile"
   local _hg_wpid="$_BG_HEALTH_PID"
   _marker_write "$_hg_inflight" "$_hg_wpid" "$_BG_HEALTH_PGID"
   _rotate_health_logs
-  DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running (0s)${C_RESET}"
+  # CONSOLE HONESTY (HERD-531): a trusted dispatch is a SMOKE, not the full suite — say so on the row,
+  # so nobody reads a 30-second green as "the ~350-test suite passed here". Byte-identical when the
+  # lever is off (_hg_profile empty → the original row text).
+  if [ -n "$_hg_profile" ]; then
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · light smoke (0s · heavy trusted from ${_hg_prov})${C_RESET}"
+  else
+    DISPLAY[_hg_idx]="    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_hg_sl}${C_RESET}${_hg_pn} ${C_YELLOW}health-check · running (0s)${C_RESET}"
+  fi
   _HC_RESULT="RUNNING"
   # healthcheck_started (not just a later 'outcome'): the record shows runs IN FLIGHT — so a suite that
   # never finishes (killed, restart) is visible in the journal, and log_path points at the tailable log.

@@ -259,6 +259,23 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # REVIEW_INFLIGHT_TIMEOUT="1800"   # seconds before an in-flight reviewer is SIGTERMed + reaped (default 1800 = 30m)
 # HEALTH_INFLIGHT_TIMEOUT="1800"   # seconds before an in-flight healthcheck suite is SIGTERMed + reaped (default 1800 = 30m)
 
+# suite economy (HERD-531 / HERD-532) — the health gate is the pipeline's dominant cost (~350 tests,
+# 20-60 min per suite), and today it is paid twice: once by the builder pre-PR, once by the watcher on
+# the SAME commit. Both levers below are ship-dormant and FAIL-CLOSED — anything they cannot prove is
+# the full suite, exactly as today.
+#   HEALTH_TRUST_BUILDER  on → a heavy healthcheck writes a provenance record (sha, worktree, profile,
+#        outcome, duration) into the worktree pool, and the watcher runs the LIGHT profile as a smoke
+#        when the candidate's EXACT head sha already has a CLEAN heavy record from a CLEAN tree at that
+#        worktree (journaling health_trusted). Stale sha / dirty tree / non-clean outcome / a record the
+#        watcher itself wrote → full re-run.
+#   HEALTH_SUITE_SCOPE    diff → the heavy suite runs only the tests the worktree's diff can affect,
+#        mapped by the tests/test-<name>.sh ↔ scripts/herd/<name>.sh pairing, an optional per-test
+#        '# suite-deps:' header, and an always-run core. Any unmappable or wide-blast path (bin/herd,
+#        herd-config.sh, agent-watch.sh, either healthcheck wrapper, capabilities.tsv, the selection
+#        library, the bats discovery surface) selects the FULL curated set.
+# HEALTH_TRUST_BUILDER="off"   # off (default) | on
+# HEALTH_SUITE_SCOPE="full"    # full (default) | diff
+
 # native-burst (HERD-107) — the bounded read-only FAN-OUT seam (scripts/herd/burst.sh).
 #   off  default — byte-identical to today: research fan-out is un-hinted; the review is a single reviewer.
 #   on   read-only work may BURST — fan out several CONCURRENT calls bounded by REVIEW_CONCURRENCY (the
