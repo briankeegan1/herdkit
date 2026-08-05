@@ -97,6 +97,14 @@ if [ -f "$HERE/journal.sh" ]; then
   # shellcheck source=/dev/null
   . "$HERE/journal.sh"
 fi
+# capacity-ledger.sh (HERD-557) only defines functions (no source-time side effects); a partially-
+# upgraded tree missing it must not break the healthcheck — run_heavy()'s CAPACITY_BUDGET branch below
+# probes `capacity_budget_enabled` with `command -v` before ever calling into it, so an absent file
+# here just falls straight through to the untouched HERD-529 `_lss_*` flat-cap path.
+if [ -f "$HERE/capacity-ledger.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HERE/capacity-ledger.sh"
+fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # caps-sync guard (rc 2), never break the healthcheck it is a part of.
 # Prefer the tree-under-test's copy when present so a branch that changes the lint is linted by
@@ -529,9 +537,29 @@ _lss_acquire() {
 # ── heavy profile: delegate to the project health command ────────────────────
 run_heavy() {
   if [ -z "$HEALTHCHECK_CMD" ]; then run_light; return; fi
-  _lss_acquire
+  # ── HERD-557: suite-capacity LEDGER — the evolved HERD-529 slot machinery. CAPACITY_BUDGET=off (the
+  # ship default), an unresolved worktree pool, or no python3 (the ledger's flock backbone,
+  # capacity_flock_run.py) all fall straight through to the ORIGINAL, UNTOUCHED `_lss_acquire` flat-cap
+  # path below — byte-identical to before this feature existed. Only when the ledger is genuinely
+  # available does admission route through capacity_acquire_and_run instead, with class resolved from
+  # the SAME provenance stamps agent-watch.sh already sets: HERD_HEALTH_PROVENANCE=watcher marks a
+  # watcher-dispatched suite, HERD_HEALTH_RETRY_KIND=flaky-solo marks the RETRY-BEFORE-RED solo re-run
+  # (a drain barrier, not merely a higher priority — see docs/spikes/capacity-admission.md). Absent
+  # either, a suite is builder-local — the bottom class, guaranteed its own reserved-slice unit so a
+  # watcher burst can never starve it.
+  local _cap_active=0 _cap_class="builder-local"
+  if command -v capacity_budget_enabled >/dev/null 2>&1 \
+     && capacity_budget_enabled 2>/dev/null \
+     && [ -n "$(capacity_pool_dir 2>/dev/null)" ] \
+     && [ -n "$(capacity_python_bin 2>/dev/null)" ]; then
+    _cap_active=1
+    [ "${HERD_HEALTH_PROVENANCE:-}" = "watcher" ] && _cap_class="watcher"
+    [ "${HERD_HEALTH_RETRY_KIND:-}" = "flaky-solo" ] && _cap_class="retry-solo"
+  else
+    _lss_acquire
+  fi
   # Resolve the command relative to the worktree (it's a committed project file).
-  local out rc
+  local out rc _cap_cap
   # HERD-533 STREAM: the previous shape captured the WHOLE suite's output into $out via a bare
   # command substitution, so nothing reached our own stdout — and thus the dispatch log the async
   # health worker redirects healthcheck.sh's stdout into — until the suite fully exited (a ~9-minute
@@ -546,7 +574,15 @@ run_heavy() {
   # profile-aware project script actually sees --heavy instead of defaulting to light while this
   # wrapper reports clean. See the header contract comment above.
   [ -n "${HEALTHCHECK_PROGRESS_LOG:-}" ] && { : > "$HEALTHCHECK_PROGRESS_LOG"; } 2>/dev/null
-  if [ -n "$ONELINE" ]; then
+  if [ "$_cap_active" -eq 1 ]; then
+    _cap_cap="$(herd_numeric LOCAL_SUITE_CONCURRENCY 2)"
+    case "$_cap_cap" in ''|*[!0-9]*) _cap_cap=2 ;; esac
+    if [ -n "$ONELINE" ]; then
+      out="$(set -o pipefail; capacity_acquire_and_run suite "$_cap_cap" "$_cap_class" -- bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+    else
+      out="$(set -o pipefail; capacity_acquire_and_run suite "$_cap_cap" "$_cap_class" -- bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
+    fi
+  elif [ -n "$ONELINE" ]; then
     out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy --oneline" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?
   else
     out="$(set -o pipefail; bash -c "cd '$DIR' && $HEALTHCHECK_CMD '$DIR' --heavy" 2>&1 | tee -a "${HEALTHCHECK_PROGRESS_LOG:-/dev/null}")"; rc=$?

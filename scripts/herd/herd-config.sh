@@ -815,6 +815,22 @@ fi
 # back toward the configured floor, never a fabricated ceiling. Unknown value → off (fail safe).
 # Consumed by agent-watch.sh / engine-version.sh.
 : "${GATE_SCALE:="off"}"           # off (default) | on — see capabilities.tsv / agent-watch.sh
+# CAPACITY_BUDGET (HERD-557 P1) — evolve the HERD-529 LOCAL_SUITE_CONCURRENCY slot pool into a
+# PRIORITY-AWARE ledger (scripts/herd/capacity-ledger.sh — the design doc is
+# docs/spikes/capacity-admission.md): off (default, ship-dormant) | on (yolo posture adopts on —
+# templates/postures.tsv). off -> scripts/herd/healthcheck.sh's run_heavy() calls the ORIGINAL,
+# UNTOUCHED `_lss_acquire` flat-cap machinery — byte-identical to before this key existed. on -> the
+# SAME LOCAL_SUITE_CONCURRENCY unit count is instead admitted through a reserved-slice partition (a
+# watcher-only unit and a builder-local-only unit so neither class can starve the other by possession —
+# see the design doc for why time-based aging was rejected in favor of this) plus a RETRY-SOLO drain
+# barrier for the flaky-retry re-run (holds the whole ledger alone, or gives up as env-suspect within
+# its window) and an overload breaker (loadavg far past cores freezes admission regardless of ledger
+# room). The acquire itself is a real, atomic, non-blocking flock (scripts/herd/capacity_flock_run.py,
+# portable macOS/Linux) tied to the holding process's own fd — a crashed/killed holder's unit is
+# released BY THE KERNEL, not by any reconciler this engine has to run. FAIL-SOFT: no worktree pool, no
+# python3, or this key simply off — all fall back to the same untouched flat-cap path. Unknown value ->
+# off (fail safe). Consumed by healthcheck.sh / capacity-ledger.sh.
+: "${CAPACITY_BUDGET:="off"}"      # off (default) | on — see capabilities.tsv / capacity-ledger.sh
 # RESTART-SAFE INFLIGHT TIMEOUTS (HERD-185) — an in-flight review/health worker that outlives this many
 # seconds (age read from its on-disk dispatch marker, so ANY watcher instance — even one that restarted
 # mid-run — can enforce it) is SIGTERMed + reaped by the every-tick corpse sweep, freeing its slot. Well

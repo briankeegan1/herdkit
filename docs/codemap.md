@@ -23,6 +23,7 @@ Role summarized from each file's top-of-file comment.
 - `backlog-view.sh` — live, styled backlog viewer for the coordinator's left pane.
 - `bats-fd3-guard.sh` — HERD-462: the shared-chokepoint half of the bats-FD3 wedge fix.
 - `burst.sh` — the ONE reusable BOUNDED-CONCURRENCY FAN-OUT "seam" for herdkit's READ-ONLY work
+- `capacity-ledger.sh` — HERD-557 P1: the shared SUITE-CAPACITY LEDGER. docs/spikes/capacity-admission.md
 - `caps-sync-lint.sh` — THE shared caps-sync guard (HERD-220): the capabilities manifest
 - `changelog.sh` — journal-driven CHANGELOG + release-tag helper (HERD-256 / HERD-168 part 2/3).
 - `ci-repair.sh` — CI auto-repair for INHERITED reds (HERD-250).
@@ -159,7 +160,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `engine-version.sh` → `journal.sh`
 - `fleet.sh` → `herd-config.sh`, `journal.sh`
 - `governance-drift-sweep.sh` → `governance.sh`, `herd-config.sh`, `journal.sh`
-- `healthcheck.sh` → `commit-lint.sh`, `herd-config.sh`, `journal.sh`
+- `healthcheck.sh` → `capacity-ledger.sh`, `commit-lint.sh`, `herd-config.sh`, `journal.sh`
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`
@@ -221,6 +222,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `BASELINE_AWARE_GATE` → `healthcheck.sh`
 - `BRANCH_TEMPLATE` → `agent-watch.sh`
 - `BUDGET_DAILY` → `cost.sh`, `herd-feature.sh`, `herd-quick.sh`
+- `CAPACITY_BUDGET` → `capacity-ledger.sh`
 - `CHECKOUT_GUARD` → `agent-watch.sh`
 - `CI_AUTOREPAIR` → `ci-repair.sh`
 - `CI_FAST_BOUNCE` → `agent-watch.sh`
@@ -389,5 +391,5 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WEDGE_AUTOWAKE` → `agent-watch.sh`
 - `WEDGE_GRACE_MIN` → `agent-watch.sh`
 - `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `backlog-view.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `herd-watch.sh`, `status.sh`, `sweep.sh`, `watcher-resurrect.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `healthcheck.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `herd-watch.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `approvals.sh`, `capacity-ledger.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `healthcheck.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `herd-watch.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
 - `WORK_UNIT_KIND` → `agent-watch.sh`, `work-unit.sh`
