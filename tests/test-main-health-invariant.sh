@@ -85,12 +85,24 @@ export HC_MODE="$T/hc-mode"; printf 'green\n' > "$HC_MODE"
 BIN="$T/bin"; mkdir -p "$BIN"
 # GH_LOG_FAILED (HERD-476): the `gh run view <id> --log-failed` stub output, for the CI honest-identity
 # leg (_main_health_ci_log_identity). Kept as simple/global as GH_RUNS — one scenario at a time.
+# GH_WORKFLOW_RUN_RC (HERD-545): the exit code `gh workflow run …` (the starvation re-dispatch) hands
+# back — default 0 (succeeds), same as the pre-existing catch-all `exit 0`, so every test written
+# before HERD-545 is byte-unaffected; a starvation test sets it to non-zero to drive the local-fallback
+# branch of _main_health_ci_redispatch.
+# GH_UNAVAILABLE (HERD-545): simulates an offline/uninstalled gh WITHOUT ever removing this stub from
+# $BIN — moving the stub aside used to let PATH fall through to a REAL system `gh`, which (this repo's
+# own git remote being the real herdkit GitHub repo) then made a REAL, un-hermetic network call. The old
+# _main_ci_classify's exact-sha filter happened to mask that (a fixture sha can never match a real
+# GitHub run), but _main_ci_starve_scan (HERD-545) classifies the newest CONCLUSIVE run regardless of
+# sha, so the leak stopped being harmless. $BIN stays FIRST on $PATH at all times now.
 cat > "$BIN/gh" <<'GHSTUB'
 #!/usr/bin/env bash
+[ -n "${GH_UNAVAILABLE:-}" ] && exit 1
 printf '%s\n' "$*" >> "${GH_CALLS:-/dev/null}"
 case "$1 $2" in
-  "run list") printf '%s\n' "${GH_RUNS:-}"; exit 0 ;;
-  "run view") printf '%s\n' "${GH_LOG_FAILED:-}"; exit 0 ;;
+  "run list")     printf '%s\n' "${GH_RUNS:-}"; exit 0 ;;
+  "run view")     printf '%s\n' "${GH_LOG_FAILED:-}"; exit 0 ;;
+  "workflow run") exit "${GH_WORKFLOW_RUN_RC:-0}" ;;
 esac
 exit 0
 GHSTUB
@@ -560,9 +572,7 @@ unset GH_RUNS
 reset_state
 new_sha "feat: a sha probed while gh itself is unavailable"
 SHA_OFFLINE="$(head_sha)"
-mv "$BIN/gh" "$BIN/gh.disabled"
-_main_health_ci_leg; RC=$?
-mv "$BIN/gh.disabled" "$BIN/gh"
+GH_UNAVAILABLE=1 _main_health_ci_leg; RC=$?
 [ "$RC" -eq 0 ] || fail "(b1) _main_health_ci_leg did not fail-soft (rc=$RC) when gh is unavailable"
 [ ! -s "$MAIN_HEALTH_STATE" ] || fail "(b1) an unavailable gh painted a red anyway"
 ok "(b1) an unavailable gh binary is fail-soft: no red, rc=0"
@@ -808,5 +818,167 @@ settle
 ok "(t) an ANSI-laden rc/path blob with no file token reads dishonest — never filed, never spawned"
 unset GH_RUNS GH_LOG_FAILED
 MAIN_HEALTH_AUTOFIX=off
+
+# ── HERD-545: CI-leg starvation under merge bursts ──────────────────────────────────────────────────
+# GROUNDED (2026-08-05): MAIN RED stood anchored to an OLD sha's CI FAILURE while 17 merges in a row
+# auto-cancelled every newer run before it could complete. The pre-fix leg (_main_ci_classify "$sha")
+# only ever asked "is there a COMPLETED run for the CURRENT head" — during a burst the answer is "no"
+# on every tick after the first, so the stale red could never be superseded OR even requalified as
+# stale. _main_ci_starve_scan always classifies the newest CONCLUSIVE run in the window and counts the
+# distinct newer shas that never got one of their own.
+
+# (u1) a cancelled chain renders the standing red QUALIFIED — naming the anchor sha and the cancelled
+# count — instead of leaving a bare "CI <workflow>: <conclusion>" that reads as a live verdict about
+# whatever main happens to be at right now.
+reset_state
+new_sha "fix: this commit's CI run will fail and anchor the row"
+SHA_ANCHOR="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}]'
+_main_health_ci_leg
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(u1) setup: the initial CI failure did not paint MAIN RED"
+IFS=$'\x1f' read -r _u1s_sha _u1s_since _u1s_local _u1s_ci < "$MAIN_HEALTH_STATE"
+[ "$_u1s_ci" = "CI build: FAILURE" ] || fail "(u1) setup: the FIRST detection did not render the plain (unqualified) message: '$_u1s_ci'"
+[ "$(cat "$MAIN_HEALTH_CI_STATE")" = "$SHA_ANCHOR FAILURE 0" ] || fail "(u1) setup: the dedup memo did not record cancelled-count 0: $(cat "$MAIN_HEALTH_CI_STATE")"
+
+# Three merges land back-to-back and every one of their CI runs is auto-cancelled before completing —
+# the classic starvation shape. current HEAD moves to the newest (still-cancelled) sha.
+new_sha "chore: merge burst 1 (its own CI run gets cancelled)"; SHA_C1="$(head_sha)"
+new_sha "chore: merge burst 2 (its own CI run gets cancelled)"; SHA_C2="$(head_sha)"
+new_sha "chore: merge burst 3 (its own CI run gets cancelled)"; SHA_C3="$(head_sha)"
+export GH_RUNS='[
+  {"headSha":"'"$SHA_C3"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_C2"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_C1"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}
+]'
+_main_health_ci_leg
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(u1) the anchor red vanished once newer runs started cancelling"
+IFS=$'\x1f' read -r _u1_sha _u1_since _u1_local _u1_ci < "$MAIN_HEALTH_STATE"
+[ "$_u1_sha" = "$SHA_ANCHOR" ] || fail "(u1) the pinned sha drifted off the anchor: '$_u1_sha'"
+grep -q "CI red at ${SHA_ANCHOR:0:7}" <<< "$_u1_ci" || fail "(u1) the row did not name the anchor sha: '$_u1_ci'"
+grep -q "3 newer runs cancelled" <<< "$_u1_ci" || fail "(u1) the row did not count the 3 cancelled newer runs: '$_u1_ci'"
+grep -q "awaiting a completed run" <<< "$_u1_ci" || fail "(u1) the row did not say it is awaiting a fresh signal: '$_u1_ci'"
+[ "$_u1_ci" = "CI build: FAILURE" ] && fail "(u1) the row stayed BARE despite 3 newer cancelled runs — the starvation regression itself"
+ok "(u1) a cancelled-chain anchor red renders QUALIFIED (anchor sha + cancelled count), never a bare unqualified conclusion"
+
+# (u2) a completed GREEN on a sha NEWER than (but not equal to) the pinned anchor clears the stale red
+# — HERD-545 part 3. Before this fix the leg only ever looked for a PASS on the exact current head, so
+# a green landing on any other sha in the window was invisible to it.
+new_sha "fix: this commit's CI run finally completes green"
+SHA_GREEN="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_GREEN"'","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"build"}]'
+NOTIFY_GREEN_BEFORE="$(ncount 'main green')"
+_main_health_ci_leg
+[ ! -s "$MAIN_HEALTH_STATE" ] || fail "(u2) a green completed run on a NEWER sha did not clear the stale anchor red: $(cat "$MAIN_HEALTH_STATE")"
+[ -z "$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)" ] || fail "(u2) the CI dedup memo was not reset on the newer-sha clear"
+[ "$(ncount 'main green')" -eq "$((NOTIFY_GREEN_BEFORE + 1))" ] || fail "(u2) the newer-sha green did not notify recovery exactly once"
+ok "(u2) a completed green on ANY newer sha clears the stale anchor, not only a green on the exact current head"
+unset GH_RUNS
+
+# (u3) starvation reaching the cancelled-count threshold (_MAIN_CI_STARVE_K), with no run in progress,
+# requests a fresh CI signal exactly once per sha — never once per scan, and never while a run is still
+# in flight ("re-dispatch once per sha only when idle").
+reset_state
+new_sha "fix: anchor commit for the re-dispatch test"
+SHA_RD_ANCHOR="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_RD_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}]'
+_main_health_ci_leg
+new_sha "chore: cancelled 1"; SHA_RD_C1="$(head_sha)"
+new_sha "chore: cancelled 2"; SHA_RD_C2="$(head_sha)"
+new_sha "chore: cancelled 3"; SHA_RD_C3="$(head_sha)"    # current HEAD, K=3 cancelled shas above the anchor
+: > "$GH_CALLS"
+export GH_RUNS='[
+  {"headSha":"'"$SHA_RD_C3"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_RD_C2"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_RD_C1"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_RD_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}
+]'
+_main_health_ci_leg
+[ "$(gcount 'workflow run build')" -eq 1 ] || fail "(u3) reaching K cancelled newer runs with nothing in progress did not request a fresh signal: $(cat "$GH_CALLS")"
+[ "$(jcount "\"event\":\"main_health_ci_redispatch\".*\"sha\":\"$SHA_RD_C3\".*\"result\":\"dispatched\"")" -eq 1 ] || fail "(u3) the redispatch was not journaled as dispatched for the CURRENT head sha"
+ok "(u3a) starvation reaching the K threshold with no run in progress requests a fresh CI signal (gh workflow run)"
+
+# A repeat tick for the SAME sha must never ask gh again — guarded once per sha, not once per scan.
+_main_health_ci_leg
+[ "$(gcount 'workflow run build')" -eq 1 ] || fail "(u3) a repeat scan for the SAME still-starved sha asked gh workflow run again — the once-per-sha guard leaked"
+ok "(u3b) a repeat scan for the SAME (still-starved) sha never re-asks gh — once-per-sha guard holds"
+
+# A genuinely NEW head sha, still starved, re-arms the guard — it is per-sha, not a global one-shot.
+new_sha "chore: cancelled 4 — a new head, still starved"; SHA_RD_C4="$(head_sha)"
+export GH_RUNS='[
+  {"headSha":"'"$SHA_RD_C4"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_RD_C3"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_RD_C2"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_RD_C1"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_RD_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}
+]'
+_main_health_ci_leg
+[ "$(gcount 'workflow run build')" -eq 2 ] || fail "(u3) a NEW starved head sha did not get its own fresh-signal request"
+ok "(u3c) a genuinely new starved head sha re-arms the re-dispatch guard (per-sha, not a global one-shot)"
+unset GH_RUNS
+
+# The idle gate: K cancelled newer runs is reached, but a run is STILL IN PROGRESS somewhere in the
+# window — re-dispatch must be withheld (asking GitHub for ANOTHER run while one is already in flight
+# would just create a second thing to get cancelled).
+reset_state
+new_sha "fix: anchor commit for the idle-gate test"
+SHA_IDLE_ANCHOR="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_IDLE_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}]'
+_main_health_ci_leg
+new_sha "chore: cancelled a"; SHA_IDLE_C1="$(head_sha)"
+new_sha "chore: cancelled b"; SHA_IDLE_C2="$(head_sha)"
+new_sha "chore: cancelled c"; SHA_IDLE_C3="$(head_sha)"
+new_sha "chore: still running"; SHA_IDLE_C4="$(head_sha)"   # current HEAD — its run has not finished yet
+: > "$GH_CALLS"
+export GH_RUNS='[
+  {"headSha":"'"$SHA_IDLE_C4"'","status":"IN_PROGRESS","conclusion":"","workflowName":"build"},
+  {"headSha":"'"$SHA_IDLE_C3"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_IDLE_C2"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_IDLE_C1"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_IDLE_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}
+]'
+_main_health_ci_leg
+[ "$(gcount 'workflow run')" -eq 0 ] || fail "(u3) a re-dispatch fired while a run in the window was STILL IN PROGRESS: $(cat "$GH_CALLS")"
+ok "(u3d) re-dispatch is withheld while any run in the window is still in progress, even past the K threshold"
+unset GH_RUNS
+
+# (u4) when the live re-dispatch itself is unavailable (no workflow_dispatch trigger, an older gh, no
+# write scope), the leg falls back to the LOCAL suite's OWN verdict for the exact starved sha — already
+# being produced by the ordinary MAIN_HEALTH_TICK re-suite regardless of CI's health — and clears the
+# stale CI anchor off of it, honestly tagged provenance=local-fallback.
+reset_state
+printf 'green\n' > "$HC_MODE"
+new_sha "fix: anchor commit for the local-fallback test"
+SHA_LF_ANCHOR="$(head_sha)"
+export GH_RUNS='[{"headSha":"'"$SHA_LF_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}]'
+_main_health_ci_leg
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(u4) setup: the CI failure did not paint MAIN RED"
+new_sha "chore: cancelled x"; SHA_LF_C1="$(head_sha)"
+new_sha "chore: cancelled y"; SHA_LF_C2="$(head_sha)"
+new_sha "chore: cancelled z"; SHA_LF_C3="$(head_sha)"     # current HEAD
+# The ordinary local re-suite verifies the CURRENT head sha clean, independent of CI's own starvation.
+reconcile_main_health; settle
+[ -e "$(_main_health_marker "$SHA_LF_C3")" ] || fail "(u4) setup: the local suite never produced a verdict for the current head sha"
+_lf_local=""
+if [ -s "$MAIN_HEALTH_STATE" ]; then
+  IFS=$'\x1f' read -r _lf_sha _lf_since _lf_local _lf_ci < "$MAIN_HEALTH_STATE"
+fi
+[ -z "$_lf_local" ] || fail "(u4) setup: the local suite unexpectedly reproduced a red for the current head sha: '$_lf_local'"
+export GH_WORKFLOW_RUN_RC=1     # the live re-dispatch is unavailable (no workflow_dispatch wired, e.g.)
+export GH_RUNS='[
+  {"headSha":"'"$SHA_LF_C3"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_LF_C2"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_LF_C1"'","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"build"},
+  {"headSha":"'"$SHA_LF_ANCHOR"'","status":"COMPLETED","conclusion":"FAILURE","workflowName":"build"}
+]'
+NOTIFY_LF_BEFORE="$(ncount 'main green')"
+_main_health_ci_leg
+[ "$(gcount 'workflow run build')" -eq 1 ] || fail "(u4) the leg never attempted the live re-dispatch before falling back"
+[ "$(jcount "\"event\":\"main_health_ci_redispatch\".*\"sha\":\"$SHA_LF_C3\".*\"result\":\"fallback\"")" -eq 1 ] || fail "(u4) the failed live re-dispatch was not journaled as a fallback"
+[ "$(jcount "\"event\":\"main_health_ci_redispatch\".*\"sha\":\"$SHA_LF_C3\".*\"result\":\"cleared\".*\"provenance\":\"local-fallback\"")" -eq 1 ] || fail "(u4) the local-suite fallback did not clear the stale CI anchor with an honest provenance tag"
+[ ! -s "$MAIN_HEALTH_STATE" ] || fail "(u4) the stale CI anchor survived the local-fallback clear: $(cat "$MAIN_HEALTH_STATE")"
+[ "$(ncount 'main green')" -eq "$((NOTIFY_LF_BEFORE + 1))" ] || fail "(u4) the local-fallback clear did not notify recovery exactly once"
+ok "(u4) an unavailable live re-dispatch falls back to the local suite's own verdict, clearing the stale anchor with provenance=local-fallback"
+unset GH_RUNS GH_WORKFLOW_RUN_RC
 
 echo "ALL PASS ($pass checks)"
