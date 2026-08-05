@@ -60,6 +60,7 @@ Unit-driven by ``tests/test_live_runtime.py`` + gate wrapper ``tests/test-py-liv
 """
 
 import glob
+import hashlib
 import json
 import os
 import re
@@ -1900,6 +1901,14 @@ class _GraphQLDiscovery:
 # as if this trust check did not exist. SHIP-DORMANT: HEALTH_TRUST_BUILDER off (the default) means
 # ``_health_trust_on`` is False and :meth:`LiveGates.health` never even opens the record file — zero
 # behavior change, byte-identical to before this existed.
+#
+# FORMAT VERSION 2 (HERD-560): the record grew a leading ``version`` field and a trailing
+# ``log_digest`` field (10 fields total, was 8) — see health-trust.sh's header for the full field
+# list and the companion ``.health-provenance-log-<sha>`` file the digest is verified against. A
+# pre-HERD-560 record (8 fields, no version) or an unrecognized version reads as ABSENT — never an
+# error — exactly as if this sha had no record at all. A well-formed record is ALSO refused when
+# stale: older than ``HEALTH_TRUST_MAX_AGE_SECS`` (default 21600s / 6h), written before the commit it
+# claims to attest existed, or its digest no longer matches the companion log's actual content.
 
 def _health_trust_on(config):
     """Port of ``herd_health_trust_on`` (health-trust.sh) — is HEALTH_TRUST_BUILDER on? An
@@ -1926,6 +1935,37 @@ def _health_trust_file(trees, sha):
     if not trees or not sha:
         return ""
     return os.path.join(trees.rstrip("/"), ".health-provenance-%s" % sha)
+
+
+def _health_trust_log_file(trees, sha):
+    """Port of ``herd_health_trust_log_file`` (HERD-560) — the companion suite-log path a CLEAN
+    record's ``log_digest`` is verified against. Same empty-argument contract as
+    :func:`_health_trust_file`."""
+    if not trees or not sha:
+        return ""
+    return os.path.join(trees.rstrip("/"), ".health-provenance-log-%s" % sha)
+
+
+def _health_trust_digest_file(path):
+    """sha256 hex digest of ``path``'s content, read as bytes off disk (never a re-quoted string
+    round-trip, so a trailing newline can never desync this from the bash writer's own
+    ``sha256sum``/``shasum`` hash of the same file). ``""`` on any failure — the caller treats that as
+    "no digest" and refuses to trust, never fabricates one."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+# HEALTH_TRUST_MAX_AGE_SECS (HERD-560) — the freshness window's bounded-age default, seconds. Mirrors
+# health-trust.sh's own ``${HEALTH_TRUST_MAX_AGE_SECS:-21600}`` fallback so bash and python agree on
+# the default with no config-manifest wiring needed (an operator who wants a different bound sets the
+# env var directly, the same ad-hoc-override convention HEALTH_TRUST_KEEP_DAYS already uses).
+_HEALTH_TRUST_DEFAULT_MAX_AGE_SECS = 21600
 
 
 def _health_trust_commit_epoch(worktree, sha):
@@ -1959,14 +1999,23 @@ def _health_trust_check(trees, sha, worktree):
             line = fh.readline().rstrip("\n")
     except Exception:
         return "", "malformed record"
+    fields = line.split("\t")
+    # OLD-FORMAT (pre-HERD-560, 8 fields, no version) reads as ABSENT — never an error: an engine
+    # upgrade must never turn a stale-format leftover into a red gate, only into a plain full re-run,
+    # exactly as if this sha had no record at all.
+    if len(fields) == 8:
+        return "", "old-format record (absent)"
     # A truncated/garbled/interrupted-write record proves nothing — refuse it rather than guessing at
     # whichever fields happen to be present (mirrors the bash reader's own $_ht_epoch emptiness check).
-    fields = line.split("\t")
-    if len(fields) != 8:
+    if len(fields) != 10:
         return "", "malformed record"
-    r_sha, r_wt, r_prof, r_out, _r_dur, r_prov, r_state, r_epoch = fields
+    (version, r_sha, r_wt, r_prof, r_out, _r_dur, r_prov, r_state, r_epoch, r_digest) = fields
     if not r_epoch or not r_epoch.isdigit():
         return "", "malformed record"
+    # An unrecognized version (a FUTURE format this engine build predates) reads as ABSENT too — the
+    # same fail-soft-toward-full-re-run rule as an old-format record, never an error.
+    if version != "2":
+        return "", "old-format record (absent)"
     # STALE SHA: the record must name the very commit being gated.
     if r_sha != sha:
         return "", "stale sha in record"
@@ -1984,13 +2033,41 @@ def _health_trust_check(trees, sha, worktree):
         wt_abs = _health_trust_abspath(worktree)
         if r_wt != wt_abs:
             return "", "record worktree %s != %s" % (r_wt, wt_abs)
-    # RECORD-OLDER-THAN-THE-SHA: a record written BEFORE the commit existed cannot have tested it (a
-    # recycled path, a clock skew, a hand-forged file). An unresolvable commit is refused too.
+    # FRESHNESS WINDOW, part 1 — BOUNDED AGE (HERD-560): a record older than
+    # HEALTH_TRUST_MAX_AGE_SECS (default 21600s / 6h) cannot be trusted no matter how clean its
+    # outcome — the world may have moved on since (a dependency bump, a config drift landing on
+    # default) that only a fresh suite run would see. 0/negative disables the bound (unlimited,
+    # pre-HERD-560 behavior); a non-numeric override falls back to the default.
+    max_age = os.environ.get("HEALTH_TRUST_MAX_AGE_SECS", "")
+    try:
+        max_age = int(max_age)
+    except (TypeError, ValueError):
+        max_age = _HEALTH_TRUST_DEFAULT_MAX_AGE_SECS
+    if max_age > 0:
+        now = int(_now_epoch())
+        if now - int(r_epoch) > max_age:
+            return "", "record older than %ss (stale by age)" % max_age
+    # FRESHNESS WINDOW, part 2 — RECORD PREDATES THE BRANCH'S NEWEST PUSH: a record written BEFORE
+    # the commit existed cannot have tested it (a recycled path, a clock skew, a hand-forged file).
+    # An unresolvable commit is refused too.
     ct = _health_trust_commit_epoch(worktree or r_wt, sha)
     if not ct or not ct.isdigit():
         return "", "commit time unresolvable"
     if int(r_epoch) < int(ct):
         return "", "record predates the commit"
+    # DIGEST (HERD-560): the record's claimed suite-log digest must match the companion log file's
+    # ACTUAL content. A missing/unreadable log, or one that no longer hashes to what was recorded,
+    # proves nothing and is refused exactly like every disqualifier above — no signing, so this
+    # catches a corrupted/truncated/swapped log, never a deliberately forged one (the threat model is
+    # staleness, not forgery; see the header).
+    if not r_digest or r_digest == "-":
+        return "", "no suite log for record"
+    log_path = _health_trust_log_file(trees, sha)
+    if not log_path or not os.path.isfile(log_path):
+        return "", "no suite log for record"
+    actual = _health_trust_digest_file(log_path)
+    if not actual or actual != r_digest:
+        return "", "digest mismatch"
     return r_prov, ""
 
 

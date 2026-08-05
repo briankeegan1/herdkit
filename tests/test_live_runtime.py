@@ -3270,9 +3270,30 @@ class TestHealthTrustBuilder(unittest.TestCase):
     def _rec_file(self, sha):
         return os.path.join(self.trees, ".health-provenance-%s" % sha)
 
-    def _plant(self, sha, wt, prof, outcome, dur, prov, state, epoch):
+    def _log_file(self, sha):
+        return os.path.join(self.trees, ".health-provenance-log-%s" % sha)
+
+    def _plant(self, sha, wt, prof, outcome, dur, prov, state, epoch, digest="-"):
+        """Write a FORMAT VERSION 2 (HERD-560) record directly. ``digest`` defaults to ``"-"`` — the
+        right shape for every disqualifier this class proves gets caught BEFORE the digest check ever
+        runs; a test that needs to reach TRUSTED supplies a real digest via :meth:`_write_log`."""
+        with open(self._rec_file(sha), "w", encoding="utf-8") as fh:
+            fh.write("\t".join(["2", sha, wt, prof, outcome, str(dur), prov, state, str(epoch),
+                                digest]) + "\n")
+
+    def _plant_old(self, sha, wt, prof, outcome, dur, prov, state, epoch):
+        """Write a PRE-HERD-560 (8-field, no version, no digest) record — the exact shape the engine
+        wrote before this hardening — to prove it now reads as ABSENT, never half-parsed."""
         with open(self._rec_file(sha), "w", encoding="utf-8") as fh:
             fh.write("\t".join([sha, wt, prof, outcome, str(dur), prov, state, str(epoch)]) + "\n")
+
+    def _write_log(self, sha, content):
+        """Write the companion suite-log file for ``sha`` and return its sha256 hex digest — the same
+        pairing herd_health_trust_write produces on a CLEAN run."""
+        path = self._log_file(sha)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return LR._health_trust_digest_file(path)
 
     def _commit_epoch(self, sha=None):
         out = subprocess.check_output(
@@ -3307,7 +3328,9 @@ class TestHealthTrustBuilder(unittest.TestCase):
 
     def test_clean_heavy_record_from_clean_tree_is_trusted(self):
         epoch = self._commit_epoch() + 60
-        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1234, "builder-local", "clean", epoch)
+        digest = self._write_log(self.sha, "the real suite log body")
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1234, "builder-local", "clean", epoch,
+                    digest)
         prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
         self.assertEqual(prov, "builder-local")
         self.assertEqual(reason, "")
@@ -3387,8 +3410,8 @@ class TestHealthTrustBuilder(unittest.TestCase):
         epoch = self._commit_epoch() + 60
         other = "b" * 40
         with open(self._rec_file(self.sha), "w", encoding="utf-8") as fh:
-            fh.write("\t".join([other, self.wt_abs, "heavy", "CLEAN", "1", "builder-local",
-                                "clean", str(epoch)]) + "\n")
+            fh.write("\t".join(["2", other, self.wt_abs, "heavy", "CLEAN", "1", "builder-local",
+                                "clean", str(epoch), "-"]) + "\n")
         prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
         self.assertEqual(prov, "")
         self.assertEqual(reason, "stale sha in record")
@@ -3405,6 +3428,94 @@ class TestHealthTrustBuilder(unittest.TestCase):
         prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
         self.assertEqual(prov, "")
         self.assertEqual(reason, "malformed record")
+
+    # ── HERD-560: FORMAT VERSION 2 — old-format / unrecognized-version reads as ABSENT ─────────────
+    def test_pre_hardening_eight_field_record_reads_as_absent(self):
+        epoch = self._commit_epoch() + 60
+        self._plant_old(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "old-format record (absent)")
+
+    def test_unrecognized_version_reads_as_absent_not_an_error(self):
+        epoch = self._commit_epoch() + 60
+        digest = self._write_log(self.sha, "some log")
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch, digest)
+        with open(self._rec_file(self.sha), encoding="utf-8") as fh:
+            line = fh.read()
+        with open(self._rec_file(self.sha), "w", encoding="utf-8") as fh:
+            fh.write("99" + line[len("2"):])
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "old-format record (absent)")
+
+    # ── HERD-560: DIGEST — a CLEAN record is re-verified against its companion suite log ───────────
+    def test_digest_mismatch_never_trusted(self):
+        epoch = self._commit_epoch() + 60
+        digest = self._write_log(self.sha, "the real suite log body")
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch, digest)
+        prov, _reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "builder-local")   # fixture precondition: trusted before tampering
+        with open(self._log_file(self.sha), "w", encoding="utf-8") as fh:
+            fh.write("tampered")
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "digest mismatch")
+
+    def test_missing_companion_log_never_trusted(self):
+        epoch = self._commit_epoch() + 60
+        digest = self._write_log(self.sha, "a log that will be deleted")
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch, digest)
+        os.remove(self._log_file(self.sha))
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "no suite log for record")
+
+    def test_clean_record_with_no_digest_never_trusted(self):
+        """A CLEAN record whose digest field is still the "-" placeholder (a writer that had no log
+        to hash) is refused — a digest with nothing behind it proves nothing."""
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "no suite log for record")
+
+    # ── HERD-560: BOUNDED AGE — a record older than HEALTH_TRUST_MAX_AGE_SECS is refused ───────────
+    def test_stale_by_age_never_trusted(self):
+        epoch = self._commit_epoch() + 60
+        digest = self._write_log(self.sha, "aging suite log body")
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch, digest)
+        old = os.environ.get("HERD_FAKE_NOW")
+        os.environ["HERD_FAKE_NOW"] = str(epoch + 100)
+        try:
+            os.environ["HEALTH_TRUST_MAX_AGE_SECS"] = "50"
+            try:
+                prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+            finally:
+                os.environ.pop("HEALTH_TRUST_MAX_AGE_SECS", None)
+        finally:
+            if old is None:
+                os.environ.pop("HERD_FAKE_NOW", None)
+            else:
+                os.environ["HERD_FAKE_NOW"] = old
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "record older than 50s (stale by age)")
+
+    def test_default_age_bound_does_not_reject_a_fresh_record(self):
+        epoch = self._commit_epoch() + 60
+        digest = self._write_log(self.sha, "fresh suite log body")
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch, digest)
+        old = os.environ.get("HERD_FAKE_NOW")
+        os.environ["HERD_FAKE_NOW"] = str(epoch + 100)   # 100s old, far under the 21600s default
+        try:
+            prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        finally:
+            if old is None:
+                os.environ.pop("HERD_FAKE_NOW", None)
+            else:
+                os.environ["HERD_FAKE_NOW"] = old
+        self.assertEqual(prov, "builder-local")
+        self.assertEqual(reason, "")
 
     # ── wired into LiveGates.health(): lever off is byte-identical ───────────────────────────────
     def _gates(self, config=None, jpath=None):
@@ -3432,7 +3543,8 @@ class TestHealthTrustBuilder(unittest.TestCase):
 
     def test_lever_on_trusted_record_dispatches_light_and_journals(self):
         epoch = self._commit_epoch() + 60
-        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch)
+        digest = self._write_log(self.sha, "gate happy-path suite log")
+        self._plant(self.sha, self.wt_abs, "heavy", "CLEAN", 1, "builder-local", "clean", epoch, digest)
         jpath = os.path.join(self.tmp, "j.jsonl")
         g = self._gates(config={"HEALTH_TRUST_BUILDER": "on"}, jpath=jpath)
         self.assertTrue(g._health_trust_on)

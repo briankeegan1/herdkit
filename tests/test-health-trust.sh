@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-health-trust.sh — hermetic tests for SHA-MATCHED BUILDER-LOCAL HEALTH TRUST (HERD-531).
+# test-health-trust.sh — hermetic tests for SHA-MATCHED BUILDER-LOCAL HEALTH TRUST (HERD-531/560).
 #
 # suite-deps: scripts/herd/health-trust.sh scripts/herd/healthcheck.sh scripts/herd/agent-watch.sh
 #
@@ -21,9 +21,10 @@
 #   (9)  RECORD OLDER THAN THE COMMIT (the "record older than the sha's push" case) and an
 #        UNRESOLVABLE commit → not trusted.
 #   (10) MALFORMED / TRUNCATED record → not trusted.
-#   (11) WRITER: the real scripts/herd/healthcheck.sh heavy profile authors a builder-local record on a
-#        clean run, records CODEERROR on a red one, records NOTHING under --oneline or --light (neither
-#        may ever author evidence a heavy re-run could be skipped on), and honors
+#   (11) WRITER: the real scripts/herd/healthcheck.sh heavy profile authors a builder-local FORMAT
+#        VERSION 2 record (with a real log_digest + companion log) on a clean run, records CODEERROR
+#        (digest "-", no companion log) on a red one, records NOTHING under --oneline or --light
+#        (neither may ever author evidence a heavy re-run could be skipped on), and honors
 #        HERD_HEALTH_PROVENANCE=watcher — the stamp agent-watch.sh puts on its OWN runs.
 #   (12) BYTE-IDENTICAL OFF end-to-end: the same healthcheck.sh run with the lever off produces
 #        byte-for-byte identical output and exit status, and leaves the shared pool untouched.
@@ -34,6 +35,12 @@
 #        journaling health_trusted provenance=builder-local, labelling the console row honestly, and
 #        really passing --light through to healthcheck.sh — while a candidate with NO record produces
 #        the byte-identical pre-change dispatch (unprofiled argv, no health_trusted line).
+#   (15) FORMAT VERSION 2 (HERD-560): a pre-hardening 8-field record — or one naming an unrecognized
+#        future version — reads as ABSENT, never an error: a plain full re-run, same as no record.
+#   (16) DIGEST (HERD-560): a CLEAN record is re-verified against its companion suite-log file on
+#        every check. A tampered or missing log is never trusted, even when every other field matches.
+#   (17) BOUNDED AGE (HERD-560): a record older than HEALTH_TRUST_MAX_AGE_SECS is refused regardless
+#        of outcome; the 6h default does not false-flag a record written moments ago.
 #
 # Fully hermetic: throwaway git fixtures + temp dirs, a STUB project health command, NO herdr, gh,
 # network or model. Run:  bash tests/test-health-trust.sh
@@ -73,8 +80,19 @@ SHA="$(git -C "$WT" rev-parse HEAD)"
 WTP="$(cd "$WT" && pwd -P)"
 
 rec_file() { printf '%s' "$TREES/.health-provenance-$1"; }
-# plant <sha> <worktree> <profile> <outcome> <duration> <provenance> <tree_state> <epoch>
+log_file() { printf '%s' "$TREES/.health-provenance-log-$1"; }
+# plant <sha> <worktree> <profile> <outcome> <duration> <provenance> <tree_state> <epoch> [digest]
+# Writes a FORMAT VERSION 2 record directly (bypassing herd_health_trust_write) so a test can shape
+# every field independently. digest defaults to "-" (no log claimed) when omitted — the right shape
+# for every disqualifier this file proves gets caught BEFORE the digest check ever runs.
 plant() {
+  printf '2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:--}" > "$(rec_file "$1")"
+}
+# plant_old <sha> <worktree> <profile> <outcome> <duration> <provenance> <tree_state> <epoch>
+# Writes a PRE-HERD-560 (8-field, no version, no digest) record — the exact shape the engine wrote
+# before this hardening — to prove it now reads as ABSENT rather than half-parsed into false trust.
+plant_old() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" > "$(rec_file "$1")"
 }
 NOW="$(date +%s)"
@@ -82,8 +100,9 @@ NOW="$(date +%s)"
 # ── (1) LEVER OFF is a hard no-op on both sides ────────────────────────────────────────────────────
 unset HEALTH_TRUST_BUILDER
 herd_health_trust_on && fail "(1) HEALTH_TRUST_BUILDER must default to OFF (ship-dormant)"
-herd_health_trust_write "$TREES" "$SHA" "$WT" heavy CLEAN 42 builder-local
+herd_health_trust_write "$TREES" "$SHA" "$WT" heavy CLEAN 42 builder-local "some log"
 [ ! -e "$(rec_file "$SHA")" ] || fail "(1) lever off wrote a provenance record into the shared pool"
+[ ! -e "$(log_file "$SHA")" ] || fail "(1) lever off wrote a companion suite log into the shared pool"
 herd_health_trust_check "$TREES" "$SHA" "$WT" >/dev/null && fail "(1) lever off must never trust"
 [ "$HERD_HEALTH_TRUST_REASON" = "lever off" ] || fail "(1) off must say why: got '$HERD_HEALTH_TRUST_REASON'"
 # An unrecognized value reads OFF — a typo can never arm a path that skips the authoritative suite.
@@ -94,9 +113,11 @@ ok "(1) lever off is a hard no-op (no record written, nothing trusted); a typo r
 export HEALTH_TRUST_BUILDER=on
 
 # ── (2) the happy path: a clean heavy record for the exact sha, clean tree, same worktree ──────────
-herd_health_trust_write "$TREES" "$SHA" "$WT" heavy CLEAN 1234 builder-local
+herd_health_trust_write "$TREES" "$SHA" "$WT" heavy CLEAN 1234 builder-local "the real suite log for $SHA"
 [ -f "$(rec_file "$SHA")" ] || fail "(2) lever on did not write the provenance record"
-IFS=$'\t' read -r R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH < "$(rec_file "$SHA")"
+[ -f "$(log_file "$SHA")" ] || fail "(2) a CLEAN record must write a companion suite log"
+IFS=$'\t' read -r R_VER R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH R_DIGEST < "$(rec_file "$SHA")"
+[ "$R_VER"   = "2" ]            || fail "(2) record version wrong: $R_VER"
 [ "$R_SHA"   = "$SHA" ]          || fail "(2) record sha wrong: $R_SHA"
 [ "$R_WT"    = "$WTP" ]          || fail "(2) record worktree wrong: $R_WT (want $WTP)"
 [ "$R_PROF"  = "heavy" ]         || fail "(2) record profile wrong: $R_PROF"
@@ -105,6 +126,7 @@ IFS=$'\t' read -r R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH < "$(rec_
 [ "$R_PROV"  = "builder-local" ] || fail "(2) record provenance wrong: $R_PROV"
 [ "$R_STATE" = "clean" ]         || fail "(2) a committed, unmodified tree must record tree_state=clean"
 case "$R_EPOCH" in ''|*[!0-9]*) fail "(2) record epoch must be numeric: '$R_EPOCH'" ;; esac
+[ -n "$R_DIGEST" ] && [ "$R_DIGEST" != "-" ] || fail "(2) a CLEAN record must carry a real log digest, got '$R_DIGEST'"
 GOT="$(herd_health_trust_check "$TREES" "$SHA" "$WT")" \
   || fail "(2) a clean heavy record for this exact sha must be TRUSTED ($HERD_HEALTH_TRUST_REASON)"
 [ "$GOT" = "builder-local" ] || fail "(2) check must print the record's provenance, got '$GOT'"
@@ -122,7 +144,8 @@ herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
   || fail "(3) unexpected reason: '$HERD_HEALTH_TRUST_REASON'"
 # …and a record whose BODY names a different sha than its own filename is corrupt, not merely stale.
 plant "$SHA2" "$WTP" heavy CLEAN 10 builder-local clean "$NOW"
-sed -i.bak "s/^$SHA2/deadbeef/" "$(rec_file "$SHA2")" && rm -f "$(rec_file "$SHA2").bak"
+TAB="$(printf '\t')"
+sed -i.bak "s/^2${TAB}$SHA2/2${TAB}deadbeef/" "$(rec_file "$SHA2")" && rm -f "$(rec_file "$SHA2").bak"
 herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
   && fail "(3) a record whose body sha disagrees with its filename must be refused"
 [ "$HERD_HEALTH_TRUST_REASON" = "stale sha in record" ] \
@@ -130,8 +153,8 @@ herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
 ok "(3) a stale sha (no record, or a record naming another commit) forces the full re-run"
 
 # ── (4)-(10) every other disqualifier is a full re-run ─────────────────────────────────────────────
-# Each row plants ONE record differing in exactly one field from the trusted shape of (2).
-#   label | profile | outcome | provenance | tree_state | epoch-offset | worktree | expected reason
+# Each row plants ONE record differing in exactly one field from the trusted shape of (2). No digest
+# is given (defaults "-") — every one of these is caught well before the digest check ever runs.
 try_reject() {
   local label="$1" prof="$2" out="$3" prov="$4" state="$5" epoch="$6" wt="$7" want="$8"
   plant "$SHA2" "$wt" "$prof" "$out" 7 "$prov" "$state" "$epoch"
@@ -208,12 +231,15 @@ run_hc on
 [ "$RC" -eq 0 ] || fail "(11) the stub-clean heavy run should exit 0, got $RC — $OUT"
 REC="$(rec_file "$SHA2")"
 [ -f "$REC" ] || fail "(11) a clean heavy run must author a provenance record"
-IFS=$'\t' read -r R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH < "$REC"
+IFS=$'\t' read -r R_VER R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH R_DIGEST < "$REC"
+[ "$R_VER"  = "2" ]           || fail "(11) record version should be 2, got $R_VER"
 [ "$R_SHA"  = "$SHA2" ]        || fail "(11) record sha should be the worktree HEAD, got $R_SHA"
 [ "$R_PROF" = "heavy" ]        || fail "(11) record profile should be heavy, got $R_PROF"
 [ "$R_OUT"  = "CLEAN" ]        || fail "(11) record outcome should be CLEAN, got $R_OUT"
 [ "$R_PROV" = "builder-local" ] || fail "(11) an unstamped run must record provenance=builder-local, got $R_PROV"
 case "$R_DUR" in ''|*[!0-9]*) fail "(11) duration must be numeric, got '$R_DUR'" ;; esac
+[ -n "$R_DIGEST" ] && [ "$R_DIGEST" != "-" ] || fail "(11) a CLEAN run must record a real log digest, got '$R_DIGEST'"
+[ -f "$(log_file "$SHA2")" ] || fail "(11) a CLEAN run must write a companion suite log"
 # The fixture carries uncommitted .out/.rc scratch files, so the tree is legitimately DIRTY here —
 # which is exactly the state the reader must refuse. Proving the WRITER records it honestly is the
 # point: a builder that ran the suite over uncommitted edits never earns a skip.
@@ -222,18 +248,22 @@ herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
   && fail "(11) a dirty-tree record must not be trusted end-to-end"
 
 # HERD_HEALTH_PROVENANCE=watcher — the stamp agent-watch.sh puts on its own runs.
-rm -f "$REC"
+rm -f "$REC" "$(log_file "$SHA2")"
 run_hc on HERD_HEALTH_PROVENANCE=watcher
-IFS=$'\t' read -r R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH < "$REC"
+IFS=$'\t' read -r R_VER R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH R_DIGEST < "$REC"
 [ "$R_PROV" = "watcher" ] || fail "(11) HERD_HEALTH_PROVENANCE must be honored, got $R_PROV"
 
-# A RED heavy run records CODEERROR (and so can never justify a skip).
-rm -f "$REC"
+# A RED heavy run records CODEERROR (and so can never justify a skip) — and authors NO companion log
+# / a digest of "-": a non-clean outcome is never trusted regardless of digest, so hashing its log
+# would prove nothing.
+rm -f "$REC" "$(log_file "$SHA2")"
 printf 'not ok 1 boom\n' > "$WT/.out"; printf '1\n' > "$WT/.rc"
 run_hc on
 [ "$RC" -eq 1 ] || fail "(11) a stub code error should exit 1, got $RC"
-IFS=$'\t' read -r R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH < "$REC"
+IFS=$'\t' read -r R_VER R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH R_DIGEST < "$REC"
 [ "$R_OUT" = "CODEERROR" ] || fail "(11) a red heavy run must record CODEERROR, got $R_OUT"
+[ "$R_DIGEST" = "-" ] || fail "(11) a red heavy run must record log_digest=-, got '$R_DIGEST'"
+[ ! -f "$(log_file "$SHA2")" ] || fail "(11) a red heavy run must never write a companion suite log"
 printf '✅ stub clean\n' > "$WT/.out"; printf '0\n' > "$WT/.rc"
 
 # --oneline (the status pane) and --light never author a record: neither may attest a heavy run.
@@ -255,7 +285,7 @@ env HERD_CONFIG_FILE="$T/no-such-config" HEALTHCHECK_CMD="" HEALTHCHECK_HEAVY_GL
     HEALTH_TRUST_BUILDER=on bash "$HC" "$WT" --heavy >/dev/null 2>&1
 [ -z "$(find "$TREES" -name '.health-provenance-*' 2>/dev/null)" ] \
   || fail "(11) --heavy with no HEALTHCHECK_CMD (which delegates to light) must author no record"
-ok "(11) healthcheck.sh authors an honest heavy record (sha/profile/outcome/duration/provenance/tree_state); --oneline and --light author none"
+ok "(11) healthcheck.sh authors an honest VERSION 2 heavy record (sha/profile/outcome/duration/provenance/tree_state/log_digest + companion log on CLEAN); --oneline and --light author none"
 
 # ── (12) BYTE-IDENTICAL when off ───────────────────────────────────────────────────────────────────
 rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
@@ -358,7 +388,7 @@ rm -f "$TREES"/.health-provenance-* "$TREES"/.health-* 2>/dev/null || true
 : > "$T/gate-journal.jsonl"
 git -C "$WT" checkout -q -- . 2>/dev/null || true
 rm -f "$WT/.out" "$WT/.rc"                                  # make the fixture tree genuinely clean
-herd_health_trust_write "$TREES" "$SHA2" "$WT" heavy CLEAN 99 builder-local
+herd_health_trust_write "$TREES" "$SHA2" "$WT" heavy CLEAN 99 builder-local "gate happy-path suite log"
 herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
   || fail "(14a) fixture precondition: the record should be trusted ($HERD_HEALTH_TRUST_REASON)"
 run_gate_probe "$SHA2"
@@ -383,7 +413,66 @@ grep -q -- '--light' "$GARGV" && fail "(14b) an untrusted dispatch must not run 
   || fail "(14b) an untrusted dispatch argv must be byte-identical to before: '$(cat "$GARGV")'"
 ok "(14) the gate dispatches a trusted candidate as a --light smoke (journaled + labelled), and is byte-identical with no record"
 
+# ── (15) FORMAT VERSION 2 (HERD-560): old-format / unrecognized-version reads as ABSENT ────────────
+rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
+plant_old "$SHA2" "$WTP" heavy CLEAN 5 builder-local clean "$NOW"
+herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
+  && fail "(15) a pre-HERD-560 8-field record must never be trusted"
+[ "$HERD_HEALTH_TRUST_REASON" = "old-format record (absent)" ] \
+  || fail "(15) unexpected reason for an old-format record: '$HERD_HEALTH_TRUST_REASON'"
+# …and an unrecognized FUTURE version reads the same way — absent, never an error.
+plant "$SHA2" "$WTP" heavy CLEAN 5 builder-local clean "$NOW" "deadbeefdigest"
+sed -i.bak "s/^2/99/" "$(rec_file "$SHA2")" && rm -f "$(rec_file "$SHA2").bak"
+herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
+  && fail "(15) an unrecognized record version must never be trusted"
+[ "$HERD_HEALTH_TRUST_REASON" = "old-format record (absent)" ] \
+  || fail "(15) unexpected reason for an unknown-version record: '$HERD_HEALTH_TRUST_REASON'"
+ok "(15) a pre-HERD-560 record (or an unrecognized future version) reads as ABSENT, never an error"
+
+# ── (16) DIGEST (HERD-560): a CLEAN record is re-verified against its companion suite log ──────────
+rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
+herd_health_trust_write "$TREES" "$SHA2" "$WT" heavy CLEAN 5 builder-local "the real suite log body"
+herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
+  || fail "(16) fixture precondition: a freshly written CLEAN record with its own log must be trusted ($HERD_HEALTH_TRUST_REASON)"
+# Corrupt the companion log AFTER the fact (a truncated/tampered file) — same record, same digest
+# field, different bytes on disk.
+printf 'tampered\n' > "$(log_file "$SHA2")"
+herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
+  && fail "(16) a record whose companion log no longer matches its digest must never be trusted"
+[ "$HERD_HEALTH_TRUST_REASON" = "digest mismatch" ] \
+  || fail "(16) unexpected reason for a tampered log: '$HERD_HEALTH_TRUST_REASON'"
+# …and a record with NO companion log at all (deleted, or authored skipping [log]) is refused too —
+# a digest with nothing to verify against proves nothing.
+rm -f "$(log_file "$SHA2")"
+herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
+  && fail "(16) a record with a missing companion log must never be trusted"
+[ "$HERD_HEALTH_TRUST_REASON" = "no suite log for record" ] \
+  || fail "(16) unexpected reason for a missing log: '$HERD_HEALTH_TRUST_REASON'"
+ok "(16) a CLEAN record is re-verified against its companion suite log on every check — tampered or missing, never trusted"
+
+# ── (17) BOUNDED AGE (HERD-560): a record older than HEALTH_TRUST_MAX_AGE_SECS is refused ──────────
+# A real (short) sleep, not a backdated epoch: the fixture commit was just made THIS test run, so
+# backdating the epoch past a few seconds would also trip "predates the commit" (9) — a different
+# disqualifier. A couple of real seconds isolates the age dimension cleanly and stays well inside the
+# 21600s default, so the "still trusted under default" half of this check is never a coincidence.
+rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
+herd_health_trust_write "$TREES" "$SHA2" "$WT" heavy CLEAN 5 builder-local "aging suite log body"
+herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
+  || fail "(17) fixture precondition: a fresh record must be trusted ($HERD_HEALTH_TRUST_REASON)"
+sleep 2
+HEALTH_TRUST_MAX_AGE_SECS=1 herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
+  && fail "(17) a record older than HEALTH_TRUST_MAX_AGE_SECS must never be trusted"
+[ "$HERD_HEALTH_TRUST_REASON" = "record older than 1s (stale by age)" ] \
+  || fail "(17) unexpected reason: '$HERD_HEALTH_TRUST_REASON'"
+# …and the SAME record, with no override, stays trusted — the 6h default comfortably outlives this
+# test's wall-clock span, so the bound is opt-in-tightenable, not a hidden always-on flake source.
+herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
+  || fail "(17) the default 6h age bound must not reject a record written moments ago ($HERD_HEALTH_TRUST_REASON)"
+ok "(17) a record older than HEALTH_TRUST_MAX_AGE_SECS is refused regardless of outcome; the 6h default does not false-flag a fresh-enough record"
+
 echo
-echo "ALL PASS ($PASS checks) — HERD-531 sha-matched builder-local trust: off is a hard no-op, only a"
-echo "CLEAN heavy builder-local record of the EXACT sha from a CLEAN tree at the SAME worktree earns a"
-echo "light smoke, and every other case falls back to the full re-run."
+echo "ALL PASS ($PASS checks) — HERD-531/560 sha-matched builder-local trust: off is a hard no-op, only a"
+echo "CLEAN heavy builder-local VERSION 2 record of the EXACT sha from a CLEAN tree at the SAME worktree,"
+echo "digest-matched against its companion suite log and within the freshness window, earns a light"
+echo "smoke — every other case, including a pre-hardening or unrecognized-version record, falls back to"
+echo "the full re-run."
