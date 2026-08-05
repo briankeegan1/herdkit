@@ -3282,6 +3282,56 @@ _retire_reviewer_pane() {
   rm -f "$reg" 2>/dev/null || true
 }
 
+# _close_review_viewer_tab <slug> [reason] — retire the STANDALONE review·<slug> viewer tab by
+# SLUG-LABELED lookup (HERD-523 leg 2 / issue #634).
+#
+# The leak this closes: when herd-review.sh falls back to a standalone review·<slug> tab, the ONLY
+# record of that tab is a line appended to $TREES/.herd-tabs. Both teardown paths key on that registry
+# — merge teardown (herd_teardown_slug) and the orphan sweep's allowlist model — so a registration
+# write that fails leaves the tab live, unregistered, and therefore PERMANENTLY un-sweepable: no rail
+# can even see it. (herd-review.sh now journals that failed write rather than swallowing it, but a
+# journal line does not close a tab.)
+#
+# So teardown must not depend on the registry at all. This closes the tab the way _purge_stale_review_tab
+# already does on re-dispatch — by asking herdr for the tab LABELED for this slug — which works with an
+# EMPTY .herd-tabs. The registry row is still dropped afterwards when one exists, so a successful
+# registration never lingers as a stale row.
+#
+# LABEL MATCH, tightened: _purge_stale_review_tab uses a bare startswith("review·<slug>"), which on a
+# prefix-colliding pair (slug "auth" vs "auth-retry") would also match the OTHER slug's tab. There it
+# is bounded — that path is about to recreate the tab it just closed — but here we close on someone
+# else's verdict, so the match is anchored: the exact label, or the label followed by a space (the
+# "review·<slug> ✅" decorated form). Never a bare prefix.
+#
+# FAIL-SOFT + byte-quiet: no herdr, no matching tab, or a close hiccup ⇒ no output, no journal line —
+# the overwhelmingly common case (the reviewer ran as a split INSIDE the builder's tab, so there is no
+# viewer tab at all) is a silent no-op. Dry-run inert.
+_close_review_viewer_tab() {
+  local _crv_slug="${1:-}" _crv_reason="${2:-verdict-consumed}" _crv_ws _crv_tab
+  [ -z "${DRYRUN:-}" ] || return 0
+  [ -n "$_crv_slug" ] || return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  # Headless is panes-as-a-view: there are no tabs at all, so there is nothing to look up or close —
+  # skip BEFORE the control-room reads, the same shape every driver pane seam uses.
+  _herd_driver_is_headless && return 0
+  _crv_ws="$(herd_resolve_workspace_id 2>/dev/null || true)"
+  _crv_tab="$(herdr tab list ${_crv_ws:+--workspace "$_crv_ws"} 2>/dev/null | SLUG="$_crv_slug" python3 -c '
+import sys, json, os
+want = "review·" + os.environ.get("SLUG", "")
+try:
+    tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
+    print(next((t["tab_id"] for t in tabs
+                if (t.get("label", "") == want or t.get("label", "").startswith(want + " "))), ""))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  [ -n "${_crv_tab:-}" ] || return 0
+  herdr tab close "$_crv_tab" >/dev/null 2>&1 || true
+  journal_append review_viewer_tab_closed slug "$_crv_slug" tab "$_crv_tab" reason "$_crv_reason"
+  # Drop the allowlist row when the registration DID land; a no-op when it never did (the leak case).
+  _herd_tabs_drop_row "$TREES/.herd-tabs" "$_crv_tab"
+}
+
 # _sweep_reviewer_registry — one-shot STARTUP reconcile of the dispatch registry against live
 # pids/panes (HERD-113 requirement 3). For each (pr,sha) row: a still-alive poller is a genuinely live
 # reviewer → left untouched (a later dispatch ADOPTS it). A dead poller whose PANE still exists is an
@@ -3815,6 +3865,12 @@ _review_gate_step() {
     # an INFRA-FAIL reviewer that already tore down its own pane).
     rm -f "$result" "$inflight" "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
     _retire_reviewer_pane "$pr" "$sha" verdict-consumed
+    # …and the STANDALONE viewer tab, if this review ran on the fallback placement (HERD-523 leg 2 /
+    # issue #634). _retire_reviewer_pane only ever retires the pane the DISPATCH REGISTRY names — the
+    # split inside the builder's tab — so a fallback dispatch's whole tab survived verdict consumption
+    # and was reaped only if its .herd-tabs row had landed. This closes it by slug label instead, so
+    # teardown holds with an EMPTY registry. Byte-quiet no-op in the common split placement.
+    _close_review_viewer_tab "$slug" verdict-consumed
     echo "$_rgs_echo"; return 0
   fi
 

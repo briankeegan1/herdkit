@@ -33,6 +33,25 @@ ok(){ PASS=$((PASS+1)); echo "PASS $1"; }
 
 [ -f "$WATCH" ] || fail "missing agent-watch.sh at $WATCH"
 
+# herdr stub (HERD-523): collecting a verdict in _review_gate_step now also retires the standalone
+# review·<slug> viewer tab by slug-labeled lookup, so the verdict-consumption path consults the control
+# room. This test asserts BREAKER/ledger state only and must never reach a LIVE herdr — the
+# daemon-hermeticity guard (.herd/healthcheck.project.sh) reds exactly that, and the header above
+# promises "NO herdr". A stub is how that promise is KEPT once the path can reach for one; empty
+# rosters ⇒ no tab to find, so every assertion below is unchanged.
+BIN="$T/bin"; mkdir -p "$BIN"
+cat > "$BIN/herdr" <<'STUB'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "workspace list") printf '{"result":{"workspaces":[]}}\n' ;;
+  "tab list")       printf '{"result":{"tabs":[]}}\n' ;;
+  *)                printf '{}\n' ;;
+esac
+exit 0
+STUB
+chmod +x "$BIN/herdr"
+export PATH="$BIN:$PATH"
+
 # source_watcher <trees> [MAX] [COOLDOWN] — source the REAL watcher in lib mode with the breaker knobs
 # in the CURRENT shell. Callers run each scenario in its own subshell so ledger state cannot leak.
 source_watcher() {
