@@ -2115,6 +2115,42 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
         self.assertFalse(os.path.exists(self.state.health_dispatch_file(c)))
         self.assertFalse(os.path.exists(self.state.health_inflight_file(c)))  # marker cleared on collect
 
+    # ── HERD-567: the python half of the env-suspect port — _collect_env_suspect ────────────────────
+    def test_health_collect_journals_env_suspect_from_sidechannel(self):
+        """The live worker (_HEALTH_WORKER_SH) drops a `<log>.envsuspect` side-channel the instant it
+        classifies a run-1 timeout as env-suspect (see that string's docstring for why the log itself
+        is not a reliable channel for this at collect time — a reproduced failure overwrites it). The
+        collector must read it, journal `health_env_suspect`, and remove the marker."""
+        c = self.cand()
+        _marker_write(self.state.health_inflight_file(c), os.getpid(), nonce="n-live")
+        with open(self.state.health_dispatch_file(c), "w") as fh:
+            fh.write("n-live\tCODEERROR\tnot ok 2 - foo.bats # timeout after 120s\n")
+        log = self.state.health_log_file(c)
+        os.makedirs(os.path.dirname(log), exist_ok=True)
+        with open(log + ".envsuspect", "w") as fh:
+            fh.write("not ok 2 - foo.bats # timeout after 120s\n")
+        g, _, _ = self._gates()
+        self.assertEqual(g.health(c), "CODEERROR")
+        rows = [e for e in events(self.journal.path) if e["event"] == "health_env_suspect"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["dir"], c.slug)
+        self.assertIn("timeout after 120s", rows[0]["detail"])
+        self.assertFalse(os.path.exists(log + ".envsuspect"))     # side-channel consumed, not left behind
+
+    def test_health_collect_without_sidechannel_journals_nothing(self):
+        """Byte-identical baseline: ENV_SUSPECT_TIMEOUT off (or on but never classified) means the
+        live worker never drops the side-channel file — the collector must not journal anything for a
+        plain CODEERROR/FLAKY/CLEAN collect, exactly as before this lever existed."""
+        c = self.cand()
+        _marker_write(self.state.health_inflight_file(c), os.getpid(), nonce="n-live")
+        with open(self.state.health_dispatch_file(c), "w") as fh:
+            fh.write("n-live\tCODEERROR\tnot ok 2 - foo.bats\n")
+        g, _, _ = self._gates()
+        self.assertEqual(g.health(c), "CODEERROR")
+        rows = [e for e in events(self.journal.path) if e["event"] == "health_env_suspect"] \
+            if os.path.exists(self.journal.path) else []
+        self.assertEqual(rows, [])
+
     def test_health_stale_out_file_ignored_and_redispatched(self):
         """HERD-349: an out-file that predates the live dispatch (no live marker, so no matching nonce)
         is NEVER consumed — it is dropped, `stale_result_ignored` is journaled, and a fresh suite is
