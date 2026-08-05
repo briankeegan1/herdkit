@@ -214,7 +214,7 @@ if [ "$_chg_lines" -eq 2 ]; then
 else
   checkpoint journal_once_on_change fail "expected 2 gate_scale journal lines after the triple changed, got $_chg_lines"
 fi
-[ -n "${GATE_SCALE_NOTE:-}" ] && printf '%s' "$GATE_SCALE_NOTE" | grep -q 'scaled' \
+[ -n "${GATE_SCALE_NOTE:-}" ] && grep -q 'scaled' <<< "$GATE_SCALE_NOTE" \
   && checkpoint console_note_scaled pass "console note carries the 'scaled' qualifier: $(printf '%s' "$GATE_SCALE_NOTE" | tr -d '\n')" \
   || checkpoint console_note_scaled fail "console note missing or lacks the 'scaled' qualifier (note='${GATE_SCALE_NOTE:-}')"
 
