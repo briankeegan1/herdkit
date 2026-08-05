@@ -247,6 +247,9 @@ EXEMPT_NAMES = {
     "TAB", "TEMPLATES_DIR", "TMPDIR", "TRACKER_DRIFT", "TREES", "TSWEEP_LIMIT", "WPANE",
     "WT",  # agent-watch.sh: git worktree list --porcelain for this tick
     "HOSTNAME",  # bash shell built-in (set by the shell, never a .herd/config knob)
+    "CLAUDE_PROJECT_DIR",  # HERD-525: Claude Code exports this into every hook's environment (the
+                            # project root); herd_write_ratelimit_hook's generated command reads it at
+                            # HOOK RUNTIME to resolve the sentinel path portably — never a .herd/config knob.
 }
 def exempt(k, declared, file_locals):
     if k in declared:        # already declared → not a ghost

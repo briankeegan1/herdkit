@@ -1242,6 +1242,20 @@ PY
 # (starting fresh from {}). Best-effort: any failure warns but returns 0 so it never aborts worktree
 # creation — the fallback banner-scrape still catches the limit hit if the hook is absent.
 #
+# HERD-525 / GH #638: the SENTINEL PATH embedded in the generated hook command is resolved AT HOOK
+# RUNTIME, never baked in at generate time. A prior version embedded this worktree's `pwd -P` (an
+# absolute, machine-specific path) directly into the hook command string written into
+# .claude/settings.json; in a two-operator repo (e.g. macOS vs WSL checkouts of the SAME commit) that
+# committed file then ping-pongs between each operator's absolute path forever, and on whichever
+# machine the OTHER operator's path is checked out, the hook writes to a path that doesn't exist on
+# that box — auto-resume silently degrades to the banner-scrape fallback. The generated command
+# instead computes the sentinel path from `$CLAUDE_PROJECT_DIR` (the project root Claude Code exports
+# into every hook's environment) with a `$PWD` fallback for harnesses that don't set it — ONE portable
+# form for both the main checkout and any worktree, so the generated file is byte-identical no matter
+# which machine or checkout produced it. Regenerating over an old-style absolute hook converges it to
+# this portable form once (the merge below replaces a mismatched `rate_limit` entry's command) and is
+# then byte-stable on every subsequent call.
+#
 # NOTE: the exact hook event name / rate-limit matcher is Claude-Code-version-dependent; the watcher
 # does NOT rely on it firing (the banner-scrape fallback covers hookless environments). Disable with
 # HERD_LIMIT_HOOK=off.
@@ -1253,13 +1267,11 @@ herd_write_ratelimit_hook() {
   local _rh_abs
   _rh_abs="$(cd "$_rh_dir" 2>/dev/null && pwd -P)" || _rh_abs="$_rh_dir"
   local _rh_settings="$_rh_abs/.claude/settings.json"
-  local _rh_sentinel="$_rh_abs/.herd-limit-sentinel"
   mkdir -p "$_rh_abs/.claude" 2>/dev/null || return 0
-  if ! HERD_RH_SETTINGS="$_rh_settings" HERD_RH_SENTINEL="$_rh_sentinel" python3 - <<'PY'
+  if ! HERD_RH_SETTINGS="$_rh_settings" python3 - <<'PY'
 import json, os, shlex, sys, tempfile
 
 path = os.environ["HERD_RH_SETTINGS"]
-sentinel = os.environ["HERD_RH_SENTINEL"]
 
 # The hook command. HERD-155 F3: a StopFailure/rate_limit hook's stdin is the harness EVENT — a JSON
 # blob (session_id, transcript_path, a reason/message, …), NOT the bare reset banner. The old `cat >`
@@ -1277,8 +1289,14 @@ if not out:
     out = (m.group(0) if m else "").strip()
 sys.stdout.write(out)
 '''
-q_sentinel = "'" + sentinel.replace("'", "'\\''") + "'"
-cmd = "python3 -c %s > %s 2>/dev/null || : > %s" % (shlex.quote(_extract), q_sentinel, q_sentinel)
+# HERD-525: the sentinel's DIRECTORY is resolved by the shell AT HOOK RUNTIME — never baked in here —
+# so the same generated command is byte-identical whichever worktree/machine/checkout produced it.
+# CLAUDE_PROJECT_DIR is the project root Claude Code exports into every hook's environment; $PWD is
+# the fallback for a harness that doesn't set it (hook commands run with cwd == the project root).
+q_sentinel = '"$_herd_rl_dir/.herd-limit-sentinel"'
+cmd = "_herd_rl_dir=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; python3 -c %s > %s 2>/dev/null || : > %s" % (
+    shlex.quote(_extract), q_sentinel, q_sentinel,
+)
 entry = {"matcher": "rate_limit", "hooks": [{"type": "command", "command": cmd}]}
 
 data = {}
