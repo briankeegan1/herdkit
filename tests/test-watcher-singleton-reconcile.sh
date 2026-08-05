@@ -83,6 +83,16 @@ _plant_table() {
   export HERD_SWEEP_PS_CMD="$f"
 }
 
+# HERD-548: this suite is about the reconcile/verdict machinery, not about the settle-threshold timing
+# leg 3 layers on top (tests/test-watcher-settle-threshold.sh owns that) — stub every candidate's age
+# as already well past WATCHER_SETTLE_SECS so a REAL just-spawned helper process (genuinely a fraction
+# of a second old in wall-clock terms) still reads as a SETTLED, immediately-classifiable duplicate,
+# exactly like a persisting one would look on a later tick.
+ETIMESTUB="$T/etime-old.sh"
+printf '#!/usr/bin/env bash\nprintf "10:00"\n' > "$ETIMESTUB"
+chmod +x "$ETIMESTUB"
+export HERD_SWEEP_PS_ETIME_CMD="$ETIMESTUB"
+
 # ══ 1. the shared classifier: watcher_singleton_verdict ══════════════════════════════════════════
 export WORKSPACE_NAME="sgtest"
 export HERD_WATCH_ARGV0="herd-watch-sgtest"
