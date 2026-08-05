@@ -266,7 +266,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HERD_LIMIT_RESUME_BUFFER` → `agent-watch.sh`
 - `HERD_LIMIT_UNKNOWN_WAIT` → `agent-watch.sh`
 - `HERD_REFIX_WAIT_TIMEOUT` → `agent-watch.sh`
-- `HERD_REPO` → `bin/herd`, `herd-links.sh`, `oss-triage.sh`, `tracker-state-sweep.sh`
+- `HERD_REPO` → `bin/herd`, `herd-links.sh`, `oss-triage.sh`
 - `HERD_THEME` → `bin/herd`, `theme.sh`
 - `HERD_VERSION` → `bin/herd`
 - `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`, `journal-audit.sh`, `posture-lint.sh`
@@ -355,6 +355,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `TEAM_PRESENCE` → `agent-watch.sh`
 - `TOKEN_MODE` → `bin/herd`
 - `TRACKED_SPAWNS` → `bin/herd`
+- `TRACKER_REPO` → `bin/herd`, `herd-links.sh`, `tracker-state-sweep.sh`
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
 - `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`

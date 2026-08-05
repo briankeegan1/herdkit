@@ -347,9 +347,149 @@ if [ "$MODE" = "auto" ]; then
   fi
 fi
 
+# ── HERD-529 LEG A: cross-worktree LOCAL SUITE SLOT ───────────────────────────────────────────────
+# HEALTH_CONCURRENCY (agent-watch.sh) serializes only the WATCHER's own dispatch loop; it has no
+# visibility into a builder running `healthcheck.sh --heavy` locally, ahead of its own PR, in its own
+# worktree. GROUNDED 2026-08-05: an 8-builder fleet ran up to 8 simultaneous builder-local heavy
+# suites — box saturation, a tolerated-as-DATA/ENV 1800s bats timeout that actually meant the suite
+# asserted nothing that run. This section mirrors agent-watch.sh's HERD-185 restart-safe marker
+# machinery (pid + start-time + dispatch-ts, so a dead/recycled holder's slot self-reclaims) under a
+# DISTINCT namespace (`.local-suite-slot-*`) in the SAME cross-worktree pool ($WORKTREES_DIR) the
+# watcher's `.health-inflight-*` markers live in — a separate accounting system, never colliding with
+# HEALTH_CONCURRENCY's, capping ALL heavy suite runs on this box (builder-local AND watcher-dispatched)
+# under LOCAL_SUITE_CONCURRENCY (herd-config.sh, default 2).
+_lss_now_epoch() { printf '%s' "${HERD_FAKE_NOW:-$(date +%s)}"; }
+
+# _lss_pid_starttime <pid> — same stable per-process token as agent-watch.sh's _pid_starttime, so a
+# recycled pid is never mistaken for its former holder. HERD_PID_STARTTIME_CMD is honored as the same
+# test seam agent-watch.sh's version defines, so a shared test fixture can stub both identically.
+_lss_pid_starttime() {
+  local p="${1:-}"; [ -n "$p" ] || return 0
+  if [ -n "${HERD_PID_STARTTIME_CMD:-}" ]; then "$HERD_PID_STARTTIME_CMD" "$p" 2>/dev/null; return 0; fi
+  ps -o lstart= -p "$p" 2>/dev/null | tr -s '[:space:]' ' ' | sed -e 's/^ //' -e 's/ $//'
+}
+
+# _lss_pool_dir — the cross-worktree pool directory, or empty when unresolved/missing. Fail-soft
+# entry point: every caller below treats an empty result as "run unslotted, exactly as today".
+_lss_pool_dir() {
+  [ -n "${WORKTREES_DIR:-}" ] && [ -d "$WORKTREES_DIR" ] && printf '%s' "$WORKTREES_DIR"
+}
+
+_lss_marker_write() {
+  local f="$1"
+  { printf '%s\n' "$$"; printf '%s\n' "$(_lss_pid_starttime "$$")"; printf '%s\n' "$(_lss_now_epoch)"; } \
+    > "$f" 2>/dev/null || true
+}
+_lss_marker_pid()       { sed -n '1p' "$1" 2>/dev/null; }
+_lss_marker_starttime() { sed -n '2p' "$1" 2>/dev/null; }
+
+# _lss_marker_live <file> — true iff the marker's pid is alive AND (recycling guard) its current
+# start-time still matches the recorded one. Mirrors agent-watch.sh's _marker_live (HERD-185).
+_lss_marker_live() {
+  local f="$1" pid st cur
+  pid="$(_lss_marker_pid "$f")"; [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  st="$(_lss_marker_starttime "$f")"; [ -n "$st" ] || return 0
+  cur="$(_lss_pid_starttime "$pid")"; [ -n "$cur" ] || return 0
+  [ "$cur" = "$st" ]
+}
+
+# _lss_reclaim_stale <pool> — drop every .local-suite-slot-* marker whose recorded holder is
+# dead/recycled, so a crashed/killed builder never wedges the pool. Run on every acquire attempt.
+_lss_reclaim_stale() {
+  local pool="$1" f
+  for f in "$pool"/.local-suite-slot-*; do
+    [ -e "$f" ] || continue
+    case "$f" in *.lock) continue ;; esac
+    _lss_marker_live "$f" || rm -f "$f" 2>/dev/null || true
+  done
+}
+
+# _lss_count_live <pool> — number of markers whose holder is VERIFIED live right now.
+_lss_count_live() {
+  local pool="$1" n=0 f
+  for f in "$pool"/.local-suite-slot-*; do
+    [ -e "$f" ] || continue
+    case "$f" in *.lock) continue ;; esac
+    _lss_marker_live "$f" && n=$((n+1))
+  done
+  printf '%s' "$n"
+}
+
+# _lss_lock / _lss_unlock <pool> — a short-held `mkdir` mutex (atomic, no flock(1) dependency — this
+# runs on macOS builder boxes too) guarding ONLY the read-count-then-write critical section below,
+# never the suite run itself. Bounded retry (~5s default) so a wedged/vanished lock-holder can never
+# hang an acquire attempt forever; on timeout the caller proceeds WITHOUT the lock — a benign race
+# that can only over-admit by a slot or two, never under-admit or deadlock.
+_lss_lock() {
+  local pool="$1" i=0 max="${HERD_LOCAL_SUITE_LOCK_TRIES:-50}"
+  case "$max" in ''|*[!0-9]*) max=50 ;; esac
+  while [ "$i" -lt "$max" ]; do
+    mkdir "$pool/.local-suite-slot.lock" 2>/dev/null && return 0
+    sleep 0.1 2>/dev/null || sleep 1
+    i=$((i+1))
+  done
+  return 1
+}
+_lss_unlock() { rmdir "$1/.local-suite-slot.lock" 2>/dev/null || true; }
+
+# _lss_try_acquire <pool> <cap> — claim the first free numbered slot (1..cap); prints its marker path
+# on success (exit 0); prints nothing on failure (exit 1 — every slot is live right now).
+_lss_try_acquire() {
+  local pool="$1" cap="$2" i marker locked=0
+  _lss_lock "$pool" && locked=1
+  _lss_reclaim_stale "$pool"
+  i=1
+  while [ "$i" -le "$cap" ]; do
+    marker="$pool/.local-suite-slot-$i"
+    if [ ! -e "$marker" ] || ! _lss_marker_live "$marker"; then
+      _lss_marker_write "$marker"
+      [ "$locked" -eq 1 ] && _lss_unlock "$pool"
+      printf '%s' "$marker"
+      return 0
+    fi
+    i=$((i+1))
+  done
+  [ "$locked" -eq 1 ] && _lss_unlock "$pool"
+  return 1
+}
+
+# _lss_release — drop this run's own marker (idempotent; safe to call with none held). Wired as an
+# EXIT trap so a crash/interrupt still frees the slot promptly — the NEXT acquirer's
+# _lss_reclaim_stale self-heals a marker this trap somehow missed (a SIGKILL, e.g.).
+_LSS_MARKER=""
+_lss_release() { [ -n "$_LSS_MARKER" ] && rm -f "$_LSS_MARKER" 2>/dev/null; _LSS_MARKER=""; }
+
+# _lss_acquire — HERD-529: claim a cross-worktree local-suite slot before running the heavy profile.
+# Prints a VISIBLE 'waiting for a local suite slot (n ahead, cap N)' line — one per retry — on every
+# attempt that finds no free slot, so the builder pane always shows WHY it is waiting (never a silent
+# stall). Written to STDERR, deliberately: run_heavy() executes inside run_profile()'s
+# `MAIN_OUT="$(run_profile)"` command substitution, which captures only stdout — a wait line on stdout
+# would sit invisibly buffered inside $MAIN_OUT until the ENTIRE suite finishes (defeating the whole
+# point). Stderr passes straight through a `$(...)` capture uncaptured, so it reaches the builder's
+# terminal / tailed log the instant it's printed — genuinely unbuffered, not just unflushed. Fail-soft:
+# no resolvable pool dir (WORKTREES_DIR unset/missing) → returns immediately, running unslotted exactly
+# as before this feature existed.
+_lss_acquire() {
+  local pool cap live
+  pool="$(_lss_pool_dir)"
+  [ -n "$pool" ] || return 0
+  cap="$(herd_numeric LOCAL_SUITE_CONCURRENCY 2)"
+  case "$cap" in ''|*[!0-9]*) cap=2 ;; esac
+  [ "$cap" -ge 1 ] 2>/dev/null || cap=1
+  trap '_lss_release' EXIT
+  while :; do
+    _LSS_MARKER="$(_lss_try_acquire "$pool" "$cap")" && break
+    live="$(_lss_count_live "$pool")"
+    printf 'waiting for a local suite slot (%s ahead, cap %s)\n' "$live" "$cap" >&2
+    sleep "${HERD_LOCAL_SUITE_SLOT_POLL_SECS:-2}" 2>/dev/null || sleep 2
+  done
+}
+
 # ── heavy profile: delegate to the project health command ────────────────────
 run_heavy() {
   if [ -z "$HEALTHCHECK_CMD" ]; then run_light; return; fi
+  _lss_acquire
   # Resolve the command relative to the worktree (it's a committed project file).
   local out rc
   if [ -n "$ONELINE" ]; then

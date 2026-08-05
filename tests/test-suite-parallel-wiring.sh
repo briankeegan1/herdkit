@@ -15,11 +15,20 @@
 #       HERD-463 — and the output notes the serial fallback.
 #   (3) HEALTHCHECK_SUITE_WORKERS=1 → no --jobs even with parallel present (bound<=1 is a strict
 #       serial request, matching scripts/herd/burst.sh's own "bound<=1 is strict serial" contract).
-#   (4) an over-requested HEALTHCHECK_SUITE_WORKERS is capped at the box's own (stubbed) core count.
-#   (5)/(6) HERD-499: the fan-out is ALSO clamped by live CONCURRENT sibling suites (mutation-proof
-#       of _hk_live_sibling_suites / the new divisor in _hk_suite_workers) — a solo suite (no
-#       $WORKTREES_DIR/.health-inflight-* markers, or none with a live pid) gets the FULL count;
-#       two live fake sibling markers HALVE it (cores / max(1, siblings)).
+#   (4) HERD-529: an EXPLICIT HEALTHCHECK_SUITE_WORKERS, even one that exceeds the box's own (stubbed)
+#       core count, is honored UNCHANGED — no core-count cap. Supersedes the old HERD-499 behavior
+#       (where an explicit request was ALSO capped at the core count); leg B's dynamic default is what
+#       now avoids oversubscription for the UNSET case, so an explicit override no longer needs a
+#       second clamp on top of it.
+#   (5)/(6) HERD-529: an EXPLICIT HEALTHCHECK_SUITE_WORKERS also overrides the live-sibling-suite
+#       clamp — (5) a solo suite (no $WORKTREES_DIR/.local-suite-slot-* markers) gets the full
+#       explicit count; (6) two live fake local-suite-slot markers do NOT shrink it (explicit always
+#       wins unchanged; mirrors the old HERD-499 mutation-proof, now inverted for leg B's contract).
+#   (7)/(8) HERD-529 leg B: when HEALTHCHECK_SUITE_WORKERS is UNSET, the DEFAULT is derived
+#       dynamically instead of a flat 4 — max(2, cores / max(1, live local-suite-slot count)), read
+#       from leg A's $WORKTREES_DIR/.local-suite-slot-* markers (_hk_local_suite_slot_count) — (7) no
+#       live markers → divisor 1 → default equals the box's own core count; (8) two live markers →
+#       divisor 2 → default halves (cores / 2).
 #
 # Run:  bash tests/test-suite-parallel-wiring.sh
 set -uo pipefail
@@ -125,41 +134,57 @@ grep -q -- '--jobs' <<< "$ARGV" && fail "(3) workers=1 must NOT pass --jobs even
 ok
 echo "PASS (3) HEALTHCHECK_SUITE_WORKERS=1 stays serial even with GNU parallel present"
 
-# ── (4) worker count is capped at the (stubbed) core count ────────────────────────────────────────
+# ── (4) HERD-529: an over-requested HEALTHCHECK_SUITE_WORKERS is honored UNCHANGED, uncapped ───────
 run_proj yes HEALTHCHECK_SUITE_WORKERS=99
 [ "$RC" -eq 0 ] || fail "(4) expected clean exit, got $RC — out: $OUT"
-grep -qE -- '--jobs 8\b' <<< "$ARGV" || fail "(4) expected --jobs capped at the stubbed core count (8), got: $ARGV"
+grep -qE -- '--jobs 99\b' <<< "$ARGV" || fail "(4) expected explicit --jobs 99 UNCAPPED (HERD-529: explicit always wins unchanged), got: $ARGV"
 ok
-echo "PASS (4) an over-requested HEALTHCHECK_SUITE_WORKERS is capped at the box's own core count"
+echo "PASS (4) HERD-529: an explicit HEALTHCHECK_SUITE_WORKERS is never capped by the box's own core count"
 
-# ── (5)/(6) HERD-499: fan-out is ALSO clamped by live CONCURRENT sibling suites ───────────────────
-# $F has no .herd/config through cases (1)-(4) above, so _hk_live_sibling_suites() was reading 0
-# siblings (fail-soft) the whole time — those cases are unaffected by what follows. Only now do we
+# ── (5)/(6)/(7)/(8) HERD-529: leg A/B wiring — $WORKTREES_DIR/.local-suite-slot-* markers ─────────
+# $F has no .herd/config through cases (1)-(4) above, so _hk_local_suite_slot_count() was reading 0
+# live markers (fail-soft) the whole time — those cases are unaffected by what follows. Only now do we
 # point the fixture's own .herd/config at a throwaway $WORKTREES_DIR pool, mirroring how a real
 # project resolves it (_hk_regtabs() reads .herd/config the same way, not an inherited env var).
 POOL="$T/pool"; mkdir -p "$POOL" "$F/.herd"
 printf 'WORKTREES_DIR="%s"\n' "$POOL" > "$F/.herd/config"
 
-# (5) solo: pool exists but holds no markers → the sibling divisor is max(1,0)=1 → FULL count, same
-# as the box's own core cap (workers=8 requires HEALTHCHECK_SUITE_WORKERS >= cores so the sibling
-# clamp, not the request cap, is what's under test).
+# (5) explicit + solo: pool exists but holds no markers → still just honors the explicit request.
 run_proj yes HEALTHCHECK_SUITE_WORKERS=8
 [ "$RC" -eq 0 ] || fail "(5) expected clean exit, got $RC — out: $OUT"
-grep -qE -- '--jobs 8\b' <<< "$ARGV" || fail "(5) expected FULL --jobs 8 with no sibling markers, got: $ARGV"
+grep -qE -- '--jobs 8\b' <<< "$ARGV" || fail "(5) expected explicit --jobs 8 with no local-suite-slot markers, got: $ARGV"
 ok
-echo "PASS (5) HERD-499: no live sibling markers → sibling divisor=1 → full worker count (unchanged)"
+echo "PASS (5) HERD-529: explicit HEALTHCHECK_SUITE_WORKERS with no live local-suite-slot markers → honored unchanged"
 
-# (6) two FAKE sibling markers, each recording THIS test script's own live pid (kill -0 "$$" succeeds
-# for as long as this script is running) → sibling divisor=2 → workers halved (8/2=4), even though
-# HEALTHCHECK_SUITE_WORKERS still requests 8.
-printf '%s\n' "$$" > "$POOL/.health-inflight-fakeA-deadbeef"
-printf '%s\n' "$$" > "$POOL/.health-inflight-fakeB-deadbeef"
+# (6) two FAKE local-suite-slot markers, each recording THIS test script's own live pid (kill -0 "$$"
+# succeeds for as long as this script is running) — an explicit request is NOT shrunk by them (HERD-529
+# inverts the old HERD-499 contract: explicit always wins unchanged, even with live siblings present).
+printf '%s\n' "$$" > "$POOL/.local-suite-slot-1"
+printf '%s\n' "$$" > "$POOL/.local-suite-slot-2"
 run_proj yes HEALTHCHECK_SUITE_WORKERS=8
 [ "$RC" -eq 0 ] || fail "(6) expected clean exit, got $RC — out: $OUT"
-grep -qE -- '--jobs 4\b' <<< "$ARGV" || fail "(6) expected HALVED --jobs 4 with two live sibling markers, got: $ARGV"
+grep -qE -- '--jobs 8\b' <<< "$ARGV" || fail "(6) expected UNCHANGED --jobs 8 despite two live local-suite-slot markers (explicit overrides the clamp), got: $ARGV"
 ok
-echo "PASS (6) HERD-499: two live sibling suite markers → workers halved (cores / siblings)"
-rm -f "$POOL/.health-inflight-fakeA-deadbeef" "$POOL/.health-inflight-fakeB-deadbeef"
+echo "PASS (6) HERD-529: explicit HEALTHCHECK_SUITE_WORKERS overrides the live-sibling clamp"
+rm -f "$POOL/.local-suite-slot-1" "$POOL/.local-suite-slot-2"
+
+# (7) UNSET + solo (no live markers) → dynamic default divisor=max(1,0)=1 → default = cores (8).
+run_proj yes
+[ "$RC" -eq 0 ] || fail "(7) expected clean exit, got $RC — out: $OUT"
+grep -qE -- '--jobs 8\b' <<< "$ARGV" || fail "(7) expected UNSET default --jobs 8 (cores/1) with no live markers, got: $ARGV"
+ok
+echo "PASS (7) HERD-529 leg B: unset HEALTHCHECK_SUITE_WORKERS with no live local-suite-slot markers → dynamic default = box core count"
+
+# (8) UNSET + two live markers (re-planted; (6)/(7) each clean up after themselves) → dynamic default
+# divisor=2 → default = cores/2 = 4.
+printf '%s\n' "$$" > "$POOL/.local-suite-slot-1"
+printf '%s\n' "$$" > "$POOL/.local-suite-slot-2"
+run_proj yes
+[ "$RC" -eq 0 ] || fail "(8) expected clean exit, got $RC — out: $OUT"
+grep -qE -- '--jobs 4\b' <<< "$ARGV" || fail "(8) expected UNSET default --jobs 4 (cores/2) with two live local-suite-slot markers, got: $ARGV"
+ok
+echo "PASS (8) HERD-529 leg B: unset HEALTHCHECK_SUITE_WORKERS + two live local-suite-slot markers → dynamic default halves (cores / live)"
+rm -f "$POOL/.local-suite-slot-1" "$POOL/.local-suite-slot-2"
 
 echo
-echo "ALL PASS ($pass checks) — HERD-463 local heavy-gate bats --jobs wiring: present + bounded when GNU parallel is available, byte-identical serial fallback when it is not. HERD-499: fan-out also clamped by live concurrent sibling suites."
+echo "ALL PASS ($pass checks) — HERD-463 local heavy-gate bats --jobs wiring: present + bounded when GNU parallel is available, byte-identical serial fallback when it is not. HERD-529: an explicit HEALTHCHECK_SUITE_WORKERS always wins unchanged (leg B); an unset one now derives its default dynamically from leg A's live local-suite-slot count instead of a flat 4."

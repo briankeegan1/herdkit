@@ -632,6 +632,19 @@ fi
 : "${COORDINATOR_CMD:="/coordinator"}"  # the generated coordinator skill the control room runs
 : "${HERD_VERSION:="1"}"
 : "${HERD_REPO:=""}"            # <owner>/herdkit — where engine bugs escalate (herd report)
+# TRACKER_REPO (HERD-534 / GH #651) — the <owner>/<repo> the WORK-TRACKER backend
+# (scripts/herd/backends/github.sh) files/lists/updates/closes items in. LEG A of the bug this key
+# fixes: the github backend used to inject -R $HERD_REPO on every gh issue verb, so any project with
+# HERD_REPO set (report/triage escalation target) had its OWN backlog silently file onto that OTHER
+# repo instead of its own — a `backend switch github --migrate` in one project filed 8 work items onto
+# the herdkit ENGINE repo (#640-647), and the backlog pane listed that other project's
+# engine-escalation issues as local work. TRACKER_REPO is a SEPARATE key the github backend reads
+# EXCLUSIVELY for its own repo selection; it NEVER falls back to HERD_REPO (herd report / herd triage /
+# oss-triage.sh keep using HERD_REPO alone, unaffected). Default '' (unset) → the backend passes no -R
+# flag at all, so `gh` resolves the repo itself from the CWD's `origin` remote — byte-identical to a
+# project whose origin IS its own tracker. Set only when the tracker repo differs from origin (a
+# tracker-only repo separate from the code repo).
+: "${TRACKER_REPO:=""}"
 : "${WATCHER_AUTOMERGE:="true"}"  # legacy lever; MERGE_POLICY takes precedence when set
 : "${MERGE_POLICY:=""}"           # auto | approve | observe (empty → derive from WATCHER_AUTOMERGE)
 : "${HUMAN_VERIFY_POLICY:="hold"}"  # HERD-59: how a PR's HUMAN-VERIFY: block is handled under MERGE_POLICY=auto — hold (default, today's exact per-PR hold) | coordinator (loud, coordinator-actionable hold) | auto (informational: journal + comment the steps, merge on green). Unknown → hold. Consumed by agent-watch.sh + herd-approve.sh
@@ -683,6 +696,17 @@ fi
 # fed; 0 → strict no-surplus. Advisory only: --force / HERD_FORCE_SPAWN=1 bypasses it. Non-numeric → 1.
 : "${SPAWN_AHEAD:="1"}"
 : "${HEALTH_CONCURRENCY:="1"}"   # max healthcheck suites the watcher runs at once (default 1: serialize — all feature worktrees share one git object store, so overlapping suites race on shared .git locks and paint false-red)
+# LOCAL_SUITE_CONCURRENCY (HERD-529) — max HEAVY healthcheck suites this BOX runs at once, across ALL
+# worktrees and ALL callers (builder-local `scripts/herd/healthcheck.sh --heavy` runs AND the
+# watcher's own dispatch) — a distinct, wider ceiling than HEALTH_CONCURRENCY, which only serializes
+# the watcher's OWN dispatch loop and has no visibility into a builder running the heavy suite locally
+# ahead of its own PR. GROUNDED 2026-08-05: an 8-builder fleet ran up to 8 simultaneous builder-local
+# heavy suites (box saturation, a tolerated-as-DATA/ENV 1800s bats timeout that actually meant the
+# suite asserted nothing that run). Enforced in scripts/herd/healthcheck.sh's run_heavy() via a
+# cross-worktree slot pool under $WORKTREES_DIR, namespaced `.local-suite-slot-*` (distinct from the
+# watcher's own `.health-inflight-*` markers, so the two accounting systems never collide). Default 2.
+# Non-numeric → 2 (resolved via herd_numeric, warns once, fails toward the safe default).
+: "${LOCAL_SUITE_CONCURRENCY:="2"}"
 # RESTART-SAFE INFLIGHT TIMEOUTS (HERD-185) — an in-flight review/health worker that outlives this many
 # seconds (age read from its on-disk dispatch marker, so ANY watcher instance — even one that restarted
 # mid-run — can enforce it) is SIGTERMed + reaped by the every-tick corpse sweep, freeing its slot. Well

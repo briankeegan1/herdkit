@@ -15,6 +15,10 @@
 #     HERD_REPO           — linked repo (owner/repo)
 #     HERD_REPORT_BACKEND — adapter name (github, linear, file, changelog)
 #     HERD_LINK_TARGET    — optional tracker routing (e.g. Linear team ID); may be empty
+#     TRACKER_REPO        — mirrors HERD_REPO (HERD-534): backends/github.sh reads TRACKER_REPO
+#                            exclusively for its own repo selection, never HERD_REPO, so a report-path
+#                            caller sourcing that backend against the resolved peer needs this set too.
+#                            Harmless for every other report backend (linear/jira/changelog ignore it).
 #   Returns 0 on match, 1 if the name is not found or no links file exists.
 
 _herd_find_links() {
@@ -48,6 +52,7 @@ _herd_resolve_link() {
     HERD_REPO="$_hl_repo"
     HERD_REPORT_BACKEND="${_hl_backend:-github}"
     HERD_LINK_TARGET="$_hl_target"
+    TRACKER_REPO="$_hl_repo"
     return 0
   done < "$_hl_file"
   return 1
