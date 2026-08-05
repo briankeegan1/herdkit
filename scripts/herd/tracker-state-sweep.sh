@@ -229,21 +229,23 @@ _tsweep_ref_backend_mismatch() {
   return 0
 }
 
-# _tsweep_gh_evidence REF — best-effort, READ-ONLY: when HERD_REPO names a repo and gh is on PATH,
+# _tsweep_gh_evidence REF — best-effort, READ-ONLY: when TRACKER_REPO names a repo and gh is on PATH,
 # looks up the bare numeric ref as a github issue purely to record found-state EVIDENCE in the
 # unresolvable journal event's detail. Never a resolution path — mixing github's numbering into a
 # non-github backend's heal would risk resolving the WRONG item if a numeric id ever collides with a
 # real local one (the latent hazard above). Fail-soft: prints nothing on any absence/error.
-# HERD_REPO is NOT set by this script — it is the existing config key herd-config.sh already sources
-# above (default EMPTY: `: "${HERD_REPO:=""}"`), the same one the github backend uses for its own
-# issue ops. This function adds no new required input: on a project that has it configured, the
-# evidence lookup fires for free; everywhere else it stays silently empty (fail-soft), exactly as
-# before this function existed.
+# TRACKER_REPO is NOT set by this script — it is the existing config key herd-config.sh already
+# sources above (default EMPTY: `: "${TRACKER_REPO:=""}"`), the SAME one the github backend uses for
+# its own issue ops (HERD-534: this used to read HERD_REPO — the report/triage escalation key, never
+# this project's own tracker repo — so a project with HERD_REPO configured but a non-github
+# SCRIBE_BACKEND had this evidence lookup silently probe a STRANGER's repo). This function adds no new
+# required input: on a project that has TRACKER_REPO configured, the evidence lookup fires for free;
+# everywhere else it stays silently empty (fail-soft), exactly as before this function existed.
 _tsweep_gh_evidence() {
   local num="${1#\#}"
-  [ -n "${HERD_REPO:-}" ] || return 0
+  [ -n "${TRACKER_REPO:-}" ] || return 0
   command -v gh >/dev/null 2>&1 || return 0
-  gh issue view "$num" -R "$HERD_REPO" --json state 2>/dev/null \
+  gh issue view "$num" -R "$TRACKER_REPO" --json state 2>/dev/null \
     | python3 -c 'import sys, json
 try: print(json.load(sys.stdin).get("state", "").lower())
 except Exception: pass' 2>/dev/null || true

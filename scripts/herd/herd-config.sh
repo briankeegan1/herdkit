@@ -632,6 +632,19 @@ fi
 : "${COORDINATOR_CMD:="/coordinator"}"  # the generated coordinator skill the control room runs
 : "${HERD_VERSION:="1"}"
 : "${HERD_REPO:=""}"            # <owner>/herdkit — where engine bugs escalate (herd report)
+# TRACKER_REPO (HERD-534 / GH #651) — the <owner>/<repo> the WORK-TRACKER backend
+# (scripts/herd/backends/github.sh) files/lists/updates/closes items in. LEG A of the bug this key
+# fixes: the github backend used to inject -R $HERD_REPO on every gh issue verb, so any project with
+# HERD_REPO set (report/triage escalation target) had its OWN backlog silently file onto that OTHER
+# repo instead of its own — a `backend switch github --migrate` in one project filed 8 work items onto
+# the herdkit ENGINE repo (#640-647), and the backlog pane listed that other project's
+# engine-escalation issues as local work. TRACKER_REPO is a SEPARATE key the github backend reads
+# EXCLUSIVELY for its own repo selection; it NEVER falls back to HERD_REPO (herd report / herd triage /
+# oss-triage.sh keep using HERD_REPO alone, unaffected). Default '' (unset) → the backend passes no -R
+# flag at all, so `gh` resolves the repo itself from the CWD's `origin` remote — byte-identical to a
+# project whose origin IS its own tracker. Set only when the tracker repo differs from origin (a
+# tracker-only repo separate from the code repo).
+: "${TRACKER_REPO:=""}"
 : "${WATCHER_AUTOMERGE:="true"}"  # legacy lever; MERGE_POLICY takes precedence when set
 : "${MERGE_POLICY:=""}"           # auto | approve | observe (empty → derive from WATCHER_AUTOMERGE)
 : "${HUMAN_VERIFY_POLICY:="hold"}"  # HERD-59: how a PR's HUMAN-VERIFY: block is handled under MERGE_POLICY=auto — hold (default, today's exact per-PR hold) | coordinator (loud, coordinator-actionable hold) | auto (informational: journal + comment the steps, merge on green). Unknown → hold. Consumed by agent-watch.sh + herd-approve.sh

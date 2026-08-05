@@ -196,7 +196,7 @@ step "5" "Dependency-watcher calls _backend_item_state provider-lib#${ISSUE_NUMB
 real "_backend_item_state  →  4th adapter op (backends/github.sh, linear.sh, file.sh, changelog.sh)"
 ITEM_STATE=""
 ITEM_STATE="$(
-    HERD_REPO="provider-org/provider-lib"
+    TRACKER_REPO="provider-org/provider-lib"
     PATH="$T/bin:$PATH"
     . "$HERD_SCRIPTS/backends/github.sh"
     ITEM_STATE=""
