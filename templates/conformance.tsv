@@ -217,6 +217,8 @@ health-trust.sh	unit	tests/test-health-trust.sh
 health-trust.sh	unit	tests/test_live_runtime.py
 HEALTH_TRUST_BUILDER	unit	tests/test-health-trust.sh
 HEALTH_TRUST_BUILDER	unit	tests/test_live_runtime.py
+HEALTH_TRUST_MAX_AGE_SECS	unit	tests/test-health-trust.sh
+HEALTH_TRUST_MAX_AGE_SECS	unit	tests/test_live_runtime.py
 HEALTH_SUITE_SCOPE	unit	tests/test-suite-scope.sh
 bats-fd3-guard.sh	unit	tests/test-bats-fd3-guard.sh
 gate-coverage-lint.sh	unit	tests/test-gate-coverage.sh
