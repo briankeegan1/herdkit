@@ -205,9 +205,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # herd_spawn_gate_saturated, is never called from here); safe to source in lib mode.
 # shellcheck source=/dev/null
 . "$HERE/herd-spawn-gate.sh"
-# SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531) — the shared provenance-record library, sourced for its
-# READ half (herd_health_trust_check), which the health dispatch below consults before running a full
-# suite. Sourcing DEFINES functions only; byte-inert until HEALTH_TRUST_BUILDER is opted in.
+# SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531) — the shared provenance-record library. Sourced here for
+# its READ half, herd_health_trust_check, which _healthcheck_gate below still consults — but
+# _healthcheck_gate itself is the bash-parity DISPATCH gate (see its own header comment, HERD-555):
+# it has had zero production callers since the Python engine port, so this READ call is exercised only
+# by tests/sim driving _healthcheck_gate directly, never by a live watcher tick. The ACTUAL live READ
+# (the one HEALTH_TRUST_BUILDER=on candidates hit today) is pysrc/herd/live_runtime.py's
+# LiveGates.health, which ports this same herd_health_trust_check contract. Sourcing DEFINES functions
+# only; byte-inert until HEALTH_TRUST_BUILDER is opted in.
 # shellcheck source=scripts/herd/health-trust.sh
 . "$HERE/health-trust.sh"
 
@@ -15187,6 +15192,25 @@ _health_worker() {
   printf '%s\n' "$_hw_line" > "$_hw_out.tmp.$$" 2>/dev/null && mv "$_hw_out.tmp.$$" "$_hw_out" 2>/dev/null || true
 }
 
+# RETIREMENT NOTE (HERD-555): _healthcheck_gate has had ZERO production callers since the Python
+# engine port (HERD-300/P5b) — docs/symbol-index.md confirms "callers: —", and grepping
+# agent-watch.sh's own tick loop for an invocation (as opposed to a comment mentioning it) finds none.
+# The LIVE health dispatch — including the sha-matched builder-local trust READ this function used to
+# be the only caller of (herd_health_trust_check, health-trust.sh) — is pysrc/herd/live_runtime.py's
+# LiveGates.health today.
+#
+# It is deliberately NOT deleted: per the P5b lesson (only the outer `_tick_act` entrypoint was
+# actually orphaned; every helper below it stayed because tests/sim drive it directly — see
+# docs/HERD-42 / the P5b bash-deletion notes), this function is the direct SUT of a large bash
+# hermetic test/sim surface that still verifies bash-side gate parity — deleting it would red all of:
+# tests/test-healthcheck-gate.sh, test-health-autofix.sh, test-health-observability.sh,
+# test-watcher-health-cache.sh, test-restart-safe-dispatch.sh, test-watcher-self-restart.sh,
+# test-gate-order-stale-dup.sh, test-merge-fairness.sh, test-watcher-leakguard-exemption.sh,
+# test-health-trust.sh (case 14, the trusted-dispatch decision itself), and the sim scenarios under
+# scripts/herd/sim/ (sandbox-concurrency, sandbox-shared-config, sandbox-multiseat,
+# sandbox-self-restart, engine-down, engine-pause). None of those were in scope to rewrite here —
+# rewriting that whole surface onto the Python gate is its own item, not a HERD-555 side effect.
+#
 # _healthcheck_gate <pr#> <slug> <worktree-dir> <display-idx> [headSha] — the serialized, ASYNC,
 # retry-before-red healthcheck as a NON-BLOCKING dispatch/collect state machine (unified with the review
 # gate — see _review_gate_step). Sets DISPLAY[<idx>] and the global _HC_RESULT to one token; returns 0
