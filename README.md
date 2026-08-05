@@ -430,6 +430,37 @@ Then launch the control room:
 bash ~/source/herdkit/scripts/herd/coordinator.sh
 ```
 
+## Joining someone else's herd project — `herd adopt`
+
+`herd init` is for a project you are standing up. If you just **cloned** a project someone else
+already herds, you want `herd adopt` instead:
+
+```sh
+git clone git@github.com:someone/theirproject.git
+cd theirproject
+herd adopt          # localize the clone for THIS machine — non-interactive, idempotent
+herd render         # rebuild the per-machine coordinator skill
+herd reload         # bring up the control room
+```
+
+Why a second command exists: `.herd/config` is **committed**, and it carries the author's *absolute*
+`PROJECT_ROOT` and `WORKTREES_DIR`. Straight out of a clone, every lane, the watcher lock, the
+worktree pool and the journal resolve into somebody else's home directory. `herd adopt`:
+
+- derives `PROJECT_ROOT` from the clone's physical path and `WORKTREES_DIR` as the sibling pool
+  `<PROJECT_ROOT>-trees`, and writes **both through the validated machine-scope setter** into the
+  gitignored `.herd/config.local` overlay — the committed baseline is never touched, so the clone
+  stays byte-clean for its author and for your next `git pull`;
+- creates the worktree pool;
+- guarantees the overlay is ignored by git, via `.git/info/exclude` — checkout-local, so adopting
+  never dirties the clone;
+- runs the dependency doctor and prints the next two commands.
+
+It takes an optional path (`herd adopt ~/source/theirproject`, default: the current directory), and
+re-running it on an already-localized project is a no-op report. Use it again any time a project
+directory is **moved or renamed**. Findings from the onboarding session that motivated it are in
+[docs/audits/2026-08-05-collaborator-onboarding.md](docs/audits/2026-08-05-collaborator-onboarding.md).
+
 Other commands:
 
 ```sh
