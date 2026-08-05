@@ -226,6 +226,7 @@ git-scope-lint.sh	unit	tests/test-git-scope-lint.sh
 git-scope-lint.sh	unit	tests/test-nested-repo-isolation.sh
 journal-emission-lint.sh	unit	tests/test-journal-emission-lint.sh
 env-export-lint.sh	unit	tests/test-env-export-lint.sh
+lever-reachability-lint.sh	unit	tests/test-lever-reachability-lint.sh
 hermetic-env-scrub.sh	unit	tests/test-hermetic-env-scrub.sh
 doc-drift-lint.sh	unit	tests/test-doc-drift.sh
 HERDKIT_HOME	unit	tests/test-doc-drift.sh
