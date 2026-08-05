@@ -43,7 +43,7 @@ esac
 EOF
 chmod +x "$T/bin/gh"
 export PATH="$T/bin:$PATH"
-export HERD_REPO="acme/widgets"
+export TRACKER_REPO="acme/widgets"
 
 gh_claim() {  # $1 = ref (issue number), $2 = who
   ( cd "$T" && . "$BACKENDS/github.sh"

@@ -5074,17 +5074,18 @@ cmd_backend() {
 }
 
 cmd_backend_switch() {
-  local target="" migrate=""
+  local target="" migrate="" assume_yes=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --migrate)    migrate=1 ;;
       --no-migrate) migrate=0 ;;
+      --yes|-y)     assume_yes=1 ;;
       -*)           die "herd backend switch: unknown flag '$1'" ;;
       *)            [ -z "$target" ] && target="$1" || die "herd backend switch: one backend name only" ;;
     esac
     shift
   done
-  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate]"
+  [ -n "$target" ] || die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate] [--yes]"
 
   # Load the project (mirrors cmd_backlog's loader).
   local root; root="$(pwd)"
@@ -5218,6 +5219,31 @@ cmd_backend_switch() {
     else
       migrate=0
       say "(non-interactive: NOT migrating $n_old open item(s) — re-run with --migrate to replay them)"
+    fi
+  fi
+  # HERD-534 / GH #651 (LEG A): a github migration FILES items on TRACKER_REPO — print the resolved
+  # destination and require an explicit confirmation right before anything is filed, independent of
+  # the generic prompt above (which never fires when --migrate was passed explicitly — exactly the
+  # path the real incident took: `backend switch github --migrate` silently filed 8 work items onto
+  # the wrong repo). --yes (or a typed y/yes below) is the only way past this for github.
+  if [ "$target" = "github" ] && [ "${migrate:-0}" = "1" ] && [ "$n_old" -gt 0 ]; then
+    local _tr_dest="${TRACKER_REPO:-}"
+    if [ -z "$_tr_dest" ]; then
+      _tr_dest="$(cd "$PROJECT_ROOT" 2>/dev/null && gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)" || _tr_dest=""
+    fi
+    say "github migration destination: ${_tr_dest:-<unresolved — TRACKER_REPO unset and the origin remote could not be read; gh will use its own default>}"
+    if [ "$assume_yes" -ne 1 ]; then
+      if [ -t 0 ]; then
+        printf 'File %s migrated item(s) onto %s? [y/N] ' "$n_old" "${_tr_dest:-this repo}" >&2
+        local _tr_ans=""; IFS= read -r _tr_ans </dev/tty || true
+        case "$_tr_ans" in
+          y|Y|yes) ;;
+          *) say "migration skipped — SCRIBE_BACKEND is now $target, nothing was filed"; migrate=0 ;;
+        esac
+      else
+        say "non-interactive: NOT filing $n_old item(s) onto ${_tr_dest:-the resolved repo} without --yes (re-run 'herd backend switch github --migrate --yes' to confirm the destination)"
+        migrate=0
+      fi
     fi
   fi
   if [ "${migrate:-0}" = "1" ] && [ "$n_old" -gt 0 ]; then
@@ -5561,6 +5587,8 @@ _deps_state() {
     case "${HERD_REPORT_BACKEND:-github}" in
       github) command -v gh >/dev/null 2>&1 || { printf 'unknown'; exit 0; } ;;
     esac
+    # HERD-534: backends/github.sh reads TRACKER_REPO (never HERD_REPO) for its own repo selection;
+    # _herd_resolve_link above already set TRACKER_REPO to the same resolved peer repo as HERD_REPO.
     ITEM_STATE=""
     # shellcheck source=/dev/null
     . "$bf"
@@ -5776,6 +5804,9 @@ cmd_report() {
     fi
   fi
 
+  # HERD-534: backends/github.sh reads TRACKER_REPO (never HERD_REPO) for its own repo selection —
+  # herd report targets HERD_REPO (the just-resolved escalation destination), so mirror it in here.
+  [ "$report_backend" = "github" ] && TRACKER_REPO="$HERD_REPO"
   local backend_file="$SCRIPTS_DIR/backends/${report_backend}.sh"
   [ -f "$backend_file" ] \
     || die "unknown HERD_REPORT_BACKEND '$report_backend' — no backends/${report_backend}.sh"
