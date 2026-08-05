@@ -319,13 +319,16 @@ done
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
-# Two tabs (control room + builder) and eight panes (watcher, backlog, builder, the reviewer split for
-# the reviewer-pane-lifecycle checkpoint, the two resolver splits for the HERD-280 retire/escalate legs,
-# the health split for the HERD-313 retire-on-outcome checkpoint, and the claude-as-root pane for the
-# alive checkpoint). All but the ESCALATE resolver pane are closed again within their own steps — that
-# one stays open BY DESIGN and goes with the workspace at teardown.
-[ "$(sc "$SCR" tabs_created)" -eq 2 ]  || fail "(B) tabs_created should be 2 (got $(sc "$SCR" tabs_created))"
-[ "$(sc "$SCR" panes_created)" -eq 8 ] || fail "(B) panes_created should be 8 (got $(sc "$SCR" panes_created))"
+# Three tabs and nine panes. Tabs: the control room, the builder, and the disposable `health·<slug>` TAB
+# the HERD-554 reconcile MINTS for an observed in-flight suite (the only leg that creates a tab rather
+# than splitting a pane — _spawn_health_pane calls `herdr tab create`, so its pane counts too). Panes:
+# watcher, backlog, builder, the reviewer split for the reviewer-pane-lifecycle checkpoint, the two
+# resolver splits for the HERD-280 retire/escalate legs, the health split for the HERD-313
+# retire-on-outcome checkpoint, that minted health pane, and the claude-as-root pane for the alive
+# checkpoint. All but the ESCALATE resolver pane are closed again within their own steps — that one
+# stays open BY DESIGN and goes with the workspace at teardown.
+[ "$(sc "$SCR" tabs_created)" -eq 3 ]  || fail "(B) tabs_created should be 3 (got $(sc "$SCR" tabs_created))"
+[ "$(sc "$SCR" panes_created)" -eq 9 ] || fail "(B) panes_created should be 9 (got $(sc "$SCR" panes_created))"
 # The reviewer pane is retired on verdict consumption (HERD-113).
 [ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # The resolver pane retires on a consumed DONE and SURVIVES an ESCALATE (HERD-280).
@@ -333,6 +336,12 @@ done
 [ "$(cp_status "$SCR" resolver_pane_kept_on_escalate)" = "pass" ] || fail "(B) resolver_pane_kept_on_escalate not pass"
 # The disposable health pane retires the moment its suite ends (HERD-313 leg a).
 [ "$(cp_status "$SCR" health_pane_retired_on_outcome)" = "pass" ] || fail "(B) health_pane_retired_on_outcome not pass"
+# HERD-554: the reconcile also MINTS the pane for an observed in-flight suite (a marker + log and
+# nothing else — the shape the Python engine leaves behind), and the same pass takes it away again.
+[ "$(cp_status "$SCR" health_pane_created_from_observed_suite)" = "pass" ] \
+  || fail "(B) health_pane_created_from_observed_suite not pass"
+[ "$(cp_status "$SCR" health_pane_roundtrip_on_same_reconcile)" = "pass" ] \
+  || fail "(B) health_pane_roundtrip_on_same_reconcile not pass"
 # CLEAN TEARDOWN: zero leaked tabs, and the fake herdr's state has no workspaces left behind.
 [ "$(sc "$SCR" leaked_tabs)" -eq 0 ] || fail "(B) leaked_tabs must be 0 (got $(sc "$SCR" leaked_tabs))"
 LEFT="$(python3 -c 'import json; print(len(json.load(open("'"$STATE"'"))["workspaces"]))')"
