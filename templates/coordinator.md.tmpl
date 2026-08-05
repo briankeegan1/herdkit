@@ -563,6 +563,47 @@ item** (anything under `agent-watch.sh`, the lanes, `herd-review.sh`, or gate / 
 tell the builder to reproduce the change in the matching sim scenario and confirm a clean scorecard
 before opening the PR, so the engine change is proven against the real gate loop, not just unit tests.
 
+## Pipeline throughput & scaling
+
+GROUNDED 2026-08-05 (HERD-530): an 8-builder fleet starved both gates because none of this lived
+in the rendered skill — every seat had to re-derive it live from the engine. Read this before
+spawning a large fleet, not after the gates back up.
+
+**Lifecycle + diagnosis — `herd why` FIRST.** Every PR moves INTAKE → HEALTH → REVIEW → BLESSED →
+merge; a `herd/gates Expected — Waiting` status is not itself a stall. Run `herd why <pr#>` (see
+*Diagnose a gate* above) before touching anything. Two queued-not-stalled signatures to recognize
+on sight:
+
+- **`health-check · queued (N ahead)`** — slot starvation, not a hang: in-flight suites already
+  fill the `HEALTH_CONCURRENCY` cap. A candidate with `health_pending` but no `healthcheck_started`
+  in its journal hasn't started running yet — it's waiting its turn, not stuck.
+- **A 0-byte suite log with a live, CPU-burning bats descendant** — RUNNING, not wedged. Confirm a
+  live descendant before treating a silent log as dead (`HEALTH_EARLY_REAP_SECS` governs this).
+
+**The three throughput knobs.**
+
+| Knob | Where | Notes |
+|---|---|---|
+| `REVIEW_CONCURRENCY` | `herd config set --local REVIEW_CONCURRENCY <n>` | max parallel pre-merge reviews (validated key) |
+| `HEALTH_CONCURRENCY` | `herd config set --local HEALTH_CONCURRENCY <n>` | max parallel healthcheck suites (validated key) |
+| `HEALTHCHECK_SUITE_WORKERS` | `export` in `.herd/config.local` | env-only, not a `config set` key — bounds bats' intra-suite `--jobs` fan-out |
+
+Use `--local` in this SHARED checkout so the committed baseline stays clean for every operator;
+`config set` auto-restarts the watcher for a watcher-affecting key, so a raised cap takes effect
+immediately (see *Workflow settings* above).
+
+**Scaling rule.** `REVIEW_CONCURRENCY`/`HEALTH_CONCURRENCY` default for a 2–3 builder herd — raise
+both to match fleet size BEFORE spawning a large one, not after the gates back up.
+
+**The spawn-gate formula.** A lane HOLDS a new spawn when in-flight builders already exceed
+`REVIEW_CONCURRENCY + SPAWN_AHEAD` and the review pipeline is saturated. `spawn.sh` queues a held
+spawn durably — nothing is lost — and the watcher drains the queue as slots free. `HERD_FORCE_SPAWN=1`
+(or a leading `--force`) bypasses the hold for a genuinely urgent item and journals the bypass.
+
+**Standing duty.** When engine mechanics or workflow behavior change, updating the affected skill
+template is part of FINISHING that change — a stale section here is a rail a seat will follow into
+a wrong action.
+
 ## Troubleshooting: setup problems or a wrong-rendering pane → `herd doctor` FIRST
 
 When something in the control room looks wrong at the environment level — a command misbehaves on a
@@ -847,4 +888,6 @@ red default branch, a dirty PR — has an owner under the `yolo` posture. Route 
 - Honor `AGENTS.md`/`CLAUDE.md`: **code** branches → PR → merge; the **one exception** is
   `{{BACKLOG_FILE}}`, which commits straight to the default branch per *Backlog writes*. Never
   commit anything under `{{DENY_PATHS}}`. No AI co-author trailer on commits.
+- **Updating a stale skill template is part of finishing an engine change** — see *Pipeline
+  throughput & scaling*'s standing duty.
 - You coordinate; sub-agents build.
