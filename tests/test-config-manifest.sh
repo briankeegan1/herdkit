@@ -230,7 +230,14 @@ EXEMPT_NAMES = {
                            # Read cross-file by status.sh's NOTES summary (HERD-492) exactly as
                            # bin/herd's `herd notes` and agent-watch.sh already read it.
     "DEPS_FILE", "DEP_STATES_FILE",
-    "DEP_WATCHER_LIB", "DRYRUN", "HERDKIT_HOME", "HERDR_MIN_VERSION", "ITEM_STATE", "ITEM_UPDATED",
+    "DEP_WATCHER_LIB", "DRYRUN",
+    "HEALTHCHECK_PROGRESS_LOG",  # HERD-494: set by agent-watch.sh's health worker as an env prefix
+                                 # around its healthcheck.sh invocation (a dogfood-only knob, same
+                                 # framing as HEALTHCHECK_BATS_FILTER/HEALTHCHECK_SUITE_WORKERS —
+                                 # capabilities.tsv `env` rows, not `config`), read in healthcheck.sh
+                                 # (tees the suite's live output into it) and .herd/healthcheck.project.sh
+                                 # — a cross-file env-passthrough contract, not a .herd/config knob
+    "HERDKIT_HOME", "HERDR_MIN_VERSION", "ITEM_STATE", "ITEM_UPDATED",
     "WATCHER_RESURRECT_LIB",  # watcher-resurrect.sh lib-mode test seam (HERD-489), same shape as
                               # DEP_WATCHER_LIB above — never a .herd/config knob
     "JOURNAL_FILE", "JOURNAL_MAX_BYTES", "LEDGER_FILE", "LOG", "MAIN", "MAIN_HEALTH", "NO_COLOR",
