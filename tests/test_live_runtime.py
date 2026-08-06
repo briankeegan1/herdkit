@@ -30,6 +30,7 @@ import subprocess
 import time
 
 from herd import cost_emit as CE
+from herd import decisions as D
 from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
                                LiveActuator, LiveHoldSource,
@@ -312,6 +313,195 @@ class TestGateOutcomes(LiveCase):
                                  if o["event"] == "refix_bounce" and o.get("rule") == "healthcheck")
         self.assertEqual(total_bounces, 1,
                          "same sha walked 5 times must produce 1 bounce, got %d" % total_bounces)
+
+
+class TestRefixCapDurableLatch(LiveCase):
+    """HERD-576 leg 1: the durable per-(pr, rail) exhaustion latch — a restart-safe marker FILE
+    (mirroring the HERD-185 inflight-marker pattern of "one small file names one fact") that STOPS a
+    rail bouncing once its budget is spent, independent of re-deriving the count from the ledger, and
+    is cleared the instant the rail's red genuinely resolves. Every tick() call below is its own
+    fresh LiveTick (its own process, in production) sharing only the on-disk state dir — the process
+    boundary IS the scenario, exactly like test_refix_round_advances_per_new_sha above."""
+
+    def _tick(self, cand, config, state_dir, tag):
+        scenario = {"candidates": [cand], "config": config}
+        jpath = os.path.join(self.tmp, "latch-%s.jsonl" % tag)
+        j = LiveJournal(jpath)
+        t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                     DryRunActuator(j), j, state=LiveState(state_dir))
+        t.run()
+        return events(jpath) if os.path.exists(jpath) else []
+
+    def _latch_path(self, state_dir, pr, kind="health"):
+        return os.path.join(state_dir, ".refix-escalated-%s-%s" % (pr, kind))
+
+    def test_three_bounces_then_needs_you_latches_durably_across_restart(self):
+        state_dir = os.path.join(self.tmp, "state-latch")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}
+        pr = 700
+        # Three DIFFERENT shas, each its own "restart" — rounds 1, 2, 3, exactly at the cap.
+        for i, sha in enumerate(["sha-a", "sha-b", "sha-c"], 1):
+            cand = {"pr": pr, "sha": sha, "slug": "feat-cap", "health": "CODEERROR"}
+            evs = self._tick(cand, config, state_dir, "r%d" % i)
+            rb = [e for e in evs if e["event"] == "refix_bounce" and e.get("rule") == "healthcheck"]
+            self.assertEqual(len(rb), 1, "sha %s round %d" % (sha, i))
+            self.assertEqual(rb[0]["round"], i)
+        self.assertFalse(os.path.exists(self._latch_path(state_dir, pr)),
+                         "the latch must not exist before the budget is actually spent")
+
+        # A 4th trigger (a fresh sha, a fresh "restart") — budget exhausted → ESCALATE, no bounce,
+        # and the durable latch is now written to disk.
+        cand4 = {"pr": pr, "sha": "sha-d", "slug": "feat-cap", "health": "CODEERROR"}
+        evs4 = self._tick(cand4, config, state_dir, "r4")
+        self.assertFalse([e for e in evs4 if e["event"] == "refix_bounce"],
+                         "budget-exhausted trigger must not bounce")
+        esc = [e for e in evs4 if e["event"] == "health_refix_escalated"]
+        self.assertEqual(len(esc), 1)
+        self.assertIn("refix limit (3 rounds) reached", esc[0]["reason"])
+        latch_path = self._latch_path(state_dir, pr)
+        self.assertTrue(os.path.exists(latch_path), "cap exhaustion must write the durable latch")
+
+        # PROVE the latch carries genuine, INDEPENDENT restart-safety value: even with the durable
+        # ledger itself gone (simulating the exact loss the ledger-count arithmetic alone cannot
+        # survive), the latch ALONE must still stop a brand-new sha from bouncing.
+        os.remove(os.path.join(state_dir, ".agent-watch-refixed"))
+        cand5 = {"pr": pr, "sha": "sha-e", "slug": "feat-cap", "health": "CODEERROR"}
+        evs5 = self._tick(cand5, config, state_dir, "r5")
+        self.assertFalse([e for e in evs5 if e["event"] == "refix_bounce"],
+                         "the durable latch alone must still stop a bounce even with the ledger gone")
+
+    def test_rail_reset_clears_the_durable_latch_and_restores_budget(self):
+        state_dir = os.path.join(self.tmp, "state-latch-reset")
+        os.makedirs(state_dir)
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "1"}
+        pr = 701
+        latch_path = self._latch_path(state_dir, pr)
+
+        cand1 = {"pr": pr, "sha": "sha-x", "slug": "feat-reset", "health": "CODEERROR"}
+        self._tick(cand1, config, state_dir, "x1")          # round 1 == cap
+        cand2 = {"pr": pr, "sha": "sha-y", "slug": "feat-reset", "health": "CODEERROR"}
+        evs2 = self._tick(cand2, config, state_dir, "x2")   # exhausted -> latched
+        self.assertTrue([e for e in evs2 if e["event"] == "health_refix_escalated"])
+        self.assertTrue(os.path.exists(latch_path))
+
+        # The rail's red genuinely RESOLVES (CLEAN) — the latch clears at the same instant the
+        # ledger count itself zeroes (contract §4 refund-on-green).
+        cand_clean = {"pr": pr, "sha": "sha-z", "slug": "feat-reset", "health": "CLEAN"}
+        self._tick(cand_clean, config, state_dir, "x3")
+        self.assertFalse(os.path.exists(latch_path), "a genuine resolve must clear the durable latch")
+
+        # A fresh CODEERROR after the reset bounces at round 1 again — the budget is truly restored,
+        # not just cosmetically unlatched.
+        cand4 = {"pr": pr, "sha": "sha-w", "slug": "feat-reset", "health": "CODEERROR"}
+        evs4 = self._tick(cand4, config, state_dir, "x4")
+        rb = [e for e in evs4 if e["event"] == "refix_bounce"]
+        self.assertEqual(len(rb), 1)
+        self.assertEqual(rb[0]["round"], 1)
+
+
+class TestGateConfigGenerationHint(LiveCase):
+    """HERD-576 leg 2: a sha-cached CODEERROR verdict that predates the gate config running THIS
+    tick renders an advisory hint — so an operator reading a long-standing red can tell a stale
+    verdict from a fresh one instead of wondering why an old red survived a config change."""
+
+    class _ReusedHealthGates:
+        """A minimal gates stub whose `health()` always reports a REUSED cache hit (`reused_health`
+        True) — the one shape the live `LiveGates.health()` never produces on the SAME tick a verdict
+        is freshly collected (a fresh collect always stamps the CURRENT generation, by construction;
+        only a later tick reusing an OLDER stamp can ever observe a mismatch)."""
+
+        reused_review = True
+
+        def __init__(self, verdict="CODEERROR"):
+            self.reused_health = True
+            self._verdict = verdict
+
+        def health(self, cand):
+            return self._verdict
+
+        def review(self, cand):
+            return "PASS"
+
+    def _run(self, cand_dict, config, state, tag):
+        scenario = {"candidates": [cand_dict], "config": config}
+        jpath = os.path.join(self.tmp, "genhint-%s.jsonl" % tag)
+        j = LiveJournal(jpath)
+        t = LiveTick(config, FixtureDiscovery(scenario), self._ReusedHealthGates(),
+                     DryRunActuator(j), j, state=state)
+        t.run()
+        return events(jpath) if os.path.exists(jpath) else []
+
+    def test_hint_fires_when_cached_generation_predates_current_config(self):
+        state_dir = os.path.join(self.tmp, "state-genhint-a")
+        os.makedirs(state_dir)
+        state = LiveState(state_dir)
+        cand_dict = {"pr": 900, "sha": "sha-old", "slug": "feat-gen", "agent_status": "idle"}
+        cand = LiveCandidate.from_dict(cand_dict)
+
+        # Plant a cache entry as if it were collected under an OLDER config (REFIX_MAX_ROUNDS=3).
+        old_gen = D.gate_config_generation({"REFIX_MAX_ROUNDS": "3"})
+        state.record_health_result(cand, "CODEERROR", "not ok 1 - foo.bats")
+        state.record_health_generation(cand, old_gen)
+
+        # This tick runs under a DIFFERENT config (REFIX_MAX_ROUNDS=5) — the operator changed posture
+        # since the red was cached — and the gates stub reports it as a REUSED cache hit.
+        new_config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "5"}
+        self.assertNotEqual(old_gen, D.gate_config_generation(new_config))
+        evs = self._run(cand_dict, new_config, state, "a")
+        hint_rows = [e for e in evs if e["event"] == "health_gate_config_stale"]
+        self.assertEqual(len(hint_rows), 1)
+        self.assertEqual(hint_rows[0]["pr"], 900)
+        self.assertIn("cached verdict predates gate config", hint_rows[0]["detail"])
+        self.assertIn("new sha required", hint_rows[0]["detail"])
+
+    def test_no_hint_when_cached_generation_matches_current_config(self):
+        state_dir = os.path.join(self.tmp, "state-genhint-b")
+        os.makedirs(state_dir)
+        state = LiveState(state_dir)
+        cand_dict = {"pr": 901, "sha": "sha-same", "slug": "feat-gen2", "agent_status": "idle"}
+        cand = LiveCandidate.from_dict(cand_dict)
+
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}
+        gen = D.gate_config_generation(config)
+        state.record_health_result(cand, "CODEERROR", "not ok 1 - foo.bats")
+        state.record_health_generation(cand, gen)
+
+        evs = self._run(cand_dict, config, state, "b")
+        self.assertFalse([e for e in evs if e["event"] == "health_gate_config_stale"],
+                         "an unchanged gate config must never render the hint")
+
+    def test_no_hint_when_no_generation_was_ever_recorded(self):
+        # A cache written before this feature existed (or a store-backend pool) carries no generation
+        # stamp — fail-soft: silence, never a false "predates config" flag with nothing to compare to.
+        state_dir = os.path.join(self.tmp, "state-genhint-c")
+        os.makedirs(state_dir)
+        state = LiveState(state_dir)
+        cand_dict = {"pr": 902, "sha": "sha-legacy", "slug": "feat-gen3", "agent_status": "idle"}
+        cand = LiveCandidate.from_dict(cand_dict)
+        state.record_health_result(cand, "CODEERROR", "not ok 1 - foo.bats")   # no generation stamped
+
+        config = {"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "3"}
+        evs = self._run(cand_dict, config, state, "c")
+        self.assertFalse([e for e in evs if e["event"] == "health_gate_config_stale"])
+
+    def test_fresh_collect_never_hints_same_tick(self):
+        # LiveGates.health()'s REAL collect path stamps the CURRENT generation the same instant it
+        # caches the verdict — the hint's non-reused guard means a genuinely fresh red never
+        # self-flags. Exercised directly against the real LiveGates (not the stub above).
+        state_dir = os.path.join(self.tmp, "state-genhint-fresh")
+        os.makedirs(state_dir)
+        state = LiveState(state_dir)
+        cand = LiveCandidate(5, "deadbeef", slug="feat-fresh")
+        _marker_write(state.health_inflight_file(cand), os.getpid(), nonce="n-live")
+        with open(state.health_dispatch_file(cand), "w", encoding="utf-8") as fh:
+            fh.write("n-live\tCODEERROR\tnot ok 1 - foo.bats\n")
+        journal = LiveJournal(os.path.join(self.tmp, "fresh.jsonl"))
+        gates = LiveGates("/nonexistent-home", state, journal, config={"REFIX_MAX_ROUNDS": "3"})
+        self.assertEqual(gates.health(cand), "CODEERROR")
+        self.assertFalse(gates.reused_health)
+        self.assertEqual(state.health_cached_generation(cand),
+                         D.gate_config_generation({"REFIX_MAX_ROUNDS": "3"}))
 
 
 class TestTransitionDedupe(LiveCase):

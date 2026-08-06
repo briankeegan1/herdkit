@@ -211,6 +211,22 @@ grep -q 'needs you' <<< "$(row)" || fail "(6) exhausted-budget row must read nee
 grep -q '"event":"ci_fastbounce_escalated"' "$JOURNAL_FILE" || fail "(6) must journal ci_fastbounce_escalated"
 ok "(6) shared REFIX_MAX_ROUNDS budget exhaustion escalates to needs-you"
 
+# ── (6b) HERD-576: cap exhaustion writes the durable per-rail latch, shared with the live python
+# health path (pysrc/herd/live_runtime.py `_refix_rail_escalated`) — a restart-safe marker FILE, not
+# just a re-derivable ledger count. ────────────────────────────────────────────────────────────────
+_refix_rail_escalated 40 health || fail "(6b) cap exhaustion must write the durable escalation latch"
+ok "(6b) cap exhaustion latches the rail durably (shared health-rail marker)"
+
+# ── (6c) the latch alone (even with the ledger's bounce rows gone) still stops a fresh sha ─────────
+rm -f "$REFIX_STATE"
+runs_before_6c="$(runs)"
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_ci_fastbounce 40 slug-a "sha-cap-latched" 0 "$WT" feat/a "$CI_SUM" || fail "(6c) latched call must still return 0 (needs-you)"
+[ "$(runs)" = "$runs_before_6c" ] \
+  || fail "(6c) the durable latch alone must still block a bounce with the ledger gone (got $(runs), was $runs_before_6c)"
+grep -q 'needs you' <<< "$(row)" || fail "(6c) latched row must still read needs you (got: $(row))"
+ok "(6c) the durable latch alone stops a bounce even after the ledger is lost"
+
 # ── (7) dead/missing agent preflight → needs-you, never types into a dead session ────────────
 reset_state
 export CI_FAST_BOUNCE=on HERD_CI_FASTBOUNCE_IDENTITY='app/greet.test.sh'
