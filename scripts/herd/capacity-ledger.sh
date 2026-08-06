@@ -336,6 +336,22 @@ capacity_agent_lease_cap() {
   printf '%s' "$((conc + ahead))"
 }
 
+# capacity_agent_lease_admit_ceiling <cap> — the REAL number of 'spawn'-class units admittable out of
+# <cap>, i.e. <cap> minus whatever capacity_reserved_top claims for a (not-yet-existing) higher class —
+# 'spawn' never matches the 'top' case in capacity_candidate_slots, so that slot is structurally
+# un-leasable to it (deliberate P3 headroom, see docs/spikes/capacity-admission.md §6). capacity_agent_lease_cap's
+# raw REVIEW_CONCURRENCY+SPAWN_AHEAD value therefore OVERSTATES the real admit ceiling by
+# capacity_reserved_top's count once cap >= 2 — this is the number to report to an operator.
+capacity_agent_lease_admit_ceiling() {
+  local cap="$1" top
+  case "$cap" in ''|*[!0-9]*) cap=2 ;; esac
+  top="$(capacity_reserved_top "$cap")"
+  case "$top" in ''|*[!0-9]*) top=0 ;; esac
+  local ceil=$((cap - top))
+  [ "$ceil" -ge 0 ] 2>/dev/null || ceil=0
+  printf '%s' "$ceil"
+}
+
 # capacity_suite_queue_saturated — true iff the SUITE tenant's ledger is fully occupied RIGHT NOW
 # (live count >= LOCAL_SUITE_CONCURRENCY): a suite trying to acquire this instant would have to queue.
 # Consumed by herd-spawn-gate.sh (HERD-581 P2) as an ADDITIONAL saturation signal, closing the
@@ -448,9 +464,12 @@ capacity_agent_lease_reserve() {
 # unavailable') is a MARKER the watcher's spawn-queue drain (agent-watch.sh:_drain_lane_worker) greps
 # for to tell a HELD spawn from a hard failure — mirroring herd_spawn_gate_emit_defer's own contract.
 herd_capacity_lease_emit_defer() {
-  local slug="${1:-}"
+  local slug="${1:-}" cap ceiling
+  cap="$(capacity_agent_lease_cap)"
+  ceiling="$(capacity_agent_lease_admit_ceiling "$cap")"
   printf '⏸️  agent capacity lease unavailable — holding spawn until a slot frees%s\n' "${slug:+ (slug: $slug)}"
-  printf '   every "spawn" class unit is held; cap = REVIEW_CONCURRENCY + SPAWN_AHEAD = %s\n' "$(capacity_agent_lease_cap)"
+  printf '   every "spawn" class unit is held; admit ceiling = %s (REVIEW_CONCURRENCY + SPAWN_AHEAD = %s, minus the reserved-top slot spawns never lease)\n' \
+    "$ceiling" "$cap"
   printf '   this build would just wait behind the lease; the watcher re-queues it for a later tick.\n'
   printf '   force past the gate for an urgent item:  HERD_FORCE_SPAWN=1  (or pass --force before the slug)\n'
 }

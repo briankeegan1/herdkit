@@ -94,6 +94,22 @@ if herd_spawn_gate_saturated; then
     exit 0
   fi
 fi
+
+# Agent-class capacity lease (HERD-581 / HERD-557 P2) — acquire BEFORE ANY side effect (worktree,
+# tab, claim), same as the review-gate check just above and for the SAME reason: the durable spawn
+# queue's held-spawn contract (agent-watch.sh's _drain_lane_worker: a deferral that created nothing
+# releases the intent for a clean re-drain) only holds when the defer point precedes every side
+# effect. A real, held semaphore on concurrent agent SESSIONS (capacity-ledger.sh's 'agent' tenant,
+# class 'spawn'), distinct from the review-gate check above (which reads REVIEW state, not a leased
+# unit). CAPACITY_BUDGET=off (default) / no worktree pool / no python3 all fall back to
+# capacity_agent_lease_reserve's own fail-soft return-0 — proceeds unslotted, byte-identical to before
+# this feature existed. --force / HERD_FORCE_SPAWN=1 bypasses, same override surface as the review-gate
+# check, so an urgent item is never blocked by lease pressure.
+if [ "$FORCE_SPAWN" != "1" ] && command -v capacity_agent_lease_reserve >/dev/null 2>&1 \
+   && ! capacity_agent_lease_reserve "$(capacity_agent_lease_cap)" "$SLUG"; then
+  herd_capacity_lease_emit_defer "$SLUG"
+  exit 0
+fi
 DIR="$WORKTREES_DIR/$SLUG"
 MODEL="${HERD_FEATURE_MODEL:-$MODEL_FEATURE}"
 # Deterministic model step-up: if the coordinator-passed task text matches MODEL_ESCALATE_GLOB
@@ -296,20 +312,6 @@ If your feature needs a manual step you cannot perform yourself (a live smoke te
 if [ -n "$TASK" ]; then SPEC="$RULES"$'\n\n'"$TASK"; else SPEC="$RULES"; fi
 TASK_SPEC_FILE="$WORKTREES_DIR/$SLUG.task.md"
 POINTER="$(herd_write_task_spec "$TASK_SPEC_FILE" "$SPEC")"
-
-# Agent-class capacity lease (HERD-581 / HERD-557 P2) — acquire BEFORE launching the runtime below.
-# A real, held semaphore on concurrent agent SESSIONS (capacity-ledger.sh's 'agent' tenant, class
-# 'spawn'), distinct from the review-gate check above (which reads REVIEW state, not a leased unit).
-# CAPACITY_BUDGET=off (default) / no worktree pool / no python3 all fall back to
-# capacity_agent_lease_reserve's own fail-soft return-0 — proceeds unslotted, byte-identical to before
-# this feature existed. --force / HERD_FORCE_SPAWN=1 bypasses, same override surface as the review-gate
-# check, so an urgent item is never blocked by lease pressure.
-if [ "$FORCE_SPAWN" != "1" ] && command -v capacity_agent_lease_reserve >/dev/null 2>&1 \
-   && ! capacity_agent_lease_reserve "$(capacity_agent_lease_cap)" "$SLUG"; then
-  herd_capacity_lease_emit_defer "$SLUG"
-  exit 0
-fi
-
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
   # Headless: launch a DETACHED background agent (no herdr pane) into the registry. Fail-loud so a
   # spawn that cannot start does not masquerade as success (mirrors the herdr bail above). Pass the RAW

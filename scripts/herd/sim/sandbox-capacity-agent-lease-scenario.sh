@@ -207,7 +207,12 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   sleep 0.5
 done
 _a_journaled=0
-[ -f "$JOURNAL_A" ] && grep -q '"capacity_lease_released"' "$JOURNAL_A" 2>/dev/null && _a_journaled=1
+# journal_append's write lands a beat AFTER the marker disappears (capacity_agent_lease_hold journals
+# only once capacity_flock_run.py has fully returned) — poll briefly rather than a single racy read.
+for _ in 1 2 3 4 5 6 7 8; do
+  [ -f "$JOURNAL_A" ] && grep -q '"capacity_lease_released"' "$JOURNAL_A" 2>/dev/null && { _a_journaled=1; break; }
+  sleep 0.25
+done
 if capacity_agent_lease_reserve 1 agent-three; then _a3_admit=0; else _a3_admit=1; fi  # freed -> should admit now
 if [ "$_a1_admit" -eq 0 ] && [ "$_a2_admit" -eq 1 ] && [ "$_a_reclaimed" -eq 1 ] && [ "$_a_journaled" -eq 1 ] && [ "$_a3_admit" -eq 0 ]; then
   checkpoint agent_lease_admitted_then_reclaimed_on_kill pass "agent-one admitted (rc=0) at a live pid; agent-two denied at cap=1 while it held; SIGKILLing the pid reclaimed the marker (<=7.5s poll) and journaled capacity_lease_released; agent-three then admitted into the freed unit"
@@ -231,7 +236,10 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sleep 0.5
 done
 _t_journaled=0
-[ -f "$JOURNAL_S" ] && grep -q 'reason.*start_timeout' "$JOURNAL_S" 2>/dev/null && _t_journaled=1
+for _ in 1 2 3 4 5 6 7 8; do
+  [ -f "$JOURNAL_S" ] && grep -q 'reason.*start_timeout' "$JOURNAL_S" 2>/dev/null && { _t_journaled=1; break; }
+  sleep 0.25
+done
 if [ "$_t_admit" -eq 0 ] && [ "$_t_released" -eq 1 ] && [ "$_t_journaled" -eq 1 ]; then
   checkpoint agent_lease_start_timeout_self_releases pass "the lease admitted, then self-released within its start timeout (never observed the slug going alive) and journaled reason=start_timeout"
 else

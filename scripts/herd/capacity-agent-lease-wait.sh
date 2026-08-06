@@ -30,7 +30,8 @@ case "$START_TIMEOUT" in ''|*[!0-9]*) START_TIMEOUT=60 ;; esac
 case "$CONFIRM" in ''|*[!0-9]*) CONFIRM=3 ;; esac
 case "$POLL" in ''|*[!0-9]*) POLL=5 ;; esac
 
-_alive() { [ "$(herd_driver_agent_liveness "$SLUG" 2>/dev/null)" = "alive" ]; }
+_liveness() { herd_driver_agent_liveness "$SLUG" 2>/dev/null; }
+_alive() { [ "$(_liveness)" = "alive" ]; }
 
 waited=0
 until _alive; do
@@ -39,13 +40,17 @@ until _alive; do
   sleep "$POLL" 2>/dev/null || sleep 5
 done
 
+# Death confirmation counts ONLY positive death evidence ('dead' / 'missing') toward CONFIRM — a
+# probe-blind 'unknown' read (herdr hiccup, transient process-info miss) is SKIPPED: it neither resets
+# nor advances the counter, so it can never manufacture a release on its own. Without this split,
+# 'unknown' silently counted as death alongside 'dead' — CONFIRM consecutive hiccups would release a
+# still-live lease, contradicting the "no false reds" contract every other liveness probe follows.
 dead=0
 while :; do
   sleep "$POLL" 2>/dev/null || sleep 5
-  if _alive; then
-    dead=0
-  else
-    dead=$((dead + 1))
-    [ "$dead" -ge "$CONFIRM" ] && exit 0
-  fi
+  case "$(_liveness)" in
+    alive)         dead=0 ;;
+    dead|missing)  dead=$((dead + 1)); [ "$dead" -ge "$CONFIRM" ] && exit 0 ;;
+    *)             : ;;  # unknown — inconclusive, hold the counter where it was
+  esac
 done
