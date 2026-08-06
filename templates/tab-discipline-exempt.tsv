@@ -1,0 +1,69 @@
+kind	pattern	reason
+# templates/tab-discipline-exempt.tsv — the committed EXEMPTION TABLE for the TAB DISCIPLINE
+# invariant (HERD-569). Operator directive, 2026-08-05, verbatim: "there shouldn't be ANY other tabs
+# spawned other than builders, or the scribe". The workspace tab bar is the operator's
+# situational-awareness surface, so a tab that is neither a builder, the scribe, nor the control room
+# is a defect — and both halves of the invariant read THIS ONE FILE for the deliberate exceptions:
+#
+#   • the RECONCILED SWEEP (scripts/herd/tab-discipline.sh, runtime) reads the `label` rows — a tab
+#     whose LABEL matches one is never retired, however it came to exist;
+#   • the CREATION LINT (scripts/herd/tab-create-lint.sh, both gate surfaces) reads the `callsite`
+#     rows — a module named by one may open a tab without reding the build.
+#
+# One file on purpose: an exception is almost never one-sided. A lane that still opens its own tab
+# (a `callsite` row) needs the sweep to leave that tab alone (a `label` row), and seeing the pair
+# side by side is what makes an unpaired row obviously wrong.
+#
+# TAB-separated. Blank lines and `#` comments are ignored; the first line is the header.
+#
+# Columns:
+#   kind      label | callsite
+#   pattern   label  = a glob matched against the TAB LABEL (`case` globbing: `resolve·*`).
+#             callsite = a repo-root-relative FILE path, suffix-matched (scripts/herd/fleet.sh).
+#   reason    MANDATORY, free text. A row is a DECISION on the record, so a bare row reds as
+#             EXEMPT-MALFORMED rather than silently laundering a finding. State WHY the exception
+#             exists and WHAT retires it.
+#
+# The `callsite` rows are a RATCHET, not a licence: a row that no longer excuses anything reds as
+# STALE-EXEMPT and must be dropped (an exemption list that outlives what it excused is how a ratchet
+# quietly stops ratcheting). Rows are FILE-scoped because line numbers churn under every edit above
+# them — so each baseline row below names the conversion that will retire it, and a second tab-create
+# smuggled into an already-listed file is the known cost of that choice.
+#
+# The `label` rows are NOT stale-checked: they describe RUNTIME tabs, and a label that happens not to
+# be on screen right now is exactly the state the sweep exists to preserve on the next tick.
+
+# ── LIVE-AGENT LANES: a tab here holds a real agent, not a view ───────────────────────────────────
+# These two lanes still open standalone tabs, and their tabs are NOT disposable views: closing one
+# kills a working agent mid-task. So they are exempted on BOTH sides until each is converted to the
+# pane-split-with-tab-fallback shape (the pattern HERD-568 established for the health pane and this
+# PR applied to the review viewer). Retiring a live resolver or the research drainer to tidy the tab
+# bar would trade a cosmetic defect for a lost unit of work — the wrong trade, loudly.
+callsite	scripts/herd/herd-resolve.sh	The resolver lane opens resolve·<slug> for a LIVE resolver agent (not a view). Retire this row when the resolver is converted to a split inside the builder's tab with tab-fallback-only-when-the-tab-is-gone, per HERD-569's conversion of the review viewer.
+label	resolve·*	A live resolver agent works in this tab; closing it severs an in-flight conflict resolution. Paired with the herd-resolve.sh callsite row — both retire together when the resolver becomes a pane split.
+callsite	scripts/herd/research.sh	The research drainer lane opens its own tab for a LIVE drainer agent (not a view). Retire this row when the researcher is converted to a pane split, the same way the scribe drainer's placement is revisited.
+label	researcher-*	The research drainer agent lives in this tab; closing it drops the queued research work mid-drain. Paired with the research.sh callsite row.
+
+# ── FLEET: another PROJECT's control room, in another project's workspace ─────────────────────────
+# `herd fleet` stands up the control-room tab of a DIFFERENT project, in THAT project's workspace.
+# It is a control-room create by role; it only shows up here because the allowed-module list is
+# deliberately the three modules that own THIS workspace's tabs. The sweep never sees these tabs at
+# all — it is scoped to this workspace's id — so there is no paired label row, and there must not be
+# one: this engine does not retire another project's tabs (the cross-project-kill lesson).
+callsite	scripts/herd/fleet.sh	`herd fleet` creates the CONTROL-ROOM tab of another project, in that project's own workspace — a control-room create by role, outside this workspace's allowed-module set. Retire this row only if fleet's control-room creation moves behind coordinator.sh.
+
+# ── WATCHER: the builder respawn, and the health pane awaiting HERD-568 ───────────────────────────
+# agent-watch.sh holds two tab creates. One is a BUILDER tab (the respawn path re-opens the tab of a
+# builder whose pane died) — allowed by role, in the wrong module only because respawn lives in the
+# watcher. The other is the disposable health· view pane, which HERD-568 is converting to a split
+# inside the builder's own tab; until that lands, its tabs stay creatable (and, being pure views, they
+# are NOT given a label row — a stray health· tab is exactly what the sweep should retire).
+callsite	scripts/herd/agent-watch.sh	Two sites: the builder RESPAWN re-opens a builder tab (allowed by role, watcher-resident by history), and the disposable health· view pane, which HERD-568 converts to a pane split inside the builder's tab. Retire this row when respawn moves behind the driver seam and HERD-568 has landed.
+
+# ── REVIEW VIEWER: the deliberate, journaled, sweep-eligible fallback ─────────────────────────────
+# HERD-569 converted this call site: the headless-review viewer is now a SPLIT inside the builder's
+# tab, and only opens a standalone review·<slug> tab when that tab is genuinely GONE. The remaining
+# create is the fallback itself — it journals `review_viewer_tab_fallback` with its reason and
+# registers the tab in .herd-tabs, so it stays visible and sweep-eligible. There is deliberately NO
+# paired label row: a review· viewer is a `tail -f`, so retiring a stray one costs nothing.
+callsite	scripts/herd/herd-review.sh	The standalone review·<slug> viewer tab is now a FALLBACK only — taken when the builder's tab is gone, journaled as review_viewer_tab_fallback, and registered in .herd-tabs so the sweep can still reap it. Retire this row if the viewer is ever dropped in favour of the log alone.

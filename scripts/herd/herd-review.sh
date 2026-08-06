@@ -19,6 +19,12 @@
 #   human watches the genuine Claude TUI work alongside the feature. Falls back to a standalone
 #   review·<slug> tab when the builder tab is gone, or when herdr is unavailable. Whichever
 #   pane/tab is created is registered in $WORKTREES_DIR/.herd-tabs so teardown handles it.
+#   HERD-569 (the TAB DISCIPLINE invariant — only builder tabs and the scribe may exist): the
+#   HEADLESS-review VIEWER follows the same rule as the agent pane. It is a `tail -f`, so it
+#   splits into the builder's tab too, and opens a standalone review·<slug> tab ONLY when that
+#   tab is genuinely gone — journaling `review_viewer_tab_fallback` with its reason when it does.
+#   A split needs no registry row (the builder tab's teardown closes it); the standalone tab
+#   still gets one, so the tab-discipline sweep can reap it.
 #
 #   REVIEWER AGENT (agent-pane mode): the agent runs interactively in the TUI — the user sees
 #   Opus reasoning live. The agent task instructs it to write the verdict to the result file as
@@ -890,19 +896,73 @@ except Exception:
   fi
 
   if [ "$_AGENT_PANE_MODE" = "0" ]; then
-    # Fallback: standalone review·<slug> tab, tailing the headless review log.
-    # Retire any existing review·<slug> tab (+ its stale registry line) for this slug so repeated
-    # dispatches reuse one standalone tab's worth of screen instead of accumulating tabs/rows.
+    # VIEWER PLACEMENT (HERD-569 — the TAB DISCIPLINE invariant). The headless review still deserves a
+    # visible tail, but a VIEW has no business owning a whole tab: the operator directive is that only
+    # builder tabs and the scribe may exist, and this fallback was one of the named offenders. So the
+    # viewer now goes where the work is — a bottom SPLIT inside the builder's own tab — and only opens
+    # a standalone review·<slug> tab when that tab is genuinely GONE. Same shape as the agent-pane
+    # placement above, and as HERD-568's health-pane fix: pane-first, tab-fallback-only-when-tab-gone.
+    # Retire any existing standalone review·<slug> tab (+ its stale registry line) for this slug first,
+    # so a dispatch that flips from the tab fallback back to a split never orphans the old tab.
     _purge_stale_review_tab
 
-    created="$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$CWD" --label "review·$SLUG" --no-focus 2>/dev/null || true)"
-    read -r TAB ROOT < <(printf '%s' "$created" | python3 -c \
-      'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
+    _VIEW_SPLIT=0
+    # PREFERRED: split inside the builder's tab. $_builder_tab was resolved above (empty when the
+    # builder's tab is gone, which is precisely when the fallback is legitimate).
+    if [ -n "${_builder_tab:-}" ]; then
+      # A viewer pane from a PRIOR round still holds this tab under the same label. Close it before
+      # splitting — one viewer's worth of screen per slug, not one per dispatch. Guarded (HERD-134):
+      # the id is proven to still BE this slug's reviewer before the close, so a recycled id can never
+      # vaporise the live builder pane sharing the tab.
+      _stale_view_pane="$(herdr pane list ${_WS_ID:+--workspace "$_WS_ID"} 2>/dev/null | TAB="$_builder_tab" LBL="review·$SLUG" python3 -c '
+import sys, json, os
+tab, lbl = os.environ["TAB"], os.environ["LBL"]
+try:
+    for p in (json.load(sys.stdin).get("result") or {}).get("panes") or []:
+        if str(p.get("tab_id","")) == tab and (p.get("label") or "") == lbl:
+            print(p.get("pane_id", "") or "", end=""); break
+except Exception:
+    pass
+' 2>/dev/null || true)"
+      [ -n "${_stale_view_pane:-}" ] && herd_close_pane_verified "$_stale_view_pane" "review·$SLUG" || true
+
+      _view_anchor="$(_herd_herdr_tab_root_pane "$_builder_tab")"
+      if [ -n "${_view_anchor:-}" ]; then
+        ROOT="$(herdr pane split "$_view_anchor" --direction down --cwd "$CWD" --no-focus 2>/dev/null | python3 -c '
+import sys, json
+try:
+    print((json.load(sys.stdin)["result"]["pane"]["pane_id"]) or "", end="")
+except Exception:
+    pass
+' 2>/dev/null || true)"
+        if [ -n "${ROOT:-}" ]; then
+          TAB="$_builder_tab"
+          _VIEW_SPLIT=1
+          # No registry row: the split lives INSIDE the builder's tab, so tearing that tab down on
+          # merge closes it automatically — exactly as the agent-pane placement above reasons.
+        fi
+      fi
+    fi
+
+    # FALLBACK, taken ONLY when the builder's tab is gone (or the split itself failed): a standalone
+    # review·<slug> tab. It is journaled with its reason — the exemption row that lets this call site
+    # past the tab-create lint (templates/tab-discipline-exempt.tsv) is granted on exactly that
+    # condition — and registered below, so the tab-discipline sweep can still reap it.
+    if [ -z "${ROOT:-}" ]; then
+      journal_append review_viewer_tab_fallback pr "${PR:-}" slug "$SLUG" \
+        reason "$([ -n "${_builder_tab:-}" ] && printf 'split-failed' || printf 'builder-tab-gone')"
+      created="$(herdr tab create ${_WS_ID:+--workspace "$_WS_ID"} --cwd "$CWD" --label "review·$SLUG" --no-focus 2>/dev/null || true)"
+      read -r TAB ROOT < <(printf '%s' "$created" | python3 -c \
+        'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
+    fi
+
     if [ -n "${ROOT:-}" ]; then
       herdr pane rename "$ROOT" "review·$SLUG" >/dev/null 2>&1 || true
       herdr pane run "$ROOT" "tail -f '$LOG'" >/dev/null 2>&1 || true
     fi
-    # Register in the sweep allowlist so only engine-created tabs are ever swept.
+    # Register in the sweep allowlist so only engine-created tabs are ever swept. Only the STANDALONE
+    # fallback has a tab of its own to register — a split has no tab to reap, and writing a row for
+    # the BUILDER's tab would hand the orphan sweep a licence to close it.
     # NOT best-effort-silent any more (HERD-523 leg 3 / issue #634): this registry row is what the
     # orphan sweep's ALLOWLIST model keys on, so a write that fails — unwritable $WORKTREES_DIR, a full
     # disk, a $WORKTREES_DIR that does not exist — used to leave the tab live and UNREGISTERED, i.e.
@@ -911,7 +971,7 @@ except Exception:
     # JOURNALED event + a loud stderr line, so the leak is diagnosable instead of silent. Teardown
     # itself no longer depends on this row landing — agent-watch.sh's verdict-consumption path closes
     # the viewer tab by slug-labeled lookup (leg 2) — so this is forensics, not the last line of defense.
-    if [ -n "${TAB:-}" ]; then
+    if [ -n "${TAB:-}" ] && [ "$_VIEW_SPLIT" = "0" ]; then
       if printf 'review·%s %s review\n' "$SLUG" "$TAB" >> "$WORKTREES_DIR/.herd-tabs" 2>/dev/null; then
         :
       else

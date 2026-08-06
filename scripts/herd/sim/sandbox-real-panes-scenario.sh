@@ -23,6 +23,13 @@
 #     reconcile MINTS a real `health·<slug>` pane for an OBSERVED in-flight suite — a pid-live inflight
 #     marker + its sha-scoped log and nothing else, the shape pysrc/herd/live_runtime.py leaves behind —
 #     and RETIRES it the instant that suite ends;
+#   • TAB DISCIPLINE (HERD-569): a real tab bar is stood up holding one of EVERY allowed shape — a
+#     registered builder, a builder spared only by its live worktree, the scribe, the control room
+#     (by label AND by HERD_WATCHER_TAB_ID) and a committed label exemption — plus two strays, and
+#     the shipped reconcile takes exactly the two, across four consecutive ticks;
+#   • REVIEW VIEWER PLACEMENT (HERD-569): the headless review viewer SPLITS into the builder's tab
+#     (via the shipped _herd_herdr_tab_root_pane anchor) and the workspace's tab COUNT is unchanged —
+#     a view costs a pane, never a tab;
 #   • CLEAN TEARDOWN — the disposable workspace is closed and NO tab or pane is leaked afterward
 #     (so the result satisfies the tab-leak-guard).
 #
@@ -872,6 +879,138 @@ except Exception:
     else
       checkpoint health_pane_roundtrip_on_same_reconcile fail \
         "create/retire round trip broke (pane='$HC_PANE' rc2=$HC_RC2 duplicated=$HC_DUP gone=$HC_GONE row_dropped=$HC_DROPPED)"
+    fi
+  fi
+
+  # ── TAB DISCIPLINE (HERD-569): the tab bar is RECONCILED, and allowed tabs are never touched ──────
+  # Operator directive 2026-08-05: "there shouldn't be ANY other tabs spawned other than builders, or
+  # the scribe". The shipped sweep (herd_tab_discipline_sweep, agent-watch.sh in lib mode) enumerates
+  # THIS workspace's tabs and retires everything outside the allowed set. Because the action is
+  # CLOSING TABS, the interesting assertion is the negative one: a real tab bar is stood up here
+  # holding one of EVERY allowed shape — a registered builder, a builder spared only by its live
+  # worktree (the registry row that never landed), the scribe, the control room, and a committed
+  # `label` exemption — plus two strays, and the sweep must take exactly the two across repeated ticks.
+  # Labels are derived the way herd-config.sh derives them from WORKSPACE_NAME, so this proves the
+  # sweep spares the labels the ENGINE actually uses, not labels invented by the test.
+  if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ]; then
+    step tabdiscipline "planted stray tabs are retired within a tick; builder/scribe/control-room/exempt tabs never are"
+    _td_mk_tab() {
+      herdr tab create --workspace "$WSID" --cwd "$REPO" --label "$1" --no-focus 2>/dev/null \
+        | hj 'd["result"]["tab"]["tab_id"]'
+    }
+    _td_present() {
+      tab_json "$WSID" | TD="$1" python3 -c '
+import sys,json,os
+td=os.environ["TD"]
+try:
+    tabs=(json.load(sys.stdin).get("result") or {}).get("tabs") or []
+    print("yes" if any(str(t.get("tab_id",""))==td for t in tabs) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null
+    }
+    TD_SLUG="$(printf '%s' "$WS_LABEL" | tr -c 'A-Za-z0-9_-' '-')"
+    TD_SCRIBE="$(_td_mk_tab "scribe-$TD_SLUG")"          # (c) the scribe drainer
+    TD_COORD="$(_td_mk_tab "coordinator-$TD_SLUG")"      # (d) the control room, by LABEL
+    TD_WTONLY="$(_td_mk_tab "rp-unregistered")"          # (b) a builder whose registry row never landed
+    TD_EXEMPT="$(_td_mk_tab "resolve·rp-builder")"       # (e) a committed label exemption
+    TD_STRAY_KIND="$(_td_mk_tab "health·rp-builder")"    # stray: registered, but not kind=builder
+    TD_STRAY_BARE="$(_td_mk_tab "rp-leftover-view")"     # stray: no registry row at all
+    for _t in "$TD_SCRIBE" "$TD_COORD" "$TD_WTONLY" "$TD_EXEMPT" "$TD_STRAY_KIND" "$TD_STRAY_BARE"; do
+      [ -n "$_t" ] && TABS_CREATED=$((TABS_CREATED+1))
+    done
+
+    TD_T="$ART/tabdisctrees"; mkdir -p "$TD_T/.herd"
+    # The registry claims the builder tab (a) and the health tab (kind health — a stray). The
+    # worktree DIRECTORY is what spares rp-unregistered (b): no row for it exists anywhere.
+    printf 'rp-builder %s builder\nhealth·rp-builder %s health\n' "$BUILD_TAB" "$TD_STRAY_KIND" \
+      > "$TD_T/.herd-tabs"
+    mkdir -p "$TD_T/rp-unregistered"
+    TD_JOURNAL="$ART/td-journal.jsonl"; : > "$TD_JOURNAL"
+
+    # ONE lib-mode load, FOUR ticks: the first must retire both strays, and the three after it must be
+    # inert — "untouched across many ticks" is the property, and a sweep that only behaves on tick one
+    # would pass a single-shot assertion.
+    # HERD_WATCHER_TAB_ID is what coordinator.sh hands the watcher at spawn, and it is the sweep's
+    # SELF-EXCLUSION. This scenario's control room is labelled `herd-watch·rp`, nothing like the
+    # engine's `coordinator-<slug>` — which makes it the strongest possible version of "the control
+    # room is never touched": the tab is spared by IDENTITY, not by matching a naming convention.
+    # (Learned the hard way: without this the first run of the leg swept the scenario's own room.)
+    ( export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+             PROJECT_ROOT="$REPO" WORKTREES_DIR="$TD_T" DEFAULT_BRANCH=main \
+             WORKSPACE_NAME="$WS_LABEL" JOURNAL_FILE="$TD_JOURNAL" \
+             HERD_WATCHER_TAB_ID="$CTRL_TAB" \
+             TAB_DISCIPLINE=on HERD_DISPOSABLE_WORKSPACE=1
+      # shellcheck source=/dev/null
+      . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+      herd_tab_discipline_sweep || exit 4
+      sleep 0.5
+      herd_tab_discipline_sweep && herd_tab_discipline_sweep && herd_tab_discipline_sweep
+    ) ; TD_RC=$?
+
+    _td_gone=yes
+    for _t in "$TD_STRAY_KIND" "$TD_STRAY_BARE"; do
+      _i=0
+      while [ "$_i" -lt 25 ]; do
+        [ "$(_td_present "$_t")" = no ] && break
+        _i=$((_i+1)); sleep 0.2
+      done
+      [ "$(_td_present "$_t")" = no ] || _td_gone=no
+    done
+    _td_kept=yes _td_lost=""
+    for _t in "$BUILD_TAB" "$CTRL_TAB" "$TD_SCRIBE" "$TD_COORD" "$TD_WTONLY" "$TD_EXEMPT"; do
+      [ -n "$_t" ] || continue
+      [ "$(_td_present "$_t")" = yes ] || { _td_kept=no; _td_lost="$_td_lost $_t"; }
+    done
+    _td_journaled="$(grep -c '"event":"tab_discipline_retired"' "$TD_JOURNAL" 2>/dev/null || printf 0)"
+    _td_rowdropped=no
+    grep -q " $TD_STRAY_KIND " "$TD_T/.herd-tabs" 2>/dev/null || _td_rowdropped=yes
+    _td_rowkept=no
+    grep -q "^rp-builder $BUILD_TAB builder$" "$TD_T/.herd-tabs" 2>/dev/null && _td_rowkept=yes
+    if [ "$TD_RC" = 0 ] && [ "$_td_gone" = yes ] && [ "$_td_kept" = yes ] \
+       && [ "$_td_journaled" = 2 ] && [ "$_td_rowdropped" = yes ] && [ "$_td_rowkept" = yes ]; then
+      checkpoint tab_discipline_sweep pass \
+        "both strays retired on the first tick (2 tab_discipline_retired events, stray registry row pruned); builder/live-worktree/scribe/control-room (by label AND by HERD_WATCHER_TAB_ID)/exempt tabs survived four ticks untouched"
+    else
+      checkpoint tab_discipline_sweep fail \
+        "tab-discipline sweep wrong (rc=$TD_RC strays_gone=$_td_gone allowed_kept=$_td_kept lost='$_td_lost' retired_events=$_td_journaled stray_row_dropped=$_td_rowdropped builder_row_kept=$_td_rowkept)"
+    fi
+  fi
+
+  # ── REVIEW VIEWER PLACEMENT (HERD-569): a view SPLITS into the builder's tab, it does not take one ─
+  # The headless-review viewer used to open a standalone review·<slug> TAB. It is a `tail -f`, so it
+  # now goes where the work is. Exercise the exact SHIPPED seam herd-review.sh's converted fallback
+  # calls — _herd_herdr_tab_root_pane (driver.sh) to find the builder tab's anchor, then a real
+  # `pane split` — and assert the viewer pane lands INSIDE the builder's tab with NO new tab created.
+  if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ] && [ -n "$BUILD_PANE" ]; then
+    step reviewsplit "the headless review viewer splits into the builder's tab and creates NO tab"
+    # shellcheck source=scripts/herd/driver.sh
+    . "$HERE/../driver.sh"   # _herd_herdr_tab_root_pane / herd_close_pane_verified (functions only)
+    RVW_BEFORE="$(tab_json "$WSID" | hj 'len((d.get("result") or {}).get("tabs") or [])')"
+    RVW_ANCHOR="$(_herd_herdr_tab_root_pane "$BUILD_TAB")"
+    RVW_SPLIT="$(herdr pane split "${RVW_ANCHOR:-$BUILD_PANE}" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"
+    RVW_PANE="$(printf '%s' "$RVW_SPLIT" | hj 'd["result"]["pane"]["pane_id"]')"
+    [ -n "$RVW_PANE" ] && { PANES_CREATED=$((PANES_CREATED+1)); herdr pane rename "$RVW_PANE" "review·rp-builder" >/dev/null 2>&1 || true; }
+    RVW_TAB_OF="$(pane_json "$WSID" | RP="$RVW_PANE" python3 -c '
+import sys,json,os
+rp=os.environ["RP"]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print(next((str(p.get("tab_id","")) for p in panes if str(p.get("pane_id",""))==rp), ""))
+except Exception:
+    print("")
+' 2>/dev/null)"
+    RVW_AFTER="$(tab_json "$WSID" | hj 'len((d.get("result") or {}).get("tabs") or [])')"
+    # The SHIPPED guarded close retires it by its own label — never by a captured id alone (HERD-134).
+    RVW_CLOSED=no
+    if [ -n "$RVW_PANE" ] && herd_close_pane_verified "$RVW_PANE" "review·rp-builder"; then RVW_CLOSED=yes; fi
+    if [ -n "$RVW_ANCHOR" ] && [ "$RVW_TAB_OF" = "$BUILD_TAB" ] && [ "$RVW_AFTER" = "$RVW_BEFORE" ] \
+       && [ "$RVW_CLOSED" = yes ]; then
+      checkpoint review_viewer_splits_into_builder_tab pass \
+        "viewer pane $RVW_PANE landed in the builder's own tab $BUILD_TAB; tab count unchanged ($RVW_BEFORE); guarded close retired it by label"
+    else
+      checkpoint review_viewer_splits_into_builder_tab fail \
+        "viewer placement wrong (anchor='$RVW_ANCHOR' pane_tab='$RVW_TAB_OF' expected='$BUILD_TAB' tabs_before=$RVW_BEFORE tabs_after=$RVW_AFTER closed=$RVW_CLOSED)"
     fi
   fi
 
