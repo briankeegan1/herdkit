@@ -465,18 +465,35 @@ if [ -f scripts/herd/hermetic-env-scrub.sh ]; then
   herd_hermetic_env_scrub
 fi
 
+# HERD-571: agent-watch.sh's hermetic-guard choke point tags its own log line "refusal" (a 4th TSV
+# field) when the caller opted in with HERD_HERMETIC_GUARD_REFUSAL — a test deliberately driving that
+# exact choke point as its subject (e.g. tests/test-watcher-boot-journal.sh case (a)). Filter those out
+# here so a test that shares this run's HERD_HERMETIC_GUARD without pinning its own private log (a
+# test-isolation bug, not a hermeticity leak) can no longer red the whole suite — same "a refusal is
+# not a leak" principle as the HERD-441 console-guard ordering fix, one layer deeper. Every other line
+# (the herdr/claude/codex/osascript/notify-send tripwire hits, and any untagged/legacy agent-watch.sh
+# reach) is unaffected — still a genuine leak.
+_hk_dh_leak_lines() {
+  awk -F'\t' '!(NF==4 && $1=="agent-watch.sh" && $4=="refusal")' "$1" 2>/dev/null
+}
+
 _hk_dh_verdict() {
   # A non-empty leak log ⇒ a test reached the live control room or spawned a real daemon. This is a
   # HARD code error (exit 1), NEVER downgraded to the HERD-187 env-only tolerance — so it is checked
   # BEFORE the env classification. Cleans up the sandbox dir on the way out (leak or clean).
+  local _hk_dh_leaks="" _hk_dh_sorted=""
   if [ -n "$_hk_dh_log" ] && [ -s "$_hk_dh_log" ]; then
+    _hk_dh_leaks="$(_hk_dh_leak_lines "$_hk_dh_log")"
+  fi
+  if [ -n "$_hk_dh_leaks" ]; then
+    _hk_dh_sorted="$(sort -u <<< "$_hk_dh_leaks")"
     if [ -n "$ONELINE" ]; then
-      echo "daemon-hermeticity: a test touched a LIVE production surface (control room / desktop notification) — $(sort -u "$_hk_dh_log" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
+      echo "daemon-hermeticity: a test touched a LIVE production surface (control room / desktop notification) — ${_hk_dh_sorted%%$'\n'*}"
     else
       echo "DAEMON-HERMETICITY: a test reached a LIVE production surface"
       echo "  (a hermetic test must stub herdr/claude, never launch agent-watch.sh against real state,"
       echo "   and never deliver a desktop notification — install scripts/herd/sim/sim-notify-stub.sh)"
-      sort -u "$_hk_dh_log" | sed 's/^/  leak: /'
+      printf '%s\n' "$_hk_dh_sorted" | sed 's/^/  leak: /'
     fi
     rm -rf "$_hk_dh_dir" "$_hk_jh_dir"
     exit 1

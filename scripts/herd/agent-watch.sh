@@ -17479,8 +17479,24 @@ fi
 # dogfood gate carried a permanent daemon-hermeticity red. Everything between the old and new
 # position is refusal logic plus a one-shot self-exec of this same script — no daemon, no loop, and
 # the re-exec's second pass funnels straight back into this guard.
+#
+# HERD-571 REFUSAL-VS-LEAK TAG: the SAME "a refusal is not a leak" principle, one layer deeper. A test
+# whose own subject IS this exact choke point (e.g. tests/test-watcher-boot-journal.sh case (a), or
+# test-daemon-hermeticity.sh's guard proof) deliberately drives a reach here — that reach is EXPECTED,
+# not a leak, even though it still must exit 0 the same way. A caller that is deliberately exercising
+# the refusal opts in with HERD_HERMETIC_GUARD_REFUSAL=1, tagging its own log line "refusal" as a 4th
+# TSV field; every other caller (an untagged reach — a test that forgot to stub a watcher spawn, or
+# `cmd_reload`'s background fallback genuinely trying to launch one) is tagged "leak", UNCHANGED from
+# today's behavior. This is belt-and-suspenders: .herd/healthcheck.project.sh's _hk_dh_verdict only
+# reds on "leak"-tagged (or legacy untagged) lines now, so a future test that shares the outer harness's
+# HERD_HERMETIC_GUARD without pinning a private log — reaching this guard for a refusal it deliberately
+# opted into — no longer poisons the whole suite. INERT for every existing caller: the opt-in var is
+# unset everywhere except where a test explicitly sets it, so the log line is byte-identical (same 3
+# fields, "leak" implied) for anyone who doesn't ask for the new behavior.
 if [ -n "${HERD_HERMETIC_GUARD:-}" ]; then
-  printf '%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" \
+  _hg_kind="leak"
+  [ -n "${HERD_HERMETIC_GUARD_REFUSAL:-}" ] && _hg_kind="refusal"
+  printf '%s\t%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" "$_hg_kind" \
     >> "$HERD_HERMETIC_GUARD" 2>/dev/null || true
   journal_append watcher_boot_failed pid "$$" phase hermetic_guard \
     reason "test-hermeticity-redirect" workspace "${WORKSPACE_NAME:-}" component agent-watch
