@@ -213,6 +213,7 @@ watcher-exempt.sh	unit	tests/test-watcher-exempt.sh
 context-guard.sh	unit	tests/test-context-guard.sh
 suite-shard.sh	unit	tests/test-suite-shard.sh
 suite-shard.sh	unit	tests/test-suite-scope.sh
+scope-escape.sh	unit	tests/test-scope-escape.sh
 health-trust.sh	unit	tests/test-health-trust.sh
 health-trust.sh	unit	tests/test_live_runtime.py
 HEALTH_TRUST_BUILDER	unit	tests/test-health-trust.sh
@@ -319,7 +320,14 @@ HEALTH_CONCURRENCY	unit	tests/test_live_runtime.py
 LOCAL_SUITE_CONCURRENCY	unit	tests/test-local-suite-slot.sh
 LOCAL_SUITE_CONCURRENCY	unit	tests/test-suite-parallel-wiring.sh
 CAPACITY_BUDGET	sim	tests/test-capacity-ledger.sh
+CAPACITY_BUDGET	sim	tests/test-capacity-agent-lease.sh
+CAPACITY_BUDGET	sim	tests/test-agent-lease-defer-worktree.sh
 capacity-ledger.sh	sim	tests/test-capacity-ledger.sh
+capacity-ledger.sh	sim	tests/test-capacity-agent-lease.sh
+capacity-ledger.sh	sim	tests/test-agent-lease-defer-worktree.sh
+capacity-agent-lease-wait.sh	sim	tests/test-capacity-agent-lease.sh
+SPAWN_AHEAD	sim	tests/test-capacity-agent-lease.sh
+SPAWN_AHEAD	sim	tests/test-agent-lease-defer-worktree.sh
 REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_TIMEOUT_HEADROOM	sim	scripts/herd/sim/sandbox-suite-timeout-headroom-sim.sh
@@ -389,7 +397,9 @@ RED_ROW_RECHECK_MINS	unit	tests/test-ref-unparsed-reverify.sh
 red-ledger.sh	unit	tests/test-red-auto-escalate.sh
 RED_AUTOESCALATE	unit	tests/test-red-auto-escalate.sh
 ENV_SUSPECT_TIMEOUT	unit	tests/test-health-env-suspect.sh
+ENV_SUSPECT_TIMEOUT	sim	tests/test-live-health-env-suspect.sh
 HEALTH_LOAD_THRESHOLD	unit	tests/test-health-env-suspect.sh
+HEALTH_LOAD_THRESHOLD	sim	tests/test-live-health-env-suspect.sh
 AGING_PR_TTL	unit	tests/test-aging-pr-alarm.sh
 aging-pr.sh	unit	tests/test-aging-pr-alarm.sh
 MAIN_HEALTH_AUTOFIX	unit	tests/test-main-health-invariant.sh
@@ -450,6 +460,7 @@ scripts/herd/layout-reconcile.sh	unit	tests/test-layout-reconcile.sh
 TASK_PANE_VIEW	unit	tests/test-task-spec-pane.sh
 DOCTOR_STARTUP_HINT	unit	tests/test-doctor-point-of-need.sh
 scripts/herd/task-spec-view.sh	unit	tests/test-task-spec-pane.sh
+scripts/herd/health-pane-view.sh	unit	tests/test-health-pane-view.sh
 HERD_THEME	unit	tests/test-theme.sh
 scripts/herd/theme.sh	unit	tests/test-theme.sh
 .herd/themes	unit	tests/test-theme.sh

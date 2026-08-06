@@ -327,18 +327,22 @@ done
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
-# Nine tabs and ten panes. Tabs: the control room, the builder, the disposable `health·<slug>` TAB the
-# HERD-554 reconcile MINTS for an observed in-flight suite, and the SIX the HERD-569 tab-discipline leg
-# plants to give the sweep one of every allowed shape plus two strays (scribe, control-room-by-label,
-# a live-worktree builder, a committed label exemption, and the two strays it must retire). Panes:
-# watcher, backlog, builder, the reviewer split for the reviewer-pane-lifecycle checkpoint, the two
-# resolver splits for the HERD-280 retire/escalate legs, the health split for the HERD-313
-# retire-on-outcome checkpoint, that minted health pane, the HERD-569 review-viewer split (the whole
-# point of the conversion: a viewer costs a PANE, not a tab), and the claude-as-root pane for the alive
+# Ten tabs and twelve panes. Tabs: the control room, the builder, the disposable `health·<slug>` TAB
+# the HERD-554 reconcile MINTS for an observed in-flight suite with NO live builder tab to split into
+# (the create-half checkpoint's fixture never registers one), the HERD-568 fallback checkpoint's OWN
+# standalone tab (its .herd-tabs row names a tab that no longer exists, so it too must mint a fresh
+# one), and the SIX the HERD-569 tab-discipline leg plants to give the sweep one of every allowed shape
+# plus two strays (scribe, control-room-by-label, a live-worktree builder, a committed label exemption,
+# and the two strays it must retire). Panes: watcher, backlog, builder, the reviewer split for the
+# reviewer-pane-lifecycle checkpoint, the two resolver splits for the HERD-280 retire/escalate legs, the
+# health split for the HERD-313 retire-on-outcome checkpoint, that minted health pane, the HERD-568
+# split-placement checkpoint's pane (split INTO the builder tab — no new tab), the HERD-568 fallback
+# checkpoint's pane (its own new tab, counted above), the HERD-569 review-viewer split (the whole point
+# of the conversion: a viewer costs a PANE, not a tab), and the claude-as-root pane for the alive
 # checkpoint. All but the ESCALATE resolver pane are closed again within their own steps — that one
 # stays open BY DESIGN and goes with the workspace at teardown.
-[ "$(sc "$SCR" tabs_created)" -eq 9 ]   || fail "(B) tabs_created should be 9 (got $(sc "$SCR" tabs_created))"
-[ "$(sc "$SCR" panes_created)" -eq 10 ] || fail "(B) panes_created should be 10 (got $(sc "$SCR" panes_created))"
+[ "$(sc "$SCR" tabs_created)" -eq 10 ]  || fail "(B) tabs_created should be 10 (got $(sc "$SCR" tabs_created))"
+[ "$(sc "$SCR" panes_created)" -eq 12 ] || fail "(B) panes_created should be 12 (got $(sc "$SCR" panes_created))"
 # The reviewer pane is retired on verdict consumption (HERD-113).
 [ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # The resolver pane retires on a consumed DONE and SURVIVES an ESCALATE (HERD-280).
@@ -352,6 +356,14 @@ done
   || fail "(B) health_pane_created_from_observed_suite not pass"
 [ "$(cp_status "$SCR" health_pane_roundtrip_on_same_reconcile)" = "pass" ] \
   || fail "(B) health_pane_roundtrip_on_same_reconcile not pass"
+# HERD-568: a live builder tab gets the health pane as a SPLIT inside it (tab id equality against the
+# real builder tab), never a fresh standalone tab.
+[ "$(cp_status "$SCR" health_pane_split_in_builder_tab)" = "pass" ] \
+  || fail "(B) health_pane_split_in_builder_tab not pass"
+# HERD-568: a .herd-tabs row naming a tab that no longer exists degrades to the standalone-tab
+# fallback, journaled reason=no-builder-tab.
+[ "$(cp_status "$SCR" health_pane_fallback_reaped_builder_tab)" = "pass" ] \
+  || fail "(B) health_pane_fallback_reaped_builder_tab not pass"
 # HERD-569 TAB DISCIPLINE: the sweep retires the planted strays and — the assertion that matters, since
 # the action is closing tabs — leaves the builder, the live-worktree builder, the scribe, the control
 # room (by label AND by HERD_WATCHER_TAB_ID) and the committed label exemption alone across four ticks.

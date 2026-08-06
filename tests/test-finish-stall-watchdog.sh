@@ -26,6 +26,8 @@
 #   • the shared-pool clock is durable across "seats" (a fresh accessor call sees the same anchor)
 #   • the console rows: calm re-task-sent vs red needs-you, no leak of the banned 'idle' word
 #   • never fires while a PR exists or while the agent is working (escape hatches)
+#   • HERD-574: the FIRST_STALL/SECOND_STALL journal carries kind=uncommitted for a dirty tracked tree
+#     vs kind=unpushed for a clean tree sitting on commits ahead of its own remote
 # Run:  bash tests/test-finish-stall-watchdog.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -357,6 +359,8 @@ rec="$(_finish_stall_record e2e-slug)"
 grep -q '🔁' "$HERDR_NOTIFY_LOG" || fail "tick3: a delivered re-task must notify calmly"
 grep -q '⚠️' "$HERDR_NOTIFY_LOG" && fail "tick3: a delivered re-task must NOT also shout needs-you"
 grep -q finish_stall_wake "$JOURNAL_FILE" || fail "tick3: the wake must be journaled"
+grep -q '"kind":"uncommitted"' "$JOURNAL_FILE" \
+  || fail "tick3: a dirty (uncommitted tracked changes) tree must journal kind=uncommitted"
 ok
 
 # tick 3b: the nudge just delivered flips the agent to 'working' — the REAL tick loop routes a
@@ -412,6 +416,22 @@ CLEAN_WT="$T/wt-clean-escape"; mkgit "$CLEAN_WT"
 v="$(HERD_NOW_EPOCH="$((T5 + 120))" _reconcile_finish_stall e2e-slug "$CLEAN_WT" done feat)"
 [ "$v" = "NOT_STALLED" ] || fail "escape: a clean, nothing-ahead tree should be NOT_STALLED, got $v"
 [ -z "$(_finish_stall_record e2e-slug)" ] || fail "escape: NOT_STALLED must clear the record"
+ok
+
+# HERD-574: the OTHER work signature — a CLEAN tree sitting on commits ahead of its own remote (never
+# pushed) — must journal kind=unpushed, not kind=uncommitted, so the two incident shapes are
+# distinguishable without recomputing them from the raw commits/dirty fields.
+: > "$SENT"; : > "$HERDR_NOTIFY_LOG"
+UNPUSHED_WT="$T/wt-unpushed-e2e"; mkgit "$UNPUSHED_WT"
+git -C "$UNPUSHED_WT" checkout -q -b feat
+printf 'up\n' > "$UNPUSHED_WT/up.txt"; git -C "$UNPUSHED_WT" add -A; git -C "$UNPUSHED_WT" commit -qm up
+v="$(HERD_NOW_EPOCH="$NOW" _reconcile_finish_stall unpushed-slug "$UNPUSHED_WT" done feat)"
+[ "$v" = "PENDING" ] || fail "unpushed: first sighting should be PENDING, got $v"
+v="$(HERD_NOW_EPOCH="$((NOW + GRACE + 1))" _reconcile_finish_stall unpushed-slug "$UNPUSHED_WT" done feat)"
+[ "$v" = "FIRST_STALL" ] || fail "unpushed: past grace should be FIRST_STALL, got $v"
+grep -q '"kind":"unpushed"' "$JOURNAL_FILE" \
+  || fail "unpushed: a clean, committed-ahead-of-origin tree must journal kind=unpushed"
+_finish_stall_clear unpushed-slug
 ok
 
 # a wake that never lands escalates on the VERY FIRST crossing (no second chance)

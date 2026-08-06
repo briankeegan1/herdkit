@@ -811,10 +811,12 @@ on 2026-07-30/31 to drain ~20 items: parallel builders collision-mapped by file 
 items sequenced behind shared files, builder notes routed every cycle. Codifying it makes ANY
 seat able to run it — invariance over seat-local skill, per `docs/multi-seat-doctrine.md`.
 
-**YOLO is NOT gateless.** The healthcheck and the adversarial pre-merge review still gate every
-single PR, `TRACKED_SPAWNS`/`CLAIM_REQUIRED` still make every spawn file-then-claim, and you still
-never self-merge. What disappears is the *pause* between the gates — the "shall I spawn?",
-"shall I re-task?", "shall I merge?" checkpoints. The gates are unchanged; only the waiting is gone.
+**YOLO is NOT gateless.** Whatever `HEALTHCHECK_CMD` resolves to on this project (a project may
+retire it to a no-op as its merge-gate policy — check `.herd/config` for a policy comment before
+assuming it runs a real suite) plus the adversarial pre-merge review still run on every single PR,
+`TRACKED_SPAWNS`/`CLAIM_REQUIRED` still make every spawn file-then-claim, and you still never
+self-merge. What disappears is the *pause* between the gates — the "shall I spawn?", "shall I
+re-task?", "shall I merge?" checkpoints. The gates are unchanged; only the waiting is gone.
 
 **The config half.** The matching config posture is `yolo` in `templates/postures.tsv` — every
 auto lever at once (`MERGE_POLICY=auto`, `HUMAN_VERIFY_POLICY=auto`, `REVIEW_AUTOFIX=true`,

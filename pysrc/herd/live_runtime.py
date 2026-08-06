@@ -1564,6 +1564,30 @@ def _total_health_inflight(state_dir):
 #       escalating mid-verdict. Every invocation — trusted or not — stamps HERD_HEALTH_PROVENANCE=watcher
 #       so the provenance record healthcheck.sh writes for THIS run can never later be read back as
 #       builder-local evidence (health-trust.sh's own anti-compounding rule).
+#
+# ENV-SUSPECT TIMEOUT CLASSIFICATION (HERD-546, re-hung onto this live worker by HERD-567): before
+# HERD-567, ENV_SUSPECT_TIMEOUT/HEALTH_LOAD_THRESHOLD were wired ONLY into agent-watch.sh's bash
+# _health_worker, which lost its only caller (_healthcheck_gate) at the P5b engine port — the lever
+# was configurable, defaulted correctly, unit-tested, and dead: turning it on changed nothing under
+# the shipped python engine (scripts/herd/lever-reachability-lint.sh's baseline finding, HERD-556).
+# THIS worker is the actual live suite runner (LiveGates._dispatch_health / _dispatch_merge_result),
+# so the classification is ported here, mirroring agent-watch.sh's _env_suspect_enabled /
+# _health_timeout_detail / _health_loadavg_1m / _health_sibling_suites_live / _health_load_high
+# byte-for-byte (self-contained — no sourcing, matching this script's own no-dependency style, since
+# a sourcing failure here would stall EVERY PR's health gate, not just this lever). ENV_SUSPECT_TIMEOUT
+# unset/off (default) never calls any of the _es_* helpers below — byte-inert.
+#
+# Classified while a run-1 failure is still forming its verdict: the '[env-suspect] …' marker is
+# APPENDED to the live $log (never overwriting it) the instant a timeout+load match is found, BEFORE
+# the solo retry runs — so agent-watch.sh's _health_inflight_note / _health_env_suspect_marker (the
+# render half, painted by either engine) shows it on the very next tick while the retry is still in
+# flight. On a reproduced failure the retry's own output later `mv`'s over $log (unchanged from
+# before this lever existed), so the marker is transient by design — visible only while in flight,
+# exactly like the pre-port bash behavior. The classification detail additionally lands in a
+# `$log.envsuspect` side-channel file (a single line, sanitized) so the terminal collector (`health` /
+# `_merge_result_health` in this module) can journal `health_env_suspect` once the async worker exits
+# — the log itself is not a reliable channel for that at collect time, since a reproduced failure has
+# already overwritten it by then.
 _HEALTH_WORKER_SH = r'''
 set -u
 hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"; nonce="$7"; profile="${8:-}"
@@ -1581,12 +1605,61 @@ _run() {
     HERD_HEALTH_PROVENANCE=watcher \
     bash "$hc" "${args[@]}" > "$1" 2>&1
 }
+_es_on() {
+  case "$(printf '%s' "${ENV_SUSPECT_TIMEOUT:-off}" | tr '[:upper:]' '[:lower:]')" in
+    on|true|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_es_timeout_detail() {
+  grep -m1 -E '# timeout after [0-9]+s|\(TIMEOUT after [0-9]+s\)' <<<"${1:-}" 2>/dev/null
+}
+_es_loadavg_1m() {
+  [ -n "${HERD_FAKE_LOADAVG:-}" ] && { printf '%s' "$HERD_FAKE_LOADAVG"; return 0; }
+  if [ -r /proc/loadavg ]; then awk '{print $1}' /proc/loadavg 2>/dev/null; return 0; fi
+  command -v sysctl >/dev/null 2>&1 && { sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}'; return 0; }
+  return 0
+}
+_es_siblings_live() {
+  local n=0 f pid
+  { [ -n "$cache" ] && [ -d "$cache" ]; } || { printf '0'; return 0; }
+  for f in "$cache"/.local-suite-slot-* "$cache"/.capacity-suite-live-*; do
+    [ -e "$f" ] || continue
+    case "$f" in *.lock) continue ;; esac
+    pid="$(sed -n '1p' "$f" 2>/dev/null)"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+_es_load_high() {
+  _es_on || return 1
+  local threshold load siblings
+  threshold="${HEALTH_LOAD_THRESHOLD:-4}"
+  case "$threshold" in ''|*[!0-9]*) threshold=4 ;; esac
+  load="$(_es_loadavg_1m)"
+  case "$load" in
+    ''|*[!0-9.]*) : ;;
+    *) awk -v l="$load" -v t="$threshold" 'BEGIN{exit !(l+0>=t+0)}' </dev/null && return 0 ;;
+  esac
+  siblings="$(_es_siblings_live)"
+  case "$siblings" in ''|*[!0-9]*) siblings=0 ;; esac
+  [ "$siblings" -ge 1 ]
+}
+ES_TEXT="env-suspect · timeout under load · solo re-run queued"
 _run "$log"; rc=$?
 first="$(sed -n '1p' "$log" 2>/dev/null)"
 if [ "$rc" -eq 0 ]; then
   case "$first" in "⚠️"*) line="CLEAN"$'\t'"dataenv" ;; *) line="CLEAN"$'\t'"clean" ;; esac
 else
   notok="$(grep -m1 -iE 'not ok' "$log" 2>/dev/null)"; [ -n "$notok" ] || notok="$first"
+  if _es_on; then
+    es_detail="$(_es_timeout_detail "$notok")"
+    if [ -n "$es_detail" ] && _es_load_high; then
+      printf '[env-suspect] %s\n' "$ES_TEXT" >> "$log" 2>/dev/null || true
+      printf '%s\n' "$es_detail" > "$log.envsuspect" 2>/dev/null || true
+    fi
+  fi
   _run "$log.retry"; rc2=$?
   if [ "$rc2" -eq 0 ]; then
     rm -f "$log.retry" "$log.retry.progress" 2>/dev/null || true
@@ -2160,6 +2233,30 @@ class LiveGates:
             self._main_health_pending_cache = _main_health_pending(state_dir)
         return self._main_health_pending_cache
 
+    def _collect_env_suspect(self, cand, log_path):
+        """HERD-567: the python-side half of the env-suspect port — reads the ``<log>.envsuspect``
+        side-channel _HEALTH_WORKER_SH drops the moment it classifies a run-1 timeout as env-suspect
+        (see that string's own docstring for why a side channel, not the log itself, carries this to
+        the collector), journals ``health_env_suspect`` (mirroring agent-watch.sh's ``_health_worker``
+        ``journal_append health_env_suspect dir … detail …``), and removes the marker either way. A
+        no-op — no journal line — whenever the marker is absent: every OTHER dispatch (the lever off,
+        or on but never classified) never even opens the file. Called once per terminal collect, right
+        alongside ``record_health_result`` / ``record_merge_result_verdict``."""
+        if not log_path:
+            return
+        marker = log_path + ".envsuspect"
+        try:
+            with open(marker, encoding="utf-8") as fh:
+                detail = fh.readline().strip()
+        except OSError:
+            return
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        dir_name = os.path.basename(cand.worktree) if cand.worktree else cand.slug
+        self.journal.append("health_env_suspect", "dir", dir_name, "detail", detail)
+
     # ── health rail ────────────────────────────────────────────────────────────────────────────────
     def health(self, cand):
         # MERGE_RESULT_GATE (§6.4, HERD-296): ON diverts the ENTIRE health rail to the merge-result
@@ -2210,6 +2307,7 @@ class LiveGates:
                     # step-2 collect re-reads this exact same out-file and completes the record+rm in one
                     # shot — no re-dispatch of the underlying suite, no lost result.
                     _chaos_kill("mid_gate_collect")
+                    self._collect_env_suspect(cand, st.health_log_file(cand))
                     st.record_health_result(cand, verdict, detail)
                     st.rm(disp, inflight)
                     return verdict
@@ -2358,6 +2456,7 @@ class LiveGates:
                 tested_base = _nonce_base(nonce) or base_sha
                 verdict, _, detail = rest.partition("\t")
                 if verdict in ("CLEAN", "FLAKY", "CODEERROR"):
+                    self._collect_env_suspect(cand, st.merge_result_log_file(cand.pr, cand.sha))
                     st.record_merge_result_verdict(cand.pr, cand.sha, tested_base, verdict, detail)
                     st.rm(disp, inflight)
                     _remove_merge_tree(cand.worktree, tree)
@@ -3405,6 +3504,220 @@ def _cross_seat_block_standing(pr, sha, state, config=None, me=None):
     return "", ""
 
 
+# ── stale/duplicate pre-merge gate (HERD-188, restored HERD-566/HERD-561 P5b) ─────────────────────────
+# GROUNDED: the reachability lint (HERD-556) proved the ENTIRE bash stale-dup gate
+# (stale-dup-gate.sh:stale_dup_check, dispatched by agent-watch.sh:_stale_dup_gate_step) lost its only
+# caller at the P5b port (HERD-306) — every merge under ENGINE_IMPL=python has run with NEITHER of its
+# two provable holds: DUPLICATE (this PR's tracked ref already shipped via another merged PR — #236 vs
+# #185) nor STALE-BASE (touched files the base branch materially changed since this branch's merge-base
+# — re-applying an old branch's copy would silently clobber newer work). This restoration ports the
+# gate's DECISION logic (kind + reason) faithfully from the bash spec; :meth:`LiveTick._walk` wires it
+# into the decide path, before health/review dispatch, exactly where bash placed it (HERD-227: the
+# check is deterministic-cheap, so it must run before either expensive rail is dispatched — PR #328
+# journaled a healthcheck completing 2s before a stale hold superseded it).
+#
+# LIVE-ONLY, like cross-seat (:func:`_cross_seat_block_standing`): gated on ``hold_source is not None``
+# at the call site, so every fixture/dry-run/sim tick — the whole existing test suite — never shells to
+# `gh`/`git` here and stays byte-identical.
+
+_STALE_DUP_TIMEOUT = 15   # bounded like _HV_BODY_TIMEOUT/_XSEAT_GH_TIMEOUT — an outage costs one tick
+
+_STALE_DUP_REF_PLACEHOLDER = {"none", "n/a", "na"}
+_STALE_DUP_REF_TRAILING = ".,;:!)]}*"
+# Leading decoration (heading/list/quote/bold) · "refs:" · a closing bold · the token — the SAME shape
+# as scripts/herd/pr-ref.sh's HERD_PR_REF_PY (HERD-522), so a ref reads identically at every surface.
+_STALE_DUP_REF_LINE_RE = re.compile(r"^[\s#*>-]*refs:\**\s*(\S+)", re.IGNORECASE)
+_STALE_DUP_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+
+
+def _stale_dup_ref_token(line):
+    """The raw token on an anchored ``Refs:`` line, trailing punctuation stripped; "" when the line
+    does not match or nothing usable remains after the strip (pr-ref.sh:_pr_ref_token)."""
+    m = _STALE_DUP_REF_LINE_RE.match(line)
+    if not m:
+        return ""
+    return m.group(1).rstrip(_STALE_DUP_REF_TRAILING)
+
+
+def _stale_dup_pr_ref_from_body(body):
+    """Port of pr-ref.sh's ``pr_ref_from_body`` (HERD-522): the FIRST anchored ``Refs:`` line's token,
+    HTML comments stripped first, or "" for no ref / an explicit placeholder (``<...>``, none, n/a,
+    na) — the same placeholder never raises a silent-miss alarm here either. Pure; no I/O."""
+    decommented = _STALE_DUP_HTML_COMMENT_RE.sub("", body or "")
+    for line in decommented.splitlines():
+        if not _STALE_DUP_REF_LINE_RE.match(line):
+            continue
+        tok = _stale_dup_ref_token(line)
+        if not tok or tok.startswith("<") or tok.lower() in _STALE_DUP_REF_PLACEHOLDER:
+            return ""
+        return tok
+    return ""
+
+
+def _stale_dup_enabled(config):
+    """The master lever — mirrors stale-dup-gate.sh:stale_dup_enabled EXACTLY: only the literal string
+    ``off`` disables (case-sensitive); any other value, including unset, is on."""
+    return str((config or {}).get("STALE_DUP_DETECT") or "on") != "off"
+
+
+def _stale_base_autofix_enabled(config):
+    """STALE_BASE_AUTOFIX — SHIP-DORMANT (default off): mirrors agent-watch.sh's
+    ``_stale_base_autofix_enabled`` truthy set, the same one ``_merge_result_gate_enabled`` and
+    siblings use. Any unrecognized value is off — never accidentally on from a typo."""
+    val = str((config or {}).get("STALE_BASE_AUTOFIX", "") or "").strip().lower()
+    return val in ("1", "true", "on", "yes", "enable", "enabled")
+
+
+def _stale_dup_derived_paths(config):
+    """The shared regenerable-derived-files list (HERD-214, derived-files.sh:herd_derived_paths) —
+    a stale-base overlap made ONLY of these excuses nothing (the engine regenerates them
+    deterministically; losing the working-tree copy costs nothing)."""
+    name = str((config or {}).get("COORDINATOR_CMD") or "/coordinator").strip()
+    name = name[1:] if name.startswith("/") else name
+    name = name or "coordinator"
+    return (".claude/commands/%s.md" % name, ".claude/commands/autopilot.md", ".herd/config.local")
+
+
+def _stale_dup_this_ref(pr):
+    """The ref THIS PR carries — honors the ``HERD_STALE_DUP_BODY_FILE`` test seam (reads a body from
+    a file instead of `gh`), mirroring stale-dup-gate.sh:_stale_dup_this_ref. Fail-soft: "" on any
+    read fault, never raises."""
+    body_file = os.environ.get("HERD_STALE_DUP_BODY_FILE")
+    if body_file:
+        try:
+            with open(body_file, encoding="utf-8") as fh:
+                return _stale_dup_pr_ref_from_body(fh.read())
+        except Exception:
+            return ""
+    try:
+        out = subprocess.run(["gh", "pr", "view", str(pr), "--json", "body", "-q", ".body"],
+                             capture_output=True, text=True, timeout=_STALE_DUP_TIMEOUT)
+    except Exception:
+        return ""
+    if out.returncode != 0:
+        return ""
+    return _stale_dup_pr_ref_from_body(out.stdout)
+
+
+def _stale_dup_merged_refs_shipping(ref, this_pr):
+    """The PR number of a MERGED PR — other than ``this_pr`` — whose body carries the exact same
+    ``ref``, or "" when none does. Honors the ``HERD_STALE_DUP_MERGED_FILE`` test seam (a
+    ``"<pr>\\t<ref>"``-per-line file instead of `gh`), mirroring
+    stale-dup-gate.sh:_stale_dup_merged_refs + _stale_dup_shipped_by. Fail-soft throughout."""
+    if not ref:
+        return ""
+    merged_file = os.environ.get("HERD_STALE_DUP_MERGED_FILE")
+    if merged_file:
+        try:
+            with open(merged_file, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except Exception:
+            return ""
+        for line in lines:
+            parts = line.split("\t", 1)
+            if len(parts) != 2:
+                continue
+            pr_num, r = parts
+            if pr_num and pr_num != str(this_pr) and r == ref:
+                return pr_num
+        return ""
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "list", "--state", "merged", "--search", "%s in:body" % ref,
+             "--limit", "100", "--json", "number,body"],
+            capture_output=True, text=True, timeout=_STALE_DUP_TIMEOUT)
+    except Exception:
+        return ""
+    if out.returncode != 0:
+        return ""
+    try:
+        rows = json.loads(out.stdout or "[]")
+    except Exception:
+        return ""
+    if not isinstance(rows, list):
+        return ""
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        num = row.get("number")
+        if num is None or str(num) == str(this_pr):
+            continue
+        if _stale_dup_pr_ref_from_body(row.get("body") or "") == ref:
+            return str(num)
+    return ""
+
+
+def _stale_dup_base_overlap(dir_, base, head, config=None):
+    """The files this branch touches that the base branch ALSO changed since their common merge-base
+    (touched-order, first-match-wins for the reason string) — [] when the dir is not a worktree, a ref
+    is missing, the branch already contains the base tip (not behind → cannot be stale), either diff
+    is empty, or the whole overlap is regenerable derived files (:func:`_stale_dup_derived_paths`).
+    Pure git; no network. Port of stale-dup-gate.sh:stale_dup_base_overlap."""
+    if not dir_ or not os.path.isdir(dir_):
+        return []
+    try:
+        mb = subprocess.run(["git", "-C", dir_, "merge-base", base, head],
+                            capture_output=True, text=True, timeout=_STALE_DUP_TIMEOUT)
+        if mb.returncode != 0:
+            return []
+        mb_sha = (mb.stdout or "").strip()
+        if not mb_sha:
+            return []
+        basetip = subprocess.run(["git", "-C", dir_, "rev-parse", base],
+                                 capture_output=True, text=True, timeout=_STALE_DUP_TIMEOUT)
+        if basetip.returncode != 0:
+            return []
+        # Branch is up to date with (or ahead of) base on this line of history → cannot be stale.
+        if (basetip.stdout or "").strip() == mb_sha:
+            return []
+        touched = subprocess.run(["git", "-C", dir_, "diff", "--name-only", mb_sha, head],
+                                 capture_output=True, text=True, timeout=_STALE_DUP_TIMEOUT)
+        if touched.returncode != 0:
+            return []
+        touched_files = [l for l in (touched.stdout or "").splitlines() if l]
+        if not touched_files:
+            return []
+        moved = subprocess.run(["git", "-C", dir_, "diff", "--name-only", mb_sha, base],
+                               capture_output=True, text=True, timeout=_STALE_DUP_TIMEOUT)
+        if moved.returncode != 0:
+            return []
+        moved_files = set(l for l in (moved.stdout or "").splitlines() if l)
+        if not moved_files:
+            return []
+        derived = set(_stale_dup_derived_paths(config))
+        overlap = [p for p in touched_files if p in moved_files and p not in derived]
+        return overlap
+    except Exception:
+        return []
+
+
+def _stale_dup_check(cand, config):
+    """Port of stale-dup-gate.sh:stale_dup_check (HERD-188) — the deterministic, provable-only
+    pre-merge gate. Returns ``(kind, reason)``: ``("duplicate", ...)`` when this PR's tracked
+    ``Refs:`` item already shipped via another merged PR, ``("stale-base", ...)`` when touched files
+    were changed on the base branch since this branch's merge-base, or ``(None, None)`` to proceed
+    (the lever is off, or neither condition is provable). Order matches bash: DUPLICATE first (the
+    cheaper, ground-truth "already shipped" test, skipped when the PR carries no ref), then
+    STALE-BASE. FAIL-SOFT: any read fault is read as "cannot prove a problem" — never a false hold."""
+    if not _stale_dup_enabled(config):
+        return None, None
+
+    ref = _stale_dup_this_ref(cand.pr)
+    if ref:
+        shipper = _stale_dup_merged_refs_shipping(ref, cand.pr)
+        if shipper:
+            return "duplicate", ("tracked item %s already shipped by merged PR #%s — this PR "
+                                 "re-implements Done work" % (ref, shipper))
+
+    base = str((config or {}).get("DEFAULT_BRANCH") or os.environ.get("DEFAULT_BRANCH") or "main")
+    overlap = _stale_dup_base_overlap(cand.worktree, base, cand.sha, config)
+    if overlap:
+        return "stale-base", (
+            "stale base: %d touched file(s) were changed on %s after this branch's merge-base "
+            "(e.g. %s) — merging would silently clobber newer work" % (len(overlap), base, overlap[0]))
+    return None, None
+
+
 class LiveActuator:
     """The REAL apply layer: merge via ``gh``, reap the worktree via ``git`` (contract §2, §6.1).
 
@@ -3887,6 +4200,18 @@ class LiveTick:
             return ("PR #%s failed the healthcheck (CODEERROR).\n"
                     "Read the failing suite output, fix every CODE error, run the healthcheck, and "
                     "push your fix." % cand.pr)
+        if kind == "stale":
+            # HERD-566: the stale-base rail's fresh-bounce call always passes an explicit `prompt`
+            # (the live detected overlap reason), so this generic fallback is reached only if a
+            # future caller omits it — mirrors stale-dup-gate.sh's mechanical re-task text.
+            base = str(self.config.get("DEFAULT_BRANCH") or os.environ.get("DEFAULT_BRANCH") or "main")
+            return ("PR #%s is held: STALE BASE — files this branch touches were changed on %s "
+                    "after the branch's merge-base, so a clean merge would silently clobber newer "
+                    "work.\nThis is a MECHANICAL fix (not a judgment call). From your worktree:\n"
+                    "  git fetch\n  git merge %s\n"
+                    "Resolve any conflicts PRESERVING both sides' intent, run the healthcheck, then "
+                    "push (normal push, NEVER force, NEVER push to the default branch)." %
+                    (cand.pr, base, base))
         # HERD-559: a PRE-GATE block never reached a model, so there is no review to read and no
         # comment to reply to — the canned prompt below would send the builder hunting for a finding
         # that was never posted. Name the mechanical red instead and point at the light healthcheck,
@@ -3918,7 +4243,9 @@ class LiveTick:
                 "uncommitted or unpushed work in your worktree, finish it now: commit it, push it, "
                 "and confirm (git log / gh pr view %s) that the PR head sha moved. If you believe "
                 "the fix already left the worktree, run git status and git log again — something "
-                "did not make it out." % (cand.pr, "healthcheck" if kind == "health" else "review",
+                "did not make it out." % (cand.pr,
+                                          {"health": "healthcheck", "stale": "stale base"}.get(
+                                              kind, "review"),
                                           cand.sha, cand.pr))
 
     def _bounce_and_wake(self, cand, kind, round_num, rule, prompt=None):
@@ -4029,7 +4356,8 @@ class LiveTick:
             if self.state.once(cand.pr, cand.sha, "refix_escalated_%s" % kind):
                 total = D.refix_total_count(rows, pr_str)
                 self.journal.append(
-                    "refix_escalated" if kind == "review" else "health_refix_escalated",
+                    {"health": "health_refix_escalated", "stale": "stale_refix_escalated"}.get(
+                        kind, "refix_escalated"),
                     "pr", cand.pr, "sha", cand.sha, "slug", cand.slug, "rounds", total,
                     "reason", reason + " — builder went silent without shipping a fix")
             return ESCALATE
@@ -4037,7 +4365,7 @@ class LiveTick:
         slug = str(cand.slug) if cand.slug else "-"
         _append_refix_ledger(state_dir,
                              "%s %s %s %s %s\n" % (_now_epoch(), cand.pr, cand.sha, slug, kind))
-        rule = "healthcheck" if kind == "health" else "review"
+        rule = {"health": "healthcheck", "stale": "stale"}.get(kind, "review")
         return self._bounce_and_wake(cand, kind, round_num, rule,
                                      prompt=self._refix_finish_prompt(cand, kind))
 
@@ -4327,7 +4655,58 @@ class LiveTick:
             if self.actuator.post_gate_status_pending(cand):
                 self.state.record_posted(cand.pr, cand.sha, "gate_status_pending")
 
-        # 1. stale/dup gate (deterministic-cheap): a behind-base PR HOLDS — parking is always safe.
+        # 1. stale/dup gate (HERD-188, restored HERD-566): the deterministic duplicate-ref / stale-base
+        #    file-overlap check (:func:`_stale_dup_check`), LIVE-ONLY like cross-seat (4a below) — a
+        #    fixture/dry-run/sim tick shells no `gh`/`git` here and this branch is a strict no-op, so
+        #    the whole existing test suite stays byte-identical. RESET-ON-PROGRESS (HERD-229): every
+        #    tick this proceeds (lever off, or neither condition provable) refunds the stale rail's
+        #    refix budget, mirroring stale-dup-gate.sh's caller exactly.
+        if self.hold_source is not None:
+            _sd_kind, _sd_reason = _stale_dup_check(cand, self.config)
+            if _sd_kind is None:
+                self._refix_rail_reset(cand, "stale")
+            else:
+                if self.state.once(cand.pr, cand.sha, "stale_dup_hold"):
+                    self.journal.append("stale_dup_hold", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "kind", _sd_kind, "reason", _sd_reason)
+                self._advance(cand, "stale_detected")
+                if _sd_kind == "duplicate":
+                    # DUPLICATE is a judgment call — always human. Never autofix, never consume a
+                    # refix round (stale-dup-gate.sh:_handle_stale_dup).
+                    self._advance(cand, "refix_exhausted")
+                    return ESCALATE
+                # kind == "stale-base": mechanical — OFF (default) is byte-identical to the pre-
+                # HERD-199 hold (🛑 needs-you, no bounce, no ledger); ON drives the SAME three-way
+                # bounce gate health/review already use, reusing its budget/wake/escalate machinery
+                # verbatim for a third rail (agent-watch.sh's "stale" refix-ledger kind).
+                if not _stale_base_autofix_enabled(self.config):
+                    return HOLD
+                _sd_round, _sd_budget_reason = self._refix_check_and_record(cand, "stale")
+                if _sd_round is None and _sd_budget_reason is None:
+                    outcome = self._refix_completion_incomplete(cand, "stale")
+                    return outcome if outcome is not None else BLOCK
+                if _sd_budget_reason is not None:
+                    if self.state.once(cand.pr, cand.sha, "refix_escalated_stale"):
+                        rows_after = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
+                        total = D.refix_total_count(rows_after, str(cand.pr))
+                        self.journal.append("stale_refix_escalated", "pr", cand.pr, "sha", cand.sha,
+                                            "slug", cand.slug, "rounds", total,
+                                            "reason", _sd_budget_reason + " — stale base still held")
+                    self._advance(cand, "refix_exhausted")
+                    return ESCALATE
+                _sd_base = str(self.config.get("DEFAULT_BRANCH") or os.environ.get("DEFAULT_BRANCH")
+                              or "main")
+                _sd_prompt = (
+                    "PR #%s is held: STALE BASE — files this branch touches were changed on %s "
+                    "after the branch's merge-base, so a clean merge would silently clobber newer "
+                    "work.\nThis is a MECHANICAL fix (not a judgment call). From your worktree:\n"
+                    "  git fetch\n  git merge %s\n"
+                    "Resolve any conflicts PRESERVING both sides' intent, run the healthcheck, then "
+                    "push (normal push, NEVER force, NEVER push to the default branch).\n"
+                    "Why: %s" % (cand.pr, _sd_base, _sd_base, _sd_reason))
+                return self._bounce_and_wake(cand, "stale", _sd_round, "stale", prompt=_sd_prompt)
+
+        # 1b. stale/dup gate (deterministic-cheap): a behind-base PR HOLDS — parking is always safe.
         if cand.stale:
             if self.state.once(cand.pr, cand.sha, "stale"):
                 self.journal.append("stale_dup_hold", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,

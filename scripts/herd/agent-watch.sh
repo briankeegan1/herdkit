@@ -193,6 +193,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # (_console_now_epoch, CONSOLE_LEDGER_MAX) rather than duplicating. Defines functions only; wholly
 # inert while RED_LEDGER=off (default).
 . "$HERE/red-ledger.sh"
+# Diff-scoped suite selection (HERD-532) — sourced for herd_suite_tests_for_diff / herd_suite_curated_
+# tests, which the scope-escape detector below needs to RECOMPUTE a sha's selection under the CURRENT
+# rules (never a replay of what an older run computed). Defines functions only; lib-safe.
+# shellcheck source=/dev/null
+. "$HERE/suite-shard.sh"
+# Scope-escape telemetry (HERD-575) — the shared detector both this file's main-health red leg and
+# .herd/healthcheck.project.sh's scoped-run recorder source, so they can never disagree about what
+# "scoped" means or how an escape is proven. Sourced after suite-shard.sh (it calls into it) and
+# journal.sh (it calls journal_append). Defines functions only; byte-inert unless a sha's gate was
+# previously recorded scoped — itself gated behind HEALTH_SUITE_SCOPE=diff's own default-off lever.
+# shellcheck source=/dev/null
+. "$HERE/scope-escape.sh"
 # Pre-spawn CLAIM (HERD-50) — sourced for its RELEASE half (herd_claim_release, HERD-162 F12), which
 # the dead-builder reconcile calls to un-wedge a tracker item whose builder died before opening a PR.
 # Sourcing DEFINES functions only (its lane entry point herd_claim_or_abort is never called from here);
@@ -5869,6 +5881,51 @@ _effective_health_pane() {
 # reconcile stays in lock-step with the inflight marker.
 _health_pane_registry_file() { printf '%s' "$TREES/.health-pane-registry-$1-$2"; }
 
+# _health_builder_tab <slug> — the tab_id of the BUILDER's own tab for <slug>, or empty when none is
+# found (HERD-568): the health pane's PREFERRED placement is a split INSIDE that tab, never a fresh
+# standalone one. Two sources, in order:
+#   1. $TREES/.herd-tabs — the engine's own tab registry (herd-feature.sh / herd-quick.sh write
+#      "<slug> <tab_id> builder" the moment a builder tab is created). Matched against the RAW slug
+#      first, then the SANITIZED/truncated form (herd_agent_name_sanitize) a foreign/legacy writer
+#      might have used instead — the registry's own writers always use the raw slug today, but a
+#      lookup that only tried raw would silently miss a row from any that didn't.
+#   2. `herdr agent list`, matched on the REGISTERED (sanitized) agent name — the same roster
+#      herd_driver_agent_pane_id reads, here for its tab_id instead of pane_id. Catches a builder
+#      whose .herd-tabs row is missing or stale (e.g. an adopted PR with no lane-written row) as long
+#      as the agent itself is still live.
+# Fail-soft throughout: headless / herdr absent / no match of either kind → empty output, no herdr call
+# beyond the one `agent list` in leg 2.
+_health_builder_tab() {
+  local _hbt_slug="${1:-}"
+  [ -n "$_hbt_slug" ] || return 0
+  local _hbt_reg="$TREES/.herd-tabs" _hbt_lbl _hbt_tab _hbt_role _hbt_rest
+  if [ -f "$_hbt_reg" ]; then
+    while IFS=' ' read -r _hbt_lbl _hbt_tab _hbt_role _hbt_rest; do
+      [ "${_hbt_role:-}" = builder ] && [ "$_hbt_lbl" = "$_hbt_slug" ] || continue
+      [ -n "$_hbt_tab" ] && { printf '%s' "$_hbt_tab"; return 0; }
+    done < "$_hbt_reg"
+    local _hbt_san; _hbt_san="$(herd_agent_name_sanitize "$_hbt_slug")"
+    if [ "$_hbt_san" != "$_hbt_slug" ]; then
+      while IFS=' ' read -r _hbt_lbl _hbt_tab _hbt_role _hbt_rest; do
+        [ "${_hbt_role:-}" = builder ] && [ "$_hbt_lbl" = "$_hbt_san" ] || continue
+        [ -n "$_hbt_tab" ] && { printf '%s' "$_hbt_tab"; return 0; }
+      done < "$_hbt_reg"
+    fi
+  fi
+  _herd_driver_is_headless && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  herdr agent list 2>/dev/null | SLUG="$(herd_agent_name_sanitize "$_hbt_slug")" python3 -c '
+import sys, json, os
+slug = os.environ["SLUG"]
+try:
+  for a in (json.load(sys.stdin).get("result") or {}).get("agents") or []:
+    if a.get("name") == slug:
+      print(a.get("tab_id","") or "", end=""); break
+except Exception:
+  pass
+' 2>/dev/null || true
+}
+
 # _spawn_health_pane <pr#> <slug> <sha> <worktree-dir> — stand up the disposable `health·<slug>` view
 # pane for an in-flight suite, ONCE. A PRIMITIVE: the only caller is the per-tick reconcile below, which
 # decides from the OBSERVED inflight marker — never from a dispatch event — so it rides the same signal
@@ -5876,8 +5933,22 @@ _health_pane_registry_file() { printf '%s' "$TREES/.health-pane-registry-$1-$2";
 # Self-gating + idempotent + fail-soft:
 #   • HEALTH_PANE off / dry-run / headless (no panes) / herdr absent → returns 0 having done NOTHING.
 #   • a registry row already present for this (pr,sha) → returns 0 (one pane per suite).
-# The pane runs `tail -F` of the sha-scoped health log the worker streams into (leg b's TEE), stamped
-# with a `health·<slug>` label so the guarded close recognizes it and a neighbour is never mistaken.
+#
+# PLACEMENT (HERD-568): the pane must appear WITH the builder's work, never steal a fresh tab (the
+# defect this fixes — every health_pane_spawned since PR #686 opened a brand-new tab, full fish
+# greeting + fastfetch, cluttering the tab bar). Two modes:
+#   SPLIT (preferred) — when _health_builder_tab finds the builder's own tab still open, split its
+#     ROOT pane (_herd_herdr_tab_root_pane — the task-spec-viewer / app-preview pane, NEVER the agent
+#     pane, which always lives in its OWN split off root) downward. Mirrors the exact placement
+#     herd-review.sh / herd-resolve.sh already use for their in-tab panes: below/beside the task-spec
+#     viewer, never on top of the agent.
+#   TAB (fallback) — the builder's tab is gone (retired/never existed) or the split failed: a
+#     standalone health·<slug> tab, byte-identical to the pre-HERD-568 behavior, journaled with
+#     reason=no-builder-tab so the operator can tell placement degraded from a dispatch event alone.
+# Either way the pane runs health-pane-view.sh (HERD-568 addendum) execed directly as its command — a
+# sidecar-aware tail of the live suite log ending in the final verdict — instead of typing a bare
+# `tail` into the pane's still-greeting shell, stamped with a `health·<slug>` label so the guarded
+# close recognizes it and a neighbour is never mistaken.
 _spawn_health_pane() {
   local _shp_pr="$1" _shp_slug="$2" _shp_sha="$3" _shp_dir="$4"
   [ "$(_effective_health_pane)" = on ] || return 0
@@ -5886,37 +5957,59 @@ _spawn_health_pane() {
   command -v herdr >/dev/null 2>&1 || return 0
   local _shp_reg; _shp_reg="$(_health_pane_registry_file "$_shp_pr" "$_shp_sha")"
   [ -f "$_shp_reg" ] && return 0
-  local _shp_log _shp_ws _shp_created _shp_tab _shp_root
+  local _shp_log _shp_mark _shp_ws _shp_tab="" _shp_root="" _shp_placement="tab"
   _shp_log="$(_health_log_file "${_shp_pr}-${_shp_sha}")"
+  _shp_mark="$(_health_inflight_file "${_shp_pr}-${_shp_sha}")"
   _shp_ws="$(herd_resolve_workspace_id 2>/dev/null || true)"
-  # shellcheck disable=SC2086  # ${_shp_ws:+…} deliberately word-splits into two argv when set
-  _shp_created="$(herdr tab create ${_shp_ws:+--workspace "$_shp_ws"} --cwd "$_shp_dir" --label "health·$_shp_slug" --no-focus 2>/dev/null || true)"
-  read -r _shp_tab _shp_root < <(printf '%s' "$_shp_created" | python3 -c \
-    'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
-  [ -n "${_shp_tab:-}" ] && [ -n "${_shp_root:-}" ] || return 0
+
+  local _shp_builder_tab; _shp_builder_tab="$(_health_builder_tab "$_shp_slug")"
+  if [ -n "$_shp_builder_tab" ]; then
+    local _shp_base; _shp_base="$(_herd_herdr_tab_root_pane "$_shp_builder_tab")"
+    if [ -n "$_shp_base" ]; then
+      local _shp_split
+      _shp_split="$(herdr pane split "$_shp_base" --direction down --cwd "$_shp_dir" --no-focus 2>/dev/null || true)"
+      _shp_root="$(printf '%s' "$_shp_split" | python3 -c \
+        'import sys,json; print((json.load(sys.stdin)["result"]["pane"]["pane_id"]) or "", end="")' 2>/dev/null || true)"
+      [ -n "$_shp_root" ] && { _shp_tab="$_shp_builder_tab"; _shp_placement=split; }
+    fi
+  fi
+
+  if [ "$_shp_placement" != split ]; then
+    local _shp_created
+    # shellcheck disable=SC2086  # ${_shp_ws:+…} deliberately word-splits into two argv when set
+    _shp_created="$(herdr tab create ${_shp_ws:+--workspace "$_shp_ws"} --cwd "$_shp_dir" --label "health·$_shp_slug" --no-focus 2>/dev/null || true)"
+    read -r _shp_tab _shp_root < <(printf '%s' "$_shp_created" | python3 -c \
+      'import sys,json; d=json.load(sys.stdin)["result"]; print(d["tab"]["tab_id"], d["root_pane"]["pane_id"])' 2>/dev/null || true)
+    [ -n "${_shp_tab:-}" ] && [ -n "${_shp_root:-}" ] || return 0
+    printf '%s %s health\n' "$_shp_slug" "$_shp_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
+    journal_append infra_event component health_pane slug "$_shp_slug" pr "$_shp_pr" sha "$_shp_sha" reason no-builder-tab tab "$_shp_tab"
+  fi
+
   herdr pane rename "$_shp_root" "health·$_shp_slug" >/dev/null 2>&1 || true
-  # `tail -F` (retry+follow) tolerates the log not existing yet or being rotated under it.
-  herdr pane run "$_shp_root" "tail -n +1 -F $_shp_log" >/dev/null 2>&1 || true
-  printf '%s %s health·%s\n' "$_shp_root" "$_shp_tab" "$_shp_slug" > "$_shp_reg" 2>/dev/null || true
-  printf '%s %s health\n' "$_shp_slug" "$_shp_tab" >> "$TREES/.herd-tabs" 2>/dev/null || true
-  journal_append health_pane_spawned pr "$_shp_pr" slug "$_shp_slug" sha "$_shp_sha" pane "$_shp_root" tab "$_shp_tab" log_path "$_shp_log"
+  herdr pane run "$_shp_root" "bash $HERE/health-pane-view.sh $_shp_log $_shp_mark" >/dev/null 2>&1 || true
+  printf '%s %s %s health·%s\n' "$_shp_root" "$_shp_tab" "$_shp_placement" "$_shp_slug" > "$_shp_reg" 2>/dev/null || true
+  journal_append health_pane_spawned pr "$_shp_pr" slug "$_shp_slug" sha "$_shp_sha" pane "$_shp_root" tab "$_shp_tab" log_path "$_shp_log" placement "$_shp_placement"
 }
 
 # _retire_health_pane <pr#> <sha> [reason] — close the disposable pane once its suite has ended. Mirrors
 # _retire_resolver_pane: read the registry row and, if it still names a LIVE pane, close it via the
 # HERD-134 guarded close (which REFUSES + journals pane_close_refused if the id was recycled onto a
-# neighbour), journal `health_pane_retired` on a real close, close the now-empty tab, then drop the row
-# unconditionally. FAIL-SOFT + byte-quiet: no row / no pane / already-gone ⇒ no output, no journal.
+# neighbour), journal `health_pane_retired` on a real close, then drop the row unconditionally.
+# TAB is closed too — but ONLY in `tab` placement (the standalone fallback): in `split` placement that
+# id names the BUILDER's own shared tab, and closing it would take the builder down with the health
+# pane (the review/resolve-pane precedent this mirrors, _retire_resolver_pane, draws the exact same
+# line). FAIL-SOFT + byte-quiet: no row / no pane / already-gone ⇒ no output, no journal.
 _retire_health_pane() {
-  local _rhp_pr="$1" _rhp_sha="$2" _rhp_reason="${3:-outcome-landed}" _rhp_reg _rhp_pane _rhp_tab
+  local _rhp_pr="$1" _rhp_sha="$2" _rhp_reason="${3:-outcome-landed}" _rhp_reg _rhp_pane _rhp_tab _rhp_placement
   [ -z "${DRYRUN:-}" ] || return 0
   _rhp_reg="$(_health_pane_registry_file "$_rhp_pr" "$_rhp_sha")"
   [ -f "$_rhp_reg" ] || return 0
-  read -r _rhp_pane _rhp_tab _ < "$_rhp_reg" 2>/dev/null || true
+  read -r _rhp_pane _rhp_tab _rhp_placement _ < "$_rhp_reg" 2>/dev/null || true
   if [ -n "${_rhp_pane:-}" ] && [ "$_rhp_pane" != "-" ] && herd_driver_pane_alive "$_rhp_pane"; then
     if herd_close_pane_verified "$_rhp_pane" "health·"; then
-      journal_append health_pane_retired pr "$_rhp_pr" sha "$_rhp_sha" pane "$_rhp_pane" reason "$_rhp_reason"
-      if [ -n "${_rhp_tab:-}" ] && [ "$_rhp_tab" != "-" ]; then
+      journal_append health_pane_retired pr "$_rhp_pr" sha "$_rhp_sha" pane "$_rhp_pane" \
+        placement "${_rhp_placement:--}" reason "$_rhp_reason"
+      if [ "${_rhp_placement:-}" = "tab" ] && [ -n "${_rhp_tab:-}" ] && [ "$_rhp_tab" != "-" ]; then
         herdr tab close "$_rhp_tab" >/dev/null 2>&1 || true
         _herd_tabs_drop_row "$TREES/.herd-tabs" "$_rhp_tab"
       fi
@@ -9015,6 +9108,31 @@ _main_health_autofix_spawn() {
   return 0
 }
 
+# _scope_escape_detect <sha> <failing-identity> — HERD-575: THE main-health/CI red chokepoint hook.
+# If <sha>'s own gate previously ran SCOPED (scripts/herd/scope-escape.sh's herd_scope_gate_was_
+# scoped), recompute that selection fresh against $MAIN's actual diff for <sha> and, when the failing
+# test(s) named in <failing-identity> are absent from it, journal `scope_escape` and append ONE
+# advisory row to the committed suite-deps candidate ledger (tests/suite-deps-candidates.tsv). Fully
+# fail-soft: no gate_scoped record, no resolvable diff, an unparented sha, or a failing identity that
+# names no test-*.sh file are all silent no-ops — this can never itself paint a red or block anything,
+# and is byte-inert whenever the sha it is asked about was never recorded scoped in the first place.
+_scope_escape_detect() {
+  command -v herd_scope_escape_check >/dev/null 2>&1 || return 0
+  local _sed_sha="${1:-}" _sed_fail="${2:-}"
+  [ -n "$_sed_sha" ] && [ -n "${MAIN:-}" ] && [ -d "$MAIN/tests" ] || return 0
+  local -a _sed_changed=()
+  local _sed_p
+  while IFS= read -r _sed_p; do
+    [ -n "$_sed_p" ] && _sed_changed+=("$_sed_p")
+  done < <(git -C "$MAIN" diff --name-only "${_sed_sha}^" "$_sed_sha" 2>/dev/null)
+  [ "${#_sed_changed[@]}" -gt 0 ] || return 0
+  local _sed_row
+  _sed_row="$(herd_scope_escape_check "$_sed_sha" "$_sed_fail" "$MAIN/tests" "${_sed_changed[@]}")" || return 0
+  [ -n "$_sed_row" ] || return 0
+  herd_scope_escape_append_candidate "$MAIN/tests/suite-deps-candidates.tsv" "${_sed_row}"$'\t'"candidate"
+  return 0
+}
+
 # _main_health_set_red <pr#> <sha> <healthcheck-oneline> [kind=local|ci] [ci-run-id] — a main sha
 # REPRODUCED a red in the given SCOPE (HERD-372: "local" for the healthcheck suite, "ci" for the
 # branch-CI leg; local is the default so the existing local-suite caller needs no change). MERGES into
@@ -9045,6 +9163,9 @@ _main_health_set_red() {
   printf '%s\x1f%s\x1f%s\x1f%s\n' "$_sr_sha" "$_sr_since" "$_sr_local" "$_sr_ci" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
   _sr_render="$_sr_local"; [ -n "$_sr_render" ] || _sr_render="$_sr_ci"
   journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_render" since "$_sr_since"
+  # HERD-575: was THIS sha's own gate a SCOPED run? A red surfacing here — downstream of that gate,
+  # never caught by it — is a candidate scope escape. Best-effort; never alters the verdict above.
+  _scope_escape_detect "$_sr_sha" "$_sr_render"
   # HERD-539: cache the SAME diagnosing text just journaled above into the shared red-ledger, keyed on
   # this sha, so build_main_health's row can render it back verbatim + an honest last-verified stamp.
   # No-op when RED_LEDGER is off.
@@ -13857,6 +13978,11 @@ _reconcile_wedged_builder() {
 #      'escalated' and journal finish_stall_escalated — the re-task did not finish the job.
 #   3. 'escalated' is terminal: the needs-you row keeps rendering, nothing fires again, until the slug
 #      escapes (a PR opens, the agent starts working, or the signature clears).
+#
+# HERD-574: finish_stall_detected/finish_stall_escalated also carry kind=uncommitted (dirty tracked
+# tree — the fix-hermetic-guard-taint incident: modified files, never committed) vs kind=unpushed
+# (clean tree, commits ahead of origin) — a single at-a-glance dimension over the commits/dirty fields
+# already journaled, so a journal consumer can filter/count by work-signature without recomputing it.
 
 # _finish_stall_min — FINISH_STALL_MIN in whole minutes on stdout + rc 0, or rc 1 (nothing printed)
 # when the leg is OFF: unset, empty, non-numeric, or <= 0. A typo can never turn this on.
@@ -14191,7 +14317,7 @@ _reconcile_finish_stall() {
   local _rfs_slug="$1" _rfs_wt="$2" _rfs_astatus="$3" _rfs_branch="$4"
   _finish_stall_enabled || { printf 'OFF'; return 0; }
   local _rfs_now _rfs_grace _rfs_rec _rfs_first="" _rfs_state="" _rfs_commits=0 _rfs_dirty=0 \
-        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict _rfs_mark_out _rfs_mark_epoch _rfs_mark_state
+        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict _rfs_mark_out _rfs_mark_epoch _rfs_mark_state _rfs_kind
   _rfs_now="$(_now)"
   _rfs_grace="$(_finish_stall_grace_secs)"
   case "$_rfs_astatus" in
@@ -14204,6 +14330,13 @@ _reconcile_finish_stall() {
       fi
       ;;
   esac
+  # HERD-574: the single at-a-glance work-signature dimension for the journal — kind=uncommitted for
+  # a dirty tracked tree (the fix-hermetic-guard-taint incident: modified files, never committed),
+  # kind=unpushed for a clean tree sitting on commits ahead of its own remote. Computed once here from
+  # the SAME commits/dirty probe already run above, so FIRST_STALL and SECOND_STALL both journal the
+  # identical classification for one (slug, anchor) stall — never recomputed, never drifting between
+  # the two events for the same incident.
+  _rfs_kind="unpushed"; [ "$_rfs_dirty" = "1" ] && _rfs_kind="uncommitted"
   _rfs_rec="$(_finish_stall_record "$_rfs_slug")"
   if [ -n "$_rfs_rec" ]; then
     IFS=$'\t' read -r _rfs_first _rfs_state <<< "$_rfs_rec"
@@ -14227,7 +14360,7 @@ _reconcile_finish_stall() {
       fi ;;
     FIRST_STALL)
       journal_append finish_stall_detected slug "$_rfs_slug" first_seen "${_rfs_first:-$_rfs_now}" \
-        commits "$_rfs_commits" dirty "$_rfs_dirty"
+        commits "$_rfs_commits" dirty "$_rfs_dirty" kind "$_rfs_kind"
       # DRYRUN is checked BEFORE the once-guard, never after: the guard marks the action SPENT, and a
       # dry run must never spend it — an operator who explores with AGENT_WATCH_DRYRUN=1 and then
       # disables it must still get the real nudge on the next tick, not find it silently pre-consumed
@@ -14247,7 +14380,7 @@ _reconcile_finish_stall() {
               "${_rfs_slug}: unfinished work with no PR — finish-line nudge delivered, agent is working again" default ;;
           *)
             _finish_stall_state "$_rfs_slug" escalated
-            journal_append finish_stall_escalated slug "$_rfs_slug" reason "wake failed"
+            journal_append finish_stall_escalated slug "$_rfs_slug" reason "wake failed" kind "$_rfs_kind"
             herd_driver_notify "⚠️ builder stalled before opening a PR: ${_rfs_slug}" \
               "${_rfs_slug}: work exists (uncommitted or unpushed) but the agent stopped and the auto re-task did not land — push + open the PR by hand" default ;;
         esac
@@ -14255,7 +14388,7 @@ _reconcile_finish_stall() {
     SECOND_STALL)
       if _finish_stall_action_once "$_rfs_slug" "escalate:${_rfs_first:-$_rfs_now}"; then
         _finish_stall_state "$_rfs_slug" escalated
-        journal_append finish_stall_escalated slug "$_rfs_slug" reason "stalled again after re-task"
+        journal_append finish_stall_escalated slug "$_rfs_slug" reason "stalled again after re-task" kind "$_rfs_kind"
         herd_driver_notify "⚠️ builder stalled again before opening a PR: ${_rfs_slug}" \
           "${_rfs_slug}: re-tasked once already but stopped again with work still unshipped — push + open the PR by hand" default
       fi ;;
@@ -17596,9 +17729,10 @@ _spawn_clear_held() {
 # lane observably spawned, because the lanes have TWO no-builder exits a fire-and-forget launch could
 # never see:
 #   • the lane's own advisory saturation gate defers with EXIT 0 and the stable marker line
-#     'review-gate saturated' (herd_spawn_gate_emit_defer) — a HELD spawn, not a failure: the
-#     intent is RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain
-#     stops for this tick (siblings would also defer against the same gate);
+#     'review-gate saturated' (herd_spawn_gate_emit_defer) OR 'agent capacity lease unavailable'
+#     (herd_capacity_lease_emit_defer, HERD-581) — a HELD spawn, not a failure: the intent is
+#     RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain stops for this
+#     tick (siblings would also defer against the same gate/lease);
 #   • a hard failure (bad slug, existing worktree, git/network error) exits non-zero — the intent
 #     is dropped LOUDLY (skip + journal), never silently.
 # Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
@@ -17663,7 +17797,7 @@ _drain_lane_worker() {
   # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
   # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
   # spawn_claim_lost rather than report a spawn_launched for an intent still sitting in the queue.
-  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then  # pipe-ok: bounded command output, under a pipe buffer
+  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -Eq 'review-gate saturated|agent capacity lease unavailable'; then  # pipe-ok: bounded command output, under a pipe buffer
     # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent back for
     # a later tick. The drain already stopped for this tick when it launched this worker.
     if bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1; then
