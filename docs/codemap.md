@@ -280,6 +280,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HEALTH_SUITE_SCOPE` → `suite-shard.sh`
 - `HEALTH_TIMEOUT_HEADROOM` → `agent-watch.sh`
 - `HEALTH_TRUST_BUILDER` → `health-trust.sh`
+- `HEALTH_TRUST_MAX_AGE_SECS` → `health-trust.sh`
 - `HERD_BRAND` → `herd-preflight.sh`
 - `HERD_DRIVER` → `bin/herd`, `context-guard.sh`, `driver.sh`, `herd-preflight.sh`
 - `HERD_LIMIT_RESUME_BUFFER` → `agent-watch.sh`
@@ -295,6 +296,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `JOURNAL_AUDIT` → `agent-watch.sh`, `journal-audit.sh`
 - `JOURNAL_AUDIT_ACT` → `journal-audit.sh`
 - `JOURNAL_AUDIT_DISPATCH_TTL` → `journal-audit.sh`
+- `JOURNAL_AUDIT_ESCALATE_AFTER` → `journal-audit.sh`
 - `JOURNAL_AUDIT_MERGE_GRACE` → `journal-audit.sh`
 - `JOURNAL_AUDIT_PUSHED_GRACE` → `journal-audit.sh`
 - `JOURNAL_AUDIT_RED_TTL` → `journal-audit.sh`

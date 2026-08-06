@@ -1564,6 +1564,58 @@ class TestLiveMergeVerify(LiveCase):
         self.assertFalse([o for o in ev if o["event"] == "merge"])
 
 
+class _RecordingResolverSub:
+    """Records every argv `LiveActuator.dispatch_resolver` runs and scripts a bare `bash
+    herd-resolve.sh <slug>` success/failure — proves the HERD-584 dispatch shape without ever
+    launching herdr/git/claude."""
+
+    def __init__(self, rc=0):
+        self.calls = []
+        self.rc = rc
+
+    def run(self, argv, *a, **k):
+        self.calls.append((list(argv), dict(k)))
+        return _FakeCompleted("", returncode=self.rc)
+
+
+class TestLiveDispatchResolver(LiveCase):
+    """HERD-584: LiveActuator.dispatch_resolver is the live twin of agent-watch.sh's spawn_resolver —
+    a best-effort, bounded shell-out to the EXISTING scripts/herd/herd-resolve.sh, never raising."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/some/home", LiveJournal(self.jpath))
+
+    def _cand(self):
+        return LiveCandidate(7, "deadbeef", slug="feat-x", worktree="/wt/feat-x")
+
+    def test_success_runs_herd_resolve_with_the_slug_and_pr_sha_env(self):
+        sub = _RecordingResolverSub(rc=0)
+        act = self._actuator(sub)
+        self.assertTrue(act.dispatch_resolver(self._cand()))
+        self.assertEqual(len(sub.calls), 1)
+        argv, kwargs = sub.calls[0]
+        self.assertEqual(argv[0], "bash")
+        self.assertTrue(argv[1].endswith("scripts/herd/herd-resolve.sh"))
+        self.assertEqual(argv[2], "feat-x")
+        self.assertEqual(kwargs["env"]["HERD_RESOLVE_PR"], "7")
+        self.assertEqual(kwargs["env"]["HERD_RESOLVE_SHA"], "deadbeef")
+        self.assertIn("timeout", kwargs)
+
+    def test_nonzero_exit_reports_failure(self):
+        act = self._actuator(_RecordingResolverSub(rc=1))
+        self.assertFalse(act.dispatch_resolver(self._cand()))
+
+    def test_a_raised_exception_never_escapes(self):
+        class _Raising:
+            def run(self, *a, **k):
+                raise OSError("herdr not found")
+        act = self._actuator(_Raising())
+        self.assertFalse(act.dispatch_resolver(self._cand()))
+
+
 class TestLiveMergeMethodConfig(LiveCase):
     """HERD-354: the live merge actuator composes ``gh pr merge`` from MERGE_METHOD +
     DELETE_BRANCH_ON_MERGE exactly as bash do_merge does (agent-watch.sh:_merge_method_flag /
@@ -2138,15 +2190,68 @@ class TestStaleDupGate(LiveCase):
         wake = [o for o in ev if o["event"] == "refix_wake_result"]
         self.assertEqual(wake[0]["woke"], 1)
 
-    def test_stale_base_autofix_escalates_when_nobody_wakes(self):
+    def test_stale_base_autofix_dispatches_resolver_when_nobody_wakes(self):
+        # HERD-584: the old bash healer dispatched the EXISTING conflict resolver
+        # (herd-resolve.sh) when there is no live builder to bounce, rather than escalate a
+        # MECHANICAL fix straight to a human. A worktree exists here, so the resolver fallback
+        # engages: BLOCK (awaiting the resolver's push), not ESCALATE.
         feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
         os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
         res, ev = self._tick_live(
             dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
                  agent_status="dead"),
             {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"})
+        self.assertEqual(res["outcomes"]["7"], "BLOCK")
+        self.assertFalse([o for o in ev if o["event"] == "refix_escalated_no_wake"])
+        bounce = [o for o in ev if o["event"] == "stale_base_autofix_bounce"]
+        self.assertEqual(len(bounce), 1)
+        self.assertEqual(bounce[0]["pr"], 7)
+        self.assertEqual(bounce[0]["sha"], feat_sha)
+        wake = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(wake[0]["woke"], 0)
+        self.assertEqual(wake[0]["escalated"], "false")
+        # The round is still spent (a resolver dispatch IS a real heal attempt, unlike the
+        # unwoken-bounce refund path) — never refunded via a reset row.
+        self.assertFalse([o for o in ev if o["event"] == "refix_rail_reset"])
+
+    def test_stale_base_autofix_escalates_when_resolver_dispatch_fails(self):
+        # The fallback engages (a worktree exists) but the resolver spawn itself fails (herdr down,
+        # script missing, …) — the caller must fall through to the same honest needs-you escalation
+        # a plain unwoken bounce takes, round refunded.
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+
+        class _NoResolverActuator(DryRunActuator):
+            def dispatch_resolver(self, cand):
+                return False
+
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        actuator = _NoResolverActuator(journal)
+        config = {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"}
+        scenario = {"candidates": [self.one(pr=7, sha=feat_sha, worktree=feat_dir, base="main",
+                                            health="CLEAN", review="PASS", agent_status="dead")],
+                   "config": config}
+        t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
+                     state=state, hold_source=LiveHoldSource(state, config))
+        res = t.run()
+        ev = events(self.jpath)
         self.assertEqual(res["outcomes"]["7"], "ESCALATE")
+        self.assertFalse([o for o in ev if o["event"] == "stale_base_autofix_bounce"])
         self.assertTrue([o for o in ev if o["event"] == "refix_escalated_no_wake"])
+
+    def test_stale_no_wake_fallback_declines_without_a_worktree(self):
+        # Unit-level: no worktree to resolve in place -> the fallback is inapplicable, never
+        # dispatches, and never journals (mirrors _handle_stale_dup's "no builder/worktree" branch,
+        # which stays a plain needs-you). Exercised directly since the full stale-dup gate can only
+        # PROVE a stale-base hold against a real worktree in the first place.
+        journal = LiveJournal(self.jpath)
+        t = LiveTick({}, FixtureDiscovery({"candidates": [], "config": {}}),
+                     FixtureGates({"candidates": [], "config": {}}), DryRunActuator(journal), journal,
+                     state=LiveState(self.tmp))
+        cand = LiveCandidate(pr=9, sha="deadbeef", slug="feat-nowt", worktree="")
+        self.assertFalse(t._stale_no_wake_fallback(cand))
+        self.assertFalse(os.path.exists(self.jpath), "a declined fallback must journal nothing")
 
     # ── the lever ─────────────────────────────────────────────────────────────────────────────────
 
@@ -7346,6 +7451,218 @@ class TestClaudeExecHangProbe(LiveCase):
             with self.subTest(raw=raw):
                 self.assertIsNone(LR._claude_probe_secs({"WATCH_CLAUDE_PROBE_TIMEOUT": raw}))
         self.assertEqual(LR._claude_probe_secs({"WATCH_CLAUDE_PROBE_TIMEOUT": "5"}), 5)
+
+
+class TestGhRateLimitClassification(unittest.TestCase):
+    """HERD-582: a gh call rejected on a rate limit must classify as BACKOFF, not a genuine fault.
+    The live incident (2026-08-06 02:06): a GraphQL bucket exhausted after a 50-merge day made
+    discover_via_graphql's gh call exit non-zero, which propagated straight to `main` — exit 1 —
+    and rang the bash watchdog's fault streak into a false 'ENGINE DOWN' page for a wait-with-a-
+    known-reset. Genuine failures (auth, network, malformed query) must still raise/fault verbatim."""
+
+    def test_looks_gh_rate_limited_matches_graphql_text(self):
+        self.assertTrue(LR._looks_gh_rate_limited(
+            "gh: GraphQL: API rate limit already exceeded for user ID 123. (repository)\n"))
+
+    def test_looks_gh_rate_limited_matches_rest_403_zero_remaining(self):
+        self.assertTrue(LR._looks_gh_rate_limited(
+            "HTTP/2.0 403 Forbidden\nX-RateLimit-Remaining: 0\n\n"
+            '{"message":"API rate limit exceeded for user ID 123."}\n'))
+
+    def test_looks_gh_rate_limited_false_for_genuine_failure(self):
+        self.assertFalse(LR._looks_gh_rate_limited("gh: authentication failed, run 'gh auth login'\n"))
+        self.assertFalse(LR._looks_gh_rate_limited("curl: (6) Could not resolve host\n"))
+        self.assertFalse(LR._looks_gh_rate_limited(""))
+        self.assertFalse(LR._looks_gh_rate_limited(None))
+
+    def test_403_alone_without_the_header_is_not_classified_rate_limited(self):
+        # A plain 403 (e.g. a permissions error) must NOT be mistaken for a rate limit — only the
+        # X-RateLimit-Remaining: 0 header (or the GraphQL text) authorizes the reclassification.
+        self.assertFalse(LR._looks_gh_rate_limited("gh: HTTP 403: Resource not accessible by integration"))
+
+    def test_discover_via_graphql_raises_ghratelimited_with_reset(self):
+        reset_epoch = 1735689600
+
+        class _Stub:
+            CalledProcessError = subprocess.CalledProcessError   # live_runtime references subprocess.CalledProcessError
+
+            def run(self, argv, **k):
+                if "graphql" in argv:
+                    raise subprocess.CalledProcessError(
+                        1, argv, output="",
+                        stderr="gh: GraphQL: API rate limit already exceeded for user ID 123. (repository)\n")
+                if "rate_limit" in argv:
+                    class R:
+                        returncode = 0
+                        stdout = "%d\n" % reset_epoch
+                    return R()
+                raise AssertionError("unexpected gh call: %r" % (argv,))
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            with self.assertRaises(LR.GhRateLimited) as ctx:
+                LR.discover_via_graphql(repo="owner/name")
+            self.assertEqual(ctx.exception.reset_at, reset_epoch)
+        finally:
+            LR.subprocess = orig
+
+    def test_discover_via_graphql_genuine_failure_propagates_calledprocesserror(self):
+        class _Stub:
+            CalledProcessError = subprocess.CalledProcessError
+
+            def run(self, argv, **k):
+                raise subprocess.CalledProcessError(1, argv, output="", stderr="gh: authentication failed\n")
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            with self.assertRaises(subprocess.CalledProcessError):
+                LR.discover_via_graphql(repo="owner/name")
+        finally:
+            LR.subprocess = orig
+
+    def test_repo_owner_name_raises_ghratelimited_on_rest_403(self):
+        class _Stub:
+            CalledProcessError = subprocess.CalledProcessError
+
+            def run(self, argv, **k):
+                if "rate_limit" in argv:
+                    class R:
+                        returncode = 0
+                        stdout = "1735689600\n"
+                    return R()
+                raise subprocess.CalledProcessError(
+                    1, argv, output="", stderr="HTTP/2.0 403 Forbidden\nX-RateLimit-Remaining: 0\n")
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            with self.assertRaises(LR.GhRateLimited):
+                LR._repo_owner_name(None)
+        finally:
+            LR.subprocess = orig
+
+    def test_gh_rate_limit_reset_probe_is_fail_soft(self):
+        # The follow-up "when does it reset" probe failing must never itself raise — the caller
+        # (GhRateLimited.reset_at is None) applies a default cooldown instead.
+        class _Stub:
+            def run(self, argv, **k):
+                raise OSError("gh not found")
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            self.assertIsNone(LR._gh_rate_limit_reset())
+        finally:
+            LR.subprocess = orig
+
+
+class TestLiveTickRateLimitBackoff(LiveCase):
+    """HERD-582: LiveTick.run() must never let a classified rate limit raise (no fault streak),
+    must journal engine_rate_limited with the reset stamp, and must skip the gh round-trip
+    entirely on a subsequent tick while the backoff window is still active."""
+
+    def test_journals_engine_rate_limited_and_returns_calm_summary_without_raising(self):
+        os.environ["HERD_FAKE_NOW"] = "1735689000"
+        try:
+            class _RLDiscovery:
+                def discover(self):
+                    raise LR.GhRateLimited(reset_at=1735689600)
+
+            journal = LiveJournal(self.jpath)
+            state = LiveState(self.tmp)
+            t = LiveTick({}, _RLDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                         state=state)
+            result = t.run()  # must NOT raise
+        finally:
+            os.environ.pop("HERD_FAKE_NOW", None)
+        want_until = 1735689600 + LR._GH_RATE_LIMIT_BUFFER_SECONDS
+        self.assertTrue(result.get("rate_limited"))
+        self.assertEqual(result.get("rate_limited_until"), want_until)
+        evs = events(self.jpath)
+        rl = [e for e in evs if e["event"] == "engine_rate_limited"]
+        self.assertEqual(len(rl), 1)
+        self.assertEqual(int(rl[0]["reset"]), 1735689600)
+        self.assertEqual(int(rl[0]["until"]), want_until)
+        # no ordinary tick bookkeeping ran — this tick did no candidate walk at all
+        self.assertEqual([e["event"] for e in evs if e["event"] in ("live_tick_start", "live_tick_end")], [])
+        # the marker persisted so the NEXT tick can skip the gh round-trip outright
+        self.assertEqual(state.gh_rate_limited_until(), want_until)
+
+    def test_falls_back_to_the_default_cooldown_when_the_reset_probe_itself_failed(self):
+        # reset_at=None (the cheap follow-up probe failed too) must never block the calm path —
+        # fall back to the default cooldown rather than raising or leaving the tick unbounded.
+        os.environ["HERD_FAKE_NOW"] = "1735689000"
+        try:
+            class _RLDiscovery:
+                def discover(self):
+                    raise LR.GhRateLimited(reset_at=None)
+
+            journal = LiveJournal(self.jpath)
+            state = LiveState(self.tmp)
+            t = LiveTick({}, _RLDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                         state=state)
+            result = t.run()
+        finally:
+            os.environ.pop("HERD_FAKE_NOW", None)
+        want_until = 1735689000 + LR._GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS + LR._GH_RATE_LIMIT_BUFFER_SECONDS
+        self.assertTrue(result.get("rate_limited"))
+        self.assertEqual(result.get("rate_limited_until"), want_until)
+        rl = [e for e in events(self.jpath) if e["event"] == "engine_rate_limited"]
+        self.assertEqual(len(rl), 1)
+        self.assertEqual(int(rl[0]["until"]), want_until)
+
+    def test_skips_discovery_entirely_within_an_active_backoff_window(self):
+        state = LiveState(self.tmp)
+        state.set_gh_rate_limited_until(4102444800)  # far future (year 2100)
+        calls = []
+
+        class _CountingDiscovery:
+            def discover(self):
+                calls.append(1)
+                return []
+
+        journal = LiveJournal(self.jpath)
+        t = LiveTick({}, _CountingDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                     state=state)
+        result = t.run()
+        self.assertEqual(calls, [], "discovery must not be called while the backoff window is active")
+        self.assertTrue(result.get("rate_limited"))
+        self.assertEqual(result.get("rate_limited_until"), 4102444800)
+
+    def test_clears_the_marker_and_resumes_once_the_window_has_passed(self):
+        state = LiveState(self.tmp)
+        state.set_gh_rate_limited_until(1)  # already in the past
+        calls = []
+
+        class _CountingDiscovery:
+            def discover(self):
+                calls.append(1)
+                return []
+
+        journal = LiveJournal(self.jpath)
+        t = LiveTick({"MERGE_POLICY": "auto"}, _CountingDiscovery(), FixtureGates({}),
+                     DryRunActuator(journal), journal, state=state)
+        result = t.run()
+        self.assertEqual(len(calls), 1, "discovery must run again once the backoff window has passed")
+        self.assertFalse(result.get("rate_limited"))
+        self.assertEqual(state.gh_rate_limited_until(), 0, "the marker must clear on a clean discovery")
+
+    def test_genuine_discovery_failure_still_raises_and_never_journals_rate_limited(self):
+        class _BrokenDiscovery:
+            def discover(self):
+                raise subprocess.CalledProcessError(1, ["gh"], output="",
+                                                    stderr="gh: authentication failed\n")
+
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        t = LiveTick({}, _BrokenDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                     state=state)
+        with self.assertRaises(subprocess.CalledProcessError):
+            t.run()
+        evs = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertEqual([e for e in evs if e["event"] == "engine_rate_limited"], [])
 
 
 if __name__ == "__main__":

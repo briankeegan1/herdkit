@@ -56,22 +56,47 @@
 #         WIDE-BLAST list (bin/herd, herd-config.sh, agent-watch.sh, either healthcheck wrapper,
 #         templates/capabilities.tsv, this library, and the bats discovery surface), selects the
 #         ENTIRE curated set. Unmappable never means "select nothing"; it means "select everything".
-#   Plus an ALWAYS-RUN CORE (HERD_SUITE_CORE_TESTS): the cross-cutting manifest/lint/hermeticity
-#   proofs that ANY diff can trip regardless of which file it touched. The core is unioned into
-#   every scoped selection, so scoping can never drop them.
+#   Plus an ALWAYS-RUN CORE (herd_suite_core_tests, HERD-585: sourced from the committed
+#   tests/scope-core.tsv): the cross-cutting manifest/lint/hermeticity proofs that ANY diff can trip
+#   regardless of which file it touched. The core is unioned into every scoped selection, so scoping
+#   can never drop them.
 #
 #   The invariant this must never break: a scoped selection is a SUBSET of the curated set that
 #   still contains every test the rules above map from the diff, and the fail-closed paths return
 #   the curated set EXACTLY. tests/test-suite-scope.sh mutation-proves both halves (same discipline
 #   as the shard membership proof above): a dropped test can never read as green.
 
-# The ALWAYS-RUN CORE: proofs that guard cross-cutting invariants a diff to ANY file can violate —
-# the capability/config manifests, the shared gate lints, the conformance ledger, the suite's own
-# hermeticity guards, and this selection library itself. Space-separated basenames. A name that is
-# not in the curated set (retired/renamed/exempted) is dropped silently HERE — and asserted present
-# by tests/test-suite-scope.sh, so a rename is caught by the proof rather than silently shrinking
-# the core.
-HERD_SUITE_CORE_TESTS="${HERD_SUITE_CORE_TESTS:-test-caps-sync-light.sh test-config-manifest.sh test-conformance.sh test-daemon-hermeticity.sh test-doc-drift.sh test-env-export-lint.sh test-gate-coverage.sh test-git-scope-lint.sh test-healthcheck-project-env-manifest.sh test-hermetic-env-scrub.sh test-journal-hermeticity.sh test-pipe-safety.sh test-suite-shard.sh test-suite-scope.sh test-test-cap-ledger.sh}"
+# herd_suite_core_tests <tests_dir>
+#   Prints the ALWAYS-RUN CORE as a space-separated list of test basenames: proofs that guard
+#   cross-cutting invariants a diff to ANY file can violate — the capability/config manifests, the
+#   shared gate lints, the conformance ledger, the suite's own hermeticity guards, and this selection
+#   library itself.
+#
+#   An explicit HERD_SUITE_CORE_TESTS env var — even an empty string — overrides the committed file
+#   outright; that is the escape hatch a caller uses to isolate another rule from the core union
+#   (tests/test-suite-scope.sh's suite-deps checks do this). Otherwise the core is read from the
+#   committed tests/scope-core.tsv sitting alongside <tests_dir> (HERD-585): one bare test-*.sh
+#   basename per line, '#'-comments and blank lines ignored — never a hardcoded default in this
+#   library, so the core can never silently diverge from what is actually committed and reviewed
+#   (the incident this exists to prevent: PR #708 shipped a ghost config key because the diff-scoped
+#   selection paired a changed script only with its own paired test — tests/test-config-manifest.sh,
+#   the manifest's own ghost/dead-key scan, never ran). A name that is not in the curated set
+#   (retired/renamed/exempted) is dropped silently by the intersection in herd_suite_tests_for_diff —
+#   and asserted present by tests/test-suite-scope.sh, so a rename is caught by the proof rather than
+#   silently shrinking the core. Fail-soft: a missing <tests_dir> or missing tests/scope-core.tsv
+#   prints nothing — the caller's mutation-prove test is what should be loud about a deleted
+#   committed file, not this library silently reinventing a fallback nobody can review.
+herd_suite_core_tests() {
+  local _hct_dir="${1:-}"
+  if [ -n "${HERD_SUITE_CORE_TESTS+set}" ]; then
+    printf '%s' "$HERD_SUITE_CORE_TESTS"
+    return 0
+  fi
+  [ -n "$_hct_dir" ] && [ -f "$_hct_dir/scope-core.tsv" ] || return 0
+  grep -v '^[[:space:]]*#' "$_hct_dir/scope-core.tsv" 2>/dev/null \
+    | grep -v '^[[:space:]]*$' \
+    | tr '\n' ' '
+}
 
 # WIDE-BLAST paths: a change here can plausibly affect ANY test, so it selects the full curated set.
 # Space-separated repo-root-relative paths (matched exactly, after a leading './' is stripped):
@@ -256,9 +281,10 @@ EOF
     fi
   done
 
-  # ALWAYS-RUN CORE: unioned into every scoped selection, so the cross-cutting manifest/lint/
-  # hermeticity proofs run no matter which file the diff touched.
-  for _hsd_t in ${HERD_SUITE_CORE_TESTS:-}; do
+  # ALWAYS-RUN CORE (HERD-585): unioned into every scoped selection, so the cross-cutting manifest/
+  # lint/hermeticity proofs run no matter which file the diff touched. Sourced from the committed
+  # tests/scope-core.tsv via herd_suite_core_tests — see its header comment above.
+  for _hsd_t in $(herd_suite_core_tests "$_hsd_dir"); do
     [ -n "$_hsd_t" ] || continue
     _hsd_sel="${_hsd_sel}${_hsd_t}"$'\n'
   done
