@@ -1,0 +1,38 @@
+# tests/scope-core.tsv — the ALWAYS-RUN CORE for diff-scoped suite selection (HERD-585,
+# scripts/herd/suite-shard.sh's herd_suite_core_tests / herd_suite_tests_for_diff).
+#
+# Every name below is UNIONED into EVERY scoped selection, no matter which file a diff touched —
+# these are the cross-cutting whole-tree guards a diff to ANY file can trip: the capability/config
+# manifests, the shared gate lints, the conformance ledger, and the suite's own hermeticity and
+# selection-membership proofs.
+#
+# Format: one bare tests/test-*.sh basename per line. Blank lines and `#` comments are ignored. A
+# name that is not (or no longer) in the curated set — retired, renamed, newly exempted — is dropped
+# silently by the intersection in herd_suite_tests_for_diff, and asserted present here by
+# tests/test-suite-scope.sh, so a rename is caught by the proof rather than silently shrinking the
+# core.
+#
+# INCIDENT (HERD-585): PR #708 shipped a ghost config key because the diff-scoped selection paired
+# scripts/herd/journal-audit.sh only with its own test — tests/test-config-manifest.sh, the manifest's
+# own ghost/dead-key scan, never ran. test-config-manifest.sh is the row this file exists to make
+# impossible to drop again; the rest of the cross-cutting lint runners ride along with it because the
+# same escape shape applies to every one of them. tests/test-suite-scope.sh hardcodes this exact
+# required set INDEPENDENTLY of this file's contents, so a row dropped here (by accident or by a
+# future edit) reds the mutation-prove instead of silently shrinking the core.
+test-caps-sync-light.sh
+test-config-manifest.sh
+test-conformance.sh
+test-daemon-hermeticity.sh
+test-doc-drift.sh
+test-env-export-lint.sh
+test-gate-coverage.sh
+test-git-scope-lint.sh
+test-healthcheck-project-env-manifest.sh
+test-hermetic-env-scrub.sh
+test-journal-emission-lint.sh
+test-journal-hermeticity.sh
+test-lever-reachability-lint.sh
+test-pipe-safety.sh
+test-suite-scope.sh
+test-suite-shard.sh
+test-test-cap-ledger.sh

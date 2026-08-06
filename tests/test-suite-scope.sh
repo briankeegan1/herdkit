@@ -3,7 +3,7 @@
 # selection half of scripts/herd/suite-shard.sh (herd_suite_scope_mode / herd_suite_tests_for_diff)
 # and its wiring into bats discovery (tests/discover-tests.bash).
 #
-# suite-deps: scripts/herd/suite-shard.sh tests/discover-tests.bash .herd/healthcheck.project.sh
+# suite-deps: scripts/herd/suite-shard.sh tests/discover-tests.bash .herd/healthcheck.project.sh tests/scope-core.tsv
 #
 # WHY THIS SHAPE. A scoped suite that silently DROPS a test reads as GREEN — it just finishes faster.
 # That is the same defect class tests/test-suite-shard.sh exists to make impossible for sharding, so
@@ -22,6 +22,15 @@
 #        returning everything.)
 #   (4)  ALWAYS-RUN CORE: present in every scoped selection, AND every core name resolves in the real
 #        curated set — so a rename/retirement is caught here rather than silently shrinking the core.
+#   (4b) HERD-585: the committed tests/scope-core.tsv contains an INDEPENDENTLY hardcoded required
+#        set of cross-cutting guards (config-manifest, caps-sync, gate-coverage, journal-emission,
+#        pipe-safety, git-scope, doc-drift, lever-reachability) — hardcoded HERE, not read back from
+#        the file under test, so an edit that drops one of these rows reds this proof instead of
+#        silently shrinking the core (the PR #708 escape shape: a paired-test-only selection let a
+#        ghost config key merge because test-config-manifest.sh never ran).
+#   (4c) HERD-585 MUTATION-PROVE: dropping a row from a COPY of tests/scope-core.tsv actually drops
+#        that guard from a live scoped selection — proving the union really reads the committed file
+#        rather than a value that merely happens to agree with it right now.
 #   (5)  FAIL-CLOSED, wide-blast: EACH documented wide-blast path selects the curated set EXACTLY.
 #   (6)  FAIL-CLOSED, unmappable: a path no rule maps (docs, a nested backend, a template, a Python
 #        module) selects the curated set EXACTLY — and it does so even when it is mixed in with a
@@ -48,8 +57,9 @@ ROOT="$(cd "$HERE/.." && pwd)"
 LIB="$ROOT/scripts/herd/suite-shard.sh"
 DISC="$ROOT/tests/discover-tests.bash"
 WRAPPER="$ROOT/.herd/healthcheck.project.sh"
+CORE_TSV="$ROOT/tests/scope-core.tsv"
 
-for f in "$LIB" "$DISC"; do
+for f in "$LIB" "$DISC" "$CORE_TSV"; do
   [ -f "$f" ] || { echo "FAIL: missing required file: $f" >&2; exit 1; }
 done
 
@@ -103,8 +113,9 @@ ok "(2) mutation-prove: every one of $paired name-paired scripts/herd/*.sh selec
 # journal.sh is name-paired (tests/test-journal.sh), is not wide-blast, and declares no exotic deps.
 SEL1="$(herd_suite_tests_for_diff "$ROOT/tests" scripts/herd/journal.sh)"
 has "$SEL1" "test-journal.sh" || fail "(3) the paired test-journal.sh must be selected"
+CORE="$(herd_suite_core_tests "$ROOT/tests")"
 core_present=""
-for c in $HERD_SUITE_CORE_TESTS; do has "$CURATED" "$c" && core_present="${core_present}${c}"$'\n'; done
+for c in $CORE; do has "$CURATED" "$c" && core_present="${core_present}${c}"$'\n'; done
 expected="$(printf '%s\ntest-journal.sh\n' "$core_present" | sed '/^$/d' | LC_ALL=C sort -u)"
 [ "$SEL1" = "$expected" ] || fail "(3) a single-script diff must select EXACTLY its pair + the core.
 --- got ---
@@ -117,17 +128,50 @@ ok "(3) a single scripts/herd/foo.sh diff selects exactly its paired test + the 
 
 # ── (4) ALWAYS-RUN CORE: in every scoped selection, and every core name really exists ──────────────
 missing=""
-for c in $HERD_SUITE_CORE_TESTS; do
+for c in $CORE; do
   has "$CURATED" "$c" || missing="${missing}${c} "
 done
 [ -z "$missing" ] \
   || fail "(4) core test(s) absent from the curated set (renamed/retired/exempted?): $missing
-Fix HERD_SUITE_CORE_TESTS in scripts/herd/suite-shard.sh — a stale core name silently shrinks the
-always-run set that every scoped run depends on."
-for c in $HERD_SUITE_CORE_TESTS; do
+Fix tests/scope-core.tsv — a stale core name silently shrinks the always-run set that every scoped
+run depends on."
+for c in $CORE; do
   has "$SEL1" "$c" || fail "(4) core test $c missing from a scoped selection"
 done
 ok "(4) every always-run core test resolves in the real tree and appears in every scoped selection"
+
+# ── (4b) HERD-585: the committed core file must carry this REQUIRED set, hardcoded HERE rather than
+# read back from tests/scope-core.tsv — so an edit that drops one of these rows reds this proof
+# instead of silently shrinking the core (the PR #708 escape: a paired-test-only selection let a
+# ghost config key merge because test-config-manifest.sh never ran).
+REQUIRED_CORE="test-config-manifest.sh test-caps-sync-light.sh test-gate-coverage.sh test-journal-emission-lint.sh test-pipe-safety.sh test-git-scope-lint.sh test-doc-drift.sh test-lever-reachability-lint.sh"
+req_missing=""
+for c in $REQUIRED_CORE; do
+  grep -qxF -- "$c" "$CORE_TSV" || req_missing="${req_missing}${c} "
+done
+[ -z "$req_missing" ] \
+  || fail "(4b) tests/scope-core.tsv is missing required cross-cutting guard(s): $req_missing
+These are the guards HERD-585 exists to protect (the PR #708 ghost-key escape shape); restore the
+row(s) in tests/scope-core.tsv."
+ok "(4b) tests/scope-core.tsv carries every guard the HERD-585 required set names"
+
+# ── (4c) HERD-585 MUTATION-PROVE: dropping a row from a COPY of the committed core file actually
+# drops that guard from a live scoped selection — proving the union really reads the file rather than
+# a value that merely happens to agree with it right now.
+MUT="$T/mut/tests"; mkdir -p "$MUT"
+cp "$ROOT"/tests/test-*.sh "$MUT"/ 2>/dev/null
+[ -f "$ROOT/tests/gate-coverage-exempt.tsv" ] && cp "$ROOT/tests/gate-coverage-exempt.tsv" "$MUT"/
+DROP="test-config-manifest.sh"
+grep -Fxv "$DROP" "$CORE_TSV" > "$MUT/scope-core.tsv"
+unset HERD_SUITE_CORE_TESTS
+MUT_SEL="$(herd_suite_tests_for_diff "$MUT" scripts/herd/journal.sh)"
+! has "$MUT_SEL" "$DROP" \
+  || fail "(4c) removing $DROP from a copy of tests/scope-core.tsv did not drop it from the selection — the core union is not actually reading the file"
+cp "$CORE_TSV" "$MUT/scope-core.tsv"
+INTACT_SEL="$(herd_suite_tests_for_diff "$MUT" scripts/herd/journal.sh)"
+has "$INTACT_SEL" "$DROP" \
+  || fail "(4c) restoring $DROP to the fixture core file did not re-select it — sanity check on the fixture itself failed"
+ok "(4c) dropping a row from the committed core file drops that guard from a live scoped selection"
 
 # ── (5) FAIL-CLOSED: each wide-blast path selects the curated set EXACTLY ──────────────────────────
 for w in $HERD_SUITE_WIDE_BLAST; do
@@ -167,7 +211,7 @@ printf '#!/usr/bin/env bash\n# suite-deps: templates/models.tsv\n' > "$FIX/test-
 # A decoy file in the FIXTURE dir named like a glob expansion target: if a dep token were ever
 # glob-expanded against cwd instead of matched as a pattern, this is what would silently appear.
 : > "$FIX/backends-decoy.sh"
-CORE_SAVED="$HERD_SUITE_CORE_TESTS"
+# shellcheck disable=SC2034  # read by herd_suite_core_tests via ${HERD_SUITE_CORE_TESTS+set}, not by name here
 HERD_SUITE_CORE_TESTS=""                                    # isolate the dep rule from the core union
 d_exact="$(herd_suite_tests_for_diff "$FIX" templates/models.tsv)"
 [ "$d_exact" = "$(printf 'test-declared.sh\ntest-second.sh')" ] \
@@ -178,7 +222,7 @@ d_glob="$(cd "$FIX" && herd_suite_tests_for_diff "$FIX" scripts/herd/backends/gi
 d_none="$(herd_suite_tests_for_diff "$FIX" templates/other.tsv)"
 [ "$d_none" = "$(herd_suite_curated_tests "$FIX")" ] \
   || fail "(9) a path no dep declares is unmappable and must fail closed to the fixture's full set"
-HERD_SUITE_CORE_TESTS="$CORE_SAVED"
+unset HERD_SUITE_CORE_TESTS                                 # restore file-backed core for later checks
 ok "(9) suite-deps headers select their declaring tests by exact path and by glob, and never glob-expand cwd"
 
 # ── (10) SUBSET + SHAPE: a selection never invents a name and is sorted-unique ─────────────────────
