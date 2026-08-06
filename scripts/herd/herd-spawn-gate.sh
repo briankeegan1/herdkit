@@ -28,6 +28,12 @@
 # hiccup. A force-spawn override (HERD_FORCE_SPAWN=1, or the lane's --force flag) bypasses it for
 # urgent items.
 #
+# HERD-581 (HERD-557 P2): a THIRD condition — independent of the two above — also defers: the suite-
+# capacity LEDGER (scripts/herd/capacity-ledger.sh, behind CAPACITY_BUDGET) reporting itself fully
+# contended right now (capacity_suite_queue_saturated). This is the "spawning-into-idleness" fix
+# (docs/spikes/capacity-admission.md §1c) — a box whose suite capacity is maxed isn't idle just
+# because REVIEW_CONCURRENCY has room. Off/unavailable ledger → this leg never fires (fail-soft).
+#
 # Definitions:
 #   live_reviews   — .review-inflight-<pr>-<sha> markers whose recorded reviewer pid is still alive
 #                    (mirrors agent-watch.sh's _count_live_reviews; reimplemented here, not called).
@@ -130,8 +136,9 @@ print(n)
 }
 
 # herd_spawn_gate_saturated — compute the gate state ONCE and stash the counts in globals
-# (_SG_LIVE / _SG_QUEUED / _SG_BUILDERS / _SG_CONC / _SG_AHEAD) for the caller's message. Returns 0
-# (SATURATED → the caller should defer unless forced) or 1 (headroom → proceed). Advisory only.
+# (_SG_LIVE / _SG_QUEUED / _SG_BUILDERS / _SG_CONC / _SG_AHEAD / _SG_CAPACITY) for the caller's
+# message. Returns 0 (SATURATED → the caller should defer unless forced) or 1 (headroom → proceed).
+# Advisory only.
 herd_spawn_gate_saturated() {
   local conc ahead cap
   # HERD-159: shared numeric sanitizer (warns once on a non-empty non-numeric typo).
@@ -140,19 +147,38 @@ herd_spawn_gate_saturated() {
   _SG_LIVE="$(_sg_count_live_reviews)"
   _SG_QUEUED="$(_sg_count_queued_reviews)"
   _SG_BUILDERS="$(_sg_count_inflight_builders)"
-  _SG_CONC="$conc"; _SG_AHEAD="$ahead"
+  _SG_CONC="$conc"; _SG_AHEAD="$ahead"; _SG_CAPACITY=""
   cap=$((conc + ahead))
   # Both axes must hold: the review gate has no headroom AND builders already lead past the cap.
   if [ "$((_SG_LIVE + _SG_QUEUED))" -ge "$conc" ] && [ "$_SG_BUILDERS" -gt "$cap" ]; then
+    return 0
+  fi
+  # HERD-581 (HERD-557 P2): also defer while the suite-capacity LEDGER is already fully contended —
+  # closes the "spawning-into-idleness" pathology (docs/spikes/capacity-admission.md §1c): a box whose
+  # suite capacity is fully occupied is not idle just because REVIEW_CONCURRENCY happens to have
+  # headroom, since a new spawn would just queue its own suites behind the ones already waiting.
+  # Fail-soft: guarded via command -v so a tree/pre-source order missing capacity-ledger.sh never
+  # aborts this advisory check, and capacity_suite_queue_saturated itself is false whenever
+  # CAPACITY_BUDGET is off or the ledger is unavailable — byte-identical to before this leg existed.
+  if command -v capacity_suite_queue_saturated >/dev/null 2>&1 && capacity_suite_queue_saturated; then
+    _SG_CAPACITY=1
     return 0
   fi
   return 1
 }
 
 # herd_spawn_gate_emit_defer <slug> — print the standing "review-gate saturated" hold message using
-# the counts stashed by the most recent herd_spawn_gate_saturated call.
+# the counts stashed by the most recent herd_spawn_gate_saturated call. The marker string
+# 'review-gate saturated' is REQUIRED verbatim on the first line either way — agent-watch.sh's
+# spawn-queue drain (_drain_lane_worker) greps for it to tell a HELD spawn from a hard failure.
 herd_spawn_gate_emit_defer() {
   local slug="${1:-}"
+  if [ "${_SG_CAPACITY:-}" = "1" ]; then
+    printf '⏸️  review-gate saturated — suite capacity is fully contended, holding spawn until it frees%s\n' "${slug:+ (slug: $slug)}"
+    printf '   the suite-capacity ledger (CAPACITY_BUDGET) has no free unit right now — a new spawn would just queue its own suites behind ones already waiting.\n'
+    printf '   force past the gate for an urgent item:  HERD_FORCE_SPAWN=1  (or pass --force before the slug)\n'
+    return 0
+  fi
   printf '⏸️  review-gate saturated — holding spawn until a slot opens%s\n' "${slug:+ (slug: $slug)}"
   printf '   reviews in flight: %s live + %s queued ≥ REVIEW_CONCURRENCY=%s\n' \
     "${_SG_LIVE:-?}" "${_SG_QUEUED:-?}" "${_SG_CONC:-?}"
