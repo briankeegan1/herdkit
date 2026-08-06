@@ -193,6 +193,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # (_console_now_epoch, CONSOLE_LEDGER_MAX) rather than duplicating. Defines functions only; wholly
 # inert while RED_LEDGER=off (default).
 . "$HERE/red-ledger.sh"
+# Diff-scoped suite selection (HERD-532) — sourced for herd_suite_tests_for_diff / herd_suite_curated_
+# tests, which the scope-escape detector below needs to RECOMPUTE a sha's selection under the CURRENT
+# rules (never a replay of what an older run computed). Defines functions only; lib-safe.
+# shellcheck source=/dev/null
+. "$HERE/suite-shard.sh"
+# Scope-escape telemetry (HERD-575) — the shared detector both this file's main-health red leg and
+# .herd/healthcheck.project.sh's scoped-run recorder source, so they can never disagree about what
+# "scoped" means or how an escape is proven. Sourced after suite-shard.sh (it calls into it) and
+# journal.sh (it calls journal_append). Defines functions only; byte-inert unless a sha's gate was
+# previously recorded scoped — itself gated behind HEALTH_SUITE_SCOPE=diff's own default-off lever.
+# shellcheck source=/dev/null
+. "$HERE/scope-escape.sh"
 # Pre-spawn CLAIM (HERD-50) — sourced for its RELEASE half (herd_claim_release, HERD-162 F12), which
 # the dead-builder reconcile calls to un-wedge a tracker item whose builder died before opening a PR.
 # Sourcing DEFINES functions only (its lane entry point herd_claim_or_abort is never called from here);
@@ -9096,6 +9108,31 @@ _main_health_autofix_spawn() {
   return 0
 }
 
+# _scope_escape_detect <sha> <failing-identity> — HERD-575: THE main-health/CI red chokepoint hook.
+# If <sha>'s own gate previously ran SCOPED (scripts/herd/scope-escape.sh's herd_scope_gate_was_
+# scoped), recompute that selection fresh against $MAIN's actual diff for <sha> and, when the failing
+# test(s) named in <failing-identity> are absent from it, journal `scope_escape` and append ONE
+# advisory row to the committed suite-deps candidate ledger (tests/suite-deps-candidates.tsv). Fully
+# fail-soft: no gate_scoped record, no resolvable diff, an unparented sha, or a failing identity that
+# names no test-*.sh file are all silent no-ops — this can never itself paint a red or block anything,
+# and is byte-inert whenever the sha it is asked about was never recorded scoped in the first place.
+_scope_escape_detect() {
+  command -v herd_scope_escape_check >/dev/null 2>&1 || return 0
+  local _sed_sha="${1:-}" _sed_fail="${2:-}"
+  [ -n "$_sed_sha" ] && [ -n "${MAIN:-}" ] && [ -d "$MAIN/tests" ] || return 0
+  local -a _sed_changed=()
+  local _sed_p
+  while IFS= read -r _sed_p; do
+    [ -n "$_sed_p" ] && _sed_changed+=("$_sed_p")
+  done < <(git -C "$MAIN" diff --name-only "${_sed_sha}^" "$_sed_sha" 2>/dev/null)
+  [ "${#_sed_changed[@]}" -gt 0 ] || return 0
+  local _sed_row
+  _sed_row="$(herd_scope_escape_check "$_sed_sha" "$_sed_fail" "$MAIN/tests" "${_sed_changed[@]}")" || return 0
+  [ -n "$_sed_row" ] || return 0
+  herd_scope_escape_append_candidate "$MAIN/tests/suite-deps-candidates.tsv" "${_sed_row}"$'\t'"candidate"
+  return 0
+}
+
 # _main_health_set_red <pr#> <sha> <healthcheck-oneline> [kind=local|ci] [ci-run-id] — a main sha
 # REPRODUCED a red in the given SCOPE (HERD-372: "local" for the healthcheck suite, "ci" for the
 # branch-CI leg; local is the default so the existing local-suite caller needs no change). MERGES into
@@ -9126,6 +9163,9 @@ _main_health_set_red() {
   printf '%s\x1f%s\x1f%s\x1f%s\n' "$_sr_sha" "$_sr_since" "$_sr_local" "$_sr_ci" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
   _sr_render="$_sr_local"; [ -n "$_sr_render" ] || _sr_render="$_sr_ci"
   journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_render" since "$_sr_since"
+  # HERD-575: was THIS sha's own gate a SCOPED run? A red surfacing here — downstream of that gate,
+  # never caught by it — is a candidate scope escape. Best-effort; never alters the verdict above.
+  _scope_escape_detect "$_sr_sha" "$_sr_render"
   # HERD-539: cache the SAME diagnosing text just journaled above into the shared red-ledger, keyed on
   # this sha, so build_main_health's row can render it back verbatim + an honest last-verified stamp.
   # No-op when RED_LEDGER is off.

@@ -1,0 +1,13 @@
+# tests/suite-deps-candidates.tsv — HERD-575 SUITE-DEPS CANDIDATE LEDGER: advisory rows a PROVEN
+# scope escape appends (scripts/herd/scope-escape.sh's herd_scope_escape_check, via the main-health
+# red leg in scripts/herd/agent-watch.sh) — never a human, never anything gating. Each row maps a
+# test the diff-scoped selection (HERD-532) MISSED to the changed path(s) whose sha later reded
+# downstream, on a sha whose own gate had run scoped — the exact undeclared `# suite-deps:` coverage
+# the miss proves. Rows are a WORKLIST, not a manifest: nothing reads this file to change gate
+# behavior. A human/builder PROMOTES a row by adding the real `# suite-deps:` header line to the
+# named test (see scripts/herd/suite-shard.sh) and then deleting the row here.
+#
+# Columns: test (comma-joined if more than one test missed the same escape) · changed_paths
+# (';'-joined) · sha (the red sha the escape was proven on) · status (always 'candidate' until a
+# human promotes/deletes the row — this file never sets any other value).
+test	changed_paths	sha	status

@@ -8189,6 +8189,7 @@ refix_bounces = 0
 limit_parks = 0
 limit_resumes = 0
 reaps = 0
+scope_escapes = 0
 cost_usd = 0.0
 cost_events = 0
 for o in rows:
@@ -8208,6 +8209,8 @@ for o in rows:
         limit_resumes += 1
     elif ev == "reap":
         reaps += 1
+    elif ev == "scope_escape":
+        scope_escapes += 1
     elif ev == "cost":
         cost_usd += fnum(o.get("usd"))
         cost_events += 1
@@ -8241,6 +8244,7 @@ print("    by provenance         %s" % kv(verdicts_by_source))
 print("  Refix bounces      %d" % refix_bounces)
 print("  Limit park/resume  %d / %d" % (limit_parks, limit_resumes))
 print("  Reaps              %d" % reaps)
+print("  Scope escapes      %d" % scope_escapes)
 print("  Cost recorded      $%.4f (%d event%s)" % (cost_usd, cost_events, "" if cost_events == 1 else "s"))
 if not rows:
     print("")
