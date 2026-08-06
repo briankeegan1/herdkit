@@ -180,6 +180,7 @@ JOURNAL_AUDIT_RED_TTL	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_MERGE_GRACE	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_PUSHED_GRACE	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_ACT	unit	tests/test-journal-audit-act.sh
+JOURNAL_AUDIT_ESCALATE_AFTER	unit	tests/test-journal-audit-act.sh
 journal-act.sh	unit	tests/test-journal-audit-act.sh
 LIFECYCLE_CONTRACTS	unit	tests/test-lifecycle-contracts.sh
 LIFECYCLE_CONTRACTS	unit	tests/test-lifecycle-lane-workers.sh
