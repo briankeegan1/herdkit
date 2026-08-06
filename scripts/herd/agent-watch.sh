@@ -193,6 +193,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # (_console_now_epoch, CONSOLE_LEDGER_MAX) rather than duplicating. Defines functions only; wholly
 # inert while RED_LEDGER=off (default).
 . "$HERE/red-ledger.sh"
+# Diff-scoped suite selection (HERD-532) — sourced for herd_suite_tests_for_diff / herd_suite_curated_
+# tests, which the scope-escape detector below needs to RECOMPUTE a sha's selection under the CURRENT
+# rules (never a replay of what an older run computed). Defines functions only; lib-safe.
+# shellcheck source=/dev/null
+. "$HERE/suite-shard.sh"
+# Scope-escape telemetry (HERD-575) — the shared detector both this file's main-health red leg and
+# .herd/healthcheck.project.sh's scoped-run recorder source, so they can never disagree about what
+# "scoped" means or how an escape is proven. Sourced after suite-shard.sh (it calls into it) and
+# journal.sh (it calls journal_append). Defines functions only; byte-inert unless a sha's gate was
+# previously recorded scoped — itself gated behind HEALTH_SUITE_SCOPE=diff's own default-off lever.
+# shellcheck source=/dev/null
+. "$HERE/scope-escape.sh"
 # Pre-spawn CLAIM (HERD-50) — sourced for its RELEASE half (herd_claim_release, HERD-162 F12), which
 # the dead-builder reconcile calls to un-wedge a tracker item whose builder died before opening a PR.
 # Sourcing DEFINES functions only (its lane entry point herd_claim_or_abort is never called from here);
@@ -9096,6 +9108,31 @@ _main_health_autofix_spawn() {
   return 0
 }
 
+# _scope_escape_detect <sha> <failing-identity> — HERD-575: THE main-health/CI red chokepoint hook.
+# If <sha>'s own gate previously ran SCOPED (scripts/herd/scope-escape.sh's herd_scope_gate_was_
+# scoped), recompute that selection fresh against $MAIN's actual diff for <sha> and, when the failing
+# test(s) named in <failing-identity> are absent from it, journal `scope_escape` and append ONE
+# advisory row to the committed suite-deps candidate ledger (tests/suite-deps-candidates.tsv). Fully
+# fail-soft: no gate_scoped record, no resolvable diff, an unparented sha, or a failing identity that
+# names no test-*.sh file are all silent no-ops — this can never itself paint a red or block anything,
+# and is byte-inert whenever the sha it is asked about was never recorded scoped in the first place.
+_scope_escape_detect() {
+  command -v herd_scope_escape_check >/dev/null 2>&1 || return 0
+  local _sed_sha="${1:-}" _sed_fail="${2:-}"
+  [ -n "$_sed_sha" ] && [ -n "${MAIN:-}" ] && [ -d "$MAIN/tests" ] || return 0
+  local -a _sed_changed=()
+  local _sed_p
+  while IFS= read -r _sed_p; do
+    [ -n "$_sed_p" ] && _sed_changed+=("$_sed_p")
+  done < <(git -C "$MAIN" diff --name-only "${_sed_sha}^" "$_sed_sha" 2>/dev/null)
+  [ "${#_sed_changed[@]}" -gt 0 ] || return 0
+  local _sed_row
+  _sed_row="$(herd_scope_escape_check "$_sed_sha" "$_sed_fail" "$MAIN/tests" "${_sed_changed[@]}")" || return 0
+  [ -n "$_sed_row" ] || return 0
+  herd_scope_escape_append_candidate "$MAIN/tests/suite-deps-candidates.tsv" "${_sed_row}"$'\t'"candidate"
+  return 0
+}
+
 # _main_health_set_red <pr#> <sha> <healthcheck-oneline> [kind=local|ci] [ci-run-id] — a main sha
 # REPRODUCED a red in the given SCOPE (HERD-372: "local" for the healthcheck suite, "ci" for the
 # branch-CI leg; local is the default so the existing local-suite caller needs no change). MERGES into
@@ -9126,6 +9163,9 @@ _main_health_set_red() {
   printf '%s\x1f%s\x1f%s\x1f%s\n' "$_sr_sha" "$_sr_since" "$_sr_local" "$_sr_ci" > "$MAIN_HEALTH_STATE" 2>/dev/null || true
   _sr_render="$_sr_local"; [ -n "$_sr_render" ] || _sr_render="$_sr_ci"
   journal_append main_health pr "$_sr_pr" sha "$_sr_sha" result red failed "$_sr_render" since "$_sr_since"
+  # HERD-575: was THIS sha's own gate a SCOPED run? A red surfacing here — downstream of that gate,
+  # never caught by it — is a candidate scope escape. Best-effort; never alters the verdict above.
+  _scope_escape_detect "$_sr_sha" "$_sr_render"
   # HERD-539: cache the SAME diagnosing text just journaled above into the shared red-ledger, keyed on
   # this sha, so build_main_health's row can render it back verbatim + an honest last-verified stamp.
   # No-op when RED_LEDGER is off.
@@ -13938,6 +13978,11 @@ _reconcile_wedged_builder() {
 #      'escalated' and journal finish_stall_escalated — the re-task did not finish the job.
 #   3. 'escalated' is terminal: the needs-you row keeps rendering, nothing fires again, until the slug
 #      escapes (a PR opens, the agent starts working, or the signature clears).
+#
+# HERD-574: finish_stall_detected/finish_stall_escalated also carry kind=uncommitted (dirty tracked
+# tree — the fix-hermetic-guard-taint incident: modified files, never committed) vs kind=unpushed
+# (clean tree, commits ahead of origin) — a single at-a-glance dimension over the commits/dirty fields
+# already journaled, so a journal consumer can filter/count by work-signature without recomputing it.
 
 # _finish_stall_min — FINISH_STALL_MIN in whole minutes on stdout + rc 0, or rc 1 (nothing printed)
 # when the leg is OFF: unset, empty, non-numeric, or <= 0. A typo can never turn this on.
@@ -14272,7 +14317,7 @@ _reconcile_finish_stall() {
   local _rfs_slug="$1" _rfs_wt="$2" _rfs_astatus="$3" _rfs_branch="$4"
   _finish_stall_enabled || { printf 'OFF'; return 0; }
   local _rfs_now _rfs_grace _rfs_rec _rfs_first="" _rfs_state="" _rfs_commits=0 _rfs_dirty=0 \
-        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict _rfs_mark_out _rfs_mark_epoch _rfs_mark_state
+        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict _rfs_mark_out _rfs_mark_epoch _rfs_mark_state _rfs_kind
   _rfs_now="$(_now)"
   _rfs_grace="$(_finish_stall_grace_secs)"
   case "$_rfs_astatus" in
@@ -14285,6 +14330,13 @@ _reconcile_finish_stall() {
       fi
       ;;
   esac
+  # HERD-574: the single at-a-glance work-signature dimension for the journal — kind=uncommitted for
+  # a dirty tracked tree (the fix-hermetic-guard-taint incident: modified files, never committed),
+  # kind=unpushed for a clean tree sitting on commits ahead of its own remote. Computed once here from
+  # the SAME commits/dirty probe already run above, so FIRST_STALL and SECOND_STALL both journal the
+  # identical classification for one (slug, anchor) stall — never recomputed, never drifting between
+  # the two events for the same incident.
+  _rfs_kind="unpushed"; [ "$_rfs_dirty" = "1" ] && _rfs_kind="uncommitted"
   _rfs_rec="$(_finish_stall_record "$_rfs_slug")"
   if [ -n "$_rfs_rec" ]; then
     IFS=$'\t' read -r _rfs_first _rfs_state <<< "$_rfs_rec"
@@ -14308,7 +14360,7 @@ _reconcile_finish_stall() {
       fi ;;
     FIRST_STALL)
       journal_append finish_stall_detected slug "$_rfs_slug" first_seen "${_rfs_first:-$_rfs_now}" \
-        commits "$_rfs_commits" dirty "$_rfs_dirty"
+        commits "$_rfs_commits" dirty "$_rfs_dirty" kind "$_rfs_kind"
       # DRYRUN is checked BEFORE the once-guard, never after: the guard marks the action SPENT, and a
       # dry run must never spend it — an operator who explores with AGENT_WATCH_DRYRUN=1 and then
       # disables it must still get the real nudge on the next tick, not find it silently pre-consumed
@@ -14328,7 +14380,7 @@ _reconcile_finish_stall() {
               "${_rfs_slug}: unfinished work with no PR — finish-line nudge delivered, agent is working again" default ;;
           *)
             _finish_stall_state "$_rfs_slug" escalated
-            journal_append finish_stall_escalated slug "$_rfs_slug" reason "wake failed"
+            journal_append finish_stall_escalated slug "$_rfs_slug" reason "wake failed" kind "$_rfs_kind"
             herd_driver_notify "⚠️ builder stalled before opening a PR: ${_rfs_slug}" \
               "${_rfs_slug}: work exists (uncommitted or unpushed) but the agent stopped and the auto re-task did not land — push + open the PR by hand" default ;;
         esac
@@ -14336,7 +14388,7 @@ _reconcile_finish_stall() {
     SECOND_STALL)
       if _finish_stall_action_once "$_rfs_slug" "escalate:${_rfs_first:-$_rfs_now}"; then
         _finish_stall_state "$_rfs_slug" escalated
-        journal_append finish_stall_escalated slug "$_rfs_slug" reason "stalled again after re-task"
+        journal_append finish_stall_escalated slug "$_rfs_slug" reason "stalled again after re-task" kind "$_rfs_kind"
         herd_driver_notify "⚠️ builder stalled again before opening a PR: ${_rfs_slug}" \
           "${_rfs_slug}: re-tasked once already but stopped again with work still unshipped — push + open the PR by hand" default
       fi ;;
@@ -17711,9 +17763,10 @@ _spawn_clear_held() {
 # lane observably spawned, because the lanes have TWO no-builder exits a fire-and-forget launch could
 # never see:
 #   • the lane's own advisory saturation gate defers with EXIT 0 and the stable marker line
-#     'review-gate saturated' (herd_spawn_gate_emit_defer) — a HELD spawn, not a failure: the
-#     intent is RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain
-#     stops for this tick (siblings would also defer against the same gate);
+#     'review-gate saturated' (herd_spawn_gate_emit_defer) OR 'agent capacity lease unavailable'
+#     (herd_capacity_lease_emit_defer, HERD-581) — a HELD spawn, not a failure: the intent is
+#     RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain stops for this
+#     tick (siblings would also defer against the same gate/lease);
 #   • a hard failure (bad slug, existing worktree, git/network error) exits non-zero — the intent
 #     is dropped LOUDLY (skip + journal), never silently.
 # Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
@@ -17778,7 +17831,7 @@ _drain_lane_worker() {
   # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
   # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
   # spawn_claim_lost rather than report a spawn_launched for an intent still sitting in the queue.
-  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then  # pipe-ok: bounded command output, under a pipe buffer
+  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -Eq 'review-gate saturated|agent capacity lease unavailable'; then  # pipe-ok: bounded command output, under a pipe buffer
     # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent back for
     # a later tick. The drain already stopped for this tick when it launched this worker.
     if bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1; then

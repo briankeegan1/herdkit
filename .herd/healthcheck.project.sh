@@ -636,6 +636,27 @@ EOF
         HERD_SUITE_SCOPE_TESTS="$(printf '%s' "$_hk_scope_sel" | tr '\n' ' ')"
         export HERD_SUITE_SCOPE_TESTS
         _HK_SCOPE_NOTE=" · diff-scoped $(printf '%s\n' "$_hk_scope_sel" | grep -c .)/$(printf '%s\n' "$_hk_scope_all" | grep -c .) tests"
+        # HERD-575: persist that THIS sha's gate ran scoped — the durable record a later main-health/
+        # CI red on the same sha needs to prove a scope ESCAPE (scripts/herd/scope-escape.sh). Fully
+        # best-effort in its own subshell: a missing lib, an unresolvable sha, or no WORKTREES_DIR (no
+        # .herd/config, or the HERD-458 scrub above already stripped it from THIS process — resolved
+        # fresh here the same way _hk_scope_changed's DEFAULT_BRANCH and _hk_regtabs' WORKTREES_DIR
+        # are, both above) all skip silently — never blocks or reds the gate.
+        if [ -f scripts/herd/scope-escape.sh ] && [ -f scripts/herd/journal.sh ]; then
+          _hk_scope_sha="$(git rev-parse HEAD 2>/dev/null || true)"
+          if [ -n "$_hk_scope_sha" ]; then
+            _hk_scope_wtd=""
+            [ -f .herd/config ] && _hk_scope_wtd="$(. .herd/config 2>/dev/null && printf '%s' "${WORKTREES_DIR:-}")"
+            (
+              WORKTREES_DIR="$_hk_scope_wtd"
+              # shellcheck source=scripts/herd/journal.sh
+              . scripts/herd/journal.sh
+              # shellcheck source=scripts/herd/scope-escape.sh
+              . scripts/herd/scope-escape.sh
+              herd_scope_gate_record "$_hk_scope_sha" "$_hk_scope_sel" "$_hk_scope_all"
+            ) 2>/dev/null || true
+          fi
+        fi
       fi
     fi
   fi
