@@ -240,6 +240,47 @@ def refix_complete_min_num(value):
     return int(s)
 
 
+# ── gate-config generation fingerprint (HERD-576, leg 2) ─────────────────────────────────────
+# A sha-cached red verdict can stand for a long time (the once-guard holds it, and an escalated
+# rail's durable latch — see live_runtime.py's `_refix_rail_escalated` — now stops bouncing it
+# entirely). If an operator RELEASES a changed gate posture in the meantime (bumps the refix
+# budget, flips an autofix lever) the standing red was evaluated under the OLD posture, and
+# nothing on the row explains that — an operator reading "needs you · refix limit (3 rounds)
+# reached" has no way to tell a stale verdict from a fresh one. This fingerprint answers that
+# WITHOUT a new config key or any new env-export wiring (AGENTS.md ship-dormant/no-scope-creep):
+# it hashes a small, EXPLICIT, already-resolved subset of `_CORE_ENV_KEYS`
+# (live_runtime.py:_CORE_ENV_KEYS) — the knobs that change how a rail's red is INTERPRETED or
+# ACTED on, not the knobs that only change unrelated behavior (view filters, concurrency, …).
+GATE_CONFIG_GEN_KEYS = ("REFIX_MAX_ROUNDS", "HEALTHCHECK_AUTOFIX", "HEALTH_TRUST_BUILDER", "GATE_STATUS")
+
+
+def gate_config_generation(config):
+    """A short, STABLE fingerprint of the gate-affecting config subset (:data:`GATE_CONFIG_GEN_KEYS`).
+
+    Deterministic across processes/restarts for the same config values (plain string hashing, no
+    randomness, no clock) — two watcher instances (or a watcher before/after a restart) with an
+    UNCHANGED config always agree, and any single key's value changing changes the fingerprint.
+    ``config`` is a plain dict (as already assembled by ``_config_from_env`` / a test fixture);
+    a missing key reads as the empty string, so an unset knob is part of the fingerprint too (an
+    operator SETTING a previously-unset lever is itself a posture change worth flagging).
+    """
+    import hashlib
+    canon = "\x1f".join("%s=%s" % (k, config.get(k, "") if config else "") for k in GATE_CONFIG_GEN_KEYS)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:12]
+
+
+def gate_config_generation_hint(cached_generation, current_generation):
+    """The advisory hint text when a cached verdict's generation PREDATES the current gate config,
+    else ``None``. Fail-soft / no false positive: a missing ``cached_generation`` (a verdict cached
+    before this feature existed, or a fixture that never set one) never flags a mismatch — there is
+    no earlier fingerprint to compare against, so silence is the honest answer, not a guess."""
+    if not cached_generation or not current_generation:
+        return None
+    if cached_generation == current_generation:
+        return None
+    return "cached verdict predates gate config — new sha required"
+
+
 def refix_complete_window_elapsed(now_epoch, bounce_ts, complete_min):
     """True iff at least ``complete_min`` minutes have passed since ``bounce_ts``.
 

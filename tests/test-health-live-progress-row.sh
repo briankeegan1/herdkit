@@ -18,6 +18,12 @@
 #   (4) LEG 3 — the k/N counter (_health_progress) and the liveness note (_health_inflight_note) prefer
 #       "<log>.progress" (the new streaming companion, HERD-533 leg 1) over the bare <log>, and fall
 #       back to <log> when no companion exists — today's exact behavior.
+#   (5) HERD-570 leg 2 — a 'suite: N tests' header + mixed raw/noise lines: the counter reads k/N by
+#       counting ONLY '[health-progress] …' completion lines, ignoring every other line in the file.
+#   (6) HERD-570 leg 2 — headerless: the exact same mix of '[health-progress]' + noise lines, minus the
+#       header, falls back to today's plain byte-line count (never mis-parsed as [health-progress]).
+#   (7) HERD-570 leg 3 — RETRY: once "<log>.retry.progress" exists and is newer than "<log>.progress",
+#       both the source and the inflight note switch onto it and the note is prefixed "retry 1 · ".
 #
 # Sources agent-watch.sh in lib mode (AGENT_WATCH_LIB=1); stubs gh/git/herdr so nothing touches the
 # network or the live control room. Run:  bash tests/test-health-live-progress-row.sh
@@ -92,4 +98,54 @@ got_fallback="$(_health_progress "$LOG")"
   || fail "(4) with no companion, _health_progress must fall back to reading <log> itself, got: '$got_fallback'"
 ok
 
-echo "ALL PASS ($pass checks) — the render row distinguishes queued-vs-running and its k/N counter tracks the new streaming companion."
+# ── (5) HERD-570 leg 2: header + mixed lines → k/N counts ONLY [health-progress] lines ───────────────
+LOG2="$T/hdr.log"
+PROG2="$LOG2.progress"
+cat > "$PROG2" <<'EOF'
+suite: 5 tests
+bash -n scripts/herd/foo.sh: clean
+shellcheck: clean (retried=no)
+[health-progress] test-alpha.sh ok
+some interleaved raw suite noise that is not a completion line
+[health-progress] test-beta.sh ok
+[health-progress] test-gamma.sh FAIL
+EOF
+got_hdr="$(_health_progress "$LOG2")"
+[ "$got_hdr" = "3/5" ] \
+  || fail "(5) header+mixed fixture must render '3/5' (3 completion lines / 5 header total), got: '$got_hdr'"
+note_hdr="$(_health_inflight_note "$LOG2")"
+[ "$note_hdr" = "3/5" ] || fail "(5b) _health_inflight_note must pass the header-based k/N through unprefixed, got: '$note_hdr'"
+ok
+
+# ── (6) HERD-570 leg 2: the SAME mix, minus the header, falls back to the plain line count ───────────
+LOG3="$T/nohdr.log"
+PROG3="$LOG3.progress"
+grep -v '^suite: ' "$PROG2" > "$PROG3"
+got_nohdr="$(_health_progress "$LOG3")"
+[ -z "$got_nohdr" ] \
+  || fail "(6) a headerless sidecar must never be parsed via the [health-progress] path, got: '$got_nohdr'"
+note_nohdr="$(_health_inflight_note "$LOG3")"
+[ "$note_nohdr" = "$(grep -c '' "$PROG3") lines" ] \
+  || fail "(6b) a headerless sidecar must fall back to today's plain line count, got: '$note_nohdr'"
+ok
+
+# ── (7) HERD-570 leg 3: a live retry companion, once newer, wins the source AND prefixes the note ────
+LOG4="$T/retry.log"
+PROG4="$LOG4.progress"
+RETRY4="$LOG4.retry.progress"
+printf 'suite: 5 tests\n[health-progress] test-alpha.sh ok\nnot ok 2 test-alpha.sh\n' > "$PROG4"
+sleep 1.1
+printf 'suite: 5 tests\n[health-progress] test-alpha.sh ok\n' > "$RETRY4"    # fresher: the solo re-run
+got_retry_src="$(_health_progress_source "$LOG4")"
+[ "$got_retry_src" = "$RETRY4" ] \
+  || fail "(7) a newer .retry.progress must win over .progress, got source: '$got_retry_src'"
+got_retry_note="$(_health_inflight_note "$LOG4")"
+[ "$got_retry_note" = "retry 1 · 1/5" ] \
+  || fail "(7b) the inflight note must read 'retry 1 · 1/5' while the retry companion is live, got: '$got_retry_note'"
+rm -f "$RETRY4"
+got_after_note="$(_health_inflight_note "$LOG4")"
+[ "$got_after_note" = "1/5" ] \
+  || fail "(7c) once the retry companion is gone again, the note must revert to the bare (unprefixed) k/N, got: '$got_after_note'"
+ok
+
+echo "ALL PASS ($pass checks) — the render row distinguishes queued-vs-running, its k/N counter tracks the new streaming companion (header-scoped and headerless), and a live solo retry visibly switches the source."

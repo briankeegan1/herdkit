@@ -539,6 +539,51 @@ def _append_refix_ledger(state_dir, line):
         return False
 
 
+# ── durable per-rail EXHAUSTION LATCH (HERD-576) ──────────────────────────────────────────────────
+# The refix round cap is already correctly re-derived from the durable ledger every tick (a FRESH
+# `python3 -m herd.live_runtime --tick` subprocess each cycle, HERD-358) — that arithmetic survives a
+# watcher restart on its own. This latch adds a SEPARATE, restart-safe belt: a dedicated one-file-per-
+# (pr, rail) marker under $TREES, the same shape as every other restart-safe marker this pool already
+# carries (`.review-inflight-*`, `.health-dispatch-*`, HERD-185's pattern of "one small file names one
+# fact") — so "this rail's budget is spent" is a durably PERSISTED fact the moment it is first true,
+# not only an inference re-derived by re-scanning the whole ledger. Once written, the latch survives
+# ANY restart and keeps STOPPING bounces on that rail even if the ledger scan were ever wrong; it is
+# cleared the moment the rail's red genuinely resolves (`refix_rail_reset`), exactly when the ledger
+# count itself zeroes (contract §4's refund-on-green). NOT sha-keyed: a rail's exhaustion — like its
+# budget — spans every sha until a reset, the same scope `refix_rail_count` already uses.
+def _refix_escalated_path(state_dir, pr, kind):
+    """Path to the durable exhaustion latch for this ``(pr, rail)``; ``None`` with no state dir."""
+    return os.path.join(state_dir, ".refix-escalated-%s-%s" % (pr, kind)) if state_dir else None
+
+
+def _refix_rail_escalated(state_dir, pr, kind):
+    """True iff this rail's budget was already latched exhausted and has not been reset since."""
+    path = _refix_escalated_path(state_dir, pr, kind)
+    return bool(path) and os.path.exists(path)
+
+
+def _mark_refix_rail_escalated(state_dir, pr, kind):
+    """Write the durable latch; a no-op (never raises) with no state dir or on I/O failure."""
+    path = _refix_escalated_path(state_dir, pr, kind)
+    if not path:
+        return
+    try:
+        open(path, "w", encoding="utf-8").close()
+    except Exception:
+        pass
+
+
+def _clear_refix_rail_escalated(state_dir, pr, kind):
+    """Remove the durable latch; a no-op when absent, with no state dir, or on I/O failure."""
+    path = _refix_escalated_path(state_dir, pr, kind)
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _pid_starttime(pid):
     """A stable per-pid start-time token (agent-watch.sh:_pid_starttime) — the marker's recycling guard.
     ``ps -o lstart=`` is portable across macOS/BSD+Linux; empty when ps cannot answer (caller then falls
@@ -1083,6 +1128,38 @@ class LiveState:
                 fh.write("%s\t%s\n" % (verdict, detail or ""))
         except Exception:
             pass
+
+    # gate-config generation side-channel (HERD-576, leg 2) ───────────────────────────────────────
+    # A SEPARATE file from the classic sha-cache above (never shares a name, never changes its
+    # format) — purely additive: it exists ONLY to answer "did this cached red predate the current
+    # gate config", and its absence (every cache written before this feature, or a SQLite-backend
+    # pool where the store never gained a column for it) is a first-class, silent "unknown, no hint"
+    # answer, never an error. See herd.decisions.gate_config_generation / gate_config_generation_hint.
+    def health_generation_file(self, cand):
+        return self._p(".health-result-gen-%s-%s" % (cand.pr, cand.sha))
+
+    def record_health_generation(self, cand, generation):
+        path = self.health_generation_file(cand)
+        if not path or not cand.sha:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%s\n" % generation)
+        except Exception:
+            pass
+
+    def health_cached_generation(self, cand):
+        """The generation fingerprint recorded alongside this cached verdict, or ``None`` when
+        absent/unreadable (a pre-feature cache, a store-backend pool, or a sim with no state dir)."""
+        path = self.health_generation_file(cand)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                gen = fh.readline().strip()
+        except Exception:
+            return None
+        return gen or None
 
     # merge-result-gate substrate (MERGE_RESULT_GATE, §6.4, HERD-296) ─────────────────────────────
     # A SEPARATE namespace from the classic health substrate above — never shares a filename with it —
@@ -2355,6 +2432,10 @@ class LiveGates:
                     _chaos_kill("mid_gate_collect")
                     self._collect_env_suspect(cand, st.health_log_file(cand))
                     st.record_health_result(cand, verdict, detail)
+                    # HERD-576 leg 2: stamp the gate-config generation ALONGSIDE the verdict this
+                    # exact tick observed it under, so a later tick can tell whether the operator has
+                    # since released a changed gate posture — see gate_config_generation's docstring.
+                    st.record_health_generation(cand, D.gate_config_generation(self.config))
                     st.rm(disp, inflight)
                     return verdict
                 # Nonce matched but the payload is unparseable / truncated → an infra death, NOT a verdict;
@@ -4464,12 +4545,22 @@ class LiveTick:
         if D.refix_attempted(rows, pr_str, sha_str, kind):
             return None, None
 
-        # 2. Budget check: exhausted → needs-you escalation, no bounce.
+        # 2. DURABLE LATCH (HERD-576): a rail already latched exhausted stays exhausted — a cheap,
+        #    restart-safe short-circuit that never re-derives the count, so a new sha on an already-
+        #    spent rail escalates even if the ledger scan below were ever wrong. See the latch's own
+        #    docstring (above _refix_escalated_path) for why this is a SEPARATE fact from the ledger.
+        if _refix_rail_escalated(state_dir, pr_str, kind):
+            return None, (D.refix_budget_reason(rows, pr_str, kind, self.config.get("REFIX_MAX_ROUNDS"))
+                          or "refix limit reached")
+
+        # 3. Budget check: exhausted → needs-you escalation, no bounce. Latch it durably so this rail
+        #    STOPS bouncing from here on, across any restart, until its red genuinely resolves.
         reason = D.refix_budget_reason(rows, pr_str, kind, self.config.get("REFIX_MAX_ROUNDS"))
         if reason:
+            _mark_refix_rail_escalated(state_dir, pr_str, kind)
             return None, reason
 
-        # 3. Fresh (pr, sha, kind) with budget remaining → record the bounce.
+        # 4. Fresh (pr, sha, kind) with budget remaining → record the bounce.
         rail = D.refix_rail_count(rows, pr_str, kind)
         round_num = rail + 1
         slug = str(cand.slug) if cand.slug else "-"
@@ -4502,6 +4593,17 @@ class LiveTick:
         except OSError:
             pass
 
+    def _health_gen_hint_suffix(self, cand):
+        """HERD-576 leg 2: `` · <hint>`` when this PR's cached health verdict was stamped under an
+        older gate-config generation than the one running THIS tick, else ``""`` (byte-identical
+        append — every caller can unconditionally concatenate this). See
+        herd.decisions.gate_config_generation_hint for the fail-soft "no cached generation, no
+        hint" rule (a verdict cached before this feature existed never false-flags)."""
+        cached_gen = self.state.health_cached_generation(cand)
+        current_gen = D.gate_config_generation(self.config)
+        hint = D.gate_config_generation_hint(cached_gen, current_gen)
+        return " · %s" % hint if hint else ""
+
     def _refix_rail_reset(self, cand, kind,
                           reason="rail resolved its red — per-rail refix budget restored"):
         """Append a ``reset`` row when the rail has unresolved bounces (fail-soft no-op otherwise).
@@ -4512,6 +4614,10 @@ class LiveTick:
         the refund-on-green wording; :meth:`_bounce_and_wake` (HERD-370) overrides it for the OTHER
         refund case — an unwoken bounce, where the red is emphatically NOT resolved."""
         state_dir = self.state.dir
+        # The rail's red resolved — the durable exhaustion latch (HERD-576) must never outlive that
+        # fact, even when the ledger scan below finds nothing left to zero (a stale/hand-planted
+        # marker, or a reset raced ahead of a bounce this same tick).
+        _clear_refix_rail_escalated(state_dir, str(cand.pr), kind)
         text = _read_refix_ledger(state_dir)
         rows = D.parse_refix_ledger(text)
         n = D.refix_rail_count(rows, str(cand.pr), kind)
@@ -5079,6 +5185,17 @@ class LiveTick:
             # Rail resolved → refund its per-rail budget (contract §4, bash line 10419).
             self._refix_rail_reset(cand, "health")
         if health == "CODEERROR":
+            # HERD-576 leg 2: a STANDING red (this sha's verdict came from the cache, `reused_health`
+            # true — not freshly collected THIS tick) whose stamped generation predates the gate
+            # config running right now means an operator released a changed gate posture WHILE this
+            # red sat cached. Checked every tick (independent of bounce/hold/escalate) but journaled
+            # at most once per (pr, sha) — a fresh collect always stamps the CURRENT generation, so
+            # this can only ever fire on a REUSED cache entry, never a same-tick fresh one.
+            if getattr(self.gates, "reused_health", False):
+                hint = self._health_gen_hint_suffix(cand)
+                if hint and self.state.once(cand.pr, cand.sha, "health_gen_hint"):
+                    self.journal.append("health_gate_config_stale", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "detail", hint.lstrip(" ·"))
             # Three-way bounce gate (HERD-358).  See _refix_check_and_record for the semantics.
             round_num, reason = self._refix_check_and_record(cand, "health")
             if round_num is None and reason is None:
@@ -5093,9 +5210,10 @@ class LiveTick:
                 if self.state.once(cand.pr, cand.sha, "refix_escalated_health"):
                     rows_after = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
                     total = D.refix_total_count(rows_after, str(cand.pr))
+                    escalated_reason = reason + " — health-check still red" + self._health_gen_hint_suffix(cand)
                     self.journal.append("health_refix_escalated", "pr", cand.pr, "sha", cand.sha,
                                         "slug", cand.slug, "rounds", total,
-                                        "reason", reason + " — health-check still red")
+                                        "reason", escalated_reason)
                 return ESCALATE
             # Contract §3.4 refix_bounce shape (pr, sha, slug, round, agent_status_before, rule,
             # location) — the port unifies both rails under one event keyed by `rule` (there is no

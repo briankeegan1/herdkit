@@ -331,6 +331,7 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `cross_seat_block_scan` | pr, sha, state(degraded), reason | `agent-watch.sh:_xseat_journal_degraded` — restored HERD-446 alongside `cross_seat_block_honored`; the FAIL-SOFT twin (an unreadable commit/comment scan, or an unresolvable seat identity, reports no standing block but leaves a forensic trail of why) |
 | `tab_discipline_retired` / `_stray` / `_capped` | tab_id, label, reason(unregistered\|kind:&lt;k&gt;) · capped: found, retired, cap | `tab-discipline.sh:herd_tab_discipline_sweep` (HERD-569 — the reconciled tab-bar sweep. `_retired` is a real close under `TAB_DISCIPLINE=on`; `_stray` is the `report`-mode detection that closes nothing; `_capped` records a pass that found more strays than `HERD_TAB_DISCIPLINE_MAX` and deferred the rest to the next cadence) |
 | `review_viewer_tab_fallback` | pr, slug, reason(builder-tab-gone\|split-failed) | `herd-review.sh` (HERD-569 — the headless review viewer normally SPLITS into the builder's tab; this records the one condition under which it still opens a standalone `review·<slug>` tab, which is also the condition its `callsite` exemption row is granted on) |
+| `health_gate_config_stale` | pr, sha, slug, detail | port `live_runtime.py:LiveTick._walk` (HERD-576 leg 2 — a REUSED (cache-hit, not freshly collected) CODEERROR verdict whose stamped gate-config generation predates the generation running THIS tick; journaled once per (pr, sha) via `herd.decisions.gate_config_generation`/`gate_config_generation_hint`) |
 
 `merge_result_gate` (pr, sha, slug, base, verdict — §6.4, HERD-296) and `merge_queue_hold` /
 `merge_queue_window` (pr, sha, slug, front_pr — §6.3, HERD-273) are Python-port-only additions with
@@ -426,6 +427,41 @@ port must honor the per-rail model, not the legacy shared one.
 The port models the budget as typed per-`(pr, rail)` counters + a lifetime total, with
 reset-on-green as an explicit transition — exactly the "doctrine-by-comment becomes a typed
 transition function" win of `docs/spikes/engine-port-python.md` §0.2.
+
+**The durable exhaustion latch (HERD-576).** The ledger-derived arithmetic above already survives a
+watcher restart on its own — `_refix_budget_reason` re-reads the durable `$REFIX_STATE` file fresh
+every call, and the live engine core runs as a FRESH `python3 -m herd.live_runtime --tick` subprocess
+every cycle (`engine-version.sh:herd_engine_live_tick`), so there is no in-process counter to lose.
+A SEPARATE, dedicated one-file-per-`(pr, rail)` marker — `$TREES/.refix-escalated-<pr>-<kind>`,
+`live_runtime.py:_refix_rail_escalated` / `_mark_refix_rail_escalated` / `_clear_refix_rail_escalated`,
+mirrored in bash at `agent-watch.sh:_refix_rail_escalated` — adds a belt-and-suspenders restart-safe
+STOP: written the moment `refix_budget_reason` first returns non-`None` for a `(pr, rail)`, consulted
+BEFORE re-deriving the cap on every later check, and cleared unconditionally at the top of
+`refix_rail_reset` (bash) / `LiveTick._refix_rail_reset` (python) the instant the rail's red genuinely
+resolves — the same instant the ledger count itself zeroes. This is the SAME one-file-names-one-fact
+shape as every other restart-safe marker in the pool (`.review-inflight-*`, `.health-dispatch-*`, the
+HERD-185 pattern): once written it stops that rail bouncing across ANY restart even if the ledger scan
+were ever wrong. NOT sha-keyed — a rail's exhaustion, like its budget, spans every sha until a reset.
+Live today on the health/review rails (`live_runtime.py:LiveTick._refix_check_and_record`) and the
+still-bash-live CI rail (`agent-watch.sh:_handle_ci_repair` / `_handle_ci_fastbounce`, which shares the
+`kind="health"` marker file with the python health rail since both bounce off the same CI-red-shares-
+health-rail budget, HERD-495). The dead-but-test-driven review/stale/health bash handlers do not carry
+the write half (no live call site to exercise it), so their coverage stays the pure ledger arithmetic
+alone — see §7 (test/sim-only bash), unchanged by this addition.
+
+**Gate-config generation hint (HERD-576 leg 2).** A sha-cached CODEERROR verdict can stand for a long
+time once its rail is latched. `herd.decisions.gate_config_generation(config)` fingerprints a small,
+explicit, ALREADY-resolved config subset — `GATE_CONFIG_GEN_KEYS` = `REFIX_MAX_ROUNDS`,
+`HEALTHCHECK_AUTOFIX`, `HEALTH_TRUST_BUILDER`, `GATE_STATUS` — no new config key, no new env-export
+wiring. `LiveGates.health()`'s COLLECT branch stamps this generation into a side-channel file
+(`LiveState.record_health_generation`, `$TREES/.health-result-gen-<pr>-<sha>` — a SEPARATE file from
+the classic `.health-result-<pr>-<sha>` cache, never changing that format) at the exact moment a fresh
+verdict is cached; a cache-HIT reuse never re-stamps. When `_walk` observes a REUSED (not freshly
+collected) CODEERROR whose stamped generation differs from the CURRENT tick's
+`gate_config_generation`, it journals `health_gate_config_stale` once per `(pr, sha)` with the advisory
+text `gate_config_generation_hint` returns: *"cached verdict predates gate config — new sha required"*.
+Fail-soft: a missing stamp (a cache written before this feature existed, or under `STORE_BACKEND=sqlite`,
+whose schema carries no column for it) never false-flags — no earlier fingerprint to compare against.
 
 ---
 

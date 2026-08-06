@@ -15,6 +15,12 @@
 # verdict from <log-path> the moment the suite ends and keeps following <log-path> afterward so the
 # pane never goes stale/idle at a bare shell prompt.
 #
+# RETRY-AWARE (HERD-570 leg 3): a live solo retry-before-red writes its own progress companion at
+# "<log-path>.retry.progress" (mirroring live_runtime.py's _run(), called once per attempt). This
+# viewer swaps its tail target onto it the instant it appears/gets newer than the main companion —
+# the SAME preference order agent-watch.sh's _health_progress_source now uses for the console row —
+# so the pane visibly follows the retry lap instead of staying frozen on run 1's stale companion.
+#
 # "The suite ended" is read off the OBSERVED inflight marker (the same $TREES/.health-inflight-<pr>-
 # <sha> file the reconcile's retire half watches) rather than "<log-path> became non-empty" — the bash
 # engine's <log-path> is non-empty almost from the first appended byte, so that signal alone would
@@ -28,6 +34,7 @@ set -uo pipefail
 LOG="${1:?usage: health-pane-view.sh <log-path> [inflight-marker]}"
 MARK="${2:-}"
 PROG="$LOG.progress"
+RETRY="$LOG.retry.progress"
 
 clear 2>/dev/null || true
 
@@ -37,18 +44,29 @@ clear 2>/dev/null || true
 TPID=""
 _hpv_stop() { [ -n "$TPID" ] || return 0; kill "$TPID" 2>/dev/null || true; wait "$TPID" 2>/dev/null || true; TPID=""; }
 
-SRC="$LOG"
-[ -e "$PROG" ] && SRC="$PROG"
+# _hpv_preferred_src — RETRY (present, and newer than or the only companion) > PROG > LOG, mirroring
+# agent-watch.sh's _health_progress_source exactly so the pane and the console row never disagree
+# about which file is "the live one" right now.
+_hpv_preferred_src() {
+  if [ -s "$RETRY" ] && { [ ! -s "$PROG" ] || [ "$RETRY" -nt "$PROG" ]; }; then
+    printf '%s' "$RETRY"; return 0
+  fi
+  [ -e "$PROG" ] && { printf '%s' "$PROG"; return 0; }
+  printf '%s' "$LOG"
+}
+
+SRC="$(_hpv_preferred_src)"
 tail -n +1 -F "$SRC" 2>/dev/null & TPID=$!
 
 if [ -n "$MARK" ]; then
   while [ -e "$MARK" ]; do
-    # The sidecar can appear AFTER we already latched onto the main log (a spawn that raced the
-    # worker's own truncate of .progress) — swap onto it the first tick it shows up. Happens at most
-    # once per pane lifetime.
-    if [ "$SRC" != "$PROG" ] && [ -e "$PROG" ]; then
+    # The preferred source can change AFTER we already latched onto an earlier one — the sidecar
+    # appearing (a spawn that raced the worker's own truncate of .progress), or a solo retry starting
+    # (.retry.progress appearing/going newer) — swap onto it the moment that happens.
+    _hpv_want="$(_hpv_preferred_src)"
+    if [ "$SRC" != "$_hpv_want" ]; then
       _hpv_stop
-      SRC="$PROG"
+      SRC="$_hpv_want"
       tail -n +1 -F "$SRC" 2>/dev/null & TPID=$!
     fi
     sleep 1

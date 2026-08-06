@@ -229,5 +229,45 @@ class HypothesisProperties(unittest.TestCase):
         check()
 
 
+class GateConfigGeneration(unittest.TestCase):
+    """HERD-576 leg 2: the gate-config generation fingerprint + its advisory hint predicate."""
+
+    def test_deterministic_for_identical_config(self):
+        cfg = {"REFIX_MAX_ROUNDS": "3", "HEALTHCHECK_AUTOFIX": "false"}
+        self.assertEqual(D.gate_config_generation(dict(cfg)), D.gate_config_generation(dict(cfg)))
+
+    def test_changes_when_a_tracked_key_changes(self):
+        base = {"REFIX_MAX_ROUNDS": "3"}
+        changed = {"REFIX_MAX_ROUNDS": "5"}
+        self.assertNotEqual(D.gate_config_generation(base), D.gate_config_generation(changed))
+
+    def test_unset_key_is_part_of_the_fingerprint(self):
+        # Setting a previously-unset lever is itself a posture change worth flagging.
+        self.assertNotEqual(D.gate_config_generation({}),
+                            D.gate_config_generation({"GATE_STATUS": "off"}))
+
+    def test_untracked_key_never_moves_the_fingerprint(self):
+        base = {"REFIX_MAX_ROUNDS": "3"}
+        with_noise = {"REFIX_MAX_ROUNDS": "3", "WATCHER_VIEW": "mine", "HEALTH_CONCURRENCY": "9"}
+        self.assertEqual(D.gate_config_generation(base), D.gate_config_generation(with_noise))
+
+    def test_hint_none_on_match(self):
+        gen = D.gate_config_generation({"REFIX_MAX_ROUNDS": "3"})
+        self.assertIsNone(D.gate_config_generation_hint(gen, gen))
+
+    def test_hint_none_when_cached_generation_missing(self):
+        gen = D.gate_config_generation({"REFIX_MAX_ROUNDS": "3"})
+        self.assertIsNone(D.gate_config_generation_hint(None, gen))
+        self.assertIsNone(D.gate_config_generation_hint("", gen))
+
+    def test_hint_fires_on_mismatch(self):
+        old = D.gate_config_generation({"REFIX_MAX_ROUNDS": "3"})
+        new = D.gate_config_generation({"REFIX_MAX_ROUNDS": "5"})
+        hint = D.gate_config_generation_hint(old, new)
+        self.assertIsNotNone(hint)
+        self.assertIn("cached verdict predates gate config", hint)
+        self.assertIn("new sha required", hint)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
