@@ -16267,6 +16267,14 @@ SWEEP_LIB=1
 . "$HERE/sweep.sh"
 unset SWEEP_LIB
 
+# ── Tab-discipline reconcile (HERD-569) ──────────────────────────────────────────────────────────
+# tab-discipline.sh reconciles the OBSERVED tab bar against the tabs the invariant allows (registered
+# builders, the scribe, the control room, the committed exemptions) and retires the rest. Sourced
+# AFTER _herd_tabs_drop_row above, whose registry prune it reuses when a retired stray left a row
+# behind. Ship-dormant: TAB_DISCIPLINE=off (the default) makes herd_tab_discipline_sweep a hard no-op.
+# shellcheck source=/dev/null
+. "$HERE/tab-discipline.sh"
+
 # ── Retirement invariant (HERD-164) ──────────────────────────────────────────────────────────────
 # retirement.sh reconciles "a merged/closed slug owns nothing" on EVERY tick, composing _reap_slug
 # (above) with sweep.sh's dirt/unique-commit proof helpers — so it must be sourced after BOTH. It
@@ -17377,6 +17385,12 @@ EOF
   if [ "$_ORPHAN_SWEEP_TICK" -ge "$_ORPHAN_SWEEP_INTERVAL" ]; then
     _ORPHAN_SWEEP_TICK=0
     _sweep_orphan_tabs
+    # Tab-discipline reconcile (HERD-569) rides the SAME cadence, immediately after: the orphan sweep
+    # has just closed every registered tab whose slug died and pruned the rows, so this pass reconciles
+    # a tab bar that is already as small as the allowlist model can make it — and whatever is LEFT that
+    # is neither a registered builder, the scribe, the control room, nor a committed exemption is a
+    # genuine stray rather than a race with the sweep above. Byte-inert unless TAB_DISCIPLINE is armed.
+    herd_tab_discipline_sweep
   fi
 
   # Tracker-state self-heal (HERD-86): every _TRACKER_SWEEP_INTERVAL ticks re-assert Done for any
@@ -17546,8 +17560,24 @@ fi
 # dogfood gate carried a permanent daemon-hermeticity red. Everything between the old and new
 # position is refusal logic plus a one-shot self-exec of this same script — no daemon, no loop, and
 # the re-exec's second pass funnels straight back into this guard.
+#
+# HERD-571 REFUSAL-VS-LEAK TAG: the SAME "a refusal is not a leak" principle, one layer deeper. A test
+# whose own subject IS this exact choke point (e.g. tests/test-watcher-boot-journal.sh case (a), or
+# test-daemon-hermeticity.sh's guard proof) deliberately drives a reach here — that reach is EXPECTED,
+# not a leak, even though it still must exit 0 the same way. A caller that is deliberately exercising
+# the refusal opts in with HERD_HERMETIC_GUARD_REFUSAL=1, tagging its own log line "refusal" as a 4th
+# TSV field; every other caller (an untagged reach — a test that forgot to stub a watcher spawn, or
+# `cmd_reload`'s background fallback genuinely trying to launch one) is tagged "leak", UNCHANGED from
+# today's behavior. This is belt-and-suspenders: .herd/healthcheck.project.sh's _hk_dh_verdict only
+# reds on "leak"-tagged (or legacy untagged) lines now, so a future test that shares the outer harness's
+# HERD_HERMETIC_GUARD without pinning a private log — reaching this guard for a refusal it deliberately
+# opted into — no longer poisons the whole suite. INERT for every existing caller: the opt-in var is
+# unset everywhere except where a test explicitly sets it, so the log line is byte-identical (same 3
+# fields, "leak" implied) for anyone who doesn't ask for the new behavior.
 if [ -n "${HERD_HERMETIC_GUARD:-}" ]; then
-  printf '%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" \
+  _hg_kind="leak"
+  [ -n "${HERD_HERMETIC_GUARD_REFUSAL:-}" ] && _hg_kind="refusal"
+  printf '%s\t%s\t%s\t%s\n' "agent-watch.sh" "${WORKSPACE_NAME:-?}" "$(pwd 2>/dev/null || echo '?')" "$_hg_kind" \
     >> "$HERD_HERMETIC_GUARD" 2>/dev/null || true
   journal_append watcher_boot_failed pid "$$" phase hermetic_guard \
     reason "test-hermeticity-redirect" workspace "${WORKSPACE_NAME:-}" component agent-watch
