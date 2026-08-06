@@ -3864,7 +3864,16 @@ def _stale_dup_enabled(config):
 def _stale_base_autofix_enabled(config):
     """STALE_BASE_AUTOFIX — SHIP-DORMANT (default off): mirrors agent-watch.sh's
     ``_stale_base_autofix_enabled`` truthy set, the same one ``_merge_result_gate_enabled`` and
-    siblings use. Any unrecognized value is off — never accidentally on from a typo."""
+    siblings use. Any unrecognized value is off — never accidentally on from a typo.
+
+    HERD-601: ``config`` here MUST have come from :func:`_config_from_env` (or a caller that
+    otherwise threads the key through) — ``STALE_BASE_AUTOFIX`` is a member of ``_CORE_ENV_KEYS``.
+    Before this fix the key was missing from that tuple, so a real ``--tick`` child never saw an
+    operator's ``STALE_BASE_AUTOFIX=on`` at all: this always read "" and the whole bounce /
+    resolver-dispatch branch below was permanently dead in production even though the unit tests
+    (which inject the key directly into a literal config dict, bypassing the env seam entirely)
+    stayed green — the ported healer (HERD-584/PR #716) never fired a single live
+    ``stale_base_autofix_bounce`` despite the lever reading "on"."""
     val = str((config or {}).get("STALE_BASE_AUTOFIX", "") or "").strip().lower()
     return val in ("1", "true", "on", "yes", "enable", "enabled")
 
@@ -5865,7 +5874,7 @@ _REVIEW_FASTPATH_KEYS = ("REVIEW_PREGATE", "REVIEW_MECH_FLOOR", "REVIEW_MECH_FLO
 _CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
                     "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
                     "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE",
-                    "HEALTH_TRUST_BUILDER")
+                    "HEALTH_TRUST_BUILDER", "STALE_BASE_AUTOFIX")
                    + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS
                    + _REVIEW_FASTPATH_KEYS)
 

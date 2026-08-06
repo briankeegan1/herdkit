@@ -2260,6 +2260,44 @@ class TestStaleDupGate(LiveCase):
         self.assertFalse([o for o in ev if o["event"] == "stale_base_autofix_bounce"])
         self.assertTrue([o for o in ev if o["event"] == "refix_escalated_no_wake"])
 
+    # ── HERD-601 LIVE-FIRING PROOF: the lever resolved through the SAME os.environ seam a real
+    # `--tick` child uses (_config_from_env), not a hand-built dict. Every test above injects
+    # STALE_BASE_AUTOFIX directly into a literal config dict passed to LiveTick — that proves the
+    # bounce/resolver-dispatch CODE works, but it never exercises the actual wire from an operator's
+    # `.herd/config` to this process's config dict, and that wire is exactly where the bug was: the
+    # key was missing from _CORE_ENV_KEYS/herd-config.sh's export sweep, so a real live tick's
+    # `self.config.get("STALE_BASE_AUTOFIX")` always read "" no matter what herd-config.sh resolved
+    # STALE_BASE_AUTOFIX to in the shell — the ported healer (HERD-584/PR #716) sat live in
+    # production with the lever reading "on" (`.herd/config: STALE_BASE_AUTOFIX="on"`) and fired
+    # ZERO `stale_base_autofix_bounce` events across two real holds (#714, #718). This test fails on
+    # the pre-fix tree (config.get returns None, not "on") and proves the SAME LiveTick.run() call
+    # every test above already exercises actually reaches BLOCK/stale_base_autofix_bounce when the
+    # value arrives the way production delivers it — env, not a fixture dict.
+    def test_stale_base_autofix_reaches_live_tick_via_config_from_env(self):
+        self.addCleanup(os.environ.pop, "STALE_BASE_AUTOFIX", None)
+        self.addCleanup(os.environ.pop, "MERGE_POLICY", None)
+        self.addCleanup(os.environ.pop, "DEFAULT_BRANCH", None)
+        os.environ["STALE_BASE_AUTOFIX"] = "on"
+        os.environ["MERGE_POLICY"] = "auto"
+        os.environ["DEFAULT_BRANCH"] = "main"
+        config = LR._config_from_env()
+        self.assertEqual(config.get("STALE_BASE_AUTOFIX"), "on",
+                          "_config_from_env must thread an exported STALE_BASE_AUTOFIX through — "
+                          "the HERD-601 gap (missing from _CORE_ENV_KEYS/herd-config.sh's export)")
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+        res, ev = self._tick_live(
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
+                 agent_status="dead"),
+            config)
+        self.assertEqual(res["outcomes"]["7"], "BLOCK")
+        bounce = [o for o in ev if o["event"] == "stale_base_autofix_bounce"]
+        self.assertEqual(len(bounce), 1,
+                         "stale_base_autofix_bounce must land in the journal off an env-sourced "
+                         "config — this is the exact event that never fired live")
+        self.assertEqual(bounce[0]["pr"], 7)
+        self.assertEqual(bounce[0]["sha"], feat_sha)
+
     def test_stale_no_wake_fallback_declines_without_a_worktree(self):
         # Unit-level: no worktree to resolve in place -> the fallback is inapplicable, never
         # dispatches, and never journals (mirrors _handle_stale_dup's "no builder/worktree" branch,
