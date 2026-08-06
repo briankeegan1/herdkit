@@ -27,7 +27,10 @@
 #       same shape as (3b)/(3c), and recurrence-escalate via (3d)'s machinery like any other no-action
 #       class. HERD-602 (3g): an unmapped class dedups its filing on the CLASS, not the per-finding key
 #       — two distinct keys of the same unmapped class in one sweep, or across sweeps, still file only
-#       ONE tracker item, ever.
+#       ONE tracker item, ever. HERD-606: merged_hv_no_approval is ALSO a deliberate no-action class
+#       (3h), same shape and same #723 pattern as (3e)/(3f); and (3i) proves the per-class recurrence
+#       high-water mark — a historical journal replay of an ALREADY-counted event must never inflate
+#       the recurrence tally, even when the once-guard's own per-key protection is lost.
 #
 # Fully hermetic: writes only under a mktemp dir; the shared-pool once-guard lands in the temp
 # WORKTREES_DIR, so the at-most-once guarantee is proven against the REAL store, not a stub.
@@ -114,6 +117,12 @@ reset_surfaces() {
   mkdir -p "$T/trees/.herd"
   : > "$JOURNAL_FILE"; : > "$HERD_JOURNAL_AUDIT_INBOX"
   rm -f "$HERD_JOURNAL_AUDIT_SEEN" "$HERD_JOURNAL_AUDIT_PENDING" "$HERD_JOURNAL_AUDIT_NOACTION_COUNT" "$RAILLOG" "$SCRIBELOG" "$T/rail.fail" "$T/scribe.fail"
+  # HERD-606: the per-class no-action recurrence high-water mark lives in the shared pool (pool-root
+  # .agent-watch-noaction-hwm-<class> flat files, or the sqlite backend once one engages) and — like
+  # the once-guard state under .herd/ above — is deliberately NOT reset by the "wipe .herd wholesale"
+  # line: it is meant to survive a restart. Between UNRELATED test cases it must still start fresh, or
+  # a later case's identical event timestamp reads as "already counted" by an earlier case's mark.
+  rm -f "$T"/trees/.agent-watch-noaction-hwm-* 2>/dev/null || true
 }
 run_audit() {  # run_audit <on|off> [extra KEY=VALUE env assignments…]
   # `env` (not a bare assignment prefix): a QUOTED "${@:2}" expansion is a command word to bash, not a
@@ -395,6 +404,57 @@ out="$(run_audit on)" || fail "(3f) sweep 2 exited non-zero: $out"
 [ "$(grep -c '"result":"no_action"' "$JOURNAL_FILE")" = "1" ] || fail "(3f) the no-action must journal exactly once, ever"
 pass
 echo "PASS (3f) checkout_unclean is a deliberate no-action class — journals a reason once, never acts on the live journal"
+
+# ── (3h) merged_hv_no_approval is a DELIBERATE no-action class (HERD-606, #723 pattern): the PR is
+#         already merged, so no rail can retroactively verify unrun HUMAN-VERIFY steps or undo the
+#         merge — real signal, but nothing bounded to route it to ──────────────────────────────────────
+reset_surfaces
+jline "2026-08-05T12:00:00Z" '"event":"merge","pr":211,"slug":"hv-211","sha":"decaf211"'
+jline "2026-08-05T12:01:00Z" '"event":"reap","pr":211,"slug":"hv-211","sha":"decaf211","reason":"merged"'
+printf 'Some PR body.\n\nHUMAN-VERIFY:\n- smoke test the UI\n' > "$T/bodies/211.md"
+out="$(run_audit on)" || fail "(3h) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3h) merged_hv_no_approval must never reach a rail, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3h) merged_hv_no_approval must never file a tracker item, got $(scribe_calls)"
+grep -q '"class":"merged_hv_no_approval".*"result":"no_action"' "$JOURNAL_FILE" \
+  || fail "(3h) merged_hv_no_approval must journal result=no_action: $(grep audit_acted "$JOURNAL_FILE")"
+grep -q 'audit-noaction:merged_hv_no_approval' "$HERD_JOURNAL_AUDIT_INBOX" || fail "(3h) the no-action must still get an advisory inbox row"
+grep -q '"event":"journal_audit".*"kind":"merged_hv_no_approval"' "$JOURNAL_FILE" || fail "(3h) merged_hv_no_approval must still be REPORTED (advisory)"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(3h) a no-action class must never be tracked as pending"
+out="$(run_audit on)" || fail "(3h) sweep 2 exited non-zero: $out"
+out="$(run_audit on)" || fail "(3h) sweep 3 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3h) merged_hv_no_approval must never reach a rail across sweeps, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3h) merged_hv_no_approval must never file across sweeps, got $(scribe_calls)"
+[ "$(grep -c '"result":"no_action"' "$JOURNAL_FILE")" = "1" ] || fail "(3h) the no-action must journal exactly once, ever"
+pass
+echo "PASS (3h) merged_hv_no_approval is a deliberate no-action class — journals a reason once, never acts on the live journal"
+
+# ── (3i) HERD-606: the no-action recurrence counter's per-class HIGH-WATER MARK backstops the
+#         per-key once-guard. Simulate the once-guard's protection being lost (its fallback ledger is
+#         tail-trimmed, or a pool GC drops old markers — see _ja_act_once's own comment) so the SAME
+#         checkout_unclean event is re-claimed as "new" on a later sweep: the HWM (the event's own
+#         timestamp never having advanced) must still stop it from inflating the recurrence tally a
+#         second time — the exact false-filing shape HERD-604/605 exists to prevent.
+reset_surfaces
+jline "2026-08-05T15:00:00Z" '"event":"checkout_unclean","result":"detected","head":"abc12345","paths":"scratch.txt","detached":"no"'
+out="$(run_audit on HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX=2)" || fail "(3i) sweep 1 exited non-zero: $out"
+[ "$(scribe_calls)" = "0" ] || fail "(3i) sweep 1 must not yet reach the recurrence threshold, got $(scribe_calls)"
+grep -q '^checkout_unclean	1$' "$HERD_JOURNAL_AUDIT_NOACTION_COUNT" \
+  || fail "(3i) sweep 1 must count exactly one occurrence: $(cat "$HERD_JOURNAL_AUDIT_NOACTION_COUNT" 2>/dev/null)"
+# Simulate the once-guard losing its claim on this key (its flat marker under .herd/ is gone — the
+# SAME failure mode _ja_act_once's own comment calls out for its seen-ledger fallback) WITHOUT touching
+# the HWM state (which lives at the pool root, not under .herd/ — see reset_surfaces above).
+rm -f "$T"/trees/.herd/once-* 2>/dev/null || true
+out="$(run_audit on HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX=2)" || fail "(3i) sweep 2 exited non-zero: $out"
+# The once-guard WAS bypassed (proof the simulated loss actually took effect): a second no_action fired.
+[ "$(grep -c '"class":"checkout_unclean".*"result":"no_action"' "$JOURNAL_FILE")" = "2" ] \
+  || fail "(3i) the once-guard loss must be real (a second no_action expected): $(grep audit_acted "$JOURNAL_FILE")"
+# But the HWM must have refused to recount the SAME (non-newer) timestamp — no premature recurrence.
+grep -q '^checkout_unclean	1$' "$HERD_JOURNAL_AUDIT_NOACTION_COUNT" \
+  || fail "(3i) a historical replay (same event ts) must NOT advance the recurrence count: $(cat "$HERD_JOURNAL_AUDIT_NOACTION_COUNT" 2>/dev/null)"
+[ "$(scribe_calls)" = "0" ] \
+  || fail "(3i) a historical replay must never file a false recurrence item (HERD-604/605), got $(scribe_calls)"
+pass
+echo "PASS (3i) HERD-606: the per-class high-water mark stops a historical journal replay from inflating the recurrence tally, even when the once-guard's own protection is lost"
 
 # ── (3g) HERD-602: an unmapped class that keeps recurring under DISTINCT finding keys (a new pr, a
 #         new ts) must still file EXACTLY ONE tracker item, ever — dedup keyed on the CLASS, not the

@@ -54,6 +54,10 @@ unresolvable pool / unreadable db degrades to the safe default, never a red row 
         # rc 0 = won (fire the side effect), rc 3 = already claimed (dedup)
     python3 -m herd.store --phase-duration-observe PHASE SECONDS [--pool DIR]  # HERD-496 baseline
         # records one duration, prints the rolling "<median>\t<p95>\t<n>" over the retained window
+    python3 -m herd.store --noaction-hwm-advance CLASS STAMP [--pool DIR]  # HERD-606 recurrence HWM
+        # atomic "advance iff newer": rc 0 = STAMP is past the persisted per-class high-water mark (a
+        # genuinely new occurrence — the caller should count it, and the mark now holds STAMP); rc 3 =
+        # STAMP is at-or-below the mark (a historical journal re-read — never re-counted)
 """
 
 import os
@@ -288,6 +292,25 @@ class Store:
         """Drop the record: the slug escaped (a PR opened, the agent is working, or the git/pane
         signature cleared)."""
         return self._b.clear_finish_stall(slug)
+
+    # no-action recurrence high-water mark ── HERD-606: the journal-audit auditor's DELIBERATE
+    # no-action classes (fixture_slug, merged_hv_unknown, merged_hv_no_approval,
+    # watcher_restart_blocked, checkout_unclean) count RECURRING occurrences per class so a class that
+    # keeps firing under distinct keys eventually escalates (HERD-597). That counter must advance only
+    # for a GENUINELY NEW occurrence — a bounded-window replay that resurfaces an already-counted event
+    # (the SAME journal line, seen again because it is still inside the lookback window, or because the
+    # per-key once-guard's fallback lost its claim) must never recount it. This is a SEPARATE backstop
+    # from the once-guard above: one persisted stamp per class, monotonically non-decreasing, so a
+    # historical event (by the underlying journal event's own timestamp) can never move it backwards.
+    def noaction_hwm(self, kind):
+        """The persisted high-water stamp for no-action class ``kind``, or ``None`` if never advanced."""
+        return self._b.noaction_hwm(kind)
+
+    def noaction_hwm_advance(self, kind, stamp):
+        """True iff ``stamp`` is STRICTLY newer than the persisted mark for ``kind`` — a genuinely new
+        occurrence, safe to count — in which case the mark is atomically raised to ``stamp``. False iff
+        ``stamp`` is at-or-below the current mark: a historical replay, never counted twice."""
+        return self._b.noaction_hwm_advance(kind, stamp)
 
 
 # ── flat backend: the current substrate, verbatim ─────────────────────────────────────────────────
@@ -826,6 +849,74 @@ class _FlatBackend:
         except Exception:
             pass
 
+    # no-action recurrence high-water mark ── HERD-606 (see the Store facade docstring) ───────────
+    def _noaction_hwm_file(self, kind):
+        return self._p(".agent-watch-noaction-hwm-%s" % _safe(kind))
+
+    def noaction_hwm(self, kind):
+        path = self._noaction_hwm_file(kind)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                v = (fh.readline() or "").strip()
+        except Exception:
+            return None
+        return int(v) if v.lstrip("-").isdigit() else None
+
+    def _noaction_hwm_lock(self, kind, timeout=2.0):
+        # Mirrors `_finish_stall_lock`: a sibling lockfile via O_CREAT|O_EXCL, bounded retry, proceeds
+        # UNLOCKED on timeout (fail-soft — the flat backend is the ship-dormant default, not a hardened
+        # multi-writer store).
+        lock_path = self._noaction_hwm_file(kind) + ".lock"
+        _ensure_parent(lock_path)
+        deadline = time.time() + timeout
+        while True:
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                os.close(fd)
+                return lock_path
+            except FileExistsError:
+                if time.time() >= deadline:
+                    return None
+                time.sleep(0.01)
+            except Exception:
+                return None
+
+    def _noaction_hwm_unlock(self, lock_path):
+        if not lock_path:
+            return
+        try:
+            os.remove(lock_path)
+        except Exception:
+            pass
+
+    def noaction_hwm_advance(self, kind, stamp):
+        stamp = _int(stamp)
+        lock = self._noaction_hwm_lock(kind)
+        try:
+            cur = self.noaction_hwm(kind)
+            if cur is not None and stamp <= cur:
+                return False
+            path = self._noaction_hwm_file(kind)
+            if not path:
+                return False
+            _ensure_parent(path)
+            tmp = "%s.tmp.%d.%d" % (path, os.getpid(), _thread_id())
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write("%d\n" % stamp)
+                os.replace(tmp, path)
+            except Exception:
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
+                return False
+            return True
+        finally:
+            self._noaction_hwm_unlock(lock)
+
 
 # ── sqlite backend: the same accessors, transactional under WAL ───────────────────────────────────
 
@@ -846,6 +937,7 @@ CREATE TABLE IF NOT EXISTS main_health_fix(identity TEXT PRIMARY KEY, epoch INTE
 CREATE TABLE IF NOT EXISTS phase_duration(phase TEXT, epoch INTEGER, seconds INTEGER);
 CREATE INDEX IF NOT EXISTS phase_duration_phase ON phase_duration(phase);
 CREATE TABLE IF NOT EXISTS finish_stall(slug TEXT PRIMARY KEY, epoch INTEGER, state TEXT);
+CREATE TABLE IF NOT EXISTS noaction_hwm(kind TEXT PRIMARY KEY, stamp INTEGER);
 CREATE TABLE IF NOT EXISTS state_blob  (path TEXT PRIMARY KEY, content BLOB, mode INTEGER);
 CREATE TABLE IF NOT EXISTS meta        (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -1173,6 +1265,31 @@ class _SqliteBackend:
         except Exception:
             pass
 
+    # no-action recurrence high-water mark ── HERD-606 (see the Store facade docstring) ───────────
+    def noaction_hwm(self, kind):
+        row = self._conn.execute("SELECT stamp FROM noaction_hwm WHERE kind=?", (str(kind),)).fetchone()
+        return int(row[0]) if row else None
+
+    def noaction_hwm_advance(self, kind, stamp):
+        stamp = _int(stamp)
+
+        def body(conn):
+            row = conn.execute("SELECT stamp FROM noaction_hwm WHERE kind=?", (str(kind),)).fetchone()
+            cur = int(row[0]) if row else None
+            if cur is not None and stamp <= cur:
+                return False
+            conn.execute(
+                "INSERT INTO noaction_hwm(kind, stamp) VALUES (?,?) "
+                "ON CONFLICT(kind) DO UPDATE SET stamp=excluded.stamp", (str(kind), stamp))
+            return True
+        try:
+            return self._rmw(body)
+        except Exception:
+            # Never claim a false advance: a mark that cannot be recorded must NOT count the
+            # occurrence (fail closed, mirrors `once()`) — under-counting a recurrence is safe;
+            # a phantom advance that never landed is not.
+            return False
+
     # ── migration substrate (state_blob + meta): NOT part of the accessor surface ─────────────────
     def put_blob(self, path, content, mode):
         self._conn.execute(
@@ -1196,7 +1313,7 @@ class _SqliteBackend:
         out = {}
         for t in ("approvals", "review_ledger", "health_results", "claims", "refix_rounds",
                   "once_guards", "seat_registry", "main_health_fix", "phase_duration",
-                  "finish_stall", "state_blob"):
+                  "finish_stall", "noaction_hwm", "state_blob"):
             try:
                 out[t] = self._conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0]
             except Exception:
@@ -1569,7 +1686,7 @@ def main(argv=None):
                              "--finish-stall-state", "--finish-stall-reset", "--finish-stall-clear")
     _IDENTITY_ACTIONS = ("--main-health-fix-mark", "--main-health-fix-clear", "--once") \
         + _FINISH_STALL_ACTIONS
-    _TWO_ARG_ACTIONS = ("--phase-duration-observe",)
+    _TWO_ARG_ACTIONS = ("--phase-duration-observe", "--noaction-hwm-advance")
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1637,6 +1754,19 @@ def main(argv=None):
         median, p95, n = open_store(pool).phase_duration_observe(phase_name, secs)
         sys.stdout.write("%s\t%s\t%s\n" % (median, p95, n))
         return 0
+    if action == "--noaction-hwm-advance":
+        # HERD-606: journal-audit's no-action recurrence counter must advance only for a genuinely NEW
+        # occurrence. rc 0 = STAMP is newer than the persisted mark (count it); rc 3 = STAMP is
+        # at-or-below the mark (a historical journal replay — never recount it); rc 2 = bad args.
+        if not phase_name or phase_seconds is None:
+            sys.stderr.write("herd store: --noaction-hwm-advance requires <class> <stamp>\n")
+            return 2
+        try:
+            stamp = int(phase_seconds)
+        except (TypeError, ValueError):
+            sys.stderr.write("herd store: --noaction-hwm-advance stamp must be an integer\n")
+            return 2
+        return 0 if open_store(pool).noaction_hwm_advance(phase_name, stamp) else 3
     if action == "--finish-stall-record":
         if not identity:
             sys.stderr.write("herd store: --finish-stall-record requires a slug\n")

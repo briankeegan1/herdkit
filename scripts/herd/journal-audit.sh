@@ -45,22 +45,33 @@
 #   routed to exactly ONE of three policies (the shipped mapping, `_ja_act_mapped` / `_ja_act_no_action_reason`
 #   in the ACT section below — a class never falls through to a default):
 #     MAPPED    → ONE bounded action via the rail in scripts/herd/journal-act.sh.
-#     NO-ACTION → a deliberate, journaled no-op (HERD-562/HERD-563, extended HERD-600): a class whose
-#                 finding is real but not itself actionable work — `fixture_slug` (evidence of
+#     NO-ACTION → a deliberate, journaled no-op (HERD-562/HERD-563, extended HERD-600/HERD-606): a class
+#                 whose finding is real but not itself actionable work — `fixture_slug` (evidence of
 #                 test/fixture pollution reaching a live journal, not a gap to file a tracker item
 #                 against), `merged_hv_unknown` (a transient PR-body-fetch failure; the next sweep
-#                 re-probes on its own), `watcher_restart_blocked` (an orphaned lock holder is a signal
-#                 for a human to look at — auto-killing an unidentified pid risks killing a live
-#                 builder, so no rail may act on it), and `checkout_unclean` (reconcile_checkout_cleanliness
-#                 deliberately LEAVES the contamination in place as evidence for a human; a rail that
-#                 auto-discarded it would destroy the very evidence the check exists to preserve).
+#                 re-probes on its own), `merged_hv_no_approval` (a merge whose declared HUMAN-VERIFY
+#                 steps carry no approval record — real signal, but the PR is already merged, so no
+#                 rail can retroactively verify or undo it), `watcher_restart_blocked` (an orphaned
+#                 lock holder is a signal for a human to look at — auto-killing an unidentified pid
+#                 risks killing a live builder, so no rail may act on it), and `checkout_unclean`
+#                 (reconcile_checkout_cleanliness deliberately LEAVES the contamination in place as
+#                 evidence for a human; a rail that auto-discarded it would destroy the very evidence
+#                 the check exists to preserve).
 #                 Journals `audit_acted result=no_action reason=…` exactly once and NEVER files,
 #                 escalates, or re-fires for that FINDING KEY. RECURRENCE ESCALATION (HERD-597):
 #                 a class that keeps being found under distinct keys (a new slug, a new pr) is itself a
 #                 signal nothing has looked at the root cause, so occurrences are additionally counted
 #                 PER CLASS (HERD_JOURNAL_AUDIT_NOACTION_COUNT); at HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX
 #                 (default 3) or more, ONE recurring-flagged item is filed for the whole class — dedup
-#                 on the CLASS, never per key — and the class then goes quiet forever.
+#                 on the CLASS, never per key — and the class then goes quiet forever. HIGH-WATER MARK
+#                 (HERD-606): only a genuinely NEW occurrence advances that per-class counter. Each
+#                 no-action finding carries the underlying journal event's own timestamp; a persisted
+#                 per-class high-water mark in the shared pool (`herd.store --noaction-hwm-advance`)
+#                 only ever moves forward, so a BOUNDED-WINDOW REPLAY that resurfaces an
+#                 already-counted event — the same journal line still inside the lookback window on a
+#                 later sweep, or a once-guard whose claim was lost (the seen-ledger fallback is
+#                 tail-trimmed) — can never recount it. This is a backstop ON TOP of the per-key
+#                 once-guard below, not a replacement for it.
 #     UNMAPPED  → any other class auto-files ONE dedup-keyed tracker item via the scribe. Dedup is keyed
 #                 on the CLASS (HERD-602 fix), not the per-finding key: a class that keeps producing NEW
 #                 keys (a new pr, a new slug, a new ts) still files exactly once, ever — a gap becomes
@@ -513,7 +524,7 @@ for e in events:
         seen_fixture.add(slug)
         key = "fixture_slug|%s" % slug
         summary = "known-fixture slug in journal · slug=%s event=%s" % (slug, e.get("event") or "?")
-        findings.append(("fixture_slug", key, summary, ctx(slug=slug)))
+        findings.append(("fixture_slug", key, summary, ctx(slug=slug, ts=int(e["_ts"].timestamp()))))
 
 # ── (h) watcher_restart_blocked events (HERD-342) ──────────────────────────
 # A blocked restart is a direct signal that an orphaned lock holder is preventing engine recovery.
@@ -528,7 +539,8 @@ for e in events:
         holder,
         (" workspace=%s" % workspace) if workspace else "",
     )
-    findings.append(("watcher_restart_blocked", key, summary, ctx(holder_pid=holder, workspace=workspace)))
+    findings.append(("watcher_restart_blocked", key, summary,
+                     ctx(holder_pid=holder, workspace=workspace, ts=int(e["_ts"].timestamp()))))
 
 # ── (j) unclean shared checkout (HERD-361) ──────────────────────────────────
 # reconcile_checkout_cleanliness journals `checkout_unclean result=detected/violation` when the shared
@@ -547,7 +559,7 @@ for e in events:
     key = "checkout_unclean|sha=%s|files=%s" % (head, paths)
     summary = "shared checkout UNCLEAN (evidence preserved) · head=%s detached=%s paths=%s" % (
         (head[:8] if head else "?"), detached, (paths[:80] if paths else "?"))
-    findings.append(("checkout_unclean", key, summary, ctx(sha=head)))
+    findings.append(("checkout_unclean", key, summary, ctx(sha=head, ts=int(e["_ts"].timestamp()))))
 
 for kind, key, summary, fctx in findings:
     # TAB-separated; summary flattened (no tabs/newlines).
@@ -596,11 +608,12 @@ _ja_pr_body() {
   fi
 }
 
-# _ja_hv_add <kind> <key> <summary> — accumulate one finding line in the same TSV shape python emits.
+# _ja_hv_add <kind> <key> <summary> [ctx] — accumulate one finding line in the same TSV shape python
+# emits (kind, key, summary, ctx) — ctx defaults to empty, same as a python finding with no facts.
 HV_FINDINGS=""
 _ja_hv_add() {
   local _row
-  _row="$(printf '%s\t%s\t%s' "$1" "$2" "$3")"
+  _row="$(printf '%s\t%s\t%s\t%s' "$1" "$2" "$3" "${4:-}")"
   if [ -n "$HV_FINDINGS" ]; then
     HV_FINDINGS="$(printf '%s\n%s' "$HV_FINDINGS" "$_row")"
   else
@@ -698,11 +711,11 @@ for _ts, pr, sha in rows:
     if (pr, sha) in seen:
         continue
     seen.add((pr, sha))
-    print("%s\t%s\t%s" % (pr, sha, evidence(pr, sha)))
+    print("%s\t%s\t%s\t%s" % (pr, sha, evidence(pr, sha), int(_ts.timestamp())))
 PY
   )" || MERGES=""
 
-  while IFS=$'\t' read -r _hv_pr _hv_sha _hv_evidence; do
+  while IFS=$'\t' read -r _hv_pr _hv_sha _hv_evidence _hv_ts; do
     [ -n "$_hv_pr" ] || continue
     # A merged PR is settled: once a tick has proven it clean (no block, or block + approval), that
     # verdict can never change, so memoize it in the seen-ledger. Without this, every tick re-fetches
@@ -717,7 +730,8 @@ PY
       # were declared. Reported once (the seen-ledger keys it) so a human can look; never a crash.
       _ja_hv_add "merged_hv_unknown" \
         "merged_hv_unknown|pr=${_hv_pr}|sha=${_hv_sha}" \
-        "merged PR body unreadable — human-verify approval unverifiable · pr=${_hv_pr} sha=${_hv_sha:-?}"
+        "merged PR body unreadable — human-verify approval unverifiable · pr=${_hv_pr} sha=${_hv_sha:-?}" \
+        "pr=${_hv_pr} sha=${_hv_sha} ts=${_hv_ts}"
       continue
     fi
     if ! printf '%s' "$_hv_body" | human_verify_has; then
@@ -741,7 +755,8 @@ PY
     [ "$_hv_state" = "hv-informed" ] && _hv_why="hv-informed only (never signed off)"
     _ja_hv_add "merged_hv_no_approval" \
       "merged_hv_no_approval|pr=${_hv_pr}|sha=${_hv_sha}" \
-      "merged with HUMAN-VERIFY steps, ${_hv_why} · pr=${_hv_pr} sha=${_hv_sha:-?}"
+      "merged with HUMAN-VERIFY steps, ${_hv_why} · pr=${_hv_pr} sha=${_hv_sha:-?}" \
+      "pr=${_hv_pr} sha=${_hv_sha} ts=${_hv_ts}"
   done <<EOF
 $MERGES
 EOF
@@ -873,6 +888,44 @@ _ja_act_once() {
   return 0
 }
 
+# _ja_noaction_hwm_advance <kind> <ts> — HERD-606. True iff <ts> (the underlying journal event's own
+# epoch timestamp) is STRICTLY newer than the persisted per-class high-water mark for <kind> in the
+# shared pool — a genuinely NEW occurrence, safe to feed into _ja_noaction_recur's counter — in which
+# case the mark is atomically raised to <ts>. False iff <ts> is at-or-below the mark: this occurrence
+# has ALREADY been counted (the same journal line replayed on a later sweep still inside the lookback
+# window, or a once-guard claim that was lost) and must never inflate the recurrence tally again. This
+# is a BACKSTOP on top of the per-key once-guard above, not a replacement for it: the once-guard is
+# what is normally relied on to dedup a key; this closes the gap when that guard's protection is lost
+# (its fallback — the seen-ledger — is tail-trimmed, see _ja_act_once's own comment) or the same event
+# simply never left the bounded window between sweeps.
+# <ts> empty/non-numeric (a caller that could not derive a stamp) or the shared-pool store unavailable
+# both degrade to "count it" — the pre-HWM behavior — since the once-guard above is still the floor;
+# this mark is additional protection, never the only one.
+_ja_noaction_hwm_advance() {
+  local _nh_kind="$1" _nh_ts="$2" _nh_pyp="" _nh_rc=0
+  case "$_nh_ts" in ''|*[!0-9]*) return 0 ;; esac
+  _nh_pyp="$(_ja_store_pysrc)" || _nh_pyp=""
+  [ -n "$_nh_pyp" ] || return 0
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_nh_pyp" WORKTREES_DIR="${WORKTREES_DIR:-}" \
+    python3 -m herd.store --noaction-hwm-advance "$_nh_kind" "$_nh_ts" >/dev/null 2>&1 || _nh_rc=$?
+  case "$_nh_rc" in
+    0) return 0 ;;   # genuinely newer — count it
+    3) return 1 ;;   # at-or-below the mark — a historical replay, never recount it
+    *) return 0 ;;   # store unusable → degrade to counting (the once-guard above is still the floor)
+  esac
+}
+
+# _ja_ctx_field <ctx> <name> — pull `<name>=<value>` out of a space-separated `k=v…` ctx string (the
+# same shape journal-act.sh parses via its own word-split loop). Empty when absent.
+_ja_ctx_field() {
+  local _cf_ctx="$1" _cf_name="$2" _cf_kv
+  for _cf_kv in $_cf_ctx; do
+    case "$_cf_kv" in
+      "${_cf_name}="*) printf '%s' "${_cf_kv#"${_cf_name}"=}"; return 0 ;;
+    esac
+  done
+}
+
 # _ja_act_mapped <kind> — true iff this finding class has a rail in journal-act.sh. Kept HERE, next to
 # the escalation policy, and asserted against journal-act.sh's own case arms by the unit test: a class
 # that gains a rail must gain it in both places or the test reds.
@@ -884,10 +937,11 @@ _ja_act_mapped() {
 }
 
 # _ja_act_no_action_reason <kind> — prints a reason and returns 0 iff <kind> is a DELIBERATE no-action
-# class (HERD-562/HERD-563, extended HERD-600): the finding is real and stays REPORTED (the advisory
-# half above is unaffected), but it is not itself a gap to route anywhere — neither to a rail (nothing
-# to heal) nor to the scribe (filing it would be noise, not work). Checked BEFORE `_ja_act_mapped`'s
-# unmapped fallthrough so these classes can never fall into the generic "file a tracker item" path:
+# class (HERD-562/HERD-563, extended HERD-600/HERD-606): the finding is real and stays REPORTED (the
+# advisory half above is unaffected), but it is not itself a gap to route anywhere — neither to a rail
+# (nothing to heal) nor to the scribe (filing it would be noise, not work). Checked BEFORE
+# `_ja_act_mapped`'s unmapped fallthrough so these classes can never fall into the generic "file a
+# tracker item" path:
 #   fixture_slug             — evidence that a TEST/SIM fixture wrote to the LIVE journal (see
 #                               tests/test-sim-journal-hermeticity.sh), not evidence of a production gap.
 #                               The fix is a hermeticity guard on the leaking fixture, not a filed item
@@ -896,6 +950,11 @@ _ja_act_mapped() {
 #                               sweep re-probes on its own (the seen-ledger only memoizes a SETTLED
 #                               verdict, never an unknown one — see the (g) check above), so filing a
 #                               permanent item for a transient read failure would be pure noise.
+#   merged_hv_no_approval    — a merge that declared a HUMAN-VERIFY block but carries no sha-keyed
+#                               approval record (see the (g) check above). Real signal — the declared
+#                               steps may never have run — but the PR is already MERGED: no rail can
+#                               retroactively verify unrun manual steps or undo the merge, so there is
+#                               nothing bounded to route this to. A human has to look.
 #   watcher_restart_blocked  — an orphaned lock holder is blocking watcher recovery, but the holder_pid
 #                               is an UNIDENTIFIED process to this auditor: a rail that auto-killed it
 #                               could just as easily kill a live builder mid-flight as an actual corpse.
@@ -908,7 +967,9 @@ _ja_act_mapped() {
 #                               exists to preserve, so no automated action may touch it.
 # Each class still recurrence-escalates via _ja_noaction_recur (HERD-597) below: a class that keeps
 # firing under distinct keys (a new holder_pid, a new head sha) is itself a signal nothing has looked at
-# the root cause, and files ONE class-scoped item once that keeps recurring.
+# the root cause, and files ONE class-scoped item once that keeps recurring — gated by the per-class
+# high-water mark (HERD-606, `_ja_noaction_hwm_advance` below) so a replayed/historical occurrence of a
+# key that has already been counted can never inflate that tally a second time.
 # This is a SHIPPED (hardcoded) mapping, not a config key — same posture as _ja_act_mapped just above.
 _ja_act_no_action_reason() {
   case "$1" in
@@ -917,6 +978,9 @@ _ja_act_no_action_reason() {
       ;;
     merged_hv_unknown)
       printf 'PR body unreadable (transient fetch failure) — the next sweep re-probes on its own; filing a permanent item for a transient read would be noise'
+      ;;
+    merged_hv_no_approval)
+      printf 'merged with declared HUMAN-VERIFY steps and no approval record — the PR is already merged, so no rail can retroactively verify or undo it; a human must inspect it'
       ;;
     watcher_restart_blocked)
       printf 'orphaned lock holder blocking a watcher restart — the holder_pid is unidentified, so auto-killing it risks killing a live builder; a human must inspect it, no rail can safely act'
@@ -1048,8 +1112,12 @@ _ja_act() {
     _inbox_append "audit-noaction:${_aa_kind}" "no-action (${_aa_reason}) · ${_aa_summary}"
     # RECURRENCE ESCALATION (HERD-597): this key was just claimed for the FIRST time, so it is a
     # genuinely new occurrence of the class — count it. A re-observation of an already-counted key
-    # never reaches here (the once-guard above returns first).
-    _ja_noaction_recur "$_aa_kind" "$_aa_summary"
+    # never reaches here (the once-guard above returns first). HERD-606: still gated on the per-class
+    # high-water mark — a historical journal re-read that fooled the once-guard into re-claiming this
+    # key (its fallback is a tail-trimmed ledger) must not inflate the recurrence tally a second time.
+    if _ja_noaction_hwm_advance "$_aa_kind" "$(_ja_ctx_field "$_aa_ctx" ts)"; then
+      _ja_noaction_recur "$_aa_kind" "$_aa_summary"
+    fi
     return 0
   fi
   # Per-sweep budget spent → leave this finding for the next sweep. Checked BEFORE the once-guard so a
