@@ -50,7 +50,12 @@
 #                 reaching a live journal, not a gap to file a tracker item against) and
 #                 `merged_hv_unknown` (a transient PR-body-fetch failure; the next sweep re-probes on
 #                 its own). Journals `audit_acted result=no_action reason=…` exactly once and NEVER
-#                 files, escalates, or re-fires for that key.
+#                 files, escalates, or re-fires for that FINDING KEY. RECURRENCE ESCALATION (HERD-597):
+#                 a class that keeps being found under distinct keys (a new slug, a new pr) is itself a
+#                 signal nothing has looked at the root cause, so occurrences are additionally counted
+#                 PER CLASS (HERD_JOURNAL_AUDIT_NOACTION_COUNT); at HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX
+#                 (default 3) or more, ONE recurring-flagged item is filed for the whole class — dedup
+#                 on the CLASS, never per key — and the class then goes quiet forever.
 #     UNMAPPED  → any other class auto-files ONE dedup-keyed tracker item via the scribe, so a gap
 #                 becomes WORK instead of another report.
 #   Each MAPPED action fires at most ONCE per finding key across every seat (shared-pool once-guard).
@@ -109,6 +114,12 @@
 #   JOURNAL_AUDIT_ESCALATE_AFTER  re-observations a mapped-class finding may survive, still standing,
 #                                 before escalating (default 2). 1 reproduces the pre-HERD-564 behavior
 #                                 (escalate on the very next sighting).
+#   HERD_JOURNAL_AUDIT_NOACTION_COUNT  RECURRENCE-ESCALATION ledger path (HERD-597) — one row per
+#                                 deliberate no-action CLASS, counting distinct occurrences across
+#                                 sweeps. Default $WORKTREES_DIR/.agent-watch-journal-audit-noaction-count.
+#   HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX  distinct occurrences of a no-action class before it files ONE
+#                                 recurring-flagged item (default 3). A test seam, not an operator knob
+#                                 (mirrors HERD_JOURNAL_AUDIT_ACT_MAX).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
@@ -152,8 +163,12 @@ SEEN="${HERD_JOURNAL_AUDIT_SEEN:-${WORKTREES_DIR:-/tmp}/.agent-watch-journal-aud
 # ACT-THEN-CLEAR ledger (HERD-564/573) — see the ACT section below. Only ever written when
 # JOURNAL_AUDIT_ACT=on; empty/absent is the byte-inert default state.
 PENDING="${HERD_JOURNAL_AUDIT_PENDING:-${WORKTREES_DIR:-/tmp}/.agent-watch-journal-audit-pending}"
-# Ensure parent dirs exist so inbox/seen/pending writes never fail the advisory path.
-mkdir -p "$(dirname "$INBOX")" "$(dirname "$SEEN")" "$(dirname "$PENDING")" 2>/dev/null || true
+# RECURRENCE-ESCALATION ledger (HERD-597) — one row per DELIBERATE no-action class (fixture_slug,
+# merged_hv_unknown), counting distinct occurrences across sweeps. See _ja_noaction_recur below. Only
+# ever written when JOURNAL_AUDIT_ACT=on; empty/absent is the byte-inert default state.
+NOACTION_COUNT="${HERD_JOURNAL_AUDIT_NOACTION_COUNT:-${WORKTREES_DIR:-/tmp}/.agent-watch-journal-audit-noaction-count}"
+# Ensure parent dirs exist so inbox/seen/pending/noaction-count writes never fail the advisory path.
+mkdir -p "$(dirname "$INBOX")" "$(dirname "$SEEN")" "$(dirname "$PENDING")" "$(dirname "$NOACTION_COUNT")" 2>/dev/null || true
 
 _num_or() {
   case "${1:-}" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac
@@ -375,17 +390,33 @@ for b in bounces:
         findings.append(("refix_bounce_no_wake", key, summary, ctx(pr=pr, sha=sha, slug=b.get("slug"), round=round_)))
 
 # ── (d) red state older than TTL ────────────────────────────────────────────
-# main_health result=red without a later main_health result=green (any sha clears).
+# main_health result=red without a later main_health result=green (any sha clears). ONE FINDING PER
+# SHA (HERD-597), not per red EVENT: reconcile_main_health re-confirms a standing red on its own
+# cadence, so a chronically-red main journals a FRESH `main_health result=red` every tick. The old key
+# folded the event's own ts into the dedup token, so each re-confirmation was a BRAND NEW finding with
+# a brand new PENDING row — none of them ever converged (cleared or escalated), because the once-guard
+# never saw the same key twice. Two such orphaned rows sat in the live PENDING ledger, all count=1,
+# same sha, different ts, none reaching JOURNAL_AUDIT_ESCALATE_AFTER. Keying on sha alone (using the
+# EARLIEST red event for that sha, chronologically) collapses every re-confirmation of one ongoing
+# incident into the SAME finding, so the lifecycle pass can actually clear it (a green lands) or
+# escalate it (still standing past the grace window) — bounded, like every other mapped class.
 reds = [e for e in events if e.get("event") == "main_health" and str(e.get("result") or "") == "red"]
 greens = [e for e in events if e.get("event") == "main_health" and str(e.get("result") or "") == "green"]
-for r in reds:
+seen_red_sha = set()
+for r in reds:  # events (and this filtered view) are already chronological — see events.sort() above
+    sha = str(r.get("sha") or "")
+    # An event with no sha at all can't be deduped against its siblings without risking merging two
+    # UNRELATED incidents, so it keeps the old per-event identity (ts-suffixed) rather than collapsing.
+    dedup = sha if sha else ("noshasentinel:" + r["_ts"].strftime("%Y%m%dT%H%M%SZ"))
+    if dedup in seen_red_sha:
+        continue
+    seen_red_sha.add(dedup)
     if age_secs(now, r["_ts"]) < red_ttl:
         continue
-    # Cleared if any green lands after this red.
+    # Cleared if any green lands after this (the earliest) red for this sha.
     ok = any(g["_ts"] > r["_ts"] for g in greens)
     if not ok:
-        sha = str(r.get("sha") or "")
-        key = "red_state_stale|sha=%s|ts=%s" % (sha, r["_ts"].strftime("%Y%m%dT%H%M%SZ"))
+        key = "red_state_stale|sha=%s" % (sha or "unknown")
         summary = "MAIN RED older than TTL · sha=%s failed=%s" % (
             (sha[:8] if sha else "?"), str(r.get("failed") or r.get("detail") or "")[:60])
         findings.append(("red_state_stale", key, summary, ctx(pr=r.get("pr"), sha=sha)))
@@ -783,6 +814,13 @@ _JA_ACT_SPENT=0
 # the "BOUNDED PER SWEEP" bound above. HERD_JOURNAL_AUDIT_ACT_MAX is still per-sweep total, not
 # per-class; JOURNAL_AUDIT_ESCALATE_AFTER is the SEPARATE "how many sweeps of grace" knob.
 _JA_ESCALATE_AFTER="$(_num_or "${JOURNAL_AUDIT_ESCALATE_AFTER:-}" 2)"
+# RECURRENCE ESCALATION (HERD-597): distinct occurrences a DELIBERATE no-action class (fixture_slug,
+# merged_hv_unknown) may accumulate, across every finding KEY that class has ever produced, before it
+# is itself treated as a signal worth a human's attention — see _ja_noaction_recur below. Deliberate
+# inline default, not a config key (mirrors _JA_ACT_MAX / _JA_ESCALATE_AFTER's own "test seam, not an
+# operator knob" posture); HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX exists so tests can prove the
+# threshold without seeding a dozen synthetic slugs.
+_JA_NOACTION_RECUR_MAX="$(_num_or "${HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX:-}" 3)"
 
 # _ja_act_enabled — true iff JOURNAL_AUDIT_ACT opts in. Default OFF; any unrecognized value reads as
 # off (fail toward dormant — mirrors _ja_enabled above and every other ship-dormant lever).
@@ -899,6 +937,9 @@ _ja_file_item() {
   if [ "$_fi_mode" = "escalated" ]; then
     _fi_title="journal-audit: ${_fi_kind} did not clear after its auto-action"
     _fi_body="The journal auditor (JOURNAL_AUDIT_ACT=on) ran the mapped action for this finding class and the finding was STILL found on a later sweep — the rail did not unstick it."
+  elif [ "$_fi_mode" = "recurring" ]; then
+    _fi_title="journal-audit: ${_fi_kind} keeps recurring (HERD-597)"
+    _fi_body="This is a DELIBERATE no-action class (see _ja_act_no_action_reason in journal-audit.sh) — each individual occurrence is real but not itself actionable work. It has now recurred across ${_JA_NOACTION_RECUR_MAX}+ distinct findings, which is itself a signal that something keeps PRODUCING this condition and nobody has looked at the root cause. Filed once for the whole class (dedup key below is class-scoped, not per-finding); this class will never file again."
   else
     _fi_title="journal-audit: ${_fi_kind} has no mapped auto-action"
     _fi_body="The journal auditor found this class but NO rail owns it, so nothing can heal it automatically. Map it to a bounded action in scripts/herd/journal-act.sh (and _ja_act_mapped in journal-audit.sh), or record why it must stay advisory."
@@ -907,6 +948,59 @@ _ja_file_item() {
   # shellcheck disable=SC2086  # the seam is a command LINE, not a single argv[0]
   $_fi_cmd "$(printf '%s\n\n%s\n\nFinding: %s\nDedup key: %s\nFiled by: scripts/herd/journal-audit.sh (HERD-544)' \
     "$_fi_title" "$_fi_body" "$_fi_summary" "$_fi_key")" >/dev/null 2>&1 </dev/null
+}
+
+# _ja_noaction_recur <kind> <summary> — RECURRENCE ESCALATION (HERD-597). A deliberate no-action class
+# (see _ja_act_no_action_reason) is inert PER OCCURRENCE, but a class that keeps recurring is itself a
+# gap: something keeps PRODUCING the condition and nobody has looked at why. Live case that motivated
+# this: fixture_slug fired for slug=retiree, slug=conv, slug=stuck across separate findings/sweeps —
+# three DISTINCT keys of the SAME class — and none of them ever escalated, because the per-key guard in
+# _ja_act's caller is (correctly) keyed per finding, not per class.
+#
+# Called ONLY when the caller's per-KEY once-guard (audit_noaction::<key>) just claimed a genuinely NEW
+# occurrence — a repeat sighting of an already-counted key must never double-count. Counts distinct
+# occurrences PER CLASS in NOACTION_COUNT (one row: "<class>\t<count>"); at _JA_NOACTION_RECUR_MAX or
+# more, files ONE recurring-flagged item — dedup key is class-scoped ("recurring:<class>"), so this can
+# never fire twice for the same class, and the per-key filings above it are never duplicated by it.
+# Shares the SAME per-sweep action budget as every other real scribe shellout (BOUNDED PER SWEEP): if
+# the budget is spent this sweep, the escalation is simply deferred to the next one — the count itself
+# is never lost (it is upserted unconditionally, before the budget check).
+_ja_noaction_recur() {
+  local _nr_kind="$1" _nr_summary="$2" _nr_count=0 _nr_hit=0 _nr_k _nr_c _nr_tmp
+  _nr_tmp="$(mktemp "${NOACTION_COUNT}.XXXXXX" 2>/dev/null || true)"
+  [ -n "$_nr_tmp" ] || return 0
+  : > "$_nr_tmp"
+  if [ -s "$NOACTION_COUNT" ]; then
+    while IFS=$'\t' read -r _nr_k _nr_c; do
+      [ -n "$_nr_k" ] || continue
+      if [ "$_nr_k" = "$_nr_kind" ]; then
+        _nr_count=$(( ${_nr_c:-0} + 1 ))
+        _nr_hit=1
+        printf '%s\t%s\n' "$_nr_k" "$_nr_count" >> "$_nr_tmp"
+      else
+        printf '%s\t%s\n' "$_nr_k" "$_nr_c" >> "$_nr_tmp"
+      fi
+    done < "$NOACTION_COUNT"
+  fi
+  if [ "$_nr_hit" -eq 0 ]; then
+    _nr_count=1
+    printf '%s\t%s\n' "$_nr_kind" "$_nr_count" >> "$_nr_tmp"
+  fi
+  mv -f "$_nr_tmp" "$NOACTION_COUNT" 2>/dev/null || rm -f "$_nr_tmp" 2>/dev/null
+  [ "$_nr_count" -ge "$_JA_NOACTION_RECUR_MAX" ] || return 0
+  [ "$_JA_ACT_SPENT" -lt "$_JA_ACT_MAX" ] 2>/dev/null || return 0
+  if _ja_act_once "audit_noaction_recurring::${_nr_kind}"; then
+    _JA_ACT_SPENT=$((_JA_ACT_SPENT + 1))
+    if _ja_file_item "$_nr_kind" "recurring:${_nr_kind}" "$_nr_summary" recurring; then
+      journal_append audit_acted \
+        class "$_nr_kind" \
+        key "recurring:${_nr_kind}" \
+        result recurring_filed \
+        observations "$_nr_count" \
+        component audit
+      _inbox_append "audit-recurring:${_nr_kind}" "RECURRING no-action class (${_nr_count}+ occurrences) — filed for root-cause · ${_nr_summary}"
+    fi
+  fi
 }
 
 # _ja_act <kind> <key> <summary> <ctx> — the whole action policy for ONE finding. Hard no-op (and
@@ -926,6 +1020,10 @@ _ja_act() {
       reason "$_aa_reason" \
       component audit
     _inbox_append "audit-noaction:${_aa_kind}" "no-action (${_aa_reason}) · ${_aa_summary}"
+    # RECURRENCE ESCALATION (HERD-597): this key was just claimed for the FIRST time, so it is a
+    # genuinely new occurrence of the class — count it. A re-observation of an already-counted key
+    # never reaches here (the once-guard above returns first).
+    _ja_noaction_recur "$_aa_kind" "$_aa_summary"
     return 0
   fi
   # Per-sweep budget spent → leave this finding for the next sweep. Checked BEFORE the once-guard so a

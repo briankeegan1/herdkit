@@ -42,6 +42,21 @@ pass=0
 fail() { echo "FAIL: $1" >&2; exit 1; }
 ok()   { pass=$((pass+1)); }
 
+# HERMETICITY GUARD (HERD-597), pinned BEFORE anything below can reach the journal. This file sources
+# agent-watch.sh in LIB mode with HERD_CONFIG_FILE pointed at a deliberately absent config (below), so
+# with no JOURNAL_FILE of its own herd-config.sh's REPO-DEFAULT fallback would export WORKTREES_DIR at
+# whatever real project tree this test happens to be checked out in — exactly the retirement-invariant-
+# sim.sh leak HERD-562/#708 fixed, just in the unit test instead of the sim. Cases (11)/(13)/(15) below
+# retire fixture slugs "conv" and "stuck", both in journal-audit.sh's known-fixture-slug set: a bare
+# `bash tests/test-retirement-invariant.sh` run (no bats, no HERMETIC_TEST wrapper) landed real
+# reap/retire_converged/retire_stuck events for them in the LIVE project journal on 2026-08-04 and
+# again on 2026-08-05 before this fix — a prior JOURNAL_FILE pin further down (still needed for its own
+# content assertions) only covered the file's SECOND half. Pin here so the WHOLE file is hermetic
+# regardless of how it is invoked. See tests/test-sim-journal-hermeticity.sh check (3) for the static
+# guard that keeps this from regressing silently.
+export JOURNAL_FILE="$T/journal.jsonl"
+export HERD_JOURNAL_HERMETIC=1
+
 [ -f "$WATCH" ] || fail "agent-watch.sh not found at $WATCH"
 command -v python3 >/dev/null 2>&1 || fail "python3 required to run this test"
 command -v git >/dev/null 2>&1 || fail "git required to run this test"
