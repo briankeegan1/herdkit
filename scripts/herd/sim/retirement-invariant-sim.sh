@@ -29,6 +29,16 @@
 # it never touches the operator's control room. Run:
 #   bash scripts/herd/sim/retirement-invariant-sim.sh [--artifacts DIR] [--keep]
 # Exit: 0 = every checkpoint passed · 1 = at least one failed.
+#
+# JOURNAL HERMETICITY (HERD-562): `tick()` below points HERD_CONFIG_FILE at a deliberately absent
+# "$scn/no-config" (the documented sim convention — see herd-config.sh's "hermetic test/sim seam"
+# comment), which means WORKTREES_DIR resolves to herd-config.sh's REPO-DEFAULT fallback — the real
+# tree this sim happens to be checked out in — unless JOURNAL_FILE is ALSO pinned per-scenario. It
+# was not: this sim's SLUG=retiree (and siblings retiree-zc/-working/-wedged) then landed real
+# reap/merge events under that fixture slug in the LIVE project journal, and journal-audit.sh's
+# known-fixture-slug check later found them there and filed a tracker item about it
+# (audit_acted class=fixture_slug key=fixture_slug|retiree). Every other AGENT_WATCH_LIB=1 sim in
+# this directory already pins JOURNAL_FILE (see builder-chaos-sim.sh); this one now does too.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -160,6 +170,7 @@ tick() {
   PATH="$BIN:$PATH" \
   WATCH_SH="$WATCH" SIM_MAIN="$scn/main" SIM_TREES="$scn/trees" SIM_SLUG="$slug" \
   GH_DIR="$scn/gh" HERDR_TABS="$scn/tabs.json" HERD_CONFIG_FILE="$scn/no-config" \
+  JOURNAL_FILE="$scn/journal.jsonl" HERD_JOURNAL_HERMETIC=1 \
   CRASH_AFTER="$crash" HERD_RETIRE_STUCK_TICKS=3 HERD_DISPOSABLE_WORKSPACE=1 \
   HERD_RETIRE_DEFER_TIMEOUT="${SIM_DEFER_TIMEOUT:-1800}" HERD_FAKE_NOW="${SIM_FAKE_NOW:-}" \
   SIM_AGENT_STATUS="${SIM_AGENT_STATUS:-idle}" \

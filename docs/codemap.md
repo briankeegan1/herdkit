@@ -23,6 +23,7 @@ Role summarized from each file's top-of-file comment.
 - `backlog-view.sh` — live, styled backlog viewer for the coordinator's left pane.
 - `bats-fd3-guard.sh` — HERD-462: the shared-chokepoint half of the bats-FD3 wedge fix.
 - `burst.sh` — the ONE reusable BOUNDED-CONCURRENCY FAN-OUT "seam" for herdkit's READ-ONLY work
+- `capacity-agent-lease-wait.sh` — capacity-agent-lease-wait.sh <slug> — HERD-581 (HERD-557 P2): the CMD capacity_agent_lease_hold
 - `capacity-ledger.sh` — HERD-557 P1: the shared SUITE-CAPACITY LEDGER. docs/spikes/capacity-admission.md
 - `caps-sync-lint.sh` — THE shared caps-sync guard (HERD-220): the capabilities manifest
 - `changelog.sh` — journal-driven CHANGELOG + release-tag helper (HERD-256 / HERD-168 part 2/3).
@@ -156,6 +157,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
 - `backlog-view.sh` → `herd-config.sh`, `theme.sh`
+- `capacity-agent-lease-wait.sh` → `driver.sh`, `herd-config.sh`
 - `changelog.sh` → `herd-config.sh`
 - `codemap.sh` → `herd-config.sh`
 - `coordinator.sh` → `driver.sh`, `herd-config.sh`, `herd-preflight.sh`, `layout-reconcile.sh`
@@ -171,9 +173,9 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-approve.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`
 - `herd-config.sh` → `context-guard.sh`, `resolver-claim.sh`
-- `herd-feature.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
+- `herd-feature.sh` → `capacity-ledger.sh`, `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-preflight.sh` → `driver.sh`, `engine-version.sh`
-- `herd-quick.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
+- `herd-quick.sh` → `capacity-ledger.sh`, `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`, `resolver-pane.sh`
 - `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
 - `herd-watch.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
@@ -228,7 +230,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `BASELINE_AWARE_GATE` → `healthcheck.sh`
 - `BRANCH_TEMPLATE` → `agent-watch.sh`
 - `BUDGET_DAILY` → `cost.sh`, `herd-feature.sh`, `herd-quick.sh`
-- `CAPACITY_BUDGET` → `capacity-ledger.sh`
+- `CAPACITY_BUDGET` → `capacity-ledger.sh`, `herd-spawn-gate.sh`
 - `CHECKOUT_GUARD` → `agent-watch.sh`
 - `CI_AUTOREPAIR` → `ci-repair.sh`
 - `CI_FAST_BOUNCE` → `agent-watch.sh`
@@ -304,7 +306,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `LINEAR_TEAM_ID` → `bin/herd`
 - `LOCAL_REVIEW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `LOCAL_REVIEW_GLOB` → `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
-- `LOCAL_SUITE_CONCURRENCY` → `healthcheck.sh`
+- `LOCAL_SUITE_CONCURRENCY` → `capacity-ledger.sh`, `healthcheck.sh`
 - `MAIN_HEALTH_AUTOFIX` → `agent-watch.sh`
 - `MAIN_HEALTH_CI_GATE` → `agent-watch.sh`
 - `MAIN_HEALTH_RECHECK_MINS` → `agent-watch.sh`
@@ -347,7 +349,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `RESOLVE_CLAIM_TTL` → `resolver-claim.sh`
 - `REVIEW_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
-- `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `engine-version.sh`, `herd-spawn-gate.sh`
+- `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `capacity-ledger.sh`, `engine-version.sh`, `herd-spawn-gate.sh`
 - `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`, `review-pregate.sh`, `git-pr.sh`
 - `REVIEW_ESCALATE_MAXFILES` → `posture-lint.sh`, `git-pr.sh`
 - `REVIEW_EVIDENCE_ESCALATE_ROUNDS` → `agent-watch.sh`
@@ -372,7 +374,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `SHARE_LINKS` → `bin/herd`, `agent-watch.sh`, `new-feature.sh`
 - `SHIPPED_KEEP` → —
 - `SMOKE_CMD` → `bin/herd`, `herd-resolve.sh`
-- `SPAWN_AHEAD` → `agent-watch.sh`, `herd-spawn-gate.sh`
+- `SPAWN_AHEAD` → `agent-watch.sh`, `capacity-ledger.sh`, `herd-spawn-gate.sh`
 - `STALE_BASE_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `STALE_DUP_DETECT` → `agent-watch.sh`, `stale-dup-gate.sh`
 - `STALL_QUIET_MIN` → `agent-watch.sh`

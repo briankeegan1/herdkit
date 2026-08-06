@@ -17695,9 +17695,10 @@ _spawn_clear_held() {
 # lane observably spawned, because the lanes have TWO no-builder exits a fire-and-forget launch could
 # never see:
 #   • the lane's own advisory saturation gate defers with EXIT 0 and the stable marker line
-#     'review-gate saturated' (herd_spawn_gate_emit_defer) — a HELD spawn, not a failure: the
-#     intent is RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain
-#     stops for this tick (siblings would also defer against the same gate);
+#     'review-gate saturated' (herd_spawn_gate_emit_defer) OR 'agent capacity lease unavailable'
+#     (herd_capacity_lease_emit_defer, HERD-581) — a HELD spawn, not a failure: the intent is
+#     RELEASED back to .req (spawn-step.sh release) for a later tick, and the drain stops for this
+#     tick (siblings would also defer against the same gate/lease);
 #   • a hard failure (bad slug, existing worktree, git/network error) exits non-zero — the intent
 #     is dropped LOUDLY (skip + journal), never silently.
 # Every outcome journals (spawn_launched / spawn_deferred / spawn_skipped) so the next overnight
@@ -17762,7 +17763,7 @@ _drain_lane_worker() {
   # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
   # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
   # spawn_claim_lost rather than report a spawn_launched for an intent still sitting in the queue.
-  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -q 'review-gate saturated'; then  # pipe-ok: bounded command output, under a pipe buffer
+  if [ "$_dlw_rc" -eq 0 ] && printf '%s' "$_dlw_out" | grep -Eq 'review-gate saturated|agent capacity lease unavailable'; then  # pipe-ok: bounded command output, under a pipe buffer
     # HELD, not spawned: the lane's advisory gate deferred (exit 0 + marker). Put the intent back for
     # a later tick. The drain already stopped for this tick when it launched this worker.
     if bash "$HERE/spawn-step.sh" release "$_dlw_claimed" >/dev/null 2>&1; then
