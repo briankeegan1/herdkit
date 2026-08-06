@@ -216,6 +216,17 @@ else
   HERD_TEST_CAP_LEDGER_SKIP_REASON="test-cap-ledger.sh not present"
   herd_test_cap_ledger_lint() { return 2; }
 fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# system-bash-syntax guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/bash-syntax-lint.sh"
+[ -f "$DIR/scripts/herd/bash-syntax-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/bash-syntax-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_BASH_SYNTAX_SKIP_REASON="bash-syntax-lint.sh not present"
+  herd_bash_syntax_lint() { return 2; }
+fi
 # SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531): the shared provenance-record library. Sourcing DEFINES
 # functions only and writes nothing; the record itself is written at the very END of this script, and
 # only when HEALTH_TRUST_BUILDER is on. Fail-soft on our own infra (a partially-upgraded engine tree
@@ -881,6 +892,21 @@ EOF
   if [ "$tcl_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ test-cap-ledger — $(printf '%s' "$tcl_errs" | grep -E '^(MALFORMED|STALE)' | head -1)";  # pipe-ok: head in a command substitution; status not gated
     else echo "❌ TEST-CAP-LEDGER: tests/test-caps.tsv carries a bare or stale row"; printf '%s\n' "$tcl_errs" | grep -E '^(MALFORMED|STALE)' || printf '%s\n' "$tcl_errs"; fi
+    exit 1
+  fi
+
+  # system-bash-syntax guard (HERD-608) — bash -n's every scripts/herd/*.sh under the SYSTEM
+  # /bin/bash (the interpreter the watcher pane resolves, not a PATH-resolved bash a dev box's
+  # homebrew might shadow it with). Catches a bash-3.2-only false syntax error (the heredoc-parser
+  # line-count cliff journal-audit.sh tripped, HERD-608) pre-PR instead of in the live watcher pane.
+  # The SAME lint the heavy gate runs (scripts/herd/bash-syntax-lint.sh). Same red semantics as
+  # caps-sync / gate-coverage. Skipped (never red) when the shared lint is absent, /bin/bash is
+  # absent (e.g. a Windows collaborator on Git Bash), or the tree has no scripts/herd/*.sh surface.
+  local bs_errs bs_rc
+  bs_errs="$(herd_bash_syntax_lint ".")"; bs_rc=$?
+  if [ "$bs_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ bash-syntax — $(printf '%s' "$bs_errs" | grep '^BASH-SYNTAX' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ BASH-SYNTAX: a scripts/herd/*.sh file fails 'bash -n' under the SYSTEM /bin/bash (the watcher pane's interpreter) even though it may parse cleanly under a PATH-resolved bash"; printf '%s\n' "$bs_errs" | grep '^BASH-SYNTAX' || printf '%s\n' "$bs_errs"; fi
     exit 1
   fi
 

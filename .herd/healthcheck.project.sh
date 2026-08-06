@@ -1133,6 +1133,33 @@ case "$_hc_tcl_rc" in
      exit 1 ;;
 esac
 
+# 5g. system-bash-syntax guard (HERD-608) — bash -n's every scripts/herd/*.sh under the SYSTEM
+# /bin/bash (the interpreter the watcher pane resolves, no /opt/homebrew/bin on its PATH), catching a
+# bash-3.2-only false "syntax error" (the heredoc-parser line-count cliff journal-audit.sh tripped)
+# that a PATH-resolved bash / shellcheck never sees. ONE implementation shared with the builder's
+# light pre-PR gate (scripts/herd/bash-syntax-lint.sh), so the two gates can never disagree.
+bs_note="bash-syntax: clean"
+HERD_BASH_SYNTAX_SKIP_REASON=""
+if [ -f scripts/herd/bash-syntax-lint.sh ]; then
+  . scripts/herd/bash-syntax-lint.sh
+  _hc_bs_errs="$(herd_bash_syntax_lint ".")"; _hc_bs_rc=$?
+else
+  _hc_bs_errs=""; _hc_bs_rc=2
+  HERD_BASH_SYNTAX_SKIP_REASON="scripts/herd/bash-syntax-lint.sh not present"
+fi
+case "$_hc_bs_rc" in
+  0) bs_note="bash-syntax: clean" ;;
+  2) bs_note="bash-syntax: skipped ($HERD_BASH_SYNTAX_SKIP_REASON)" ;;
+  *) bs_note="bash-syntax: SYSTEM /bin/bash SYNTAX ERROR"
+     if [ -n "$ONELINE" ]; then
+       echo "bash-syntax: $(printf '%s' "$_hc_bs_errs" | grep '^BASH-SYNTAX' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
+     else
+       echo "BASH-SYNTAX: a scripts/herd/*.sh file fails 'bash -n' under the SYSTEM /bin/bash (the watcher pane's interpreter) even though it may parse cleanly under a PATH-resolved bash"
+       printf '%s\n' "$_hc_bs_errs" | grep '^BASH-SYNTAX' || printf '%s\n' "$_hc_bs_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 5f. inert-lever guard (HERD-556) — a config key documented in templates/capabilities.tsv must have
 # a consumer the shipped engine can actually REACH. HEALTH_PANE and HEALTH_TRUST_BUILDER were both
 # silent no-ops for weeks — set, defaulted, documented and unit-tested, yet inert, because their only
@@ -1181,5 +1208,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $tabc_note; $eexp_note; $tcl_note; $lrch_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $tabc_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $tabc_note; $eexp_note; $tcl_note; $lrch_note; $bs_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $tabc_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $bs_note"; echo "  $chl_note"; }
 exit 0

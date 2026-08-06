@@ -170,6 +170,8 @@ backlog-reconcile.sh	unit	tests/test-backlog-reconcile.sh
 backlog-reconcile-sweep.sh	unit	tests/test-backlog-reconcile-sweep.sh
 governance-drift-sweep.sh	unit	tests/test-governance-drift.sh
 journal-audit.sh	unit	tests/test-journal-audit.sh
+journal-audit-replay.sh	unit	tests/test-journal-audit.sh
+journal-audit-replay.sh	unit	tests/test-journal-audit-act.sh
 lifecycle.sh	unit	tests/test-lifecycle-contracts.sh
 lifecycle.sh	unit	tests/test-lifecycle-lane-workers.sh
 JOURNAL_AUDIT	unit	tests/test-journal-audit.sh
@@ -225,6 +227,7 @@ HEALTH_SUITE_SCOPE	unit	tests/test-suite-scope.sh
 bats-fd3-guard.sh	unit	tests/test-bats-fd3-guard.sh
 gate-coverage-lint.sh	unit	tests/test-gate-coverage.sh
 pipe-safety-lint.sh	unit	tests/test-pipe-safety.sh
+bash-syntax-lint.sh	unit	tests/test-bash-syntax-lint.sh
 test-cap-ledger.sh	unit	tests/test-test-cap-ledger.sh
 git-scope-lint.sh	unit	tests/test-git-scope-lint.sh
 git-scope-lint.sh	unit	tests/test-nested-repo-isolation.sh
