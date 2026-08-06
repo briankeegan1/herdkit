@@ -98,7 +98,14 @@ export GH_STUB_RESET_EPOCH="$RESET_EPOCH"
 : > "$GH_STUB_CALLS"
 set_mode rate_limited
 set +e
-WORKTREES_DIR="$LIVE1" bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_live_tick'
+# HERD-440/HERD-596: re-export JOURNAL_FILE to THIS fixture — journal.sh's JOURNAL_FILE test seam
+# outranks WORKTREES_DIR resolution by design (a forgetful test must never pollute a live journal),
+# so under scripts/ci/run-suite.sh (which pins JOURNAL_FILE suite-wide for that same reason) leaving
+# it unset here silently redirects the tick's journal to the suite-wide pin instead of $LIVE1's own
+# — the write below then finds an empty $JPATH. Convention documented in run-suite.sh: "a test that
+# needs its own journal re-exports JOURNAL_FILE."
+JOURNAL_FILE="$LIVE1/.herd/journal.jsonl" WORKTREES_DIR="$LIVE1" \
+  bash -c '. "'"$REPO"'/scripts/herd/engine-version.sh"; herd_engine_live_tick'
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "a rate-limited tick must return 0 (backoff, not a fault) — got rc=$rc"
