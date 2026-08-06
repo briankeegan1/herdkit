@@ -145,6 +145,14 @@ if cmd == "tab rename":
         if args[2] in w["tabs"]: w["tabs"][args[2]]["label"] = args[3]
     save(s); emit({"type": "ok"})
 
+if cmd == "tab close":
+    # The tab-teardown primitive BOTH sweeps drive (_sweep_orphan_tabs, and the HERD-569
+    # tab-discipline reconcile). Without it the stub silently kept every "closed" tab, which reads
+    # exactly like a sweep that does not work — and makes a retire assertion untestable here.
+    for w in s["workspaces"].values():
+        w["tabs"].pop(args[2], None)
+    save(s); emit({"type": "ok"})
+
 if cmd == "pane split":
     src = args[2]
     for wid, w in s["workspaces"].items():
@@ -319,16 +327,18 @@ done
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
-# Three tabs and nine panes. Tabs: the control room, the builder, and the disposable `health·<slug>` TAB
-# the HERD-554 reconcile MINTS for an observed in-flight suite (the only leg that creates a tab rather
-# than splitting a pane — _spawn_health_pane calls `herdr tab create`, so its pane counts too). Panes:
+# Nine tabs and ten panes. Tabs: the control room, the builder, the disposable `health·<slug>` TAB the
+# HERD-554 reconcile MINTS for an observed in-flight suite, and the SIX the HERD-569 tab-discipline leg
+# plants to give the sweep one of every allowed shape plus two strays (scribe, control-room-by-label,
+# a live-worktree builder, a committed label exemption, and the two strays it must retire). Panes:
 # watcher, backlog, builder, the reviewer split for the reviewer-pane-lifecycle checkpoint, the two
 # resolver splits for the HERD-280 retire/escalate legs, the health split for the HERD-313
-# retire-on-outcome checkpoint, that minted health pane, and the claude-as-root pane for the alive
+# retire-on-outcome checkpoint, that minted health pane, the HERD-569 review-viewer split (the whole
+# point of the conversion: a viewer costs a PANE, not a tab), and the claude-as-root pane for the alive
 # checkpoint. All but the ESCALATE resolver pane are closed again within their own steps — that one
 # stays open BY DESIGN and goes with the workspace at teardown.
-[ "$(sc "$SCR" tabs_created)" -eq 3 ]  || fail "(B) tabs_created should be 3 (got $(sc "$SCR" tabs_created))"
-[ "$(sc "$SCR" panes_created)" -eq 9 ] || fail "(B) panes_created should be 9 (got $(sc "$SCR" panes_created))"
+[ "$(sc "$SCR" tabs_created)" -eq 9 ]   || fail "(B) tabs_created should be 9 (got $(sc "$SCR" tabs_created))"
+[ "$(sc "$SCR" panes_created)" -eq 10 ] || fail "(B) panes_created should be 10 (got $(sc "$SCR" panes_created))"
 # The reviewer pane is retired on verdict consumption (HERD-113).
 [ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # The resolver pane retires on a consumed DONE and SURVIVES an ESCALATE (HERD-280).
@@ -342,6 +352,13 @@ done
   || fail "(B) health_pane_created_from_observed_suite not pass"
 [ "$(cp_status "$SCR" health_pane_roundtrip_on_same_reconcile)" = "pass" ] \
   || fail "(B) health_pane_roundtrip_on_same_reconcile not pass"
+# HERD-569 TAB DISCIPLINE: the sweep retires the planted strays and — the assertion that matters, since
+# the action is closing tabs — leaves the builder, the live-worktree builder, the scribe, the control
+# room (by label AND by HERD_WATCHER_TAB_ID) and the committed label exemption alone across four ticks.
+[ "$(cp_status "$SCR" tab_discipline_sweep)" = "pass" ] || fail "(B) tab_discipline_sweep not pass"
+# HERD-569: the headless review viewer is a PANE inside the builder's tab, not a tab of its own.
+[ "$(cp_status "$SCR" review_viewer_splits_into_builder_tab)" = "pass" ] \
+  || fail "(B) review_viewer_splits_into_builder_tab not pass"
 # CLEAN TEARDOWN: zero leaked tabs, and the fake herdr's state has no workspaces left behind.
 [ "$(sc "$SCR" leaked_tabs)" -eq 0 ] || fail "(B) leaked_tabs must be 0 (got $(sc "$SCR" leaked_tabs))"
 LEFT="$(python3 -c 'import json; print(len(json.load(open("'"$STATE"'"))["workspaces"]))')"

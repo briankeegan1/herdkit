@@ -465,18 +465,35 @@ if [ -f scripts/herd/hermetic-env-scrub.sh ]; then
   herd_hermetic_env_scrub
 fi
 
+# HERD-571: agent-watch.sh's hermetic-guard choke point tags its own log line "refusal" (a 4th TSV
+# field) when the caller opted in with HERD_HERMETIC_GUARD_REFUSAL — a test deliberately driving that
+# exact choke point as its subject (e.g. tests/test-watcher-boot-journal.sh case (a)). Filter those out
+# here so a test that shares this run's HERD_HERMETIC_GUARD without pinning its own private log (a
+# test-isolation bug, not a hermeticity leak) can no longer red the whole suite — same "a refusal is
+# not a leak" principle as the HERD-441 console-guard ordering fix, one layer deeper. Every other line
+# (the herdr/claude/codex/osascript/notify-send tripwire hits, and any untagged/legacy agent-watch.sh
+# reach) is unaffected — still a genuine leak.
+_hk_dh_leak_lines() {
+  awk -F'\t' '!(NF==4 && $1=="agent-watch.sh" && $4=="refusal")' "$1" 2>/dev/null
+}
+
 _hk_dh_verdict() {
   # A non-empty leak log ⇒ a test reached the live control room or spawned a real daemon. This is a
   # HARD code error (exit 1), NEVER downgraded to the HERD-187 env-only tolerance — so it is checked
   # BEFORE the env classification. Cleans up the sandbox dir on the way out (leak or clean).
+  local _hk_dh_leaks="" _hk_dh_sorted=""
   if [ -n "$_hk_dh_log" ] && [ -s "$_hk_dh_log" ]; then
+    _hk_dh_leaks="$(_hk_dh_leak_lines "$_hk_dh_log")"
+  fi
+  if [ -n "$_hk_dh_leaks" ]; then
+    _hk_dh_sorted="$(sort -u <<< "$_hk_dh_leaks")"
     if [ -n "$ONELINE" ]; then
-      echo "daemon-hermeticity: a test touched a LIVE production surface (control room / desktop notification) — $(sort -u "$_hk_dh_log" | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
+      echo "daemon-hermeticity: a test touched a LIVE production surface (control room / desktop notification) — ${_hk_dh_sorted%%$'\n'*}"
     else
       echo "DAEMON-HERMETICITY: a test reached a LIVE production surface"
       echo "  (a hermetic test must stub herdr/claude, never launch agent-watch.sh against real state,"
       echo "   and never deliver a desktop notification — install scripts/herd/sim/sim-notify-stub.sh)"
-      sort -u "$_hk_dh_log" | sed 's/^/  leak: /'
+      printf '%s\n' "$_hk_dh_sorted" | sed 's/^/  leak: /'
     fi
     rm -rf "$_hk_dh_dir" "$_hk_jh_dir"
     exit 1
@@ -983,6 +1000,36 @@ case "$_hc_gscope_rc" in
      exit 1 ;;
 esac
 
+# 5e. tab-discipline creation guard (HERD-569) — the operator directive is that only builder tabs and
+# the scribe may exist, so engine code may open a workspace TAB only from the builder-lane, scribe or
+# control-room modules. Everything else splits a pane inside the tab it belongs to. scripts/herd/sim/,
+# scripts/herd/experiment/ and tests/ stand up real tabs in DISPOSABLE workspaces and are classified
+# FIXTURE — scanned, counted, never flagged. A deliberate exception is a `callsite` row in
+# templates/tab-discipline-exempt.tsv, WITH its reason (a bare row reds EXEMPT-MALFORMED; a row that
+# excuses nothing reds STALE-EXEMPT). ONE implementation shared with the builder's light pre-PR gate
+# (scripts/herd/tab-create-lint.sh), so the two can never disagree.
+tabc_note="tab-discipline: clean"
+HERD_TAB_CREATE_SKIP_REASON=""
+if [ -f scripts/herd/tab-create-lint.sh ]; then
+  . scripts/herd/tab-create-lint.sh
+  _hc_tabc_errs="$(herd_tab_create_lint ".")"; _hc_tabc_rc=$?
+else
+  _hc_tabc_errs=""; _hc_tabc_rc=2
+  HERD_TAB_CREATE_SKIP_REASON="scripts/herd/tab-create-lint.sh not present"
+fi
+case "$_hc_tabc_rc" in
+  0) tabc_note="tab-discipline: clean" ;;
+  2) tabc_note="tab-discipline: skipped ($HERD_TAB_CREATE_SKIP_REASON)" ;;
+  *) tabc_note="tab-discipline: OUT-OF-MODULE TAB CREATES"
+     if [ -n "$ONELINE" ]; then
+       echo "tab-discipline: $(printf '%s' "$_hc_tabc_errs" | grep -E '^(TAB-CREATE|EXEMPT-MALFORMED|STALE-EXEMPT)' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
+     else
+       echo "TAB-DISCIPLINE: engine code opens a workspace tab outside the builder-lane/scribe/control-room modules (split a pane instead, or record a 'callsite' row with its reason in templates/tab-discipline-exempt.tsv)"
+       printf '%s\n' "$_hc_tabc_errs" | grep -E '^(TAB-CREATE|EXEMPT-MALFORMED|STALE-EXEMPT)' || printf '%s\n' "$_hc_tabc_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 5d. env-export guard (HERD-449) — a config knob the Python engine core reads from os.environ
 # (pysrc/herd/live_runtime.py's _CORE_ENV_KEYS) must be `export`ed by herd-config.sh, or the
 # `live_runtime --tick` CHILD process never sees it and silently defaults — the bug that starved
@@ -1086,5 +1133,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $eexp_note; $tcl_note; $lrch_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $tabc_note; $eexp_note; $tcl_note; $lrch_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $tabc_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $chl_note"; }
 exit 0
