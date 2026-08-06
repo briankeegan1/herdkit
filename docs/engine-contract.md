@@ -329,6 +329,8 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `infra_breaker_open` / `_close` | — | `agent-watch.sh:2621` / `:2643` |
 | `cross_seat_block_honored` | pr, sha, seat, stage(setter\|merge), reason | `agent-watch.sh:post_gate_status` / `:11792` — restored HERD-446 at `live_runtime.py:LiveActuator.post_gate_status` (setter) and `LiveTick._walk` (merge), from the ONE shared implementation `_cross_seat_block_standing` |
 | `cross_seat_block_scan` | pr, sha, state(degraded), reason | `agent-watch.sh:_xseat_journal_degraded` — restored HERD-446 alongside `cross_seat_block_honored`; the FAIL-SOFT twin (an unreadable commit/comment scan, or an unresolvable seat identity, reports no standing block but leaves a forensic trail of why) |
+| `tab_discipline_retired` / `_stray` / `_capped` | tab_id, label, reason(unregistered\|kind:&lt;k&gt;) · capped: found, retired, cap | `tab-discipline.sh:herd_tab_discipline_sweep` (HERD-569 — the reconciled tab-bar sweep. `_retired` is a real close under `TAB_DISCIPLINE=on`; `_stray` is the `report`-mode detection that closes nothing; `_capped` records a pass that found more strays than `HERD_TAB_DISCIPLINE_MAX` and deferred the rest to the next cadence) |
+| `review_viewer_tab_fallback` | pr, slug, reason(builder-tab-gone\|split-failed) | `herd-review.sh` (HERD-569 — the headless review viewer normally SPLITS into the builder's tab; this records the one condition under which it still opens a standalone `review·<slug>` tab, which is also the condition its `callsite` exemption row is granted on) |
 
 `merge_result_gate` (pr, sha, slug, base, verdict — §6.4, HERD-296) and `merge_queue_hold` /
 `merge_queue_window` (pr, sha, slug, front_pr — §6.3, HERD-273) are Python-port-only additions with

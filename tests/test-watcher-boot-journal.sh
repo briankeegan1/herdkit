@@ -14,9 +14,22 @@
 #       (phase=singleton_lock) — exit 1, and never spawns a duplicate (the pre-existing holder pid is
 #       left untouched).
 #   (d) `watcher_boot` itself carries pid / argv0 / engine_sha / workspace fields.
+#   (e) an AMBIENT HERD_HERMETIC_GUARD this script's own caller exported (exactly what
+#       .herd/healthcheck.project.sh does for the whole suite run) never leaks into a case whose
+#       subject is a DIFFERENT guard — case (c) still reaches singleton_lock, not hermetic_guard.
 #
 # No herdr, no gh, no network, no real daemon ever left running (every case exits before the tick
 # loop). Run:  bash tests/test-watcher-boot-journal.sh
+#
+# HERD-571 ISOLATION: every invocation below explicitly pins its OWN HERD_HERMETIC_GUARD (case (a), the
+# one case whose subject IS that choke point, tagged HERD_HERMETIC_GUARD_REFUSAL=1 so it never counts as
+# a leak) or strips it via `env -u` (cases (b)/(c), whose subject is a DIFFERENT guard). Without this, an
+# outer harness that exports HERD_HERMETIC_GUARD for its whole run (.herd/healthcheck.project.sh does,
+# to catch a stray watcher spawn anywhere in the suite) leaks that value into every `bash "$WATCH"` call
+# here that does not override it — case (c) then hits the hermetic-guard choke point BEFORE it ever
+# reaches the singleton lock it means to test, exits 0 instead of the asserted non-zero, and appends a
+# line to the OUTER harness's SHARED leak log, poisoning the whole suite's daemon-hermeticity verdict for
+# every unrelated test in the same run. See case (e) below for the regression proof.
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/.." && pwd)"
@@ -60,7 +73,8 @@ journal_events() { grep -o '"event"[[:space:]]*:[[:space:]]*"[^"]*"' "$1" 2>/dev
 # ── (a) hermetic-guard choke point: boot, then boot_failed(phase=hermetic_guard), exit 0 ───────────
 J="$T/a-journal.jsonl"; : > "$J"
 LOG="$T/a-hermetic.log"; : > "$LOG"
-out="$(cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" JOURNAL_FILE="$J" HERD_HERMETIC_GUARD="$LOG" bash "$WATCH" 2>&1)"
+out="$(cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" JOURNAL_FILE="$J" HERD_HERMETIC_GUARD="$LOG" \
+  HERD_HERMETIC_GUARD_REFUSAL=1 bash "$WATCH" 2>&1)"
 rc=$?
 [ "$rc" -eq 0 ] || fail "(a) hermetic-guard redirect must exit 0 (got $rc): $out"
 ok
@@ -91,8 +105,12 @@ ok
 echo "PASS (d) watcher_boot carries pid/argv0/engine_sha/workspace"
 
 # ── (b) foreign cwd: boot, then boot_failed(phase=console_guard), exit 1 ────────────────────────────
+# `env -u HERD_HERMETIC_GUARD`: this case's subject is the console guard, not the hermetic guard — strip
+# whatever this script's OWN caller may have exported (see the HERD-571 note up top) so a foreign-cwd
+# refusal is never shadowed by an unrelated ambient guard.
 J="$T/b-journal.jsonl"; : > "$J"
-out="$(cd "$FOREIGN" && HERD_CONFIG_FILE="$PROJ/.herd/config" JOURNAL_FILE="$J" bash "$WATCH" 2>&1)"
+out="$(cd "$FOREIGN" && env -u HERD_HERMETIC_GUARD -u HERD_HERMETIC_GUARD_REFUSAL \
+  HERD_CONFIG_FILE="$PROJ/.herd/config" JOURNAL_FILE="$J" bash "$WATCH" 2>&1)"
 rc=$?
 [ "$rc" -ne 0 ] || fail "(b) foreign-cwd run must exit non-zero (got $rc): $out"
 ok
@@ -109,8 +127,13 @@ kill -0 "$HOLDER" 2>/dev/null || fail "(c) setup: fake holder unexpectedly dead"
 mkdir -p "$(dirname "$LOCK")"
 printf '%s\n' "$HOLDER" > "$LOCK"
 
+# `env -u HERD_HERMETIC_GUARD`: this case's subject is the singleton lock, not the hermetic guard — see
+# the HERD-571 note up top. Without this, an ambient HERD_HERMETIC_GUARD (exactly what
+# .herd/healthcheck.project.sh exports for its whole suite run) makes this run exit 0 at the
+# hermetic-guard choke point BEFORE it ever reaches the singleton lock, failing the assertion below.
 J="$T/c-journal.jsonl"; : > "$J"
-out="$(cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" JOURNAL_FILE="$J" bash "$WATCH" 2>&1)"
+out="$(cd "$PROJ" && env -u HERD_HERMETIC_GUARD -u HERD_HERMETIC_GUARD_REFUSAL \
+  HERD_CONFIG_FILE="$PROJ/.herd/config" JOURNAL_FILE="$J" bash "$WATCH" 2>&1)"
 rc=$?
 [ "$rc" -ne 0 ] || fail "(c) live-lock run must exit non-zero (got $rc): $out"
 ok
@@ -123,5 +146,28 @@ ok
   || fail "(c) the live holder pid must be left untouched (lock now: $(cat "$LOCK" 2>/dev/null))"
 ok
 echo "PASS (c) live-singleton-lock exit journals watcher_boot then watcher_boot_failed(singleton_lock), exit 1, no duplicate"
+
+# ── (e) ambient HERD_HERMETIC_GUARD (as an outer harness exports it) must not leak into case (c) ────
+# HERD-571 regression proof: .herd/healthcheck.project.sh exports HERD_HERMETIC_GUARD for its WHOLE
+# suite run, so every tests/test-*.sh it shells out to (this file included) inherits it in its own
+# process environment unless a case explicitly strips it. Simulate that shape by exporting it in a
+# subshell wrapping case (c)'s exact invocation (the `env -u` there must still win) — the live lock
+# from case (c) is still held, so this repeats the same singleton-lock refusal under ambient taint.
+AMBIENT_LOG="$T/ambient-shared.log"; : > "$AMBIENT_LOG"
+J="$T/e-journal.jsonl"; : > "$J"
+out="$(
+  export HERD_HERMETIC_GUARD="$AMBIENT_LOG"
+  cd "$PROJ" && env -u HERD_HERMETIC_GUARD -u HERD_HERMETIC_GUARD_REFUSAL \
+    HERD_CONFIG_FILE="$PROJ/.herd/config" JOURNAL_FILE="$J" bash "$WATCH" 2>&1
+)"
+rc=$?
+[ "$rc" -ne 0 ] || fail "(e) ambient-guard live-lock run must still exit non-zero (got $rc): $out"
+ok
+grep -q '"phase"[[:space:]]*:[[:space:]]*"singleton_lock"' "$J" \
+  || fail "(e) ambient HERD_HERMETIC_GUARD must not shadow the singleton-lock refusal (got: $(cat "$J"))"
+ok
+[ -s "$AMBIENT_LOG" ] && fail "(e) the ambient/shared guard log must stay untouched by this test (got: $(cat "$AMBIENT_LOG"))"
+ok
+echo "PASS (e) ambient HERD_HERMETIC_GUARD from an outer harness never leaks into a differently-guarded case"
 
 echo "ALL PASS ($pass checks)"
