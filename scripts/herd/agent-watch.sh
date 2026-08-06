@@ -14779,13 +14779,42 @@ _health_fail_detail() {
 # below move DURING a run instead of staying frozen until the suite exits. Fail-soft: no companion
 # (an older worker, or a caller that never set HEALTHCHECK_PROGRESS_LOG) falls straight through to
 # reading <log> itself — today's exact behavior.
+#
+# HERD-570 RETRY AWARENESS (leg 3): a live solo retry-before-red writes its OWN progress companion at
+# "<log>.retry.progress" (mirroring the main run's "<log>.progress" — see live_runtime.py's
+# _HEALTH_WORKER_SH _run(), called once per attempt). Prefer it the instant it carries bytes AND is
+# newer than (or the only) main companion, so the render — and health-pane-view.sh's own tail target,
+# which mirrors this exact preference order — visibly moves onto the retry lap instead of staying
+# frozen on run 1's now-stale companion. `-nt` degrades to "prefer retry whenever the main companion
+# is itself absent/empty" so a fresh retry with no main companion still resolves correctly. Absent
+# retry (the common case: no failure yet, or one that never needed a retry) is byte-identical to
+# before this leg.
 _health_progress_source() {
-  [ -s "${1}.progress" ] && { printf '%s' "${1}.progress"; return 0; }
+  local _hps_retry="${1}.retry.progress" _hps_main="${1}.progress"
+  if [ -s "$_hps_retry" ] && { [ ! -s "$_hps_main" ] || [ "$_hps_retry" -nt "$_hps_main" ]; }; then
+    printf '%s' "$_hps_retry"; return 0
+  fi
+  [ -s "$_hps_main" ] && { printf '%s' "$_hps_main"; return 0; }
   printf '%s' "$1"
 }
+# HERD-570 leg 2: a 'suite: N tests' header line (written by the project's own suite wrapper —
+# .herd/healthcheck.project.sh here — the moment it knows the total, before bats starts) names the
+# EXACT denominator for the per-file '[health-progress] <name> ok|FAIL' completion lines
+# (tests/herd.bats's herd_run_discovered_test) that are appended DIRECTLY to this companion the
+# instant each test finishes — unlike bats' own TAP stream (buffered in registration order under
+# --jobs, and never even routed through this companion by this project's wrapper), those completion
+# lines are exact and live. Prefer this source when the header is present. Absent header (an older
+# suite wrapper, or one that never adopted this convention) falls straight through to the pre-existing
+# TAP-plan parse below, byte-identical to before this leg.
 _health_progress() {
   local _hp_src; _hp_src="$(_health_progress_source "$1")"
   [ -f "$_hp_src" ] || return 0
+  local _hp_header_n; _hp_header_n="$(grep -m1 -oE '^suite: [0-9]+ tests$' "$_hp_src" 2>/dev/null | grep -oE '[0-9]+')"
+  if [ -n "$_hp_header_n" ]; then
+    local _hp_k; _hp_k="$(grep -cE '^\[health-progress\] ' "$_hp_src" 2>/dev/null || printf 0)"
+    printf '%s/%s' "${_hp_k:-0}" "$_hp_header_n"
+    return 0
+  fi
   local _hp_plan _hp_done
   _hp_plan="$(grep -m1 -oE '^1\.\.[0-9]+' "$_hp_src" 2>/dev/null | grep -oE '[0-9]+$')"
   [ -n "$_hp_plan" ] || return 0
@@ -14803,20 +14832,25 @@ _health_progress() {
 # Pure read of the tailable log the health worker (bash or the Python engine) streams into; no state
 # mutation, so the render half can call it every tick.
 _health_inflight_note() {
-  local _hin_log="$1" _hin_prog _hin_src _hin_es
+  local _hin_log="$1" _hin_prog _hin_src _hin_es _hin_retry=""
   # HERD-546: an env-suspect marker (written by _health_worker before its solo re-run) takes
   # precedence over the ordinary TAP/byte-count liveness clause — the operator sees WHY a run that
   # already failed once is still in flight, not just that it is. Empty (byte-inert) whenever
   # ENV_SUSPECT_TIMEOUT never fired for this run.
   _hin_es="$(_health_env_suspect_marker "$_hin_log")"
   if [ -n "$_hin_es" ]; then printf '%s' "$_hin_es"; return 0; fi
-  _hin_prog="$(_health_progress "$_hin_log")"
-  if [ -n "$_hin_prog" ]; then printf '%s' "$_hin_prog"; return 0; fi
+  # HERD-570 leg 3: once _health_progress_source has actually switched onto the retry companion, say
+  # so — "retry 1 · …" — so a retry lap reads as visibly distinct from run 1 instead of the counter
+  # (or line count / "no output yet") silently resetting with no explanation. herdkit's retry-before-
+  # red is always exactly one solo attempt, so this is never anything but "retry 1".
   _hin_src="$(_health_progress_source "$_hin_log")"
+  [ "$_hin_src" = "${_hin_log}.retry.progress" ] && _hin_retry="retry 1 · "
+  _hin_prog="$(_health_progress "$_hin_log")"
+  if [ -n "$_hin_prog" ]; then printf '%s%s' "$_hin_retry" "$_hin_prog"; return 0; fi
   if [ -s "$_hin_src" ]; then
-    printf '%s lines' "$(grep -c '' "$_hin_src" 2>/dev/null || printf 0)"
+    printf '%s%s lines' "$_hin_retry" "$(grep -c '' "$_hin_src" 2>/dev/null || printf 0)"
   else
-    printf 'no output yet'
+    printf '%sno output yet' "$_hin_retry"
   fi
 }
 

@@ -654,6 +654,33 @@ if command -v bats >/dev/null 2>&1 && ls tests/*.bats >/dev/null 2>&1; then
   # so `</dev/null` fails a stdin prompt fast, BATS_TEST_TIMEOUT names a per-test wedge, and an OUTER
   # `timeout` writing to a TEMP FILE (never `$(bats …)`, which a surviving /dev/tty grandchild would hang
   # on even after bats is killed) is the guaranteed backstop. All env-overridable.
+  #
+  # HERD-570: a 'suite: N tests' header line, named the moment the total is known and BEFORE bats
+  # actually starts, gives agent-watch.sh's live k/N counter an exact denominator — tests/herd.bats's
+  # herd_run_discovered_test appends one '[health-progress] <file> ok|FAIL' line per discovered test
+  # the instant it finishes (independent of bats' own --jobs-buffered TAP order), so N here MUST be
+  # exactly the count of tests discovery will register (curated set minus exempt minus bespoke/
+  # hand-written @test blocks — the bespoke ones never emit a completion line, so counting them in N
+  # would strand the counter short of 100% at the suite's true end). Reuse herd_bats_discover itself
+  # (never a second, drift-prone reimplementation of "which tests count") over the SAME scope
+  # (HERD_SUITE_SCOPE_TESTS, already resolved above) tests/herd.bats will actually apply, and read its
+  # bespoke list straight out of tests/herd.bats rather than hand-copying it here, so a future edit to
+  # that list can never silently desync the header from what discovery really registers. Written with a
+  # direct append (mirroring herd_run_discovered_test's own write), never through stdout, so it lands
+  # before any buffered tee output. Fail-soft: no HEALTHCHECK_PROGRESS_LOG, no discover-tests.bash, or a
+  # zero/unparseable count all skip silently — the render falls back to its pre-existing behavior.
+  if [ -n "${HEALTHCHECK_PROGRESS_LOG:-}" ] && [ -f tests/discover-tests.bash ] && [ -f tests/herd.bats ]; then
+    _hk_progress_list="$(
+      # shellcheck source=tests/discover-tests.bash
+      . tests/discover-tests.bash
+      _hk_bespoke="$(sed -n 's/^HERD_DISCOVERY_BESPOKE="\(.*\)"$/\1/p' tests/herd.bats | head -1)"  # pipe-ok: head feeds a single-line var from a small, bounded fixture file; the pipeline status is not gated
+      herd_bats_discover tests tests/gate-coverage-exempt.tsv "$_hk_bespoke"
+    )" 2>/dev/null
+    _hk_progress_n="$(printf '%s\n' "$_hk_progress_list" | grep -c .)"
+    case "$_hk_progress_n" in ''|*[!0-9]*) _hk_progress_n=0 ;; esac
+    [ "$_hk_progress_n" -gt 0 ] 2>/dev/null \
+      && printf 'suite: %s tests\n' "$_hk_progress_n" >> "$HEALTHCHECK_PROGRESS_LOG" 2>/dev/null || true
+  fi
   _hk_bats_out="$(mktemp 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/hk-bats.$$")"
   BATS_TEST_TIMEOUT="${BATS_TEST_TIMEOUT:-120}"
   # HERD-463: bats-core's `--jobs N` parallelizes WITHIN tests/herd.bats's ~350 dynamically-registered
