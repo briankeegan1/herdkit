@@ -4739,14 +4739,26 @@ class LiveTick:
                                     "detail", "refix ledger unwritable — once-guard will not hold")
         return round_num, None
 
-    def _maybe_arm_review_escalation(self, cand, round_num):
+    def _maybe_arm_review_escalation(self, cand):
         """Port of agent-watch.sh:_maybe_arm_review_escalation — called right after a fresh REVIEW
-        refix bounce is recorded. ``round_num`` is that bounce's OWN round number (the just-recorded
-        REVIEW-kind rail count returned by :meth:`_refix_check_and_record`), so this needs no separate
-        ledger re-scan the way bash's ``refix_round_count_kind`` call does. Ship-dormant: see
-        :func:`_review_evidence_escalate_rounds` for why a garbage threshold fails to "never arm"."""
+        refix bounce is recorded. Arms off the LIFETIME review-bounce count
+        (``D.refix_round_count_kind``), NOT ``_refix_check_and_record``'s rail-budget round number: a
+        rail reset (written on every review PASS, ``_refix_rail_reset``) zeroes the BUDGET but must
+        never erase the EVIDENCE that the cheap reviewer already missed this PR across multiple rounds
+        — exactly what ``refix_round_count_kind``'s own docstring says it exists for ("read only to
+        arm a stronger-reviewer escalation … so a rail reset must not erase it"). Concretely: bounce
+        (rail=1, lifetime=1) -> fix pushed, review PASSes and resets the rail (rail=0, lifetime=1) ->
+        a LATER sha bounces review again (rail=1, lifetime=2) — the rail-budget number alone would
+        never reach the default threshold of 2, so this RE-SCANS the ledger for the lifetime count,
+        mirroring bash's own ``refix_round_count_kind "$pr" review`` re-read rather than reusing the
+        rail's round number. Ship-dormant: see :func:`_review_evidence_escalate_rounds` for why a
+        garbage threshold fails to "never arm"."""
         threshold = _review_evidence_escalate_rounds(self.config)
-        if threshold is None or round_num is None or round_num < threshold:
+        if threshold is None:
+            return
+        rows = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
+        lifetime = D.refix_round_count_kind(rows, str(cand.pr), "review")
+        if lifetime < threshold:
             return
         esc_file = self.state.review_escalate_file(cand.pr)
         if not esc_file:
@@ -5497,7 +5509,7 @@ class LiveTick:
             # missed the real issue — arm a one-shot Opus escalation for this PR's NEXT review dispatch
             # (consumed in LiveGates.review). Placed right after the bounce is recorded, mirroring
             # bash's `_maybe_arm_review_escalation "$pr"` call right after `record_refix`.
-            self._maybe_arm_review_escalation(cand, round_num)
+            self._maybe_arm_review_escalation(cand)
             # Contract §3.4 refix_bounce shape — mirror the shadow twin (shadow_runtime.py:429) and
             # bash (agent-watch.sh:7321); the live tick parses no finding location for either rail.
             # HERD-370: see the health leg above — _bounce_and_wake owns the wake verification the

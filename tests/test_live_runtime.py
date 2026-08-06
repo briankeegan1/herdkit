@@ -7207,6 +7207,29 @@ class TestReviewModelEscalation(LiveCase):
         self.assertTrue(os.path.exists(state.review_escalate_file(21)),
                         "a second failed REVIEW round must arm the escalation marker")
 
+    def test_lifetime_count_survives_a_rail_reset_between_bounces(self):
+        # PR #711 review finding: arming must use the LIFETIME review-bounce count
+        # (D.refix_round_count_kind), not the rail's reset-zeroable round_num. Reproduces the exact
+        # counter-example: bounce (rail=1, lifetime=1) -> review PASSes, resetting the rail (rail=0,
+        # lifetime=1, unchanged — a reset never refunds the lifetime count) -> a LATER sha bounces
+        # review again (rail=1, lifetime=2) -> must still arm at the default threshold of 2, even
+        # though the RAIL count alone never reaches 2 across this sequence.
+        state = LiveState(self.tmp)
+        res1, _ = self._walk(25, "sha-a")                       # review BLOCK -> rail=1, lifetime=1
+        self.assertEqual(res1["outcomes"]["25"], "BLOCK")
+        self.assertFalse(os.path.exists(state.review_escalate_file(25)))
+
+        res2, _ = self._walk(25, "sha-b", review="PASS")        # review PASS -> resets the rail to 0
+        self.assertNotEqual(res2["outcomes"]["25"], "BLOCK")
+        self.assertFalse(os.path.exists(state.review_escalate_file(25)),
+                         "a PASS must never arm anything on its own")
+
+        res3, _ = self._walk(25, "sha-c")                       # review BLOCK again -> rail=1, lifetime=2
+        self.assertEqual(res3["outcomes"]["25"], "BLOCK")
+        self.assertTrue(os.path.exists(state.review_escalate_file(25)),
+                        "the LIFETIME count (2) must arm even though the rail-budget round number is "
+                        "only 1 at this bounce (the rail was reset by the intervening PASS)")
+
     def test_health_rounds_never_arm_review_escalation(self):
         # REVIEW_EVIDENCE_ESCALATE_ROUNDS counts REVIEW-kind bounces ONLY — a healthcheck bounce is
         # evidence about the SUITE, not the reviewer, and must never arm an Opus re-review.
