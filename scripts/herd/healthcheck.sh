@@ -173,6 +173,17 @@ else
   herd_git_scope_lint() { return 2; }
 fi
 # Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# tab-discipline creation guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/tab-create-lint.sh"
+[ -f "$DIR/scripts/herd/tab-create-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/tab-create-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_TAB_CREATE_SKIP_REASON="tab-create-lint.sh not present"
+  herd_tab_create_lint() { return 2; }
+fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
 # env-export guard (rc 2), never break the healthcheck it is a part of.
 # Prefer the tree-under-test's copy when present (HERD-309).
 _HERD_LINT_SRC="$HERE/env-export-lint.sh"
@@ -809,6 +820,24 @@ EOF
   if [ "$gscope_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ git-scope — $(printf '%s' "$gscope_errs" | grep '^GIT-SCOPE' | head -1)";  # pipe-ok: head in a command substitution; status not gated
     else echo "❌ GIT-SCOPE: a production engine path stages repo-wide or commits without a pathspec (name the paths, or annotate '# herd-scope-ok: <why>')"; printf '%s\n' "$gscope_errs" | grep '^GIT-SCOPE' || printf '%s\n' "$gscope_errs"; fi
+    exit 1
+  fi
+
+  # tab-discipline creation guard (HERD-569) — the workspace tab bar is the operator's
+  # situational-awareness surface, and the operator directive is that only builder tabs and the scribe
+  # may exist. A `tab create` in engine code outside the builder-lane / scribe / control-room modules
+  # adds a tab nobody asked for; the runtime sweep (scripts/herd/tab-discipline.sh) retires whatever
+  # strays appear, and this is the build-time half that stops new ones being written. The SAME lint the
+  # heavy gate runs (scripts/herd/tab-create-lint.sh). Same red semantics as caps-sync / git-scope.
+  # scripts/herd/sim/, scripts/herd/experiment/ and tests/ are classified FIXTURE (real tabs in
+  # DISPOSABLE workspaces) and never flagged; a deliberate exception is a `callsite` row in
+  # templates/tab-discipline-exempt.tsv, WITH its reason. Skipped (never red) when the lint is absent
+  # or the tree has no engine tab surface.
+  local tabc_errs tabc_rc
+  tabc_errs="$(herd_tab_create_lint ".")"; tabc_rc=$?
+  if [ "$tabc_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ tab-discipline — $(printf '%s' "$tabc_errs" | grep -E '^(TAB-CREATE|EXEMPT-MALFORMED|STALE-EXEMPT)' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ TAB-DISCIPLINE: engine code opens a workspace tab outside the builder-lane/scribe/control-room modules (split a pane instead, or record a 'callsite' row with its reason in templates/tab-discipline-exempt.tsv)"; printf '%s\n' "$tabc_errs" | grep -E '^(TAB-CREATE|EXEMPT-MALFORMED|STALE-EXEMPT)' || printf '%s\n' "$tabc_errs"; fi
     exit 1
   fi
 

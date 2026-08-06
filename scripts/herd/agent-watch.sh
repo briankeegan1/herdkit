@@ -16186,6 +16186,14 @@ SWEEP_LIB=1
 . "$HERE/sweep.sh"
 unset SWEEP_LIB
 
+# ── Tab-discipline reconcile (HERD-569) ──────────────────────────────────────────────────────────
+# tab-discipline.sh reconciles the OBSERVED tab bar against the tabs the invariant allows (registered
+# builders, the scribe, the control room, the committed exemptions) and retires the rest. Sourced
+# AFTER _herd_tabs_drop_row above, whose registry prune it reuses when a retired stray left a row
+# behind. Ship-dormant: TAB_DISCIPLINE=off (the default) makes herd_tab_discipline_sweep a hard no-op.
+# shellcheck source=/dev/null
+. "$HERE/tab-discipline.sh"
+
 # ── Retirement invariant (HERD-164) ──────────────────────────────────────────────────────────────
 # retirement.sh reconciles "a merged/closed slug owns nothing" on EVERY tick, composing _reap_slug
 # (above) with sweep.sh's dirt/unique-commit proof helpers — so it must be sourced after BOTH. It
@@ -17296,6 +17304,12 @@ EOF
   if [ "$_ORPHAN_SWEEP_TICK" -ge "$_ORPHAN_SWEEP_INTERVAL" ]; then
     _ORPHAN_SWEEP_TICK=0
     _sweep_orphan_tabs
+    # Tab-discipline reconcile (HERD-569) rides the SAME cadence, immediately after: the orphan sweep
+    # has just closed every registered tab whose slug died and pruned the rows, so this pass reconciles
+    # a tab bar that is already as small as the allowlist model can make it — and whatever is LEFT that
+    # is neither a registered builder, the scribe, the control room, nor a committed exemption is a
+    # genuine stray rather than a race with the sweep above. Byte-inert unless TAB_DISCIPLINE is armed.
+    herd_tab_discipline_sweep
   fi
 
   # Tracker-state self-heal (HERD-86): every _TRACKER_SWEEP_INTERVAL ticks re-assert Done for any
