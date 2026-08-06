@@ -54,6 +54,7 @@ export JOURNAL_FILE="$T/trees/.herd/journal.jsonl"
 export HERD_JOURNAL_AUDIT_INBOX="$T/trees/.agent-watch-inbox"
 export HERD_JOURNAL_AUDIT_SEEN="$T/trees/.agent-watch-journal-audit-seen"
 export HERD_JOURNAL_AUDIT_PENDING="$T/trees/.agent-watch-journal-audit-pending"
+export HERD_JOURNAL_AUDIT_NOACTION_COUNT="$T/trees/.agent-watch-journal-audit-noaction-count"
 export HERD_APPROVALS_FILE="$T/trees/.agent-watch-approvals"
 # PR-body source: check (g) is not the main subject of this file, so the default (no per-pr override
 # file) is an empty body — declares no HUMAN-VERIFY block. (2d) below drives the merged_hv_unknown
@@ -107,7 +108,7 @@ reset_surfaces() {
   rm -rf "$T/trees/.herd" 2>/dev/null || true
   mkdir -p "$T/trees/.herd"
   : > "$JOURNAL_FILE"; : > "$HERD_JOURNAL_AUDIT_INBOX"
-  rm -f "$HERD_JOURNAL_AUDIT_SEEN" "$HERD_JOURNAL_AUDIT_PENDING" "$RAILLOG" "$SCRIBELOG" "$T/rail.fail" "$T/scribe.fail"
+  rm -f "$HERD_JOURNAL_AUDIT_SEEN" "$HERD_JOURNAL_AUDIT_PENDING" "$HERD_JOURNAL_AUDIT_NOACTION_COUNT" "$RAILLOG" "$SCRIBELOG" "$T/rail.fail" "$T/scribe.fail"
 }
 run_audit() {  # run_audit <on|off> [extra KEY=VALUE env assignments…]
   # `env` (not a bare assignment prefix): a QUOTED "${@:2}" expansion is a command word to bash, not a
@@ -227,6 +228,42 @@ out="$(run_audit on)" || fail "(2c) sweep 3 exited non-zero: $out"
 pass
 echo "PASS (2c) a mapped finding that resolves journals audit_finding_cleared and stops tracking"
 
+# ── (2d) red_state_stale RE-CONFIRMS for the SAME sha across multiple sweeps — it must dedupe to ONE
+#         tracked finding and converge (escalate), never spawn a fresh PENDING row per re-confirmation
+#         (HERD-597). reconcile_main_health re-journals `main_health result=red` on its own cadence
+#         while a red stands, so the pre-fix key (sha+the red EVENT's own ts) turned every
+#         re-confirmation into a BRAND NEW finding — the live PENDING ledger held three such orphaned
+#         rows for the SAME sha, all count=1, none ever reaching JOURNAL_AUDIT_ESCALATE_AFTER ────────
+reset_surfaces
+jline "2026-08-05T13:00:00Z" '"event":"main_health","pr":902,"sha":"d5ef2756","result":"red","failed":"tests/y.sh"'
+out="$(run_audit on)" || fail "(2d) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2d) sweep 1 must drive the re-verify rail once, got $(rail_calls)"
+[ "$(wc -l < "$HERD_JOURNAL_AUDIT_PENDING" | tr -cd '0-9')" = "1" ] || fail "(2d) sweep 1 must track exactly one pending row, got: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+# A re-confirmation: a FRESH main_health red event, same sha, no green in between. This must not read
+# as a brand-new finding.
+jline "2026-08-05T13:10:00Z" '"event":"main_health","pr":902,"sha":"d5ef2756","result":"red","failed":"tests/y.sh"'
+out="$(run_audit on)" || fail "(2d) sweep 2 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2d) a re-confirmed red must never re-drive the rail, got $(rail_calls)"
+[ "$(wc -l < "$HERD_JOURNAL_AUDIT_PENDING" | tr -cd '0-9')" = "1" ] || fail "(2d) a re-confirmed red must still track exactly ONE pending row, got: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+[ "$(count_event audit_acted)" = "1" ] || fail "(2d) sweep 2 is within the grace window — no escalation yet"
+# A second re-confirmation, still the same sha: the second re-observation the lifecycle pass sees
+# (JOURNAL_AUDIT_ESCALATE_AFTER default 2) — escalate LOUDLY, exactly once, for the single tracked row.
+jline "2026-08-05T13:20:00Z" '"event":"main_health","pr":902,"sha":"d5ef2756","result":"red","failed":"tests/y.sh"'
+out="$(run_audit on)" || fail "(2d) sweep 3 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2d) escalation must never re-drive the rail, got $(rail_calls)"
+[ "$(count_event audit_acted)" = "2" ] || fail "(2d) sweep 3 must escalate the single tracked finding"
+grep -q '"result":"escalated"' "$JOURNAL_FILE" || fail "(2d) sweep 3 must journal result=escalated"
+[ "$(scribe_calls)" = "1" ] || fail "(2d) the escalation must file exactly one item, got $(scribe_calls)"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(2d) an escalated finding must stop being tracked: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+# Further re-confirmations of the same sha: fully silent — the finding already settled.
+jline "2026-08-05T13:30:00Z" '"event":"main_health","pr":902,"sha":"d5ef2756","result":"red","failed":"tests/y.sh"'
+out="$(run_audit on)" || fail "(2d) sweep 4 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2d) a settled finding must never re-act, got $(rail_calls)"
+[ "$(count_event audit_acted)" = "2" ] || fail "(2d) a settled finding must journal no further audit_acted"
+[ "$(scribe_calls)" = "1" ] || fail "(2d) a settled finding must never file a second item"
+pass
+echo "PASS (2d) red_state_stale re-confirmations of the same sha dedupe to one tracked finding and converge (HERD-597)"
+
 # ── (3) an UNMAPPED finding class files EXACTLY ONE deduped item, ever ──────────────────────────
 reset_surfaces
 jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'      # pushed_no_unresolved: no rail
@@ -284,6 +321,39 @@ grep -q '"class":"merged_hv_unknown".*"result":"no_action"' "$JOURNAL_FILE" \
 [ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(3c) a no-action class must never be tracked as pending"
 pass
 echo "PASS (3c) merged_hv_unknown is a deliberate no-action class — a transient read failure never files an item"
+
+# ── (3d) RECURRENCE ESCALATION (HERD-597): a deliberate no-action class that keeps recurring under
+#         DISTINCT finding keys files ONE class-scoped item at HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX
+#         occurrences, then goes quiet forever. Live case: fixture_slug fired for slug=retiree,
+#         slug=conv and slug=stuck across separate sweeps — three distinct keys of the SAME class —
+#         and never escalated at all before this, because the per-key no-action guard in (3b)/(3c) is
+#         (correctly) keyed per finding, not per class ──────────────────────────────────────────────
+reset_surfaces
+jline "2026-08-05T15:00:00Z" '"event":"reap","pr":77,"slug":"retiree","sha":"fff","reason":"merged"'
+out="$(run_audit on HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX=3)" || fail "(3d) sweep 1 exited non-zero: $out"
+[ "$(scribe_calls)" = "0" ] || fail "(3d) a single occurrence must never file anything, got $(scribe_calls)"
+[ "$(grep -c '"result":"no_action"' "$JOURNAL_FILE")" = "1" ] || fail "(3d) sweep 1 must journal exactly one no_action"
+# A second, DISTINCT slug — a different finding key, same class.
+jline "2026-08-05T15:05:00Z" '"event":"reap","pr":78,"slug":"conv","sha":"eee","reason":"merged"'
+out="$(run_audit on HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX=3)" || fail "(3d) sweep 2 exited non-zero: $out"
+[ "$(scribe_calls)" = "0" ] || fail "(3d) two distinct occurrences must still not file, got $(scribe_calls)"
+# A THIRD, distinct slug — the third distinct occurrence of the SAME class → escalate exactly once.
+jline "2026-08-05T15:10:00Z" '"event":"reap","pr":79,"slug":"stuck","sha":"ddd","reason":"merged"'
+out="$(run_audit on HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX=3)" || fail "(3d) sweep 3 exited non-zero: $out"
+[ "$(scribe_calls)" = "1" ] || fail "(3d) the third distinct occurrence must file exactly one recurring item, got $(scribe_calls)"
+grep -q '"class":"fixture_slug".*"result":"recurring_filed"' "$JOURNAL_FILE" \
+  || fail "(3d) the recurrence escalation must journal result=recurring_filed: $(grep audit_acted "$JOURNAL_FILE")"
+grep -q 'Dedup key: recurring:fixture_slug' "$SCRIBELOG" || fail "(3d) the filed item's dedup key must be CLASS-scoped, not per-slug: $(cat "$SCRIBELOG")"
+grep -q 'audit-recurring:fixture_slug' "$HERD_JOURNAL_AUDIT_INBOX" || fail "(3d) the recurrence escalation must be LOUD in the operator inbox"
+filed_title="$(sed -n 1p "$SCRIBELOG")"
+[ "$filed_title" = "journal-audit: fixture_slug keeps recurring (HERD-597)" ] || fail "(3d) unexpected filed title: $filed_title"
+# A fourth distinct occurrence: the CLASS already escalated — never a second filed item, ever.
+jline "2026-08-05T15:15:00Z" '"event":"reap","pr":80,"slug":"hd","sha":"ccc","reason":"merged"'
+out="$(run_audit on HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX=3)" || fail "(3d) sweep 4 exited non-zero: $out"
+[ "$(scribe_calls)" = "1" ] || fail "(3d) a class that already escalated must never file a second item, got $(scribe_calls)"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(3d) a no-action class must never be tracked as pending, even when recurring"
+pass
+echo "PASS (3d) a recurring no-action class (3+ distinct keys) files exactly one class-scoped item (HERD-597)"
 
 # ── (4) each mapped class routes to the rail WITH the context it needs ──────────────────────────
 reset_surfaces
