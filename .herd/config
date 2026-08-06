@@ -11,9 +11,22 @@ BACKLOG_FILE="BACKLOG.md"
 SCRIBE_BACKEND="linear"
 SHARE_LINKS=""
 
-# HEALTHCHECK = shellcheck over the scripts + bats over the tests (degrades to bash -n + the
-# hermetic queue tests when those tools are absent).
-HEALTHCHECK_CMD=".herd/healthcheck.project.sh"
+# HEALTHCHECK_CMD — herdkit's OWN merge-gate policy (2026-08-06 operator decision, HERD-579).
+# RETIRED as this project's merge gate: HEALTHCHECK_CMD is a no-op (`true`), so the watcher's
+# heavy-profile invocation always exits 0 clean. Rationale — herdkit's own worst-case healthcheck
+# cost profile is uniquely bad among the projects it gates: engine diffs are unscopeable (a change
+# anywhere in bin/scripts/pysrc can affect the whole tree), so every PR pays the FULL suite, on a
+# SHARED box, contending with other builders/reviewers/the watcher for the same CPU. Merge safety
+# for herdkit now rests on: adversarial pre-merge review (unchanged — still gates every PR) +
+# GitHub CI informing MAIN_HEALTH_CI_GATE (a red main alarms loudly, it is never silently ignored)
+# + the auto-repair loop (MAIN_HEALTH_AUTOFIX / CI_AUTOREPAIR) that heals a red main forward
+# instead of leaning on a pre-merge local run to prevent one.
+# REVERT (one line): HEALTHCHECK_CMD=".herd/healthcheck.project.sh"  — re-arms the local suite as
+# the merge gate; HEALTHCHECK_HEAVY_GLOB below still governs heavy/light routing once armed.
+# The healthcheck TOOL itself is untouched: scripts/herd/healthcheck.sh and
+# .herd/healthcheck.project.sh remain herdkit's own local dev healthcheck AND the gate every
+# CONSUMER project still runs by default — only herdkit's own merge-time use is retired here.
+HEALTHCHECK_CMD=true
 # HEALTHCHECK_HEAVY_GLOB (HERD-65) — egrep of changed diff paths (repo-root-relative) that force the
 # heavy profile; no match → the light per-file syntax gate (bash -n / py_compile). Chosen so
 # engine-critical paths stay heavy while docs-only *.md and .herd/config VALUE-only diffs skip the

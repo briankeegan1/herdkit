@@ -27,10 +27,12 @@ route notes, read a gate, reconcile a merge — lives in the **`{{COORDINATOR_CM
 skill deliberately does **not** restate it: a forked copy would drift, and a drifted copy is
 worse than no copy (`docs/multi-seat-doctrine.md`, rule 2 — one shared check at every surface).
 
-**Autopilot is NOT gateless.** The healthcheck and the adversarial pre-merge review still gate
-every single PR, `TRACKED_SPAWNS`/`CLAIM_REQUIRED` still make every spawn file-then-claim, and
-you still never self-merge. What disappears is the *pause* — between cycles, and between the
-last merge and the next arrival of work.
+**Autopilot is NOT gateless.** Whatever `HEALTHCHECK_CMD` resolves to on this project (a project
+may retire it to a no-op as its merge-gate policy — check `.herd/config` for a policy comment
+before assuming it runs a real suite) plus the adversarial pre-merge review still run on every
+single PR, `TRACKED_SPAWNS`/`CLAIM_REQUIRED` still make every spawn file-then-claim, and you still
+never self-merge. What disappears is the *pause* — between cycles, and between the last merge and
+the next arrival of work.
 
 ## 1. Posture check — idempotent, never a blind re-apply
 
