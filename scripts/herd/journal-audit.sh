@@ -45,19 +45,26 @@
 #   routed to exactly ONE of three policies (the shipped mapping, `_ja_act_mapped` / `_ja_act_no_action_reason`
 #   in the ACT section below — a class never falls through to a default):
 #     MAPPED    → ONE bounded action via the rail in scripts/herd/journal-act.sh.
-#     NO-ACTION → a deliberate, journaled no-op (HERD-562/HERD-563): a class whose finding is real but
-#                 not itself actionable work — `fixture_slug` (evidence of test/fixture pollution
-#                 reaching a live journal, not a gap to file a tracker item against) and
-#                 `merged_hv_unknown` (a transient PR-body-fetch failure; the next sweep re-probes on
-#                 its own). Journals `audit_acted result=no_action reason=…` exactly once and NEVER
-#                 files, escalates, or re-fires for that FINDING KEY. RECURRENCE ESCALATION (HERD-597):
+#     NO-ACTION → a deliberate, journaled no-op (HERD-562/HERD-563, extended HERD-600): a class whose
+#                 finding is real but not itself actionable work — `fixture_slug` (evidence of
+#                 test/fixture pollution reaching a live journal, not a gap to file a tracker item
+#                 against), `merged_hv_unknown` (a transient PR-body-fetch failure; the next sweep
+#                 re-probes on its own), `watcher_restart_blocked` (an orphaned lock holder is a signal
+#                 for a human to look at — auto-killing an unidentified pid risks killing a live
+#                 builder, so no rail may act on it), and `checkout_unclean` (reconcile_checkout_cleanliness
+#                 deliberately LEAVES the contamination in place as evidence for a human; a rail that
+#                 auto-discarded it would destroy the very evidence the check exists to preserve).
+#                 Journals `audit_acted result=no_action reason=…` exactly once and NEVER files,
+#                 escalates, or re-fires for that FINDING KEY. RECURRENCE ESCALATION (HERD-597):
 #                 a class that keeps being found under distinct keys (a new slug, a new pr) is itself a
 #                 signal nothing has looked at the root cause, so occurrences are additionally counted
 #                 PER CLASS (HERD_JOURNAL_AUDIT_NOACTION_COUNT); at HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX
 #                 (default 3) or more, ONE recurring-flagged item is filed for the whole class — dedup
 #                 on the CLASS, never per key — and the class then goes quiet forever.
-#     UNMAPPED  → any other class auto-files ONE dedup-keyed tracker item via the scribe, so a gap
-#                 becomes WORK instead of another report.
+#     UNMAPPED  → any other class auto-files ONE dedup-keyed tracker item via the scribe. Dedup is keyed
+#                 on the CLASS (HERD-602 fix), not the per-finding key: a class that keeps producing NEW
+#                 keys (a new pr, a new slug, a new ts) still files exactly once, ever — a gap becomes
+#                 WORK instead of a flood of duplicate reports of the same gap.
 #   Each MAPPED action fires at most ONCE per finding key across every seat (shared-pool once-guard).
 #   ACT-THEN-CLEAR (HERD-564/HERD-573): a mapped action is tracked (HERD_JOURNAL_AUDIT_PENDING) until
 #   its finding is resolved one way or the other — every sweep re-checks each tracked key against the
@@ -877,18 +884,31 @@ _ja_act_mapped() {
 }
 
 # _ja_act_no_action_reason <kind> — prints a reason and returns 0 iff <kind> is a DELIBERATE no-action
-# class (HERD-562/HERD-563): the finding is real and stays REPORTED (the advisory half above is
-# unaffected), but it is not itself a gap to route anywhere — neither to a rail (nothing to heal) nor
-# to the scribe (filing it would be noise, not work). Checked BEFORE `_ja_act_mapped`'s unmapped
-# fallthrough so these two classes can never fall into the generic "file a tracker item" path:
-#   fixture_slug        — evidence that a TEST/SIM fixture wrote to the LIVE journal (see
-#                          tests/test-sim-journal-hermeticity.sh), not evidence of a production gap.
-#                          The fix is a hermeticity guard on the leaking fixture, not a filed item
-#                          every time its slug shows up in a bounded replay window.
-#   merged_hv_unknown    — the PR body fetch failed (a transient `gh`/network hiccup); the NEXT sweep
-#                          re-probes on its own (the seen-ledger only memoizes a SETTLED verdict, never
-#                          an unknown one — see the (g) check above), so filing a permanent item for a
-#                          transient read failure would be pure noise.
+# class (HERD-562/HERD-563, extended HERD-600): the finding is real and stays REPORTED (the advisory
+# half above is unaffected), but it is not itself a gap to route anywhere — neither to a rail (nothing
+# to heal) nor to the scribe (filing it would be noise, not work). Checked BEFORE `_ja_act_mapped`'s
+# unmapped fallthrough so these classes can never fall into the generic "file a tracker item" path:
+#   fixture_slug             — evidence that a TEST/SIM fixture wrote to the LIVE journal (see
+#                               tests/test-sim-journal-hermeticity.sh), not evidence of a production gap.
+#                               The fix is a hermeticity guard on the leaking fixture, not a filed item
+#                               every time its slug shows up in a bounded replay window.
+#   merged_hv_unknown        — the PR body fetch failed (a transient `gh`/network hiccup); the NEXT
+#                               sweep re-probes on its own (the seen-ledger only memoizes a SETTLED
+#                               verdict, never an unknown one — see the (g) check above), so filing a
+#                               permanent item for a transient read failure would be pure noise.
+#   watcher_restart_blocked  — an orphaned lock holder is blocking watcher recovery, but the holder_pid
+#                               is an UNIDENTIFIED process to this auditor: a rail that auto-killed it
+#                               could just as easily kill a live builder mid-flight as an actual corpse.
+#                               That call needs a human looking at the live pane/process, not a bounded
+#                               rail guessing. Real signal, no safe automated action.
+#   checkout_unclean         — reconcile_checkout_cleanliness deliberately LEAVES the contamination in
+#                               the shared checkout in place (staged/tracked cruft, or a detached HEAD)
+#                               as evidence for a human to inspect; see the (j) check above. A rail that
+#                               auto-reset/auto-discarded it would destroy the very evidence the check
+#                               exists to preserve, so no automated action may touch it.
+# Each class still recurrence-escalates via _ja_noaction_recur (HERD-597) below: a class that keeps
+# firing under distinct keys (a new holder_pid, a new head sha) is itself a signal nothing has looked at
+# the root cause, and files ONE class-scoped item once that keeps recurring.
 # This is a SHIPPED (hardcoded) mapping, not a config key — same posture as _ja_act_mapped just above.
 _ja_act_no_action_reason() {
   case "$1" in
@@ -897,6 +917,12 @@ _ja_act_no_action_reason() {
       ;;
     merged_hv_unknown)
       printf 'PR body unreadable (transient fetch failure) — the next sweep re-probes on its own; filing a permanent item for a transient read would be noise'
+      ;;
+    watcher_restart_blocked)
+      printf 'orphaned lock holder blocking a watcher restart — the holder_pid is unidentified, so auto-killing it risks killing a live builder; a human must inspect it, no rail can safely act'
+      ;;
+    checkout_unclean)
+      printf 'shared checkout left deliberately dirty as evidence for a human to inspect — an automated rail must never discard/reset the contamination itself'
       ;;
     *) return 1 ;;
   esac
@@ -1039,10 +1065,20 @@ _ja_act() {
       # everything appended here — this file is deliberately append-only.
       printf '%s\t%s\t0\t%s\n' "$_aa_key" "$_aa_kind" "$_aa_summary" >> "$PENDING" 2>/dev/null || true
     else
-      # No rail owns this class: filing IS the action, and it is TERMINAL — burn the escalation guard
-      # in the same breath so a class that keeps being found can never file a second item.
+      # No rail owns this class: filing IS the action, and it is TERMINAL — burn the (per-key)
+      # escalation guard in the same breath so this key can never later escalate into a duplicate.
       _ja_act_once "audit_escalate::${_aa_key}" >/dev/null 2>&1 || true
-      if _ja_file_item "$_aa_kind" "$_aa_key" "$_aa_summary"; then _aa_result="filed"; else _aa_result="file_failed"; fi
+      # HERD-602: the guard above (audit_act::<key>) is keyed PER FINDING KEY, so a class that keeps
+      # producing NEW keys (a new pr, a new slug, a new ts) reaches this branch once per key and would
+      # file one tracker item per key — a flood of duplicates for what is really ONE gap. The actual
+      # filing is therefore gated on a SECOND, CLASS-scoped guard: only the first key of a class ever
+      # reaches the scribe; every later key of the same class still gets acted on (journaled, budget
+      # spent, escalation guard burned) but never files again.
+      if _ja_act_once "audit_unmapped_filed::${_aa_kind}"; then
+        if _ja_file_item "$_aa_kind" "$_aa_key" "$_aa_summary"; then _aa_result="filed"; else _aa_result="file_failed"; fi
+      else
+        _aa_result="already_filed_for_class"
+      fi
     fi
     journal_append audit_acted \
       class "$_aa_kind" \

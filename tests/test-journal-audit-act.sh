@@ -23,6 +23,11 @@
 #   (7) BOUNDED: at most HERD_JOURNAL_AUDIT_ACT_MAX actions fire per sweep; the findings not reached
 #       are acted on the next sweep, never dropped.
 #   (8) journal-act.sh itself answers an UNKNOWN class `unmapped` with no control room at all.
+#   HERD-600: watcher_restart_blocked and checkout_unclean are DELIBERATE no-action classes ((3e)/(3f)),
+#       same shape as (3b)/(3c), and recurrence-escalate via (3d)'s machinery like any other no-action
+#       class. HERD-602 (3g): an unmapped class dedups its filing on the CLASS, not the per-finding key
+#       — two distinct keys of the same unmapped class in one sweep, or across sweeps, still file only
+#       ONE tracker item, ever.
 #
 # Fully hermetic: writes only under a mktemp dir; the shared-pool once-guard lands in the temp
 # WORKTREES_DIR, so the at-most-once guarantee is proven against the REAL store, not a stub.
@@ -354,6 +359,62 @@ out="$(run_audit on HERD_JOURNAL_AUDIT_NOACTION_RECUR_MAX=3)" || fail "(3d) swee
 [ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(3d) a no-action class must never be tracked as pending, even when recurring"
 pass
 echo "PASS (3d) a recurring no-action class (3+ distinct keys) files exactly one class-scoped item (HERD-597)"
+
+# ── (3e) watcher_restart_blocked is a DELIBERATE no-action class (HERD-600, #708 pattern): never a
+#         rail (an unidentified holder_pid must never be auto-killed), never a filed item per
+#         occurrence, journals its reason once ──────────────────────────────────────────────────────
+reset_surfaces
+jline "2026-08-05T15:00:00Z" '"event":"watcher_restart_blocked","holder_pid":54321,"workspace":"ws-a"'
+out="$(run_audit on)" || fail "(3e) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3e) watcher_restart_blocked must never reach a rail, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3e) watcher_restart_blocked must never file a tracker item, got $(scribe_calls)"
+grep -q '"class":"watcher_restart_blocked".*"result":"no_action"' "$JOURNAL_FILE" \
+  || fail "(3e) watcher_restart_blocked must journal result=no_action: $(grep audit_acted "$JOURNAL_FILE")"
+grep -q 'audit-noaction:watcher_restart_blocked' "$HERD_JOURNAL_AUDIT_INBOX" || fail "(3e) the no-action must still get an advisory inbox row"
+grep -q '"event":"journal_audit".*"kind":"watcher_restart_blocked"' "$JOURNAL_FILE" || fail "(3e) watcher_restart_blocked must still be REPORTED (advisory)"
+out="$(run_audit on)" || fail "(3e) sweep 2 exited non-zero: $out"
+out="$(run_audit on)" || fail "(3e) sweep 3 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3e) watcher_restart_blocked must never reach a rail across sweeps, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3e) watcher_restart_blocked must never file across sweeps, got $(scribe_calls)"
+[ "$(grep -c '"result":"no_action"' "$JOURNAL_FILE")" = "1" ] || fail "(3e) the no-action must journal exactly once, ever"
+pass
+echo "PASS (3e) watcher_restart_blocked is a deliberate no-action class — journals a reason once, never acts on the live journal"
+
+# ── (3f) checkout_unclean is a DELIBERATE no-action class (HERD-600, #708 pattern): the evidence is
+#         preserved for a human, so no rail may auto-discard it and no per-occurrence item is filed ───
+reset_surfaces
+jline "2026-08-05T15:00:00Z" '"event":"checkout_unclean","result":"detected","head":"abc12345","paths":"scratch.txt","detached":"no"'
+out="$(run_audit on)" || fail "(3f) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3f) checkout_unclean must never reach a rail, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3f) checkout_unclean must never file a tracker item, got $(scribe_calls)"
+grep -q '"class":"checkout_unclean".*"result":"no_action"' "$JOURNAL_FILE" \
+  || fail "(3f) checkout_unclean must journal result=no_action: $(grep audit_acted "$JOURNAL_FILE")"
+grep -q '"event":"journal_audit".*"kind":"checkout_unclean"' "$JOURNAL_FILE" || fail "(3f) checkout_unclean must still be REPORTED (advisory)"
+out="$(run_audit on)" || fail "(3f) sweep 2 exited non-zero: $out"
+[ "$(scribe_calls)" = "0" ] || fail "(3f) checkout_unclean must never file across sweeps, got $(scribe_calls)"
+[ "$(grep -c '"result":"no_action"' "$JOURNAL_FILE")" = "1" ] || fail "(3f) the no-action must journal exactly once, ever"
+pass
+echo "PASS (3f) checkout_unclean is a deliberate no-action class — journals a reason once, never acts on the live journal"
+
+# ── (3g) HERD-602: an unmapped class that keeps recurring under DISTINCT finding keys (a new pr, a
+#         new ts) must still file EXACTLY ONE tracker item, ever — dedup keyed on the CLASS, not the
+#         per-finding key. Two distinct pushed_no_unresolved keys in the SAME sweep, then a third one
+#         on a later sweep ───────────────────────────────────────────────────────────────────────────
+reset_surfaces
+jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'
+jline "2026-08-05T14:05:00Z" '"event":"symbol_index_refresh","pushed":"no"'
+out="$(run_audit on)" || fail "(3g) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3g) an unmapped class must never reach a rail, got $(rail_calls)"
+[ "$(scribe_calls)" = "1" ] || fail "(3g) two distinct keys of the SAME unmapped class must file exactly ONE item, got $(scribe_calls)"
+[ "$(count_event audit_acted)" = "2" ] || fail "(3g) both distinct findings must still be individually acted on/journaled, got $(count_event audit_acted)"
+grep -q '"result":"filed"' "$JOURNAL_FILE" || fail "(3g) exactly one of the two must journal result=filed"
+grep -q '"result":"already_filed_for_class"' "$JOURNAL_FILE" || fail "(3g) the second distinct key must journal result=already_filed_for_class, not file again"
+# A THIRD distinct key on a later sweep: still no second filed item, ever.
+jline "2026-08-05T14:10:00Z" '"event":"some_other_refresh","pushed":"no"'
+out="$(run_audit on)" || fail "(3g) sweep 2 exited non-zero: $out"
+[ "$(scribe_calls)" = "1" ] || fail "(3g) a THIRD distinct key on a later sweep must still not file a second item, got $(scribe_calls)"
+pass
+echo "PASS (3g) HERD-602: an unmapped class dedups its filing on the CLASS, not the per-finding key — files exactly once ever"
 
 # ── (4) each mapped class routes to the rail WITH the context it needs ──────────────────────────
 reset_surfaces
