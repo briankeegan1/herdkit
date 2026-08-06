@@ -10907,6 +10907,9 @@ record_refix() {
 refix_rail_reset() {
   local _rrr_pr="$1" _rrr_kind="$2" _rrr_sha="${3:-}" _rrr_slug="${4:-}" _rrr_n
   [ -n "$_rrr_pr" ] && [ -n "$_rrr_kind" ] || return 0
+  # The rail's red resolved — the durable exhaustion latch (HERD-576) must never outlive that fact,
+  # even if the ledger scan below finds nothing left to zero (a stale/hand-planted marker).
+  _clear_refix_rail_escalated "$_rrr_pr" "$_rrr_kind"
   _rrr_n="$(refix_rail_count "$_rrr_pr" "$_rrr_kind")"
   [ "${_rrr_n:-0}" -gt 0 ] 2>/dev/null || return 0
   [ -n "$_rrr_sha" ] || _rrr_sha='-'
@@ -11054,6 +11057,26 @@ _refix_stalled_row() {
 _refix_dead_marker()  { printf '%s' "$TREES/.agent-watch-refix-dead-$1-$2"; }
 _refix_dead_seen()    { [ -f "$(_refix_dead_marker "$1" "$2")" ]; }
 _record_refix_dead()  { : > "$(_refix_dead_marker "$1" "$2")" 2>/dev/null || true; }
+
+# ── Durable per-rail EXHAUSTION LATCH (HERD-576) ────────────────────────────────────────────────
+# `_refix_budget_reason` already re-derives the cap correctly from the durable $REFIX_STATE ledger
+# every call — that arithmetic already survives a watcher restart on its own (the ledger is a real
+# file, re-scanned fresh, never held in memory across a restart). This latch adds a SEPARATE,
+# dedicated one-file-per-(pr,rail) marker — the same "one small file names one fact" shape every
+# other restart-safe marker in this pool already uses (`.review-inflight-*`, `.health-dispatch-*`,
+# the HERD-185 pattern) — so "this rail's budget is spent" is a durably PERSISTED fact from the
+# moment it first becomes true, not only an inference re-derived by re-scanning the whole ledger.
+# Once written it STOPS bouncing that rail across any restart even if the ledger scan were ever
+# wrong; `refix_rail_reset` clears it the moment the rail's red genuinely resolves — the same
+# instant the ledger count itself zeroes (contract §4 refund-on-green). NOT sha-keyed: a rail's
+# exhaustion, like its budget, spans every sha until a reset. Mirrors
+# pysrc/herd/live_runtime.py's `_refix_rail_escalated` (the live health/review path); this bash
+# copy is what the still-live CI rail (`_handle_ci_repair`/`_handle_ci_fastbounce`) consults, and
+# what the hermetic test/sim-only review/stale/health handlers exercise for parity.
+_refix_escalated_marker() { printf '%s' "$TREES/.refix-escalated-$1-$2"; }
+_refix_rail_escalated()   { [ -f "$(_refix_escalated_marker "$1" "$2")" ]; }
+_mark_refix_rail_escalated() { : > "$(_refix_escalated_marker "$1" "$2")" 2>/dev/null || true; }
+_clear_refix_rail_escalated() { rm -f "$(_refix_escalated_marker "$1" "$2")" 2>/dev/null || true; }
 
 # _maybe_arm_review_escalation <pr#> — called right AFTER record_refix. If this PR has now accumulated
 # at least REVIEW_EVIDENCE_ESCALATE_ROUNDS (default 2) failed REVIEW refix rounds, the cheap reviewer's
@@ -11476,8 +11499,16 @@ _handle_ci_repair() {
     return 0
   fi
 
-  # Budget exhausted → needs-you (still handled here so the row names the CI rail).
-  if _hcr_capmsg="$(_refix_budget_reason "$_hcr_pr" ci)"; then
+  # Budget exhausted → needs-you (still handled here so the row names the CI rail). The durable
+  # exhaustion latch (HERD-576) is consulted first: once written it stops this rail bouncing across
+  # any restart even before a fresh cap re-derivation, mirroring pysrc/herd/live_runtime.py's
+  # `_refix_rail_escalated` on the health/review rails.
+  _hcr_capmsg="$(_refix_budget_reason "$_hcr_pr" ci)"
+  if [ -z "$_hcr_capmsg" ] && _refix_rail_escalated "$_hcr_pr" ci; then
+    _hcr_capmsg="refix limit reached"
+  fi
+  if [ -n "$_hcr_capmsg" ]; then
+    _mark_refix_rail_escalated "$_hcr_pr" ci
     DISPLAY[_hcr_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_RED}needs you · ${_hcr_capmsg} · CI still red · ${_hcr_ci}${C_RESET}"
     if ! _refix_dead_seen "$_hcr_pr" "ci-cap-$_hcr_sha"; then
       _record_refix_dead "$_hcr_pr" "ci-cap-$_hcr_sha"
@@ -11706,7 +11737,15 @@ _handle_ci_fastbounce() {
   fi
 
   _cfb_rounds="$(refix_rail_count "$_cfb_pr" health)"
-  if _cfb_capmsg="$(_refix_budget_reason "$_cfb_pr" health)"; then
+  # Durable exhaustion latch (HERD-576) — SHARED with the health rail's live python path
+  # (pysrc/herd/live_runtime.py `_refix_rail_escalated`, kind="health"): both consult and mark the
+  # same $TREES/.refix-escalated-<pr>-health file, so a cap this trigger hits also stops the OTHER.
+  _cfb_capmsg="$(_refix_budget_reason "$_cfb_pr" health)"
+  if [ -z "$_cfb_capmsg" ] && _refix_rail_escalated "$_cfb_pr" health; then
+    _cfb_capmsg="refix limit reached"
+  fi
+  if [ -n "$_cfb_capmsg" ]; then
+    _mark_refix_rail_escalated "$_cfb_pr" health
     DISPLAY[_cfb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_RED}needs you · ${_cfb_capmsg} · CI red (provisional): ${_cfb_id}${C_RESET}"
     if ! _refix_dead_seen "$_cfb_pr" "ci-fastbounce-cap-$_cfb_sha"; then
       _record_refix_dead "$_cfb_pr" "ci-fastbounce-cap-$_cfb_sha"
