@@ -5146,48 +5146,14 @@ _gate_bless_eligible() {
   ! _gate_status_posted "$1" "$2" success
 }
 
-# ── Parallel gate dispatch (GATE_DISPATCH, HERD-73) ──────────────────────────────────────────────
-# _gate_dispatch_mode — resolve GATE_DISPATCH to "serial" | "parallel". Unknown/empty → serial, so
-# the default (and any typo) preserves today's EXACT serial behavior — the review dispatches only
-# after the healthcheck outcome lands.
-_gate_dispatch_mode() {
-  case "${GATE_DISPATCH:-serial}" in
-    parallel) printf parallel ;;
-    *)        printf serial ;;
-  esac
-}
-
-# _predispatch_review_if_parallel <pr#> <slug> <headSha> — under GATE_DISPATCH=parallel ONLY, advance
-# the background review state machine for (pr,sha) NOW, at the same action-pass tick the healthcheck
-# starts, so the pre-merge review runs CONCURRENTLY with the healthcheck instead of only after it
-# lands. A strict NO-OP under the default serial mode (and in dry-run, or when the head sha is not yet
-# known) so today's behavior is byte-identical.
-#
-# This ONLY kicks the reviewer off early — it never merges. The merge decision downstream is unchanged
-# and still requires BOTH gates green: the merge-path review gate re-reads the SAME sha-keyed ledger /
-# inflight marker this shares, so the dispatch is idempotent (a (pr,sha) is still reviewed at most once,
-# REVIEW_CONCURRENCY is still honored — an over-cap review reports QUEUED here exactly as in the merge
-# path). Because the reviewer is keyed to the head sha, a health CODE-ERROR does NOT touch it: the
-# candidate simply `continue`s without reaching the merge-path gate, and this same-sha re-entry on the
-# next tick collects/records the verdict rather than killing the in-flight reviewer — the sha is blocked
-# by health anyway, so the finished verdict is recorded but never acted on. The echoed token is
-# intentionally discarded; the console row for this tick is owned by the healthcheck gate.
-#
-# LEDGER PRECONDITION (mirrors the merge path's `if [ "$prior" != "PASS" ]` guard): _review_gate_step's
-# contract is "called once per tick for a candidate with NO ledger verdict yet". Once a PASS/BLOCK is
-# recorded for pr+sha the review is DONE for that commit and its result/inflight/tier markers are gone;
-# calling _review_gate_step again would find no markers and DISPATCH A BRAND-NEW review every tick — the
-# review-once invariant broken for any candidate that stays a candidate WITHOUT merging (health error,
-# approve/observe hold, human-verify hold, branch-protection block, a mergeability regression). So skip
-# the kick entirely when a verdict already exists; a new commit changes the sha and gets a fresh review.
-_predispatch_review_if_parallel() {
-  [ "$(_gate_dispatch_mode)" = "parallel" ] || return 0
-  [ -z "$DRYRUN" ] || return 0
-  local pr="$1" slug="$2" sha="$3"
-  [ -n "$sha" ] || return 0
-  review_verdict "$pr" "$sha" >/dev/null 2>&1 && return 0
-  _review_gate_step "$pr" "$slug" "$sha" >/dev/null 2>&1 || true
-}
+# (HERD-580) GATE_DISPATCH (HERD-73) was RETIRED here: its only consumers, _gate_dispatch_mode and
+# _predispatch_review_if_parallel, existed solely to kick the reviewer early under
+# GATE_DISPATCH=parallel — a mode the P5b Python port never implemented (no parallel pre-dispatch step
+# exists in pysrc/herd/live_runtime.py's walk; see the INFRA circuit breaker docstring above for the
+# three-way audit that first found this). Both functions were unreachable from any production
+# entrypoint since the P5b engine port deleted their only caller, _tick_act (HERD-556's baseline
+# finding). The config key, its herd-config.sh default, and its capabilities.tsv/conformance.tsv rows
+# were removed in the same change.
 
 # override_exists <pr#> <headSha> — true if a human override was recorded for this exact pr+sha.
 # A new commit changes the sha → override does not carry over.

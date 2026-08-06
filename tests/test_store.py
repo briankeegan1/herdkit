@@ -56,6 +56,7 @@ class AccessorParity(_PoolCase):
         st.record_review("42", "sha1", "PASS", "reviewer")
         st.record_review("42", "sha1", "BLOCK", "reviewer",
                          "rule: R | why: W")                 # last matching row wins
+        st.record_review("42", "sha0", "PASS", "reviewer")   # an EARLIER pass — not the last one
         st.record_health_result("42", "sha1", "CLEAN", "ok")
         st.bump_refix("k", "sha1")
         st.bump_refix("k", "sha1")
@@ -69,6 +70,8 @@ class AccessorParity(_PoolCase):
             "review": st.recorded_review("42", "sha1"),      # BLOCK (last)
             "review_reason": st.recorded_review_reason("42", "sha1"),      # HERD-473
             "review_reason_none": st.recorded_review_reason("99", "sha1"),
+            "review_last_pass": st.recorded_review_last_pass_sha("42"),    # HERD-580: most recent PASS
+            "review_last_pass_none": st.recorded_review_last_pass_sha("99"),
             "health": st.health_cached_verdict("42", "sha1"),
             "refix": st.refix_count("k", "sha1"),            # 2
             "once_first": st.once("g1"),
@@ -88,6 +91,10 @@ class AccessorParity(_PoolCase):
         self.assertEqual(flat["review"], "BLOCK")
         self.assertEqual(flat["review_reason"], "rule: R | why: W")
         self.assertEqual(flat["review_reason_none"], "")
+        self.assertEqual(flat["review_last_pass"], "sha0",
+                         "must be the most-recently RECORDED PASS row, not sha1's (superseded by "
+                         "its later BLOCK) and not merely the first PASS ever seen")
+        self.assertIsNone(flat["review_last_pass_none"])
         self.assertEqual(flat["health"], "CLEAN")
         self.assertEqual(flat["refix"], 2)
         self.assertTrue(flat["once_first"] and not flat["once_second"])

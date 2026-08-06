@@ -399,10 +399,11 @@ def _now_epoch():
 # non-verdict review deaths but never actually halted dispatch. This restores the READ into the walk
 # below (:meth:`LiveTick._walk`) and the two RECORD call sites the port itself can reach (the review
 # rail's verdict classification, also in :meth:`LiveTick._walk` — bash's ``_review_gate_step``). A
-# THIRD bash recorder, ``_predispatch_review_if_parallel``, is genuinely obsolete here: it exists only
+# THIRD bash recorder, ``_predispatch_review_if_parallel``, was genuinely obsolete here: it existed only
 # to kick the reviewer early under ``GATE_DISPATCH=parallel``, a lever the Python port never
 # implemented (no parallel pre-dispatch step exists in the walk) — see docs/engine-contract.md §3.3
-# for the full three-way audit. A FOURTH, ``_sweep_gate_corpses``, needs no restoration at all: it is
+# for the full three-way audit. HERD-580 retired ``GATE_DISPATCH`` and this bash body entirely on that
+# finding. A FOURTH, ``_sweep_gate_corpses``, needs no restoration at all: it is
 # bash-owned via ``herd sweep`` (scripts/herd/sweep.sh; unrelated to the deleted ``_tick_act``) and
 # still runs today, writing the SAME shared ledger file :class:`LiveState`'s breaker methods use below
 # — so a stuck reviewer corpse a `herd sweep` reaps still counts toward this exact global counter.
@@ -890,6 +891,17 @@ class LiveState:
     def review_registry_file(self, cand):
         return self._p(".review-registry-%s-%s" % (cand.pr, cand.sha))   # agent-watch.sh:1966
 
+    def review_escalate_file(self, pr):
+        """Evidence-triggered escalation arm marker, keyed per-PR (NOT per-sha; HERD-580 port of
+        agent-watch.sh:_review_escalate_file). Armed once a PR's REVIEW refix rounds prove the cheap
+        reviewer missed the issue, consumed by the next review dispatch on that PR."""
+        return self._p(".review-escalate-%s" % pr)
+
+    def claude_hang_state_file(self):
+        """The claude exec-hang probe's episode marker (HERD-108, HERD-580 port of agent-watch.sh's
+        ``CLAUDE_HANG_STATE``): one line, the epoch the CURRENT hang episode began, absent when healthy."""
+        return self._p(".agent-watch-claude-hang")
+
     def recorded_review(self, pr, sha):
         """The recorded verdict for this exact ``(pr, sha)`` — review-once reuse (agent-watch.sh:1687).
         ``awk '$2==pr && $3==sha {v=$4} END{print v}'`` — the LAST matching row wins."""
@@ -963,6 +975,30 @@ class LiveState:
         except Exception:
             return ""
         return source
+
+    def recorded_review_last_pass_sha(self, pr):
+        """The sha of the most-recently recorded PASS for this PR — any provenance (a real reviewer
+        PASS, a low-risk skip, or an earlier carry-forward, each tracing back to a real cleared commit)
+        — or ``None`` (HERD-580 port of agent-watch.sh:_review_last_passed_sha). The DELTA_REVIEW
+        carry-forward proof's "last-passed sha" input."""
+        if self._store is not None:
+            try:
+                return self._store.recorded_review_last_pass_sha(pr)
+            except Exception:
+                return None
+        path = self.review_ledger()
+        if not path or not os.path.exists(path):
+            return None
+        sha = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and f[1] == str(pr) and f[3] == "PASS":
+                        sha = f[2]
+        except Exception:
+            return None
+        return sha
 
     def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         """Append one review ledger row ``<epoch> <pr> <sha> <verdict> <source> [reason…]``
@@ -2220,9 +2256,19 @@ class LiveGates:
         # HEALTH_TRUST_BUILDER (HERD-531/555): ship-dormant, default off. Resolved ONCE per tick, same
         # rationale as _merge_result_gate above — off means health() never even opens a provenance file.
         self._health_trust_on = _health_trust_on(cfg)
+        # WATCH_CLAUDE_PROBE_TIMEOUT (HERD-108/HERD-580): the exec-hang probe result, memoized on `self`
+        # for the same reason as `_main_health_pending_cache` below — a LiveGates instance lives exactly
+        # one tick, so at most ONE `claude --version` exec happens per tick no matter how many
+        # candidates would otherwise dispatch a reviewer this round.
+        self._claude_hang_cache = None
 
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
+
+    def _claude_hang_memo(self):
+        if self._claude_hang_cache is None:
+            self._claude_hang_cache = _claude_exec_hung(self.state, self.config, self.journal)
+        return self._claude_hang_cache
 
     def _main_health_pending_memo(self, state_dir):
         """Memoized ``_main_health_pending(state_dir)`` — ONE ``rev-parse`` per tick, not one per
@@ -2582,6 +2628,15 @@ class LiveGates:
             return WAIT
         if st.reviewer_registry_live(cand):
             return WAIT
+        # 2.5 DELTA-SCOPED REVIEW carry-forward (HERD-204, ship-dormant via DELTA_REVIEW; HERD-580
+        #     port). Before spending a reviewer on this new sha, try to PROVE it differs from this PR's
+        #     last-passed sha ONLY by a merge of DEFAULT_BRANCH (a pure integration push). If proven,
+        #     the prior PASS is carried forward and no reviewer is dispatched. Placed BELOW the
+        #     in-flight checks (a review already running still finishes and its verdict is recorded)
+        #     and ABOVE the pre-gate/tier/concurrency below, so a carry consumes no reviewer slot and no
+        #     mechanical lint pass. Byte-inert when DELTA_REVIEW is off.
+        if _maybe_carry_forward_review(cand, st, self.config, self.journal):
+            return "PASS"
         # 3.5 CONCURRENCY SLOT CHECK (REVIEW_CONCURRENCY, default 2): never dispatch when the global
         #     in-flight reviewer count reaches the limit (mirrors bash's ``_count_live_reviews >= _review_conc``
         #     QUEUED path, agent-watch.sh:3115). Dead markers are not counted — a crashed reviewer never
@@ -2616,6 +2671,27 @@ class LiveGates:
             self.journal.append("review_skipped", "pr", cand.pr, "sha", cand.sha,
                                 "reason", "docs/test-only low-risk diff")
             return "PASS"
+        # EVIDENCE-TRIGGERED ESCALATION (REVIEW_MODEL_ESCALATED / REVIEW_EVIDENCE_ESCALATE_ROUNDS,
+        # HERD-580 port): if a builder's refix rounds proved the cheap reviewer missed the real issue on
+        # this PR (armed by LiveTick._maybe_arm_review_escalation right after a fresh review-BLOCK
+        # bounce), force this NEXT dispatch up to the Opus tier, overriding whatever tier the risk
+        # classification chose — even the default/STRONG empty-model path. One-shot: consumed here, and
+        # ONLY when actually dispatching — the concurrency check above already passed, so a QUEUED tick
+        # never reaches this line and the arm survives intact to a later tick with a free slot.
+        esc_file = st.review_escalate_file(cand.pr)
+        if esc_file and os.path.exists(esc_file):
+            model = self.config.get("REVIEW_MODEL_ESCALATED") or "claude-opus-4-8"
+            try:
+                os.remove(esc_file)
+            except OSError:
+                pass
+            self.journal.append("review_escalated", "pr", cand.pr, "sha", cand.sha, "model", model,
+                                "reason", "cheap reviewer missed the issue across refix rounds")
+        # WATCH_CLAUDE_PROBE_TIMEOUT (HERD-108, HERD-580 port; ship-dormant): a wedged `claude` binary
+        # would spawn a corpse reviewer that never returns a verdict — hold dispatch instead of feeding
+        # it one. Checked immediately before the dispatch it guards, memoized once per tick.
+        if self._claude_hang_memo() == "HUNG":
+            return WAIT
         # 4. DISPATCH the reviewer async + lay the marker → wait.
         self._dispatch_review(cand, model)
         return WAIT
@@ -3718,6 +3794,242 @@ def _stale_dup_check(cand, config):
     return None, None
 
 
+# ── DELTA-SCOPED REVIEW carry-forward (HERD-204, ported into the live core at HERD-580) ────────────
+# When a builder pushes a PURE INTEGRATION commit — it merged DEFAULT_BRANCH into the branch with NO
+# authored change beyond the merge — re-running the full adversarial review for that new sha burns
+# tokens/time for zero correctness gain: the newly-merged main commits are already-reviewed main, and
+# the merge itself introduced no new authored content. With DELTA_REVIEW=on, the review gate PROVES the
+# delta between the new head sha and this PR's LAST review-PASSED sha is integration-only and, if so,
+# CARRIES FORWARD the prior PASS onto the new sha instead of dispatching a reviewer.
+#
+# The proof is CONSERVATIVE + FAIL-CLOSED, mirroring agent-watch.sh:_delta_is_integration_only exactly
+# — every one of these must hold, else a normal full review:
+#   1. DELTA_REVIEW=on (opt-in; default/unknown → off → byte-inert).
+#   2. the PR has a recorded PASS for an OLDER sha (the carry source).
+#   3. the new sha is a 2-parent MERGE commit.
+#   4. one parent IS the last-passed sha (the branch side — already reviewed & PASSED).
+#   5. the OTHER parent is already contained in DEFAULT_BRANCH (already-reviewed main).
+#   6. the new commit's tree EQUALS a clean 3-way auto-merge of those two parents — i.e. the merge
+#      carries ZERO manual edits (no authored conflict resolution).
+# Any authored change beyond the merge diverges the tree (6) or breaks the parent identity (4), and a
+# missing sha / worktree / main ref simply returns "not provable" → full review. So a real code change
+# NEVER carries forward. Bash's own implementation (agent-watch.sh:_maybe_carry_forward_review) has had
+# no reachable caller since the P5b engine port — its only caller was the dead ``_review_gate_step`` —
+# so this is a fresh Python implementation, not a call-out to the bash body.
+
+def _delta_review_enabled(config):
+    """True iff ``DELTA_REVIEW`` opts in — matches bash's ``case … in on|On|ON) …`` exactly (no
+    case-folding beyond those three literals) so an operator's config reads identically either engine."""
+    return (config or {}).get("DELTA_REVIEW") in ("on", "On", "ON")
+
+
+def _delta_main_ref(dir_, config):
+    """The first resolvable ref naming DEFAULT_BRANCH in ``dir_`` (the bare name, then
+    ``origin/<name>``, then ``refs/remotes/origin/<name>``), or ``None`` when none resolves — the
+    caller then treats the delta as "not provable" → full review (port of agent-watch.sh:_delta_main_ref)."""
+    base = str((config or {}).get("DEFAULT_BRANCH") or os.environ.get("DEFAULT_BRANCH") or "main")
+    b = base[len("origin/"):] if base.startswith("origin/") else base
+    for candidate in (base, b, "origin/%s" % b, "refs/remotes/origin/%s" % b):
+        if not candidate:
+            continue
+        try:
+            out = subprocess.run(
+                ["git", "-C", dir_, "rev-parse", "--verify", "--quiet", "%s^{commit}" % candidate],
+                capture_output=True, text=True, timeout=_STALE_DUP_TIMEOUT)
+        except Exception:
+            continue
+        if out.returncode == 0:
+            return candidate
+    return None
+
+
+def _delta_is_integration_only(dir_, old, new, config):
+    """True iff the delta from ``old`` (the last-passed commit) to ``new`` (the new head) is PROVABLY a
+    pure merge of DEFAULT_BRANCH with no authored content. Fail-closed: any missing precondition,
+    unresolved ref, or content divergence → False. Pure git; no network. Port of
+    agent-watch.sh:_delta_is_integration_only."""
+    if not dir_ or not os.path.isdir(dir_):
+        return False
+    if not old or not new or old == new:
+        return False
+    try:
+        def _git(*args):
+            return subprocess.run(["git", "-C", dir_] + list(args),
+                                  capture_output=True, text=True, timeout=_STALE_DUP_TIMEOUT)
+        if _git("rev-parse", "--git-dir").returncode != 0:
+            return False
+        oldp = _git("rev-parse", "--verify", "--quiet", "%s^{commit}" % old)
+        if oldp.returncode != 0:
+            return False
+        oldfull = oldp.stdout.strip()
+        newp = _git("rev-parse", "--verify", "--quiet", "%s^{commit}" % new)
+        if newp.returncode != 0:
+            return False
+        newfull = newp.stdout.strip()
+        # The new head must be a MERGE with EXACTLY two parents (a simple integration merge).
+        pline = _git("rev-list", "--parents", "-n1", newfull)
+        if pline.returncode != 0:
+            return False
+        parts = (pline.stdout or "").split()
+        if len(parts) != 3:                    # the commit's own oid + exactly two parents
+            return False
+        _, p1, p2 = parts
+        # One parent must BE the last-passed sha (the already-reviewed branch side); the other is the
+        # main-side parent. Neither → an authored commit sits between old and the merge → full review.
+        if p1 == oldfull:
+            branchp, mainp = p1, p2
+        elif p2 == oldfull:
+            branchp, mainp = p2, p1
+        else:
+            return False
+        # The main-side parent must already be contained in DEFAULT_BRANCH (already-reviewed main).
+        mainref = _delta_main_ref(dir_, config)
+        if not mainref:
+            return False
+        if _git("merge-base", "--is-ancestor", mainp, mainref).returncode != 0:
+            return False
+        # CONTENT-TRIVIAL merge: the new commit's tree must equal a clean 3-way auto-merge of the two
+        # parents. A non-zero merge-tree (conflict) or any manual edit diverges the tree → full review.
+        autop = _git("merge-tree", "--write-tree", branchp, mainp)
+        if autop.returncode != 0:
+            return False
+        auto_lines = (autop.stdout or "").splitlines()
+        auto = auto_lines[0] if auto_lines else ""
+        if not auto:
+            return False
+        newtreep = _git("rev-parse", "--verify", "--quiet", "%s^{tree}" % newfull)
+        if newtreep.returncode != 0:
+            return False
+        return auto == newtreep.stdout.strip()
+    except Exception:
+        return False
+
+
+def _maybe_carry_forward_review(cand, state, config, journal):
+    """If ``DELTA_REVIEW=on`` and the delta from this PR's last-passed sha to ``cand.sha`` is provably
+    integration-only, RECORD a carried-forward PASS for ``cand.sha`` (source=carried-forward) + journal
+    ``review_carried_forward``, and return True so the caller skips the reviewer dispatch. Returns False
+    (carry nothing) in every other case → normal review. Port of
+    agent-watch.sh:_maybe_carry_forward_review."""
+    if not _delta_review_enabled(config):
+        return False
+    if not cand.sha:
+        return False
+    old = state.recorded_review_last_pass_sha(cand.pr)
+    if not old or old == cand.sha:
+        return False
+    if not _delta_is_integration_only(cand.worktree, old, cand.sha, config):
+        return False
+    state.record_review(cand.pr, cand.sha, "PASS", "carried-forward", "")
+    base = str((config or {}).get("DEFAULT_BRANCH") or os.environ.get("DEFAULT_BRANCH") or "main")
+    journal.append("review_carried_forward", "pr", cand.pr, "sha", cand.sha, "from_sha", old,
+                   "slug", cand.slug,
+                   "reason", "integration-only delta (merge of %s) — prior review PASS carried forward"
+                             % base)
+    return True
+
+
+# ── Evidence-triggered review escalation (HERD-580 port of agent-watch.sh:_maybe_arm_review_escalation
+#    / REVIEW_MODEL_ESCALATED consumption) ───────────────────────────────────────────────────────────
+def _review_evidence_escalate_rounds(config):
+    """``REVIEW_EVIDENCE_ESCALATE_ROUNDS``, unset/empty → 2 (bash's ``${VAR:-2}``); any OTHER
+    non-digits value → ``None`` (never arm) rather than silently falling back to 2 — bash's
+    ``[ N -ge "$VAR" ]`` errors to a non-zero test on a non-numeric VAR that is SET (``:-2`` only
+    substitutes when the var is unset/empty), so a typo'd config value fails safe to "no escalation",
+    matching that exactly rather than the more permissive default a bare ``int()`` coercion would give."""
+    raw = (config or {}).get("REVIEW_EVIDENCE_ESCALATE_ROUNDS")
+    if raw is None or str(raw) == "":
+        return 2
+    s = str(raw)
+    return int(s) if _BREAKER_DIGITS_RE.match(s) else None
+
+
+# ── Claude exec-hang probe (HERD-108, ported into the live core at HERD-580) ────────────────────────
+# On some environments `claude` WEDGES on invocation — every exec hangs before the process finishes
+# starting (e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged claude makes every review
+# dispatch spawn a corpse: the reviewer never writes a verdict, so the tick burns REVIEW_CONCURRENCY
+# slots forever against a hang it cannot see (the herd-review.sh subprocess `_dispatch_review` launches
+# never returns). This probe DETECTS the wedge DIRECTLY — a trivial `claude --version` under a hard
+# timeout, run at most ONCE per tick, memoized on the LiveGates instance exactly like
+# `_main_health_pending_memo` (a LiveGates instance lives exactly one tick) — so the watcher can HOLD
+# review dispatch and surface the hang LOUDLY (a journal infra_event) instead of feeding a dead binary.
+#
+# BYTE-INERT BY DEFAULT: WATCH_CLAUDE_PROBE_TIMEOUT defaults to 0 (off). With it 0/empty/non-numeric the
+# probe is a no-op — no claude exec, no journal, no gating — so behavior is byte-identical without it.
+
+def _claude_probe_secs(config):
+    """The armed timeout in seconds, or ``None`` when the probe is disabled (0/unset/non-numeric →
+    OFF, fail-safe parse; port of agent-watch.sh:_claude_probe_secs)."""
+    raw = (config or {}).get("WATCH_CLAUDE_PROBE_TIMEOUT")
+    s = "" if raw is None else str(raw)
+    if not _BREAKER_DIGITS_RE.match(s):
+        return None
+    n = int(s)
+    return n if n > 0 else None
+
+
+def _claude_hang_clear(state, journal):
+    """Drop the hang-episode marker; if a hang HAD been on record, journal one recovery line so the
+    episode's open/close is visible. Cheap no-op when no hang was recorded (port of
+    agent-watch.sh:_claude_hang_clear)."""
+    marker = state.claude_hang_state_file()
+    try:
+        had_hang = bool(marker) and os.path.exists(marker) and os.path.getsize(marker) > 0
+    except OSError:
+        had_hang = False
+    if not had_hang:
+        return
+    try:
+        os.remove(marker)
+    except OSError:
+        pass
+    journal.append("infra_event", "component", "agent-watch", "reason", "claude-exec-hang-cleared",
+                   "detail", "claude --version responded again — resuming review dispatch")
+
+
+def _claude_exec_hung(state, config, journal):
+    """Probe claude ONCE and return this tick's verdict:
+
+      ``"HUNG"`` — ``claude --version`` did not return within the armed timeout (a real exec-wedge).
+      ``"OK"``   — probe disabled, OR claude responded in time / exited non-zero (broken-but-not-wedged)
+                  / is absent — every NON-hang outcome never holds the queue (fail-soft).
+
+    On the FIRST HUNG of a hang episode it journals ONE loud infra_event (deduped via the hang-state
+    marker so a persistent wedge does not spam the journal every tick); any non-hang outcome CLEARS the
+    marker. A broken/absent claude is deliberately NOT a hang. Port of agent-watch.sh:_claude_exec_hung."""
+    secs = _claude_probe_secs(config)
+    if secs is None:
+        return "OK"
+    if shutil.which("claude") is None:
+        _claude_hang_clear(state, journal)
+        return "OK"
+    try:
+        subprocess.run(["claude", "--version"], capture_output=True, timeout=secs)
+    except subprocess.TimeoutExpired:
+        marker = state.claude_hang_state_file()
+        try:
+            already = bool(marker) and os.path.exists(marker) and os.path.getsize(marker) > 0
+        except OSError:
+            already = False
+        if not already:
+            journal.append("infra_event", "component", "agent-watch", "reason", "claude-exec-hang",
+                           "detail", "claude --version did not return within %ss (exec-hang) — "
+                                     "holding review dispatch" % secs, "timeout_secs", secs)
+            if marker:
+                try:
+                    with open(marker, "w", encoding="utf-8") as fh:
+                        fh.write("%s\n" % _now_epoch())
+                except OSError:
+                    pass
+        return "HUNG"
+    except Exception:
+        # A spawn failure is treated like "broken/absent", not a hang.
+        _claude_hang_clear(state, journal)
+        return "OK"
+    _claude_hang_clear(state, journal)
+    return "OK"
+
+
 class LiveActuator:
     """The REAL apply layer: merge via ``gh``, reap the worktree via ``git`` (contract §2, §6.1).
 
@@ -4171,6 +4483,24 @@ class LiveTick:
                                     "slug", cand.slug, "kind", kind,
                                     "detail", "refix ledger unwritable — once-guard will not hold")
         return round_num, None
+
+    def _maybe_arm_review_escalation(self, cand, round_num):
+        """Port of agent-watch.sh:_maybe_arm_review_escalation — called right after a fresh REVIEW
+        refix bounce is recorded. ``round_num`` is that bounce's OWN round number (the just-recorded
+        REVIEW-kind rail count returned by :meth:`_refix_check_and_record`), so this needs no separate
+        ledger re-scan the way bash's ``refix_round_count_kind`` call does. Ship-dormant: see
+        :func:`_review_evidence_escalate_rounds` for why a garbage threshold fails to "never arm"."""
+        threshold = _review_evidence_escalate_rounds(self.config)
+        if threshold is None or round_num is None or round_num < threshold:
+            return
+        esc_file = self.state.review_escalate_file(cand.pr)
+        if not esc_file:
+            return
+        try:
+            with open(esc_file, "w", encoding="utf-8"):
+                pass
+        except OSError:
+            pass
 
     def _refix_rail_reset(self, cand, kind,
                           reason="rail resolved its red — per-rail refix budget restored"):
@@ -4848,6 +5178,12 @@ class LiveTick:
                         cand, "review-block",
                         _review_block_comment(cand, self.state.recorded_review_reason(cand.pr, cand.sha)))
                 return ESCALATE
+            # EVIDENCE-TRIGGERED ESCALATION (HERD-580 port): a fresh REVIEW-kind bounce that has now
+            # accumulated >= REVIEW_EVIDENCE_ESCALATE_ROUNDS rounds is evidence the cheap reviewer
+            # missed the real issue — arm a one-shot Opus escalation for this PR's NEXT review dispatch
+            # (consumed in LiveGates.review). Placed right after the bounce is recorded, mirroring
+            # bash's `_maybe_arm_review_escalation "$pr"` call right after `record_refix`.
+            self._maybe_arm_review_escalation(cand, round_num)
             # Contract §3.4 refix_bounce shape — mirror the shadow twin (shadow_runtime.py:429) and
             # bash (agent-watch.sh:7321); the live tick parses no finding location for either rail.
             # HERD-370: see the health leg above — _bounce_and_wake owns the wake verification the

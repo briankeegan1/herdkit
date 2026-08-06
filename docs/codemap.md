@@ -93,6 +93,7 @@ Role summarized from each file's top-of-file comment.
 - `retirement.sh` — RETIREMENT AS A RECONCILED INVARIANT (HERD-164).
 - `review-panel.sh` — THE shared resolver for the MIXED-VENDOR review panel (HERD-276).
 - `review-pregate.sh` — THE shared MECHANICAL-RED PRE-GATE + SMALL-MECHANICAL-DIFF FLOOR (HERD-559).
+- `scope-escape.sh` — HERD-575 SCOPING-ESCAPE TELEMETRY: the shared detector both sides of a diff-scoped
 - `scribe-step.sh` — queue/git/report mechanics for the backlog drainer. The scribe Claude
 - `scribe.sh` — scribe.sh "<backlog change>" — ENQUEUE a backlog change and make sure exactly ONE async
 - `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
@@ -150,7 +151,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `stale-dup-gate.sh`, `steps.sh`, `sweep.sh`, `tab-discipline.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -262,7 +263,6 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `ENGINE_SEAT_RECONCILE` → `agent-watch.sh`, `git-pr.sh`
 - `ENV_SUSPECT_TIMEOUT` → `agent-watch.sh`
 - `FINISH_STALL_MIN` → `agent-watch.sh`
-- `GATE_DISPATCH` → `agent-watch.sh`
 - `GATE_SCALE` → `agent-watch.sh`
 - `GATE_STATUS` → `agent-watch.sh`, `config-viability.sh`
 - `GATE_STATUS_PENDING` → —

@@ -272,7 +272,7 @@ WATCH="$HERE/../agent-watch.sh"
 _missing=""
 for fn in _healthcheck_gate _review_gate_step _count_live_reviews _count_live_healthchecks \
           _health_slot_free _health_inflight_file _review_inflight_file do_merge already_merged \
-          review_verdict _predispatch_review_if_parallel _gate_dispatch_mode \
+          review_verdict \
           _breaker_gate _breaker_record_infra _breaker_record_ok _breaker_read \
           herd_driver_agent_resume_cmd herd_driver_agent_limit_pattern herd_driver_send_text \
           herd_driver_switch_model; do
@@ -398,13 +398,6 @@ run_tick() {
       BLOCKED) continue ;;
       *) : ;;
     esac
-
-    # PARALLEL GATE DISPATCH (GATE_DISPATCH=parallel) — mirror the watcher's action pass: kick the
-    # review off CONCURRENTLY with the healthcheck via the SHIPPED helper. A strict no-op under serial
-    # (default), so the same tick loop verifies BOTH modes. record_peak_reviews after it so a review
-    # dispatched early still counts toward the observed peak (checkpoint a).
-    _predispatch_review_if_parallel "$pr" "$slug" "$sha"
-    record_peak_reviews
 
     # (b) SERIALIZED healthcheck gate — real function; sha-keyed cache means one run per PR.
     _HC_RESULT=""

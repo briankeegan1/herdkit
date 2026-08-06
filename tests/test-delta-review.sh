@@ -118,7 +118,13 @@ step="$(DELTA_REVIEW=on _review_gate_step 101 slug-int "$NEW1")"
 ok
 
 # ── (a2) once carried, the sha's verdict is cached — no re-review on later ticks ──
-for _ in 1 2 3; do DELTA_REVIEW=on _predispatch_review_if_parallel 101 slug-int "$NEW1"; done
+# (HERD-580: GATE_DISPATCH — and its predispatch wrapper this loop used to drive — was retired as
+# genuinely unreachable. The wrapper's own review-once precondition (_review_gate_step's contract is
+# "called once per tick for a candidate with NO ledger verdict yet") is replicated inline here, exactly
+# as the wrapper itself checked it before forwarding.)
+for _ in 1 2 3; do
+  review_verdict 101 "$NEW1" >/dev/null 2>&1 || DELTA_REVIEW=on _review_gate_step 101 slug-int "$NEW1" >/dev/null
+done
 [ ! -s "$STUB_SPAWN_LOG" ] || fail "(a2) a carried sha must never dispatch a reviewer on later ticks"
 [ "$(awk -v p=101 -v s="$NEW1" '$2==p && $3==s' "$REVIEW_STATE" | grep -c .)" -eq 1 ] \
   || fail "(a2) duplicate ledger rows accumulated for the carried sha"
