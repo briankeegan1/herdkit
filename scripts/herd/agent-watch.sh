@@ -125,9 +125,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 . "$HERE/watcher-exempt.sh"
 # SHARED `Refs:` PARSER (HERD-522) — THE one implementation of "given a PR body, print its explicit
-# tracker ref", plus the silent-miss probe the reconcile alarms on. Sourced BEFORE stale-dup-gate.sh
-# and work-units/git-pr.sh because both call into it; defines two functions + one python snippet
-# (HERD_PR_REF_PY, which sweep.sh prepends to its own driver), and sourcing it twice is a no-op.
+# tracker ref" (and, since HERD-587, EVERY ref), plus the silent-miss probe the reconcile alarms on.
+# Sourced BEFORE stale-dup-gate.sh and work-units/git-pr.sh because both call into it; defines three
+# functions + one python snippet (HERD_PR_REF_PY, which sweep.sh prepends to its own driver), and
+# sourcing it twice is a no-op.
 # shellcheck source=/dev/null
 . "$HERE/pr-ref.sh"
 # STALE-DUPLICATE gate (HERD-188) — the pre-merge check that HOLDS a PR re-implementing already-shipped

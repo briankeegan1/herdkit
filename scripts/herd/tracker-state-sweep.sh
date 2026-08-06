@@ -89,7 +89,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/console-section.sh"
 # THE shared `Refs:` parser (HERD-522) — this sweep is the merge-time reconcile's BACKSTOP, so reading
 # a ref even slightly differently from it is the one drift that would make the backstop miss exactly
-# what the primary path missed. Defines HERD_PR_REF_PY + two functions; sourcing is idempotent.
+# what the primary path missed. Defines HERD_PR_REF_PY + three functions; sourcing is idempotent.
 # shellcheck source=/dev/null
 . "$HERE/pr-ref.sh"
 REPO="$PROJECT_ROOT"
@@ -136,13 +136,22 @@ _tsweep_backend_supported() {
 }
 
 # ── data source: recently-merged PRs with their Refs ──────────────────────────
-# _merged_refs — "<pr#>\t<ref>" per line, one per recently-merged PR that carries an explicit
-# `Refs: <id>` line. The ref is extracted by the SHARED parser (pr-ref.sh's HERD_PR_REF_PY, HERD-522)
-# — not a local re-derivation of its defenses, which is what this used to be: HTML comment blocks
-# stripped first (a PR-template example 'Refs:' lives inside a comment and would otherwise poison the
-# extractor), the first decoration-tolerant `Refs:` token taken, template placeholders (<...>, none,
-# n/a) dropped. Best-effort + fail-soft: no gh / offline / body-less all yield fewer (or zero) lines,
-# never a hard error.
+# _merged_refs — "<pr#>\t<ref>" per line, ONE LINE PER REF: a PR carrying N distinct `Refs: <id>`
+# lines (HERD-587, GH #708 — a PR with four bare Refs lines, three items left open for two hours until
+# hand-closed) contributes N rows, not one. Every ref is extracted by the SHARED parser (pr-ref.sh's
+# HERD_PR_REF_PY / pr_ref_all_from_body, HERD-522/HERD-587) — not a local re-derivation of its
+# defenses, which is what this used to be: HTML comment blocks stripped first (a PR-template example
+# 'Refs:' lives inside a comment and would otherwise poison the extractor), every decoration-tolerant
+# `Refs:` token taken (not just the first), template placeholders (<...>, none, n/a) dropped, duplicate
+# refs on the same PR collapsed to one row. Best-effort + fail-soft: no gh / offline / body-less all
+# yield fewer (or zero) lines, never a hard error.
+#
+# This is what makes the multi-ref BACKSTOP work with ZERO changes to the loop below: the main loop
+# already treats each "<pr>\t<ref>" row as an independent unit (its own ledger check, its own
+# probe/heal, its own journal line) — that was already true for the ordinary case of two DIFFERENT PRs
+# each carrying one ref. A PR with three refs is now just three rows through the exact same loop, so a
+# ref that failed to heal at merge time (agent-watch.sh's reconcile_backlog) gets retried on its own,
+# independently of its siblings on the same PR, next sweep.
 #
 # CRITICAL: PR bodies are MULTI-LINE. We take the RAW JSON array (gh --json, NO -q) and parse it with
 # python's json.load — NOT a jq `\(.number)\t\(.body)` template piped line-by-line, which spills each
@@ -169,8 +178,7 @@ for pr in prs if isinstance(prs, list) else []:
     num = pr.get("number")
     if num is None:
         continue
-    ref = pr_ref_from_body(pr.get("body") or "")
-    if ref:
+    for ref in pr_ref_all_from_body(pr.get("body") or ""):
         print("%s\t%s" % (num, ref))
 ' 2>/dev/null || true
 }

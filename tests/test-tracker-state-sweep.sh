@@ -184,6 +184,60 @@ grep -q 'HERD-DECOY' "$STUB_UPDATES" && fail "an HTML-comment decoy Refs was wro
 [ "$(grep -c . "$STUB_UPDATES")" -eq 1 ] || fail "expected exactly ONE heal from the JSON path, got $(grep -c . "$STUB_UPDATES")"
 pass
 
+# ── (5c) MULTI-REF (HERD-587, GH #708): one PR body with THREE 'Refs:' lines produces THREE
+#         independent (pr,ref) rows — each gets its own ledger row, its own heal/retry, exactly the
+#         way two DIFFERENT single-ref PRs always have. This is the sweep half of the fix: the
+#         merge-time reconcile (agent-watch.sh:reconcile_backlog) may fail to resolve one ref of
+#         several at merge time; this backstop must retry THAT ref alone, not the whole PR. ──
+: > "$HERD_TSWEEP_LEDGER"; : > "$STUB_UPDATES"; : > "$HERD_TSWEEP_NOTE_FILE"; : > "$JOURNAL_FILE"
+cat > "$STUB_STATES" <<'S'
+HERD-301 in-progress
+HERD-302 in-progress
+HERD-303 closed
+S
+python3 - "$T/prs-multiref.json" <<'PY'
+import sys, json
+prs = [
+  {"number": 220, "body": "Closes several trackers.\n\nRefs: HERD-301\nRefs: HERD-302\nRefs: HERD-303\n"},
+]
+open(sys.argv[1], "w").write(json.dumps(prs))
+PY
+out="$(HERD_TSWEEP_PRS_JSON_FILE="$T/prs-multiref.json" bash "$SCRIPT")" || fail "(5c) multi-ref json sweep exited non-zero: $out"
+grep -q '^HERD-301 done sweep 220$' "$STUB_UPDATES" || fail "(5c) HERD-301 (in-progress) was not healed ($(cat "$STUB_UPDATES"))"
+grep -q '^HERD-302 done sweep 220$' "$STUB_UPDATES" || fail "(5c) HERD-302 (in-progress) was not healed ($(cat "$STUB_UPDATES"))"
+grep -q '^HERD-303 ' "$STUB_UPDATES" && fail "(5c) HERD-303 (already closed) must NOT be written ($(cat "$STUB_UPDATES"))"
+[ "$(grep -c . "$STUB_UPDATES")" -eq 2 ] || fail "(5c) expected exactly 2 heals (the 2 drifted refs of 3), got $(grep -c . "$STUB_UPDATES")"
+grep -q 'healed 2' <<< "$out" || fail "(5c) summary did not report 2 heals for the one multi-ref PR ($out)"
+pass
+
+# One ref of the three fails to heal (NOCHANGE) — it retries on ITS OWN next sweep, independently of
+# its two siblings on the SAME PR (which are already ledgered and never re-probed).
+: > "$HERD_TSWEEP_LEDGER"; : > "$STUB_UPDATES"; : > "$HERD_TSWEEP_NOTE_FILE"; : > "$JOURNAL_FILE"
+cat > "$STUB_STATES" <<'S'
+HERD-401 in-progress
+HERD-402 in-progress
+S
+python3 - "$T/prs-multiref2.json" <<'PY'
+import sys, json
+prs = [
+  {"number": 221, "body": "Refs: HERD-401\nRefs: HERD-402\n"},
+]
+open(sys.argv[1], "w").write(json.dumps(prs))
+PY
+echo 'HERD-402 NOCHANGE' > "$STUB_RESULTS"     # force just this ONE ref's write to fail
+out="$(HERD_TSWEEP_PRS_JSON_FILE="$T/prs-multiref2.json" bash "$SCRIPT" 2>/dev/null)" || fail "(5c) mixed-outcome multi-ref sweep exited non-zero: $out"
+: > "$STUB_RESULTS"
+grep -q '^HERD-401 done sweep 221$' "$STUB_UPDATES" || fail "(5c) HERD-401 should heal despite its sibling HERD-402 failing"
+awk '$2=="HERD-401"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null || fail "(5c) the healed sibling HERD-401 must be ledgered"
+awk '$2=="HERD-402"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null && fail "(5c) the failed sibling HERD-402 must NOT be ledgered (it must retry)"
+grep -q 'healed 1, 1 still unhealed' <<< "$out" || fail "(5c) summary should report 1 healed / 1 unhealed for the mixed PR ($out)"
+# the retry heals ONLY HERD-402 — HERD-401 is already ledgered and is never re-probed.
+: > "$STUB_UPDATES"
+out2="$(HERD_TSWEEP_PRS_JSON_FILE="$T/prs-multiref2.json" bash "$SCRIPT")" || fail "(5c) retry sweep exited non-zero: $out2"
+grep -q '^HERD-402 done sweep 221$' "$STUB_UPDATES" || fail "(5c) the retry did not heal the previously-failed sibling HERD-402"
+grep -q '^HERD-401 ' "$STUB_UPDATES" && fail "(5c) the retry must NOT re-probe the already-healed sibling HERD-401 ($(cat "$STUB_UPDATES"))"
+pass
+
 # ── (7) HERD-411: a resolve-FAILURE ref goes silent, then ledgers after N sweeps with ONE event ─
 : > "$HERD_TSWEEP_LEDGER"; : > "$HERD_TSWEEP_UNRESOLVED_FILE"; : > "$STUB_UPDATES"; : > "$STUB_READS"
 : > "$HERD_TSWEEP_NOTE_FILE"; : > "$JOURNAL_FILE"

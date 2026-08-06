@@ -53,14 +53,17 @@
 #     the last time the engine hardcoded `KEY-42`. So `Refs: some-branch-slug` PARSES; only a body
 #     whose `refs:` yields no token at all is a miss.
 #
-# CONTRACT: sourced (never executed) — it defines two shell functions plus the python snippet the
+# CONTRACT: sourced (never executed) — it defines shell functions plus the python snippet the
 # JSON-array callers prepend to their own driver. Sourcing is idempotent and side-effect-free, so a
 # surface that also sources a sibling which sources this file is safe. Bash 3.2 clean.
 
 # HERD_PR_REF_PY — the python half, prepended to whichever driver the caller needs (one body on
 # stdin, or a whole `gh pr list --json number,body` array). Same shape as backends/linear.sh's
-# _LINEAR_PICK_STATE_PY. Exports three names:
-#   pr_ref_from_body(body)      → the ref, or "" (no Refs: line / placeholder / no token)
+# _LINEAR_PICK_STATE_PY. Exports four names:
+#   pr_ref_from_body(body)      → THE ref, or "" (no Refs: line / placeholder / no token) — the FIRST
+#                                 anchored line decides, single-valued (see its own docstring)
+#   pr_ref_all_from_body(body)  → EVERY distinct ref (HERD-587), a list, in first-seen order — every
+#                                 anchored line contributes, set-valued (see its own docstring)
 #   pr_ref_unparsed_line(body)  → the offending line when the body DECLARES a ref but yields none;
 #                                 "" when a ref parsed, when no line is declaration-shaped, or when
 #                                 the declaration is an explicit placeholder
@@ -114,6 +117,25 @@ def pr_ref_from_body(body):
         return tok
     return ""
 
+def pr_ref_all_from_body(body):
+    """EVERY distinct ref from EVERY anchored Refs: line in the body (HERD-587), in first-seen order,
+    duplicates collapsed. Unlike pr_ref_from_body, a placeholder line does NOT stop the scan — it is
+    just skipped, so a later real Refs: line still counts. This is a DIFFERENT contract from
+    pr_ref_from_body, on purpose: pr_ref_from_body answers a single-valued question ("what is THE
+    ref"), so a placeholder-first body must yield none, not skip ahead; this answers a set-valued
+    question ("which trackers does this PR carry"), so a stray placeholder line among several real
+    refs should not blank out the real ones."""
+    seen = []
+    for line in _pr_ref_decomment(body).splitlines():
+        if not _PR_REF_LINE.match(line):
+            continue
+        tok = _pr_ref_token(line)
+        if not tok or tok.startswith("<") or tok.lower() in _PR_REF_PLACEHOLDER:
+            continue
+        if tok not in seen:
+            seen.append(tok)
+    return seen
+
 def pr_ref_unparsed_line(body, cap=200):
     """The SILENT-MISS probe. "" when no line DECLARES a ref, when a ref parsed, or when the
     declaration is an explicit placeholder; otherwise the first offending line, whitespace-flattened
@@ -156,6 +178,36 @@ sys.stdout.write(pr_ref_from_body(sys.stdin.read()))' 2>/dev/null)" && { printf 
     ''|'<'*|none|None|NONE|n/a|N/A|na|NA) return 0 ;;
   esac
   printf '%s' "$ref"
+}
+
+# herd_pr_ref_all_from_body — read a PR body on stdin, print EVERY distinct `Refs:` value (HERD-587),
+# one per line, in first-seen order; nothing when the body carries none. The shell-side entry point to
+# pr_ref_all_from_body — see its docstring for how this differs from herd_pr_ref_from_body's single-
+# valued "first line decides" contract.
+#
+# NO-PYTHON3 FALLBACK, same posture as herd_pr_ref_from_body: minus the HTML-comment strip, every
+# matching line (not just the first) runs through the same decoration-tolerant anchor + punctuation
+# strip + placeholder guard, then duplicates are collapsed.
+herd_pr_ref_all_from_body() {
+  local body out rc
+  body="$(cat)"
+  if command -v python3 >/dev/null 2>&1; then
+    out="$(printf '%s' "$body" | python3 -c "$HERD_PR_REF_PY"'
+import sys
+for r in pr_ref_all_from_body(sys.stdin.read()):
+    print(r)' 2>/dev/null)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      [ -n "$out" ] && printf '%s\n' "$out"
+      return 0
+    fi
+  fi
+  # Degraded path: same rules as herd_pr_ref_from_body, minus the HTML-comment strip, every line.
+  printf '%s\n' "$body" \
+    | grep -iE '^[[:space:]#*>-]*Refs:[*]*[[:space:]]*[^[:space:]]' \
+    | sed -E 's/^[[:space:]#*>-]*[Rr][Ee][Ff][Ss]:[*]*[[:space:]]*//; s/[[:space:]].*$//; s/[.,;:!)}*]+$//' \
+    | grep -viE '^(<.*|none|n/a|na)$' \
+    | awk '!seen[$0]++' 2>/dev/null || true
 }
 
 # herd_pr_ref_unparsed_line — read a PR body on stdin; print the offending line when the body MENTIONS

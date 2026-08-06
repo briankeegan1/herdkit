@@ -69,12 +69,13 @@ ok; echo "PASS (1) one Refs: parser, reused at every surface, re-implemented at 
 
 # shellcheck source=/dev/null
 . "$LIB" || fail "sourcing pr-ref.sh failed"
-for fn in herd_pr_ref_from_body herd_pr_ref_unparsed_line; do
+for fn in herd_pr_ref_from_body herd_pr_ref_unparsed_line herd_pr_ref_all_from_body; do
   command -v "$fn" >/dev/null 2>&1 || fail "pr-ref.sh does not define $fn"
 done
 
 _ref()      { printf '%s' "$1" | herd_pr_ref_from_body; }
 _unparsed() { printf '%s' "$1" | herd_pr_ref_unparsed_line; }
+_all()      { printf '%s' "$1" | herd_pr_ref_all_from_body; }
 
 # ══ (2) TOLERANT MATCHING — the decoration shapes, including #637's own ═══════════════════════════
 while IFS='|' read -r label body want; do
@@ -241,6 +242,54 @@ GATE_REF="$(
 [ "$GATE_REF" = "HERD-267" ] \
   || fail "(9) stale_dup_extract_ref returned '$GATE_REF' — it still drops the trailing-punctuation defense"
 ok; echo "PASS (9) the stale-duplicate gate reads refs identically to the reconcile"
+
+# ══ (9b) MULTI-REF (HERD-587, GH #708) — pr_ref_all_from_body / herd_pr_ref_all_from_body ═════════
+# PR #708 carried FOUR bare 'Refs:' lines; three of the four tracker items sat open for two hours
+# because every parser above is single-valued — it answers "what is THE ref", so it only ever returns
+# the first. pr_ref_all_from_body is the set-valued sibling the merge-reconcile leg now walks: every
+# anchored line, decoration-tolerant exactly like pr_ref_from_body, duplicates collapsed, first-seen
+# order preserved.
+got="$(_all "$(printf 'Refs: HERD-1\nRefs: HERD-2\nRefs: HERD-3\n')")"
+[ "$got" = "$(printf 'HERD-1\nHERD-2\nHERD-3')" ] || fail "(9b) three bare Refs: lines → '$got', wanted HERD-1/2/3 in order"
+
+# decoration-tolerant, same shapes as (2).
+got="$(_all "$(printf '## Refs: HERD-1\n- Refs: HERD-2\n**Refs:** HERD-3\n')")"
+[ "$got" = "$(printf 'HERD-1\nHERD-2\nHERD-3')" ] || fail "(9b) decorated multi-ref lines → '$got'"
+
+# duplicates collapsed, first-seen order kept.
+got="$(_all "$(printf 'Refs: HERD-1\nRefs: HERD-2\nRefs: HERD-1\n')")"
+[ "$got" = "$(printf 'HERD-1\nHERD-2')" ] || fail "(9b) duplicate ref line not collapsed: '$got'"
+
+# a single-ref body is the n=1 case — identical to pr_ref_from_body's answer.
+got="$(_all 'Refs: HERD-522')"
+[ "$got" = "HERD-522" ] || fail "(9b) single-ref body regressed: '$got'"
+
+# a placeholder line does NOT abort the scan — unlike pr_ref_from_body (see (3): "the first Refs: line
+# no longer wins" is deliberately NOT this function's rule), a later real ref still counts.
+got="$(_all "$(printf 'Refs: <ID>\nRefs: HERD-9\n')")"
+[ "$got" = "HERD-9" ] || fail "(9b) a placeholder line wrongly blanked out a later real ref: '$got'"
+got_single="$(_ref "$(printf 'Refs: <ID>\nRefs: HERD-9\n')")"
+[ -z "$got_single" ] || fail "(9b) pr_ref_from_body regressed on the same placeholder-first body: '$got_single'"
+
+# no refs at all → empty.
+got="$(_all 'just a body, nothing tracked')"
+[ -z "$got" ] || fail "(9b) a ref-less body produced output: '$got'"
+
+# the HTML-comment strip still runs first — a commented decoy must never appear in the set.
+got="$(_all "$(printf '<!-- Refs: HERD-DECOY -->\nRefs: HERD-267\nRefs: HERD-268\n')")"
+[ "$got" = "$(printf 'HERD-267\nHERD-268')" ] || fail "(9b) an HTML-comment decoy leaked into the multi-ref set: '$got'"
+ok; echo "PASS (9b) pr_ref_all_from_body extracts every distinct ref, decoration-tolerant, dedup'd, comment-safe"
+
+# ── (9c) DEGRADED HOST — python3 shadowed, multi-ref fallback ────────────────────────────────────
+NOPY_ALL="$(
+  # shellcheck source=/dev/null
+  . "$LIB"
+  python3() { return 127; }
+  printf '%s' "$(printf 'Refs: HERD-1\n## Refs: HERD-2\nRefs: HERD-1\nRefs: <ID>\n')" | herd_pr_ref_all_from_body
+)"
+[ "$NOPY_ALL" = "$(printf 'HERD-1\nHERD-2')" ] \
+  || fail "(9c) the no-python3 multi-ref fallback returned: $NOPY_ALL"
+ok; echo "PASS (9c) without python3 the multi-ref extraction still dedups, decorates and skips placeholders"
 
 # ══ Fixture for the watcher-side legs (10)–(12) ══════════════════════════════════════════════════
 MAIN="$T/main"; TREES="$T/trees"
