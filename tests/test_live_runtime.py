@@ -1564,6 +1564,58 @@ class TestLiveMergeVerify(LiveCase):
         self.assertFalse([o for o in ev if o["event"] == "merge"])
 
 
+class _RecordingResolverSub:
+    """Records every argv `LiveActuator.dispatch_resolver` runs and scripts a bare `bash
+    herd-resolve.sh <slug>` success/failure — proves the HERD-584 dispatch shape without ever
+    launching herdr/git/claude."""
+
+    def __init__(self, rc=0):
+        self.calls = []
+        self.rc = rc
+
+    def run(self, argv, *a, **k):
+        self.calls.append((list(argv), dict(k)))
+        return _FakeCompleted("", returncode=self.rc)
+
+
+class TestLiveDispatchResolver(LiveCase):
+    """HERD-584: LiveActuator.dispatch_resolver is the live twin of agent-watch.sh's spawn_resolver —
+    a best-effort, bounded shell-out to the EXISTING scripts/herd/herd-resolve.sh, never raising."""
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/some/home", LiveJournal(self.jpath))
+
+    def _cand(self):
+        return LiveCandidate(7, "deadbeef", slug="feat-x", worktree="/wt/feat-x")
+
+    def test_success_runs_herd_resolve_with_the_slug_and_pr_sha_env(self):
+        sub = _RecordingResolverSub(rc=0)
+        act = self._actuator(sub)
+        self.assertTrue(act.dispatch_resolver(self._cand()))
+        self.assertEqual(len(sub.calls), 1)
+        argv, kwargs = sub.calls[0]
+        self.assertEqual(argv[0], "bash")
+        self.assertTrue(argv[1].endswith("scripts/herd/herd-resolve.sh"))
+        self.assertEqual(argv[2], "feat-x")
+        self.assertEqual(kwargs["env"]["HERD_RESOLVE_PR"], "7")
+        self.assertEqual(kwargs["env"]["HERD_RESOLVE_SHA"], "deadbeef")
+        self.assertIn("timeout", kwargs)
+
+    def test_nonzero_exit_reports_failure(self):
+        act = self._actuator(_RecordingResolverSub(rc=1))
+        self.assertFalse(act.dispatch_resolver(self._cand()))
+
+    def test_a_raised_exception_never_escapes(self):
+        class _Raising:
+            def run(self, *a, **k):
+                raise OSError("herdr not found")
+        act = self._actuator(_Raising())
+        self.assertFalse(act.dispatch_resolver(self._cand()))
+
+
 class TestLiveMergeMethodConfig(LiveCase):
     """HERD-354: the live merge actuator composes ``gh pr merge`` from MERGE_METHOD +
     DELETE_BRANCH_ON_MERGE exactly as bash do_merge does (agent-watch.sh:_merge_method_flag /
@@ -2138,15 +2190,68 @@ class TestStaleDupGate(LiveCase):
         wake = [o for o in ev if o["event"] == "refix_wake_result"]
         self.assertEqual(wake[0]["woke"], 1)
 
-    def test_stale_base_autofix_escalates_when_nobody_wakes(self):
+    def test_stale_base_autofix_dispatches_resolver_when_nobody_wakes(self):
+        # HERD-584: the old bash healer dispatched the EXISTING conflict resolver
+        # (herd-resolve.sh) when there is no live builder to bounce, rather than escalate a
+        # MECHANICAL fix straight to a human. A worktree exists here, so the resolver fallback
+        # engages: BLOCK (awaiting the resolver's push), not ESCALATE.
         feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
         os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
         res, ev = self._tick_live(
             dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
                  agent_status="dead"),
             {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"})
+        self.assertEqual(res["outcomes"]["7"], "BLOCK")
+        self.assertFalse([o for o in ev if o["event"] == "refix_escalated_no_wake"])
+        bounce = [o for o in ev if o["event"] == "stale_base_autofix_bounce"]
+        self.assertEqual(len(bounce), 1)
+        self.assertEqual(bounce[0]["pr"], 7)
+        self.assertEqual(bounce[0]["sha"], feat_sha)
+        wake = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(wake[0]["woke"], 0)
+        self.assertEqual(wake[0]["escalated"], "false")
+        # The round is still spent (a resolver dispatch IS a real heal attempt, unlike the
+        # unwoken-bounce refund path) — never refunded via a reset row.
+        self.assertFalse([o for o in ev if o["event"] == "refix_rail_reset"])
+
+    def test_stale_base_autofix_escalates_when_resolver_dispatch_fails(self):
+        # The fallback engages (a worktree exists) but the resolver spawn itself fails (herdr down,
+        # script missing, …) — the caller must fall through to the same honest needs-you escalation
+        # a plain unwoken bounce takes, round refunded.
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+
+        class _NoResolverActuator(DryRunActuator):
+            def dispatch_resolver(self, cand):
+                return False
+
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        actuator = _NoResolverActuator(journal)
+        config = {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"}
+        scenario = {"candidates": [self.one(pr=7, sha=feat_sha, worktree=feat_dir, base="main",
+                                            health="CLEAN", review="PASS", agent_status="dead")],
+                   "config": config}
+        t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
+                     state=state, hold_source=LiveHoldSource(state, config))
+        res = t.run()
+        ev = events(self.jpath)
         self.assertEqual(res["outcomes"]["7"], "ESCALATE")
+        self.assertFalse([o for o in ev if o["event"] == "stale_base_autofix_bounce"])
         self.assertTrue([o for o in ev if o["event"] == "refix_escalated_no_wake"])
+
+    def test_stale_no_wake_fallback_declines_without_a_worktree(self):
+        # Unit-level: no worktree to resolve in place -> the fallback is inapplicable, never
+        # dispatches, and never journals (mirrors _handle_stale_dup's "no builder/worktree" branch,
+        # which stays a plain needs-you). Exercised directly since the full stale-dup gate can only
+        # PROVE a stale-base hold against a real worktree in the first place.
+        journal = LiveJournal(self.jpath)
+        t = LiveTick({}, FixtureDiscovery({"candidates": [], "config": {}}),
+                     FixtureGates({"candidates": [], "config": {}}), DryRunActuator(journal), journal,
+                     state=LiveState(self.tmp))
+        cand = LiveCandidate(pr=9, sha="deadbeef", slug="feat-nowt", worktree="")
+        self.assertFalse(t._stale_no_wake_fallback(cand))
+        self.assertFalse(os.path.exists(self.jpath), "a declined fallback must journal nothing")
 
     # ── the lever ─────────────────────────────────────────────────────────────────────────────────
 
