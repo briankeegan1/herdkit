@@ -21,6 +21,7 @@ Role summarized from each file's top-of-file comment.
 - `backlog-reconcile-sweep.sh` — periodic, ADVISORY reconcile SWEEP for backlog drift.
 - `backlog-reconcile.sh` — keep BACKLOG.md coherent when a PR MOVES or RENAMES the things backlog
 - `backlog-view.sh` — live, styled backlog viewer for the coordinator's left pane.
+- `bash-syntax-lint.sh` — THE shared SYSTEM-BASH SYNTAX guard (HERD-608): herd_bash_syntax_lint [<root>]
 - `bats-fd3-guard.sh` — HERD-462: the shared-chokepoint half of the bats-FD3 wedge fix.
 - `burst.sh` — the ONE reusable BOUNDED-CONCURRENCY FAN-OUT "seam" for herdkit's READ-ONLY work
 - `capacity-agent-lease-wait.sh` — capacity-agent-lease-wait.sh <slug> — HERD-581 (HERD-557 P2): the CMD capacity_agent_lease_hold
@@ -70,6 +71,7 @@ Role summarized from each file's top-of-file comment.
 - `hermetic-env-scrub.sh` — HERD-458: seal off herd-config.sh's own EXPORTED keys before a hermetic
 - `human-verify.sh` — the shared parser for the per-PR HUMAN-VERIFY hold convention.
 - `journal-act.sh` — THE RAIL-DISPATCH half of "journal-audit findings become ACTIONS" (HERD-544).
+- `journal-audit-replay.sh` — THE REPLAY half of journal-audit.sh (HERD-608), split out for exactly one
 - `journal-audit.sh` — journal-driven self-audit / gap-finder (HERD-238 / N12).
 - `journal-emission-lint.sh` — THE shared CONSUMER-ONLY EVENT guard (HERD-442): every journal event
 - `journal-test-env.sh` — HERD-223 shared TEST layer: pin JOURNAL_FILE to a throwaway path so a
@@ -180,7 +182,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
 - `herd-watch.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
 - `journal-act.sh` → `agent-watch.sh`, `journal.sh`
-- `journal-audit.sh` → `aging-pr.sh`, `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`
+- `journal-audit.sh` → `aging-pr.sh`, `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal-audit-replay.sh`, `journal.sh`
 - `ledger.sh` → `herd-config.sh`
 - `new-feature.sh` → `herd-config.sh`, `herd-preflight.sh`
 - `oss-triage.sh` → `herd-config.sh`
@@ -214,7 +216,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 
 - `ADOPT_REMOTE_PRS` → `agent-watch.sh`
 - `AGENT_UPDATE` → `bin/herd`, `agent-update.sh`
-- `AGING_PR_TTL` → `agent-watch.sh`, `aging-pr.sh`, `journal-audit.sh`
+- `AGING_PR_TTL` → `agent-watch.sh`, `aging-pr.sh`, `journal-audit-replay.sh`
 - `ANOMALY_BASELINES` → `agent-watch.sh`
 - `ANOMALY_FILE_COOLDOWN_SECS` → `agent-watch.sh`
 - `ANTHROPIC_BASE_URL` → `driver.sh`
@@ -289,7 +291,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HERD_REPO` → `bin/herd`, `herd-links.sh`, `oss-triage.sh`
 - `HERD_THEME` → `bin/herd`, `theme.sh`
 - `HERD_VERSION` → `bin/herd`
-- `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`, `journal-audit.sh`, `posture-lint.sh`
+- `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`, `journal-audit-replay.sh`, `posture-lint.sh`
 - `INFRA_BREAKER_COOLDOWN` → `agent-watch.sh`
 - `INFRA_BREAKER_MAX` → `agent-watch.sh`
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
