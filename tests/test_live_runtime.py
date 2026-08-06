@@ -7064,5 +7064,217 @@ class TestReviewFastPath(LiveCase):
                     self.assertGreaterEqual(int(lat[0]["secs"]), 0)
 
 
+class TestGhRateLimitClassification(unittest.TestCase):
+    """HERD-582: a gh call rejected on a rate limit must classify as BACKOFF, not a genuine fault.
+    The live incident (2026-08-06 02:06): a GraphQL bucket exhausted after a 50-merge day made
+    discover_via_graphql's gh call exit non-zero, which propagated straight to `main` — exit 1 —
+    and rang the bash watchdog's fault streak into a false 'ENGINE DOWN' page for a wait-with-a-
+    known-reset. Genuine failures (auth, network, malformed query) must still raise/fault verbatim."""
+
+    def test_looks_gh_rate_limited_matches_graphql_text(self):
+        self.assertTrue(LR._looks_gh_rate_limited(
+            "gh: GraphQL: API rate limit already exceeded for user ID 123. (repository)\n"))
+
+    def test_looks_gh_rate_limited_matches_rest_403_zero_remaining(self):
+        self.assertTrue(LR._looks_gh_rate_limited(
+            "HTTP/2.0 403 Forbidden\nX-RateLimit-Remaining: 0\n\n"
+            '{"message":"API rate limit exceeded for user ID 123."}\n'))
+
+    def test_looks_gh_rate_limited_false_for_genuine_failure(self):
+        self.assertFalse(LR._looks_gh_rate_limited("gh: authentication failed, run 'gh auth login'\n"))
+        self.assertFalse(LR._looks_gh_rate_limited("curl: (6) Could not resolve host\n"))
+        self.assertFalse(LR._looks_gh_rate_limited(""))
+        self.assertFalse(LR._looks_gh_rate_limited(None))
+
+    def test_403_alone_without_the_header_is_not_classified_rate_limited(self):
+        # A plain 403 (e.g. a permissions error) must NOT be mistaken for a rate limit — only the
+        # X-RateLimit-Remaining: 0 header (or the GraphQL text) authorizes the reclassification.
+        self.assertFalse(LR._looks_gh_rate_limited("gh: HTTP 403: Resource not accessible by integration"))
+
+    def test_discover_via_graphql_raises_ghratelimited_with_reset(self):
+        reset_epoch = 1735689600
+
+        class _Stub:
+            CalledProcessError = subprocess.CalledProcessError   # live_runtime references subprocess.CalledProcessError
+
+            def run(self, argv, **k):
+                if "graphql" in argv:
+                    raise subprocess.CalledProcessError(
+                        1, argv, output="",
+                        stderr="gh: GraphQL: API rate limit already exceeded for user ID 123. (repository)\n")
+                if "rate_limit" in argv:
+                    class R:
+                        returncode = 0
+                        stdout = "%d\n" % reset_epoch
+                    return R()
+                raise AssertionError("unexpected gh call: %r" % (argv,))
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            with self.assertRaises(LR.GhRateLimited) as ctx:
+                LR.discover_via_graphql(repo="owner/name")
+            self.assertEqual(ctx.exception.reset_at, reset_epoch)
+        finally:
+            LR.subprocess = orig
+
+    def test_discover_via_graphql_genuine_failure_propagates_calledprocesserror(self):
+        class _Stub:
+            CalledProcessError = subprocess.CalledProcessError
+
+            def run(self, argv, **k):
+                raise subprocess.CalledProcessError(1, argv, output="", stderr="gh: authentication failed\n")
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            with self.assertRaises(subprocess.CalledProcessError):
+                LR.discover_via_graphql(repo="owner/name")
+        finally:
+            LR.subprocess = orig
+
+    def test_repo_owner_name_raises_ghratelimited_on_rest_403(self):
+        class _Stub:
+            CalledProcessError = subprocess.CalledProcessError
+
+            def run(self, argv, **k):
+                if "rate_limit" in argv:
+                    class R:
+                        returncode = 0
+                        stdout = "1735689600\n"
+                    return R()
+                raise subprocess.CalledProcessError(
+                    1, argv, output="", stderr="HTTP/2.0 403 Forbidden\nX-RateLimit-Remaining: 0\n")
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            with self.assertRaises(LR.GhRateLimited):
+                LR._repo_owner_name(None)
+        finally:
+            LR.subprocess = orig
+
+    def test_gh_rate_limit_reset_probe_is_fail_soft(self):
+        # The follow-up "when does it reset" probe failing must never itself raise — the caller
+        # (GhRateLimited.reset_at is None) applies a default cooldown instead.
+        class _Stub:
+            def run(self, argv, **k):
+                raise OSError("gh not found")
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            self.assertIsNone(LR._gh_rate_limit_reset())
+        finally:
+            LR.subprocess = orig
+
+
+class TestLiveTickRateLimitBackoff(LiveCase):
+    """HERD-582: LiveTick.run() must never let a classified rate limit raise (no fault streak),
+    must journal engine_rate_limited with the reset stamp, and must skip the gh round-trip
+    entirely on a subsequent tick while the backoff window is still active."""
+
+    def test_journals_engine_rate_limited_and_returns_calm_summary_without_raising(self):
+        os.environ["HERD_FAKE_NOW"] = "1735689000"
+        try:
+            class _RLDiscovery:
+                def discover(self):
+                    raise LR.GhRateLimited(reset_at=1735689600)
+
+            journal = LiveJournal(self.jpath)
+            state = LiveState(self.tmp)
+            t = LiveTick({}, _RLDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                         state=state)
+            result = t.run()  # must NOT raise
+        finally:
+            os.environ.pop("HERD_FAKE_NOW", None)
+        want_until = 1735689600 + LR._GH_RATE_LIMIT_BUFFER_SECONDS
+        self.assertTrue(result.get("rate_limited"))
+        self.assertEqual(result.get("rate_limited_until"), want_until)
+        evs = events(self.jpath)
+        rl = [e for e in evs if e["event"] == "engine_rate_limited"]
+        self.assertEqual(len(rl), 1)
+        self.assertEqual(int(rl[0]["reset"]), 1735689600)
+        self.assertEqual(int(rl[0]["until"]), want_until)
+        # no ordinary tick bookkeeping ran — this tick did no candidate walk at all
+        self.assertEqual([e["event"] for e in evs if e["event"] in ("live_tick_start", "live_tick_end")], [])
+        # the marker persisted so the NEXT tick can skip the gh round-trip outright
+        self.assertEqual(state.gh_rate_limited_until(), want_until)
+
+    def test_falls_back_to_the_default_cooldown_when_the_reset_probe_itself_failed(self):
+        # reset_at=None (the cheap follow-up probe failed too) must never block the calm path —
+        # fall back to the default cooldown rather than raising or leaving the tick unbounded.
+        os.environ["HERD_FAKE_NOW"] = "1735689000"
+        try:
+            class _RLDiscovery:
+                def discover(self):
+                    raise LR.GhRateLimited(reset_at=None)
+
+            journal = LiveJournal(self.jpath)
+            state = LiveState(self.tmp)
+            t = LiveTick({}, _RLDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                         state=state)
+            result = t.run()
+        finally:
+            os.environ.pop("HERD_FAKE_NOW", None)
+        want_until = 1735689000 + LR._GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS + LR._GH_RATE_LIMIT_BUFFER_SECONDS
+        self.assertTrue(result.get("rate_limited"))
+        self.assertEqual(result.get("rate_limited_until"), want_until)
+        rl = [e for e in events(self.jpath) if e["event"] == "engine_rate_limited"]
+        self.assertEqual(len(rl), 1)
+        self.assertEqual(int(rl[0]["until"]), want_until)
+
+    def test_skips_discovery_entirely_within_an_active_backoff_window(self):
+        state = LiveState(self.tmp)
+        state.set_gh_rate_limited_until(4102444800)  # far future (year 2100)
+        calls = []
+
+        class _CountingDiscovery:
+            def discover(self):
+                calls.append(1)
+                return []
+
+        journal = LiveJournal(self.jpath)
+        t = LiveTick({}, _CountingDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                     state=state)
+        result = t.run()
+        self.assertEqual(calls, [], "discovery must not be called while the backoff window is active")
+        self.assertTrue(result.get("rate_limited"))
+        self.assertEqual(result.get("rate_limited_until"), 4102444800)
+
+    def test_clears_the_marker_and_resumes_once_the_window_has_passed(self):
+        state = LiveState(self.tmp)
+        state.set_gh_rate_limited_until(1)  # already in the past
+        calls = []
+
+        class _CountingDiscovery:
+            def discover(self):
+                calls.append(1)
+                return []
+
+        journal = LiveJournal(self.jpath)
+        t = LiveTick({"MERGE_POLICY": "auto"}, _CountingDiscovery(), FixtureGates({}),
+                     DryRunActuator(journal), journal, state=state)
+        result = t.run()
+        self.assertEqual(len(calls), 1, "discovery must run again once the backoff window has passed")
+        self.assertFalse(result.get("rate_limited"))
+        self.assertEqual(state.gh_rate_limited_until(), 0, "the marker must clear on a clean discovery")
+
+    def test_genuine_discovery_failure_still_raises_and_never_journals_rate_limited(self):
+        class _BrokenDiscovery:
+            def discover(self):
+                raise subprocess.CalledProcessError(1, ["gh"], output="",
+                                                    stderr="gh: authentication failed\n")
+
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        t = LiveTick({}, _BrokenDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                     state=state)
+        with self.assertRaises(subprocess.CalledProcessError):
+            t.run()
+        evs = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertEqual([e for e in evs if e["event"] == "engine_rate_limited"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
