@@ -64,6 +64,9 @@ class AccessorParity(_PoolCase):
         st.seat_stamp("s1", 6, 1001, "active")               # latest per seat wins
         st.mark_finish_stall_seen("fs-slug", 2000)
         st.mark_finish_stall_seen("fs-slug", 9999)           # get-or-create: must NOT move the anchor
+        hwm_first = st.noaction_hwm_advance("checkout_unclean", 5000)   # True: nothing recorded yet
+        hwm_stale = st.noaction_hwm_advance("checkout_unclean", 4000)   # False: older than the mark
+        hwm_newer = st.noaction_hwm_advance("checkout_unclean", 6000)   # True: genuinely newer
         return {
             "approval": st.approval_state("42", "abcdef"),   # strongest = approved
             "approval_none": st.approval_state("99"),
@@ -78,6 +81,11 @@ class AccessorParity(_PoolCase):
             "once_second": st.once("g1"),
             "seat": sorted(st.seat_rows()),
             "finish_stall": st.finish_stall_record("fs-slug"),
+            "hwm_first": hwm_first,
+            "hwm_stale": hwm_stale,
+            "hwm_newer": hwm_newer,
+            "hwm_mark": st.noaction_hwm("checkout_unclean"),
+            "hwm_unset": st.noaction_hwm("fixture_slug"),
         }
 
     def test_parity(self):
@@ -100,6 +108,9 @@ class AccessorParity(_PoolCase):
         self.assertTrue(flat["once_first"] and not flat["once_second"])
         self.assertEqual(flat["seat"], [("s1", 6, 1001, "active")])
         self.assertEqual(flat["finish_stall"], (2000, "pending"))
+        self.assertTrue(flat["hwm_first"] and not flat["hwm_stale"] and flat["hwm_newer"])
+        self.assertEqual(flat["hwm_mark"], 6000)
+        self.assertIsNone(flat["hwm_unset"])
 
     def test_approval_purge_by_pr(self):
         for be in ("flat", "sqlite"):
@@ -167,6 +178,31 @@ class AccessorParity(_PoolCase):
             self.assertEqual(st.mark_finish_stall_seen("other-slug", 5000), (5000, "pending"), be)
             self.assertEqual(st.mark_finish_stall_seen(slug, 3000), (3000, "pending"),
                               "%s: a regression after clear could not re-anchor" % be)
+
+    def test_noaction_hwm_monotonic_and_parity(self):
+        """HERD-606: journal-audit's no-action recurrence high-water mark only ever moves FORWARD. A
+        stamp at or below the persisted mark never advances it (a historical journal replay must never
+        recount), a genuinely newer stamp does, and distinct classes never interfere with each other."""
+        for be in ("flat", "sqlite"):
+            shutil.rmtree(self.pool); os.makedirs(os.path.join(self.pool, ".herd"))
+            st = self.store(be)
+            self.assertIsNone(st.noaction_hwm("checkout_unclean"), be)
+            self.assertTrue(st.noaction_hwm_advance("checkout_unclean", 1000), "%s: first stamp must advance" % be)
+            self.assertEqual(st.noaction_hwm("checkout_unclean"), 1000, be)
+            self.assertFalse(st.noaction_hwm_advance("checkout_unclean", 1000),
+                              "%s: an EQUAL stamp must not re-advance (already counted)" % be)
+            self.assertFalse(st.noaction_hwm_advance("checkout_unclean", 500),
+                              "%s: an OLDER stamp (a historical replay) must never advance the mark" % be)
+            self.assertEqual(st.noaction_hwm("checkout_unclean"), 1000,
+                              "%s: a rejected stamp must never move the mark" % be)
+            self.assertTrue(st.noaction_hwm_advance("checkout_unclean", 2000), "%s: a newer stamp must advance" % be)
+            self.assertEqual(st.noaction_hwm("checkout_unclean"), 2000, be)
+            # a different class starts fresh — never blocked by another class's mark
+            self.assertIsNone(st.noaction_hwm("watcher_restart_blocked"), be)
+            self.assertTrue(st.noaction_hwm_advance("watcher_restart_blocked", 10),
+                             "%s: a distinct class must not inherit another class's mark" % be)
+            self.assertEqual(st.noaction_hwm("checkout_unclean"), 2000,
+                              "%s: advancing one class must not perturb another's mark" % be)
 
     def test_phase_duration_baseline_rolling_window_and_parity(self):
         """HERD-496: a rolling median/p95 per named phase, so agent-watch.sh's anomaly leg can judge a
@@ -338,6 +374,40 @@ class ConcurrentClaim(_PoolCase):
         winners, final = self._race_finish_stall_anchor("flat")
         self.assertEqual(len(winners), 1, "flat finish-stall lost-update: %r" % winners)
         self.assertIn(final, winners)
+
+    def _race_noaction_hwm_advance(self, backend, n=24, stamp=5000):
+        """HERD-606: many 'seats' racing an advance to the SAME stamp for the SAME class must converge
+        on exactly ONE winner (the first committed write) — a lost update here would double-count a
+        no-action class's recurrence tally."""
+        os.environ["STORE_BACKEND"] = backend
+        results = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(n)
+
+        def worker():
+            st = S.open_store(self.pool)
+            barrier.wait()
+            r = st.noaction_hwm_advance("checkout_unclean", stamp)
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        final = S.open_store(self.pool).noaction_hwm("checkout_unclean")
+        return results, final
+
+    def test_sqlite_noaction_hwm_single_winner(self):
+        results, final = self._race_noaction_hwm_advance("sqlite")
+        self.assertEqual(sum(1 for r in results if r), 1, "sqlite noaction-hwm lost-update: %r" % results)
+        self.assertEqual(final, 5000)
+
+    def test_flat_noaction_hwm_single_winner(self):
+        results, final = self._race_noaction_hwm_advance("flat")
+        self.assertEqual(sum(1 for r in results if r), 1, "flat noaction-hwm lost-update: %r" % results)
+        self.assertEqual(final, 5000)
 
     def _race_main_health_fix(self, backend, n=40):
         """HERD-393: many seats racing the FIRST filing of the SAME failing-test identity must
