@@ -153,6 +153,26 @@ _reconcile_pr_ref() {
   printf '%s' "$ref"
 }
 
+# _reconcile_pr_refs <pr#> — HERD-587 (GH #708): like _reconcile_pr_ref, but EVERY distinct
+# 'Refs: <ID>' line the tolerant parser (HERD-522) finds in the merged PR body, one per line, in
+# first-seen order — a single-ref body is the n=1 case and yields exactly one line, identically to
+# _reconcile_pr_ref. Empty (no output) when the body carries no ref at all, mirroring
+# _reconcile_pr_ref's fail-soft posture (missing gh / offline / body-less PR). Fires the SAME
+# silent-miss alarm as _reconcile_pr_ref (keyed on PR number, so whichever of the two call paths gets
+# there first is the one that alarms; the ledger guard in _reconcile_ref_unparsed_alarm makes a
+# second call a no-op).
+_reconcile_pr_refs() {
+  local body refs
+  body="$(_gh_timeout reconcile_pr_ref pr view "$1" --json body -q .body 2>/dev/null || true)"
+  [ -n "$body" ] || return 0
+  refs="$(printf '%s' "$body" | herd_pr_ref_all_from_body)"
+  if [ -z "$refs" ]; then
+    _reconcile_ref_unparsed_alarm "$1" "$body"
+    return 0
+  fi
+  printf '%s\n' "$refs"
+}
+
 # _reconcile_ref_unparsed_alarm <pr#> <body> — HERD-522 (GH #637): the SILENT-MISS alarm.
 #
 # A body that carries no `Refs:` line at all is ordinary — the reconcile falls through to the fuzzy
@@ -206,22 +226,39 @@ _reconcile_ref_unparsed_alarm() {
 # tick for the same merged PR reads the ledger and never re-enqueues, even if scribe.sh later dies.
 # Best-effort — a failed enqueue never blocks the merge (the advisory sweep is the backstop).
 reconcile_backlog() {
-  local rb_pr="$1" rb_slug="$2" rb_sha="${3:-}" rb_ref
+  local rb_pr="$1" rb_slug="$2" rb_sha="${3:-}" rb_refs rb_ref rb_any_ref_done=""
   reconcile_enqueued "$rb_pr" "$rb_sha" && return 0
   record_reconcile "$rb_pr" "$rb_sha" "$rb_slug"
   # EXPLICIT-REF path FIRST (HERD-39): if the merged PR carries a 'Refs: <ID>' line, resolve the
   # backlog item by that exact ref via the active backend's update-state — deterministic, no fuzzy
-  # slug/title guessing and no scribe LLM. Only when there is no ref line OR it fails to resolve
-  # (backend has no update-state op, e.g. the default file backend, or reports no match) do we fall
-  # back to today's fuzzy scribe enqueue — so ref-less PRs behave EXACTLY as before. Journal which
-  # path resolved so a drift audit can tell explicit-ref links from fuzzy ones.
-  rb_ref="$(_reconcile_pr_ref "$rb_pr")"
-  if [ -n "$rb_ref" ] && _reconcile_via_ref "$rb_ref" "$rb_pr"; then
-    journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" ref "$rb_ref" resolution explicit-ref
-    return 0
-  fi
-  if [ -n "$rb_ref" ]; then
-    journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" ref "$rb_ref" resolution fuzzy
+  # slug/title guessing and no scribe LLM.
+  #
+  # MULTI-REF (HERD-587, GH #708): a merged PR body can carry MORE than one 'Refs:' line — an item
+  # split mid-build, one PR closing several trackers at once. PR #708 carried four bare Refs lines and
+  # three of the four items sat open for two hours until a human hand-closed them, because the prior
+  # code here resolved only the FIRST ref and treated every other line as if it didn't exist. Walk
+  # EVERY distinct ref the tolerant parser (HERD-522) extracts through the SAME verify-after-write
+  # done-transition (_reconcile_via_ref) used for a single ref, one call per ref, journaling per ref —
+  # so a partial failure (ref 2 of 3 resolves, the others don't) is visible per-ref instead of
+  # collapsed into one line, and so tracker-state-sweep.sh's backstop (which already walks (pr, ref)
+  # pairs one at a time) retries exactly the refs that failed, not the whole PR. Only when NO ref line
+  # is present at all, OR every ref failed to resolve, do we fall back to today's fuzzy scribe enqueue
+  # — ONCE per PR, never once per failed ref, so ref-less PRs and the single-ref case behave EXACTLY
+  # as before.
+  rb_refs="$(_reconcile_pr_refs "$rb_pr")"
+  if [ -n "$rb_refs" ]; then
+    while IFS= read -r rb_ref; do
+      [ -n "$rb_ref" ] || continue
+      if _reconcile_via_ref "$rb_ref" "$rb_pr"; then
+        journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" ref "$rb_ref" resolution explicit-ref
+        rb_any_ref_done=1
+      else
+        journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" ref "$rb_ref" resolution fuzzy
+      fi
+    done <<EOF
+$rb_refs
+EOF
+    [ -n "$rb_any_ref_done" ] && return 0
   else
     journal_append reconcile pr "$rb_pr" slug "$rb_slug" sha "$rb_sha" resolution fuzzy
   fi

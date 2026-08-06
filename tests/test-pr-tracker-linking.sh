@@ -139,7 +139,9 @@ STUB
 chmod +x "$BIN/gh"
 # git already resolvable (the PART A clone put a real git on PATH); herdr stub already present.
 
-# Stub backend that LOGS every update-state call and reports DONE|NOCHANGE per $STUB_RESULT.
+# Stub backend that LOGS every update-state call and reports DONE|NOCHANGE per $STUB_RESULT — or, for
+# PART D's mixed-outcome cases, per-ref via $STUB_FAIL_REFS (a space-separated list of refs that get
+# NOCHANGE regardless of $STUB_RESULT; unset/empty is byte-identical to the pre-HERD-587 stub).
 BDIR="$T/backends"; mkdir -p "$BDIR"
 STUB_BACKEND_LOG="$T/backend-calls.log"; : > "$STUB_BACKEND_LOG"
 export STUB_BACKEND_LOG
@@ -147,7 +149,11 @@ cat > "$BDIR/stub.sh" <<'STUB'
 #!/usr/bin/env bash
 _backend_update_state() {
   printf 'update-state %s %s\n' "$1" "$2" >> "$STUB_BACKEND_LOG"
-  _BACKEND_RESULT="${STUB_RESULT:-DONE}"
+  local res="${STUB_RESULT:-DONE}"
+  case " ${STUB_FAIL_REFS:-} " in
+    *" $1 "*) res="NOCHANGE" ;;
+  esac
+  _BACKEND_RESULT="$res"
 }
 STUB
 
@@ -270,6 +276,86 @@ ok
 # (the default 'file' backend records state by editing BACKLOG.md, not via dispatch — must fall back).
 ( SCRIBE_BACKEND=file SCRIBE_BACKEND_DIR="$REPO/scripts/herd/backends" _reconcile_via_ref HERD-39 ) \
   && fail "C4: _reconcile_via_ref must FAIL for a backend with no _backend_update_state op (file backend)"
+ok
+
+################################################################################
+# PART D — MULTI-REF (HERD-587, GH #708): reconcile_backlog walks EVERY 'Refs:' line
+################################################################################
+# PR #708 carried FOUR bare 'Refs:' lines; the pre-fix code above resolved only the FIRST one
+# (_reconcile_pr_ref) and silently treated the other three as if they weren't there — three tracker
+# items sat open for two hours until a human hand-closed them. reconcile_backlog now walks EVERY
+# distinct ref the tolerant parser (HERD-522) extracts (_reconcile_pr_refs) through the SAME
+# verify-after-write done-transition (_reconcile_via_ref) PART B already proved for a single ref, one
+# call per ref, journaling per ref. B1/B2 above (a single 'Refs:' line) already prove the n=1 case is
+# byte-identical to before this item — this part proves n>1.
+type _reconcile_pr_refs >/dev/null 2>&1 || fail "_reconcile_pr_refs not defined"
+ok
+
+# _journal_ref_resolution <ref> — the 'resolution' recorded on the reconcile event naming <ref>.
+_journal_ref_resolution() {
+  grep "\"ref\":\"$1\"" "$JOURNAL_FILE" | grep -oE '"resolution":"[a-z-]+"' | sed -E 's/.*:"([a-z-]+)"/\1/' | tail -n1
+}
+
+# ── D1 — three distinct bare 'Refs:' lines, ALL resolve → 3 backend calls, 3 per-ref explicit-ref
+#         journal lines, NO fuzzy scribe request (the exact shape of PR #708, now fixed) ──
+reset_state
+BODY_MULTI="$T/body-multi.md"
+printf 'Closes several trackers.\n\nRefs: HERD-101\nRefs: HERD-102\nRefs: HERD-103\n' > "$BODY_MULTI"
+GH_PR_BODY_FILE="$BODY_MULTI" reconcile_backlog 601 multi-ref-slug sha601
+[ "$(backend_calls)" -eq 3 ] || fail "D1: expected exactly 3 backend update-state calls, got $(backend_calls)"
+for r in HERD-101 HERD-102 HERD-103; do
+  grep -q "^update-state $r done\$" "$STUB_BACKEND_LOG" || fail "D1: backend not asked to mark $r done"$'\n'"$(cat "$STUB_BACKEND_LOG")"
+  [ "$(_journal_ref_resolution "$r")" = "explicit-ref" ] || fail "D1: $r should journal resolution=explicit-ref, got '$(_journal_ref_resolution "$r")'"
+done
+[ "$(grep -c '"event":"reconcile"' "$JOURNAL_FILE")" -eq 3 ] \
+  || fail "D1: expected exactly 3 reconcile journal lines (one per ref), got $(grep -c '"event":"reconcile"' "$JOURNAL_FILE")"
+[ "$(scribe_calls)" -eq 0 ] || fail "D1: all-resolved multi-ref must NOT enqueue a fuzzy scribe request (got $(scribe_calls))"
+ok
+
+# ── D2 — mixed: 2 of 3 resolve, 1 NOCHANGE → still 3 backend calls + 3 per-ref journal lines
+#         (2 explicit-ref, 1 fuzzy), but NO fuzzy scribe request — at least one ref DID resolve, and a
+#         title/worktree fuzzy-match would risk mis-closing an UNRELATED item for the refs that did ──
+reset_state
+BODY_MIXED="$T/body-mixed.md"
+printf 'Refs: HERD-201\nRefs: HERD-202\nRefs: HERD-203\n' > "$BODY_MIXED"
+STUB_FAIL_REFS="HERD-202"
+GH_PR_BODY_FILE="$BODY_MIXED" reconcile_backlog 602 mixed-ref-slug sha602
+unset STUB_FAIL_REFS
+[ "$(backend_calls)" -eq 3 ] || fail "D2: expected 3 backend calls (one per ref), got $(backend_calls)"
+[ "$(_journal_ref_resolution HERD-201)" = "explicit-ref" ] || fail "D2: HERD-201 should resolve explicit-ref"
+[ "$(_journal_ref_resolution HERD-202)" = "fuzzy"        ] || fail "D2: HERD-202 (NOCHANGE) should journal fuzzy"
+[ "$(_journal_ref_resolution HERD-203)" = "explicit-ref" ] || fail "D2: HERD-203 should resolve explicit-ref"
+[ "$(scribe_calls)" -eq 0 ] || fail "D2: a PARTIAL multi-ref success must NOT fall back to fuzzy scribe (got $(scribe_calls))"
+ok
+
+# ── D3 — ALL THREE fail (NOCHANGE) → 3 backend calls + 3 fuzzy journal lines, but exactly ONE fuzzy
+#         scribe request for the whole PR (not one per failed ref) ──
+reset_state
+BODY_ALLFAIL="$T/body-allfail.md"
+printf 'Refs: HERD-301\nRefs: HERD-302\nRefs: HERD-303\n' > "$BODY_ALLFAIL"
+STUB_RESULT=NOCHANGE
+GH_PR_BODY_FILE="$BODY_ALLFAIL" reconcile_backlog 603 allfail-slug sha603
+unset STUB_RESULT
+[ "$(backend_calls)" -eq 3 ] || fail "D3: expected 3 backend calls, got $(backend_calls)"
+for r in HERD-301 HERD-302 HERD-303; do
+  [ "$(_journal_ref_resolution "$r")" = "fuzzy" ] || fail "D3: $r should journal resolution=fuzzy"
+done
+[ "$(scribe_calls)" -eq 1 ] || fail "D3: an all-failed multi-ref PR should enqueue exactly ONE fuzzy scribe request, got $(scribe_calls)"
+grep -q 'PR #603' "$SCRIBE_LOG" || fail "D3: fuzzy enqueue does not name the PR number"
+ok
+
+# ── D4 — a REPEATED ref line dispatches ONCE, not once per occurrence ──
+reset_state
+BODY_DUP="$T/body-dup.md"
+printf 'Refs: HERD-401\nRefs: HERD-401\n' > "$BODY_DUP"
+GH_PR_BODY_FILE="$BODY_DUP" reconcile_backlog 604 dup-ref-slug sha604
+[ "$(backend_calls)" -eq 1 ] || fail "D4: a repeated ref line must dispatch ONCE, not once per occurrence (got $(backend_calls))"
+ok
+
+# ── D5 — idempotent: a re-run tick for the same multi-ref PR+sha neither re-dispatches nor re-enqueues ──
+GH_PR_BODY_FILE="$BODY_DUP" reconcile_backlog 604 dup-ref-slug sha604
+[ "$(backend_calls)" -eq 1 ] || fail "D5: idempotent re-run tick re-dispatched a multi-ref PR (got $(backend_calls), want 1)"
+[ "$(scribe_calls)"  -eq 0 ] || fail "D5: idempotent re-run tick enqueued a scribe request"
 ok
 
 echo "ALL PASS ($pass checks)"
