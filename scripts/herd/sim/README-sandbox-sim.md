@@ -279,6 +279,14 @@ itself via herdr's JSON output:
 - a **builder tab** with a **stub builder** (a file/CLI-driven agent via `herdr pane report-agent` —
   no model call);
 - **agent-status transitions** `idle → working → done`, each observed via `herdr agent list`;
+- **TAB DISCIPLINE (HERD-569)** — a real tab bar holding one of *every* allowed shape (a registered
+  builder, a builder spared only by its live worktree, the scribe, the control room by label **and**
+  by `HERD_WATCHER_TAB_ID`, and a committed `label` exemption) plus **two strays**; the shipped
+  reconcile retires exactly the two and leaves the rest untouched **across four consecutive ticks**
+  — the negative assertion is the point, because the action under test is *closing tabs*;
+- **REVIEW VIEWER PLACEMENT (HERD-569)** — the headless review viewer **splits into the builder's
+  tab** (through the shipped `_herd_herdr_tab_root_pane` anchor) and the workspace's tab **count is
+  unchanged**: a view costs a pane, never a tab;
 - **CLEAN TEARDOWN** — the disposable workspace is closed and **NO tab or pane is leaked** afterward
   (`leaked_tabs` **must be 0**), so the result satisfies the tab-leak-guard.
 

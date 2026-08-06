@@ -78,6 +78,25 @@ ok; echo "PASS (A) HERD_HERMETIC_GUARD makes a launched agent-watch.sh record + 
 [ -s "$LOG" ] && fail "(A2) LIB-mode source tripped the guard (should return before it): $(cat "$LOG")"
 ok; echo "PASS (A2) LIB-mode sourcing returns before the guard — already-hermetic tests are unchanged"
 
+# ── (A3) HERD-571 refusal-vs-leak tag: default is "leak", opt-in is "refusal" ────────────────────
+# .herd/healthcheck.project.sh's _hk_dh_verdict now only reds on lines NOT tagged "refusal" — kept in
+# lockstep here so the tag the choke point writes and the tag the verdict filters on can never drift.
+: > "$LOG"
+( cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" HERD_HERMETIC_GUARD="$LOG" \
+    timeout 15 bash "$WATCH" ) ; rc=$?
+[ "$rc" -eq 0 ] || fail "(A3) guarded agent-watch.sh should exit 0 fast, got rc=$rc"
+grep -q $'^agent-watch.sh\t[^\t]*\t[^\t]*\tleak$' "$LOG" \
+  || fail "(A3) an un-opted-in reach must be tagged leak (default, byte-identical to pre-HERD-571) ($(cat "$LOG"))"
+ok; echo "PASS (A3) an un-opted-in reach is tagged leak by default"
+
+: > "$LOG"
+( cd "$PROJ" && HERD_CONFIG_FILE="$PROJ/.herd/config" HERD_HERMETIC_GUARD="$LOG" HERD_HERMETIC_GUARD_REFUSAL=1 \
+    timeout 15 bash "$WATCH" ) ; rc=$?
+[ "$rc" -eq 0 ] || fail "(A4) guarded agent-watch.sh should exit 0 fast, got rc=$rc"
+grep -q $'^agent-watch.sh\t[^\t]*\t[^\t]*\trefusal$' "$LOG" \
+  || fail "(A4) HERD_HERMETIC_GUARD_REFUSAL=1 must tag the line refusal ($(cat "$LOG"))"
+ok; echo "PASS (A4) HERD_HERMETIC_GUARD_REFUSAL=1 tags the reach refusal (a deliberate guard test, not a leak)"
+
 # ── (B) PATH SANDBOX + guard CATCH a leaking fake test ───────────────────────────────────────────
 # Fake test #1: reaches the live agent-spawn surface directly (forgot to stub herdr).
 cat > "$T/bad-reach.sh" <<'BAD'
