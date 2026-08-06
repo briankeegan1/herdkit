@@ -31,6 +31,13 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
+# Capacity ledger (HERD-557/HERD-581): sourced AFTER herd-config.sh (CAPACITY_BUDGET, REVIEW_CONCURRENCY,
+# SPAWN_AHEAD, LOCAL_SUITE_CONCURRENCY) and BEFORE herd-spawn-gate.sh, whose saturation check now also
+# consults the suite ledger, and before the agent-class lease reserve below. Guarded exactly like
+# healthcheck.sh's own sourcing: capacity-ledger.sh defines functions only (no source-time side effects),
+# so a partially-upgraded tree missing it degrades to every capacity_* caller's own command-not-found
+# fail-soft guard, never a hard abort.
+[ -f "$HERE/capacity-ledger.sh" ] && . "$HERE/capacity-ledger.sh"
 . "$HERE/herd-spawn-gate.sh"
 # Atomic pre-spawn claim (HERD-50): herd_claim_or_abort runs BEFORE worktree creation and, only when
 # CLAIM_REQUIRED is on AND a tracker id is present, claims the item synchronously so two operators
@@ -297,6 +304,20 @@ If your change needs a manual step you cannot perform yourself (a live smoke tes
 if [ -n "$TASK" ]; then SPEC="$RULES"$'\n\n'"$TASK"; else SPEC="$RULES"; fi
 TASK_SPEC_FILE="$WORKTREES_DIR/$SLUG.task.md"
 POINTER="$(herd_write_task_spec "$TASK_SPEC_FILE" "$SPEC")"
+
+# Agent-class capacity lease (HERD-581 / HERD-557 P2) — acquire BEFORE launching the runtime below.
+# A real, held semaphore on concurrent agent SESSIONS (capacity-ledger.sh's 'agent' tenant, class
+# 'spawn'), distinct from the review-gate check above (which reads REVIEW state, not a leased unit).
+# CAPACITY_BUDGET=off (default) / no worktree pool / no python3 all fall back to
+# capacity_agent_lease_reserve's own fail-soft return-0 — proceeds unslotted, byte-identical to before
+# this feature existed. --force / HERD_FORCE_SPAWN=1 bypasses, same override surface as the review-gate
+# check, so an urgent item is never blocked by lease pressure.
+if [ "$FORCE_SPAWN" != "1" ] && command -v capacity_agent_lease_reserve >/dev/null 2>&1 \
+   && ! capacity_agent_lease_reserve "$(capacity_agent_lease_cap)" "$SLUG"; then
+  herd_capacity_lease_emit_defer "$SLUG"
+  exit 0
+fi
+
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
   # Headless: launch a DETACHED background agent (no herdr pane) into the registry. Fail-loud. Pass the
   # RAW ref ($_MODEL_REF, not the pre-resolved bare $MODEL): the positional shim resolves (driver,model)

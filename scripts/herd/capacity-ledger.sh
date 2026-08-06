@@ -48,6 +48,16 @@
 # HERD-529 `_lss_*` flat-cap machinery completely untouched as ITS OWN fallback for that same
 # fail-soft contract (ledger unavailable → today's flat slot cap) — see the call site in
 # run_heavy() for the exact selection logic.
+#
+# HERD-581 (HERD-557 P2): a SECOND, independent tenant — AGENT (builder spawns), a flat COUNT of
+# concurrent agent sessions rather than a CPU-unit resource — joins SUITE below. Its one class,
+# 'spawn', routes through the SAME capacity_candidate_slots comparator (own reserved-bottom slice,
+# never the reserved-top one — "spawns stay the bottom class"), and its cap is the SAME
+# REVIEW_CONCURRENCY + SPAWN_AHEAD budget herd-spawn-gate.sh's own advisory already computes — no new
+# config key. Because a spawn's "hold the unit" is a long-lived AGENT SESSION rather than a foreground
+# subprocess capacity_acquire_and_run can simply wait() on, the acquire (capacity_agent_lease_reserve)
+# and the hold (capacity_agent_lease_hold, backed by capacity-agent-lease-wait.sh's driver-agnostic
+# herd_driver_agent_liveness poll) are split: see both below the SUITE tenant's functions.
 HERE_CAPLEDGER="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 capacity_budget_enabled() { [ "${CAPACITY_BUDGET:-off}" = "on" ]; }
@@ -145,8 +155,14 @@ capacity_candidate_slots() {
   while [ "$i" -le "$cap" ]; do
     part="$(capacity_slot_partition "$i" "$cap")"
     case "$class" in
-      watcher)       [ "$part" = "top" ]    && reserved+=("$i") ;;
-      builder-local) [ "$part" = "bottom" ] && reserved+=("$i") ;;
+      watcher)              [ "$part" = "top" ]    && reserved+=("$i") ;;
+      # HERD-581 P2: agent spawns ('spawn', the AGENT tenant's only class today) route through the
+      # SAME bottom reserved slice as 'builder-local' — the item's design conclusion "spawns stay the
+      # bottom class in the one committed comparator." The AGENT tenant's own reserved-top slot is
+      # therefore never matched by any class that exists yet, so it stays permanently un-leasable —
+      # deliberate headroom for a future higher-priority tenant of this same ledger (P3: reviews/
+      # merges), not a bug (see docs/spikes/capacity-admission.md §6's nesting note).
+      builder-local|spawn)  [ "$part" = "bottom" ] && reserved+=("$i") ;;
     esac
     [ "$part" = "general" ] && general+=("$i")
     i=$((i + 1))
@@ -295,4 +311,146 @@ capacity_acquire_and_run() {
     printf 'waiting for suite capacity (class=%s, %s live, cap=%s)\n' "$class" "$live" "$cap" >&2
     sleep "${HERD_CAPACITY_POLL_SECS:-2}" 2>/dev/null || sleep 2
   done
+}
+
+# ── AGENT tenant (HERD-581, HERD-557 P2) ──────────────────────────────────────────────────────────
+# Builder spawns are a second, independent tenant of this same ledger: a flat COUNT of concurrent
+# agent SESSIONS (not a CPU-unit shape like 'suite' — see docs/spikes/capacity-admission.md §6), the
+# one class 'spawn' (routed through the SAME capacity_candidate_slots comparator above — see its
+# 'builder-local|spawn' case). No new config key: the cap reuses the SAME REVIEW_CONCURRENCY +
+# SPAWN_AHEAD budget herd-spawn-gate.sh's own advisory already computes, under the existing
+# CAPACITY_BUDGET lever.
+#
+# capacity_agent_lease_cap — the AGENT tenant's flat count cap.
+capacity_agent_lease_cap() {
+  local conc ahead
+  if command -v herd_numeric >/dev/null 2>&1; then
+    conc="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+    ahead="$(herd_numeric SPAWN_AHEAD 1)" || true
+  else
+    conc="${REVIEW_CONCURRENCY:-2}"; case "$conc" in ''|*[!0-9]*) conc=2 ;; esac
+    ahead="${SPAWN_AHEAD:-1}";       case "$ahead" in ''|*[!0-9]*) ahead=1 ;; esac
+  fi
+  case "$conc" in ''|*[!0-9]*) conc=2 ;; esac
+  case "$ahead" in ''|*[!0-9]*) ahead=1 ;; esac
+  printf '%s' "$((conc + ahead))"
+}
+
+# capacity_suite_queue_saturated — true iff the SUITE tenant's ledger is fully occupied RIGHT NOW
+# (live count >= LOCAL_SUITE_CONCURRENCY): a suite trying to acquire this instant would have to queue.
+# Consumed by herd-spawn-gate.sh (HERD-581 P2) as an ADDITIONAL saturation signal, closing the
+# "spawning-into-idleness" pathology (design doc §1c): a box whose suite capacity is already fully
+# contended is not idle just because REVIEW_CONCURRENCY has headroom — a spawn admitted there would
+# just queue its OWN suite runs behind the ones already waiting. FAIL-SOFT: off lever / no pool / no
+# python3 -> false (never a fabricated saturation signal).
+capacity_suite_queue_saturated() {
+  capacity_budget_enabled || return 1
+  local pool; pool="$(capacity_pool_dir)"
+  [ -n "$pool" ] || return 1
+  [ -n "$(capacity_python_bin)" ] || return 1
+  local cap
+  if command -v herd_numeric >/dev/null 2>&1; then
+    cap="$(herd_numeric LOCAL_SUITE_CONCURRENCY 2)" || true
+  else
+    cap="${LOCAL_SUITE_CONCURRENCY:-2}"
+  fi
+  case "$cap" in ''|*[!0-9]*) cap=2 ;; esac
+  [ "$cap" -ge 1 ] 2>/dev/null || cap=1
+  local live; live="$(capacity_count_live "$pool" suite)"
+  [ "$live" -ge "$cap" ] 2>/dev/null
+}
+
+# capacity_agent_lease_hold <pool> <py> <lockfile> <marker> <slug> — the BODY of the detached HOLDER
+# capacity_agent_lease_reserve backgrounds. Runs capacity_flock_run.py in the FOREGROUND (this
+# function's own caller already backgrounded IT), whose CMD is capacity-agent-lease-wait.sh — a small
+# script that blocks first until <slug>'s agent SESSION goes alive (driver-agnostic:
+# herd_driver_agent_liveness, so this works identically for herdr panes and headless detached agents),
+# then blocks until it is confirmed gone. Exiting that CMD is the WHOLE release: capacity_flock_run.py's
+# own process exit is what the kernel reclaims the flock on (see docs/spikes/capacity-admission.md) —
+# this function's only remaining job is to JOURNAL that release (HERD-581 item 4) with why.
+capacity_agent_lease_hold() {
+  local pool="$1" py="$2" lk="$3" marker="$4" slug="$5"
+  "$py" "$HERE_CAPLEDGER/capacity_flock_run.py" --marker "$marker" --class spawn "$lk" -- \
+    bash "$HERE_CAPLEDGER/capacity-agent-lease-wait.sh" "$slug"
+  local rc=$?
+  case "$rc" in
+    75) : ;;  # never actually admitted (raced busy between the reserve poll and this run) — nothing held, nothing to journal
+    3)  _cap_journal capacity_lease_released tenant agent class spawn slug "$slug" reason start_timeout ;;
+    *)  _cap_journal capacity_lease_released tenant agent class spawn slug "$slug" reason agent_exited ;;
+  esac
+}
+
+# capacity_agent_lease_reserve <cap> <slug> — call BEFORE launching the runtime (HERD-581 item 1).
+# Tries each of <slug>'s candidate 'spawn' slots (capacity_candidate_slots, own reserved-bottom slice
+# first, then general) via a NON-BLOCKING flock attempt: for each candidate it backgrounds
+# capacity_agent_lease_hold (a DETACHED process — nohup-equivalent via redirected stdio + disown — that
+# outlives this shell) and, for one bounded SETTLE window, polls whether that background process is
+# still alive. capacity_flock_run.py's own shape makes this a reliable admitted/busy signal without
+# touching the (observability-only, possibly stale-from-another-holder) marker file at all: a BUSY
+# attempt fails the flock and exits within microseconds — well inside the settle window — while an
+# ADMITTED attempt blocks for the agent's entire session, so "still alive after the whole window" means
+# admitted and "died early" means busy, try the next candidate. Returns:
+#   0 — proceed with the spawn: either a unit was leased (a detached holder is now running, tracking
+#       <slug>'s liveness and releasing + journaling when it ends), OR the ledger is off/unavailable —
+#       fail-soft, unslotted, byte-identical to before this feature existed (CAPACITY_BUDGET=off never
+#       creates a single .capacity-* file, mirroring the suite tenant's own off-path contract).
+#   1 — every candidate unit is currently held (or the box is overloaded): the caller must HOLD this
+#       spawn exactly like the review-gate saturation check (print the stable marker, exit 0) so the
+#       durable spawn queue releases the intent for a later tick instead of losing it.
+capacity_agent_lease_reserve() {
+  local cap="$1" slug="$2"
+  local pool; pool="$(capacity_pool_dir)"
+  [ -n "$pool" ] || return 0
+  local py; py="$(capacity_python_bin)"
+  [ -n "$py" ] || return 0
+  capacity_budget_enabled || return 0
+
+  case "$cap" in ''|*[!0-9]*) cap=2 ;; esac
+  [ "$cap" -ge 1 ] 2>/dev/null || cap=1
+
+  if capacity_overload_high; then
+    _cap_journal capacity_lease_denied tenant agent class spawn slug "$slug" reason overload
+    return 1
+  fi
+  capacity_reclaim_dead "$pool" agent
+
+  local settle_tries="${HERD_CAPACITY_AGENT_RESERVE_POLL_TRIES:-8}"
+  local settle_secs="${HERD_CAPACITY_AGENT_RESERVE_POLL_SECS:-0.05}"
+  case "$settle_tries" in ''|*[!0-9]*) settle_tries=8 ;; esac
+
+  local idx
+  for idx in $(capacity_candidate_slots spawn "$cap"); do
+    local lk marker bgpid t died
+    lk="$(capacity_lockfile "$pool" agent "$idx")"
+    marker="$(capacity_markerfile "$pool" agent "$idx")"
+    capacity_agent_lease_hold "$pool" "$py" "$lk" "$marker" "$slug" >/dev/null 2>&1 &
+    bgpid=$!
+    disown "$bgpid" 2>/dev/null || true
+    t=0; died=0
+    while [ "$t" -lt "$settle_tries" ]; do
+      kill -0 "$bgpid" 2>/dev/null || { died=1; break; }
+      t=$((t + 1))
+      sleep "$settle_secs" 2>/dev/null || sleep 1
+    done
+    if [ "$died" -eq 1 ]; then
+      wait "$bgpid" 2>/dev/null   # reap the busy (rc=75) attempt; try the next candidate
+      continue
+    fi
+    _cap_journal capacity_lease_admitted tenant agent class spawn slug "$slug" slot "$idx"
+    return 0
+  done
+  _cap_journal capacity_lease_denied tenant agent class spawn slug "$slug" reason busy
+  return 1
+}
+
+# herd_capacity_lease_emit_defer <slug> — the stable hold message a lane prints when
+# capacity_agent_lease_reserve returns 1. The FIRST line's exact wording ('agent capacity lease
+# unavailable') is a MARKER the watcher's spawn-queue drain (agent-watch.sh:_drain_lane_worker) greps
+# for to tell a HELD spawn from a hard failure — mirroring herd_spawn_gate_emit_defer's own contract.
+herd_capacity_lease_emit_defer() {
+  local slug="${1:-}"
+  printf '⏸️  agent capacity lease unavailable — holding spawn until a slot frees%s\n' "${slug:+ (slug: $slug)}"
+  printf '   every "spawn" class unit is held; cap = REVIEW_CONCURRENCY + SPAWN_AHEAD = %s\n' "$(capacity_agent_lease_cap)"
+  printf '   this build would just wait behind the lease; the watcher re-queues it for a later tick.\n'
+  printf '   force past the gate for an urgent item:  HERD_FORCE_SPAWN=1  (or pass --force before the slug)\n'
 }
