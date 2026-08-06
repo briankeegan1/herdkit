@@ -105,7 +105,11 @@ EOF_WEDGE_STAGED
       command -v journal_append >/dev/null 2>&1 && journal_append resolver_concluded_predecessor \
         component resolver slug "$SLUG" pr "${HERD_RESOLVE_PR:--}" sha "${HERD_RESOLVE_SHA:--}"
       _wedge_checks_ok=1
-      [ -n "$SMOKE_CMD" ] && { bash -c "$SMOKE_CMD" || _wedge_checks_ok=0; }
+      # Run SMOKE_CMD IN the worktree, not the resolver script's own cwd (the watcher/control-room
+      # checkout) — the resolver's own TASK contract runs it with the agent's cwd = $DIR, and a
+      # dir-relative SMOKE_CMD (the documented "extra smoke gate") validating the wrong tree would
+      # silently bypass the very safety rail it exists to enforce.
+      [ -n "$SMOKE_CMD" ] && { ( cd "$DIR" && bash -c "$SMOKE_CMD" ) || _wedge_checks_ok=0; }
       [ "$_wedge_checks_ok" = 1 ] && { bash "$HERE/healthcheck.sh" "$DIR" || _wedge_checks_ok=0; }
       if [ "$_wedge_checks_ok" = 1 ]; then
         if git -C "$DIR" push >/dev/null 2>&1; then
@@ -128,9 +132,11 @@ EOF_WEDGE_STAGED
   else
     # Still conflicted (or a stray marker survived staging) — unsalvageable; abort clean and re-resolve.
     git -C "$DIR" merge --abort >/dev/null 2>&1 || true
+    _wedge_abort_reason="unmerged_paths"
+    [ -n "$_wedge_markers" ] && _wedge_abort_reason="conflict_markers"
     command -v journal_append >/dev/null 2>&1 && journal_append resolver_wedge_aborted \
       component resolver slug "$SLUG" pr "${HERD_RESOLVE_PR:--}" sha "${HERD_RESOLVE_SHA:--}" \
-      reason "${_wedge_markers:+conflict_markers}${_wedge_markers:-unmerged_paths}"
+      reason "$_wedge_abort_reason"
     echo "🔧 resolve·$SLUG: MERGE_HEAD with unresolved conflicts left by a predecessor resolver — aborted the stuck merge; dispatching a fresh resolve." >&2
   fi
 fi

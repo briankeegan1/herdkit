@@ -166,6 +166,63 @@ teardown() {
   grep -q 'agent start' "$HERDR_CALL_LOG"
 }
 
+@test "staged-but-still-marked fixture: fully staged content that still carries a literal conflict marker aborts with a clean 'conflict_markers' reason" {
+  git -C "$DIR" fetch -q origin
+  run git -C "$DIR" merge origin/main
+  [ "$status" -ne 0 ]
+  [ -f "$DIR/.git/MERGE_HEAD" ]
+  grep -q '<<<<<<<' "$DIR/shared.txt"
+
+  # A careless predecessor staged the file AS-IS, markers and all: zero unmerged index paths (git add
+  # resolves the index regardless of content), but the staged blob still literally carries marker text.
+  git -C "$DIR" add shared.txt
+  [ -z "$(git -C "$DIR" diff --name-only --diff-filter=U)" ]
+
+  run bash "$RESOLVE" "$SLUG"
+  [ "$status" -eq 0 ]
+
+  # Aborted clean, exactly like the truly-unmerged fixture.
+  [ ! -f "$DIR/.git/MERGE_HEAD" ]
+  ! grep -q '<<<<<<<' "$DIR/shared.txt"
+
+  # The reason label is the clean enum value, not the concatenated "conflict_markers1" bug (bash
+  # parameter expansion: ${var:+a}${var:-b} emits "a$var" whenever var is set, not "a").
+  grep -q '"event":"resolver_wedge_aborted"' "$JOURNAL_FILE"
+  grep -q '"reason":"conflict_markers"' "$JOURNAL_FILE"
+  ! grep -q '"reason":"conflict_markers1"' "$JOURNAL_FILE"
+
+  grep -q 'agent start' "$HERDR_CALL_LOG"
+}
+
+@test "SMOKE_CMD runs inside the worktree, not the resolver script's own cwd" {
+  SMOKE_MARKER="$T/smoke-cwd.marker"
+  SMOKE_CFG="$T/config-smoke"
+  cat > "$SMOKE_CFG" <<EOF
+PROJECT_ROOT="$PROJECT_ROOT"
+WORKTREES_DIR="$WORKTREES_DIR"
+WORKSPACE_NAME="herdkit"
+MODEL_RESOLVER="resolver-model"
+APP_PREVIEW_CMD=""
+SMOKE_CMD="pwd > '$SMOKE_MARKER'"
+DEFAULT_BRANCH="origin/main"
+EOF
+
+  git -C "$DIR" fetch -q origin
+  run git -C "$DIR" merge origin/main
+  [ "$status" -ne 0 ]
+  printf 'merged-line\n' > "$DIR/shared.txt"
+  git -C "$DIR" add shared.txt
+
+  # Invoked from a cwd that is deliberately NOT $DIR — mirrors production: agent-watch.sh runs
+  # `bash "$HERD_RESOLVE_BIN" "$rs"` with no `cd`, so the resolver's own cwd is the watcher/
+  # control-room checkout, never the worktree.
+  run bash -c "cd '$T' && HERD_CONFIG_FILE='$SMOKE_CFG' bash '$RESOLVE' '$SLUG'"
+  [ "$status" -eq 0 ]
+
+  [ -f "$SMOKE_MARKER" ]
+  [ "$(cat "$SMOKE_MARKER")" = "$DIR" ]
+}
+
 @test "clean tree (no MERGE_HEAD): precheck is a no-op — byte-identical dispatch, nothing journaled" {
   [ ! -f "$DIR/.git/MERGE_HEAD" ]
 
