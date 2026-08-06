@@ -7189,6 +7189,55 @@ class TestReviewModelEscalation(LiveCase):
         self.assertTrue(os.path.exists(state.review_escalate_file(34)),
                         "a QUEUED tick must never consume the arm")
 
+    def test_hung_claude_leaves_the_arm_intact_and_recovers_escalated(self):
+        # PR #711 review finding: the hang probe sat BELOW the escalation-consume block, so a HUNG tick
+        # deleted the one-shot marker without ever dispatching — the recovery tick then ran on the
+        # cheap/default tier instead of Opus, silently defeating the escalation the arm existed for.
+        # The hang gate must sit ABOVE the consume block so a HUNG tick returns WAIT untouched.
+        gates, state, journal = self._gates({"WATCH_CLAUDE_PROBE_TIMEOUT": "5",
+                                             "REVIEW_MODEL_ESCALATED": "opus-test"})
+        open(state.review_escalate_file(35), "w").close()
+        cand = LiveCandidate(35, "shaI", slug="feat-esc5")
+        hang_sub = TestClaudeExecHangProbe._HangSub()
+        orig_sub, orig_which = LR.subprocess, LR.shutil.which
+        LR.subprocess = hang_sub
+        LR.shutil.which = lambda name: "/usr/bin/claude"
+        try:
+            v = gates.review(cand)
+        finally:
+            LR.subprocess = orig_sub
+            LR.shutil.which = orig_which
+        self.assertEqual(v, WAIT)
+        self.assertEqual(hang_sub.popens, [], "no reviewer may dispatch while claude is hung")
+        self.assertTrue(os.path.exists(state.review_escalate_file(35)),
+                        "a HUNG tick must never consume the one-shot escalation arm")
+        self.assertEqual([o for o in events(self.jpath) if o["event"] == "review_escalated"], [],
+                         "no escalation dispatch happened, so no review_escalated event either")
+        held = [o for o in events(self.jpath) if o["event"] == "review_escalation_held"]
+        self.assertEqual(len(held), 1, "the held episode must be auditable")
+        self.assertEqual(held[0]["pr"], 35)
+
+        # Recovery tick: claude responds again — the SAME (untouched) arm now escalates as intended.
+        # A FRESH LiveGates instance, exactly as a real recovery tick would construct one (the hang
+        # memo is scoped to one tick/instance, so reusing `gates` here would just replay its cached
+        # HUNG verdict rather than genuinely re-probing).
+        gates2, _, _ = self._gates({"WATCH_CLAUDE_PROBE_TIMEOUT": "5", "REVIEW_MODEL_ESCALATED": "opus-test"})
+        sub2 = TestReviewFastPath._Sub({})
+        LR.subprocess = sub2
+        LR.shutil.which = lambda name: "/usr/bin/claude"
+        try:
+            v2 = gates2.review(cand)
+        finally:
+            LR.subprocess = orig_sub
+            LR.shutil.which = orig_which
+        self.assertEqual(v2, WAIT)
+        self.assertEqual(len(sub2.popens), 1)
+        self.assertEqual(sub2.popens[0][1]["env"].get("HERD_REVIEW_MODEL"), "opus-test")
+        self.assertFalse(os.path.exists(state.review_escalate_file(35)), "now consumed, one-shot")
+        esc = [o for o in events(self.jpath) if o["event"] == "review_escalated"]
+        self.assertEqual(len(esc), 1)
+        self.assertEqual(esc[0]["model"], "opus-test")
+
 
 class TestClaudeExecHangProbe(LiveCase):
     """HERD-580: port WATCH_CLAUDE_PROBE_TIMEOUT (HERD-108, agent-watch.sh's _claude_exec_hung) into

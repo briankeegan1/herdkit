@@ -2752,13 +2752,29 @@ class LiveGates:
             self.journal.append("review_skipped", "pr", cand.pr, "sha", cand.sha,
                                 "reason", "docs/test-only low-risk diff")
             return "PASS"
+        # WATCH_CLAUDE_PROBE_TIMEOUT (HERD-108, HERD-580 port; ship-dormant): a wedged `claude` binary
+        # would spawn a corpse reviewer that never returns a verdict — hold dispatch instead of feeding
+        # it one. Checked BEFORE the escalation-arm consumption below (memoized once per tick): a HUNG
+        # tick must return WAIT WITHOUT touching the one-shot arm marker, so an escalation armed by a
+        # fresh refix bounce survives intact to the recovery tick instead of being silently spent on a
+        # dispatch that never happened (a transient hang must not downgrade the NEXT review back to the
+        # cheap/default tier — the very model that already missed the issue across >=2 refix rounds).
+        if self._claude_hang_memo() == "HUNG":
+            esc_file = st.review_escalate_file(cand.pr)
+            if esc_file and os.path.exists(esc_file):
+                self.journal.append("review_escalation_held", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug,
+                                    "reason", "claude exec-hang held dispatch — escalation arm "
+                                              "preserved for the recovery tick")
+            return WAIT
         # EVIDENCE-TRIGGERED ESCALATION (REVIEW_MODEL_ESCALATED / REVIEW_EVIDENCE_ESCALATE_ROUNDS,
         # HERD-580 port): if a builder's refix rounds proved the cheap reviewer missed the real issue on
         # this PR (armed by LiveTick._maybe_arm_review_escalation right after a fresh review-BLOCK
         # bounce), force this NEXT dispatch up to the Opus tier, overriding whatever tier the risk
         # classification chose — even the default/STRONG empty-model path. One-shot: consumed here, and
-        # ONLY when actually dispatching — the concurrency check above already passed, so a QUEUED tick
-        # never reaches this line and the arm survives intact to a later tick with a free slot.
+        # ONLY when actually dispatching — both the concurrency check and the hang probe above already
+        # passed, so neither a QUEUED nor a HUNG tick ever reaches this line and the arm survives intact
+        # to a later tick with a free slot / a responsive claude.
         esc_file = st.review_escalate_file(cand.pr)
         if esc_file and os.path.exists(esc_file):
             model = self.config.get("REVIEW_MODEL_ESCALATED") or "claude-opus-4-8"
@@ -2768,11 +2784,6 @@ class LiveGates:
                 pass
             self.journal.append("review_escalated", "pr", cand.pr, "sha", cand.sha, "model", model,
                                 "reason", "cheap reviewer missed the issue across refix rounds")
-        # WATCH_CLAUDE_PROBE_TIMEOUT (HERD-108, HERD-580 port; ship-dormant): a wedged `claude` binary
-        # would spawn a corpse reviewer that never returns a verdict — hold dispatch instead of feeding
-        # it one. Checked immediately before the dispatch it guards, memoized once per tick.
-        if self._claude_hang_memo() == "HUNG":
-            return WAIT
         # 4. DISPATCH the reviewer async + lay the marker → wait.
         self._dispatch_review(cand, model)
         return WAIT
