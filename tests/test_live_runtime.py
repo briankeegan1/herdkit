@@ -2099,13 +2099,33 @@ def _make_stale_base_repo(tmp):
     return feat_dir, feat_sha
 
 
+class _StaleDupHermeticHoldSource(LiveHoldSource):
+    """LiveHoldSource twin for TestStaleDupGate (HERD-596): the class means to prove ONLY the
+    stale-dup gate (:func:`_stale_dup_check`, which already honors the ``HERD_STALE_DUP_*_FILE``
+    seams below) — never the separate ``hv_body`` human-verify read, which has no seam of its own
+    and shells straight out to a REAL ``gh pr view``. On the maintainer's authenticated box that
+    call happens to succeed against whatever the fixture's pr# resolves to in the real repo,
+    masking the miss; on an unauthenticated/gh-less CI runner it fails per HERD-237's fail-CLOSED
+    contract, forcing every candidate to HOLD before the stale-dup gate is even reached — which
+    happened to match the already-HOLD/ESCALATE/BLOCK-expecting tests below but broke the two
+    MERGE-expecting ones (CI-environment-specific: same sha, same fixtures, red only where `gh`
+    can't reach a real PR). Stub the read to always succeed with an empty, non-human-verify body;
+    ``approved()`` stays the real ledger read (hermetic already — nothing in this class writes an
+    approval row)."""
+
+    def hv_body(self, pr):
+        return "", 0
+
+
 class TestStaleDupGate(LiveCase):
     """HERD-566 (P5b HERD-561 child 1/2): the deterministic duplicate-ref / stale-base file-overlap
     pre-merge gate (HERD-188), restored into the live decide path — its only bash caller
     (agent-watch.sh:_stale_dup_gate_step) lost its wiring at the P5b port (HERD-556 reachability
     lint), so every merge under ENGINE_IMPL=python has run with NEITHER hold. LIVE-ONLY (gated on
     ``hold_source is not None``, exactly like cross-seat): every OTHER test in this module passes no
-    hold_source and so never shells to `gh`/`git` for this gate — proved directly below."""
+    hold_source and so never shells to `gh`/`git` for this gate — proved directly below. Uses
+    :class:`_StaleDupHermeticHoldSource`, not the bare :class:`LiveHoldSource`, so this class's own
+    hermeticity claim actually holds (HERD-596)."""
 
     def setUp(self):
         super().setUp()
@@ -2125,7 +2145,7 @@ class TestStaleDupGate(LiveCase):
         actuator = actuator or DryRunActuator(journal)
         scenario = {"candidates": [self.one(**cand_kwargs)], "config": config}
         t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
-                     state=state, hold_source=LiveHoldSource(state, config))
+                     state=state, hold_source=_StaleDupHermeticHoldSource(state, config))
         res = t.run()
         return res, events(self.jpath)
 
@@ -2233,7 +2253,7 @@ class TestStaleDupGate(LiveCase):
                                             health="CLEAN", review="PASS", agent_status="dead")],
                    "config": config}
         t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
-                     state=state, hold_source=LiveHoldSource(state, config))
+                     state=state, hold_source=_StaleDupHermeticHoldSource(state, config))
         res = t.run()
         ev = events(self.jpath)
         self.assertEqual(res["outcomes"]["7"], "ESCALATE")
