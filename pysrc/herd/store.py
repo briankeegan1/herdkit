@@ -176,6 +176,11 @@ class Store:
     def recorded_review_source(self, pr, sha):
         return self._b.recorded_review_source(pr, sha)
 
+    def recorded_review_last_pass_sha(self, pr):
+        """The sha of the most-recently recorded PASS row for this PR (any provenance), or ``None``
+        (HERD-580: the DELTA_REVIEW carry-forward proof's "last-passed sha" input)."""
+        return self._b.recorded_review_last_pass_sha(pr)
+
     def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         return self._b.record_review(pr, sha, verdict, source, reason)
 
@@ -419,6 +424,22 @@ class _FlatBackend:
         except Exception:
             return ""
         return source
+
+    def recorded_review_last_pass_sha(self, pr):
+        """The sha of the most-recently recorded PASS row for this PR (any provenance), or ``None``."""
+        path = self._p(".agent-watch-reviewed")
+        if not path or not os.path.isfile(path):
+            return None
+        sha = None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    f = line.split()
+                    if len(f) >= 4 and f[1] == str(pr) and f[3] == "PASS":
+                        sha = f[2]
+        except Exception:
+            return None
+        return sha
 
     def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         path = self._p(".agent-watch-reviewed")
@@ -958,6 +979,13 @@ class _SqliteBackend:
             "SELECT source FROM review_ledger WHERE pr=? AND sha=? ORDER BY rowid DESC LIMIT 1",
             (str(pr), str(sha))).fetchone()
         return (row[0] or "reviewer") if row else ""
+
+    def recorded_review_last_pass_sha(self, pr):
+        """The sha of the most-recently recorded PASS row for this PR (any provenance), or ``None``."""
+        row = self._conn.execute(
+            "SELECT sha FROM review_ledger WHERE pr=? AND verdict='PASS' ORDER BY rowid DESC LIMIT 1",
+            (str(pr),)).fetchone()
+        return row[0] if row else None
 
     def record_review(self, pr, sha, verdict, source="reviewer", reason=""):
         self._conn.execute(

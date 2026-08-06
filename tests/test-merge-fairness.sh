@@ -170,7 +170,7 @@ ok "(2) a gates-green candidate is promoted ahead of the ungated ones (arrays st
 # assertion is on the journal: `pr_merged` for the ready PR must precede every dispatch event.
 reset_state; set_cands
 ready_pr 103 sha3
-_predispatch_review_if_parallel() { journal_append review_dispatched pr "$1" sha "$3"; }
+_review_dispatch_stub() { journal_append review_dispatched pr "$1" sha "$3"; }
 _healthcheck_gate() { journal_append healthcheck_started pr "$1" sha "${5:-}"; _HC_RESULT=CLEAN; }
 replay_action_pass() {
   local j=0 idx pr sha
@@ -180,7 +180,7 @@ replay_action_pass() {
       journal_append pr_merged pr "$pr" sha "$sha"
       continue
     fi
-    _predispatch_review_if_parallel "$pr" "alpha" "$sha"
+    _review_dispatch_stub "$pr" "alpha" "$sha"
     _HC_RESULT=""; _healthcheck_gate "$pr" "alpha" "/d" 0 "$sha"
   done
 }
@@ -232,7 +232,7 @@ case "$SEQ_OFF" in
   *) fail "(3b) knob off should have merged the ready PR LAST — sequence: $SEQ_OFF" ;;
 esac
 ok "(3b) with the knob off the same ready PR merges last (the check is non-vacuous)"
-unset -f _predispatch_review_if_parallel _healthcheck_gate
+unset -f _review_dispatch_stub _healthcheck_gate
 
 # ── (4) STABLE partition: relative order preserved inside both partitions ───────────────────────
 reset_state; set_cands

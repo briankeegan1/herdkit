@@ -265,7 +265,6 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `ENGINE_SEAT_RECONCILE` → `agent-watch.sh`, `git-pr.sh`
 - `ENV_SUSPECT_TIMEOUT` → `agent-watch.sh`
 - `FINISH_STALL_MIN` → `agent-watch.sh`
-- `GATE_DISPATCH` → `agent-watch.sh`
 - `GATE_SCALE` → `agent-watch.sh`
 - `GATE_STATUS` → `agent-watch.sh`, `config-viability.sh`
 - `GATE_STATUS_PENDING` → —
