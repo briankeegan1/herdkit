@@ -714,8 +714,12 @@ bats  tests/herd.bats                 # the above + bash -n + a no-leak grep (if
 ```
 
 The dogfood healthcheck (`.herd/healthcheck.project.sh`) runs `bash -n` over every script,
-`shellcheck` if installed, and the hermetic suite — so herdkit gates its own PRs the same way it
-gates a consumer's.
+`shellcheck` if installed, and the hermetic suite — it remains herdkit's own local dev tool and
+the default merge gate every consumer project runs. As of 2026-08-06 (HERD-579), herdkit itself no
+longer uses it as ITS merge gate (`HEALTHCHECK_CMD=true` in `.herd/config`, with a policy comment
+and one-line revert): the full suite's unscopeable-diff / shared-box cost profile is uniquely bad
+for herdkit's own engine PRs, so merge safety there rests on adversarial review + GitHub CI + the
+main-health auto-repair loop instead.
 
 ## License
 

@@ -2025,6 +2025,153 @@ class TestCrossSeatBlockPrecedence(LiveCase):
         self.assertFalse([o for o in events(self.jpath) if o["event"].startswith("cross_seat_block")])
 
 
+def _make_stale_base_repo(tmp):
+    """A two-worktree repo (``main`` + ``feature``) where BOTH sides edit the same file after the
+    branch's fork point — the deterministic overlap :func:`herd.live_runtime._stale_dup_base_overlap`
+    proves against. Returns ``(feature_worktree_dir, feature_head_sha)``."""
+    main_dir = os.path.join(tmp, "main")
+    sha0 = _git_init_repo(main_dir)
+    feat_dir = os.path.join(tmp, "feat")
+    subprocess.run(["git", "-C", main_dir, "worktree", "add", "-q", "-b", "feature", feat_dir, sha0],
+                   check=True)
+    with open(os.path.join(feat_dir, "f"), "w", encoding="utf-8") as fh:
+        fh.write("feature-change")
+    subprocess.run(["git", "-C", feat_dir, "add", "f"], check=True)
+    subprocess.run(["git", "-C", feat_dir, "commit", "-q", "-m", "feature edits f"], check=True)
+    feat_sha = subprocess.check_output(
+        ["git", "-C", feat_dir, "rev-parse", "HEAD"]).decode().strip()
+    with open(os.path.join(main_dir, "f"), "w", encoding="utf-8") as fh:
+        fh.write("main-change")
+    subprocess.run(["git", "-C", main_dir, "add", "f"], check=True)
+    subprocess.run(["git", "-C", main_dir, "commit", "-q", "-m", "main edits f"], check=True)
+    return feat_dir, feat_sha
+
+
+class TestStaleDupGate(LiveCase):
+    """HERD-566 (P5b HERD-561 child 1/2): the deterministic duplicate-ref / stale-base file-overlap
+    pre-merge gate (HERD-188), restored into the live decide path — its only bash caller
+    (agent-watch.sh:_stale_dup_gate_step) lost its wiring at the P5b port (HERD-556 reachability
+    lint), so every merge under ENGINE_IMPL=python has run with NEITHER hold. LIVE-ONLY (gated on
+    ``hold_source is not None``, exactly like cross-seat): every OTHER test in this module passes no
+    hold_source and so never shells to `gh`/`git` for this gate — proved directly below."""
+
+    def setUp(self):
+        super().setUp()
+        for k in ("HERD_STALE_DUP_BODY_FILE", "HERD_STALE_DUP_MERGED_FILE"):
+            self.addCleanup(os.environ.pop, k, None)
+
+    def _seam_file(self, name, content):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return path
+
+    def _tick_live(self, cand_kwargs, config, actuator=None):
+        config = dict(config)
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        actuator = actuator or DryRunActuator(journal)
+        scenario = {"candidates": [self.one(**cand_kwargs)], "config": config}
+        t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
+                     state=state, hold_source=LiveHoldSource(state, config))
+        res = t.run()
+        return res, events(self.jpath)
+
+    # ── duplicate flavor — always a human judgment call ──────────────────────────────────────────
+
+    def test_duplicate_ref_escalates_needs_you(self):
+        body_file = self._seam_file("body.txt", "Refs: HERD-999\n")
+        merged_file = self._seam_file("merged.tsv", "555\tHERD-999\n")
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = body_file
+        os.environ["HERD_STALE_DUP_MERGED_FILE"] = merged_file
+        res, ev = self._tick_live(
+            dict(pr=42, sha="dupsha", health="CLEAN", review="PASS"),
+            {"MERGE_POLICY": "auto"})
+        self.assertEqual(res["outcomes"]["42"], "ESCALATE")
+        hold = [o for o in ev if o["event"] == "stale_dup_hold"]
+        self.assertEqual(len(hold), 1)
+        self.assertEqual(hold[0]["kind"], "duplicate")
+        self.assertIn("HERD-999", hold[0]["reason"])
+        self.assertIn("555", hold[0]["reason"])
+        # Never autofix, never consumes a refix round.
+        self.assertFalse([o for o in ev if o["event"] in ("refix_bounce", "stale_refix_escalated")])
+
+    def test_own_pr_never_counts_as_its_own_duplicate(self):
+        body_file = self._seam_file("body.txt", "Refs: HERD-999\n")
+        merged_file = self._seam_file("merged.tsv", "42\tHERD-999\n")   # same pr# as this PR
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = body_file
+        os.environ["HERD_STALE_DUP_MERGED_FILE"] = merged_file
+        res, ev = self._tick_live(
+            dict(pr=42, sha="dupsha", health="CLEAN", review="PASS"),
+            {"MERGE_POLICY": "auto"})
+        self.assertEqual(res["outcomes"]["42"], "MERGE")
+        self.assertFalse([o for o in ev if o["event"] == "stale_dup_hold"])
+
+    # ── stale-base flavor — mechanical; autofix is opt-in (STALE_BASE_AUTOFIX, default off) ────────
+
+    def test_stale_base_overlap_holds_without_autofix(self):
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+        res, ev = self._tick_live(
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main"})
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+        hold = [o for o in ev if o["event"] == "stale_dup_hold"]
+        self.assertEqual(len(hold), 1)
+        self.assertEqual(hold[0]["kind"], "stale-base")
+        self.assertIn("f", hold[0]["reason"])
+        self.assertFalse([o for o in ev if o["event"] == "refix_bounce"],
+                         "STALE_BASE_AUTOFIX off must never bounce — byte-identical to the pre-"
+                         "HERD-199 hold")
+
+    def test_stale_base_autofix_engages_and_bounces_the_live_builder(self):
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+        res, ev = self._tick_live(
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"})
+        self.assertEqual(res["outcomes"]["7"], "BLOCK")
+        bounce = [o for o in ev if o["event"] == "refix_bounce"]
+        self.assertEqual(len(bounce), 1)
+        self.assertEqual(bounce[0]["rule"], "stale")
+        self.assertEqual(bounce[0]["round"], 1)
+        wake = [o for o in ev if o["event"] == "refix_wake_result"]
+        self.assertEqual(wake[0]["woke"], 1)
+
+    def test_stale_base_autofix_escalates_when_nobody_wakes(self):
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+        res, ev = self._tick_live(
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
+                 agent_status="dead"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"})
+        self.assertEqual(res["outcomes"]["7"], "ESCALATE")
+        self.assertTrue([o for o in ev if o["event"] == "refix_escalated_no_wake"])
+
+    # ── the lever ─────────────────────────────────────────────────────────────────────────────────
+
+    def test_lever_off_is_byte_identical(self):
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "Refs: HERD-999\n")
+        os.environ["HERD_STALE_DUP_MERGED_FILE"] = self._seam_file("merged.tsv", "555\tHERD-999\n")
+        res, ev = self._tick_live(
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_DUP_DETECT": "off"})
+        self.assertEqual(res["outcomes"]["7"], "MERGE")
+        self.assertFalse([o for o in ev if o["event"] == "stale_dup_hold"])
+
+    # ── fixture/dry-run/sim ticks never shell out for this gate ─────────────────────────────────────
+
+    def test_no_hold_source_never_shells_out(self):
+        orig = LR.subprocess
+        LR.subprocess = _Poison()
+        try:
+            res, _ = self.tick([self.one(1, review="PASS", health="CLEAN")])
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(res["outcomes"]["1"], "MERGE")
+
+
 class TestVerdictParser(unittest.TestCase):
     def test_pass(self):
         self.assertEqual(parse_review_verdict("REVIEW: PASS"), "PASS")

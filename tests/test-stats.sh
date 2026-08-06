@@ -46,6 +46,7 @@ cat > "$TREES/.herd/journal.jsonl" <<'JNL'
 {"ts":"2026-07-02T10:00:07Z","event":"limit_resume_result","slug":"s2","woke":1,"escalated":false}
 {"ts":"2026-07-02T10:00:08Z","event":"reap","pr":99,"slug":"s9","sha":"zzz","reason":"dead"}
 {"ts":"2026-07-02T10:00:09Z","event":"reap","pr":98,"slug":"s8","sha":"yyy","reason":"conflict"}
+{"ts":"2026-07-02T10:00:09Z","event":"scope_escape","sha":"e1","failed":"test-orphan.sh","selected":5,"total":50,"tests":"test-a.sh test-b.sh"}
 {"ts":"2026-07-02T10:00:10Z","event":"cost","component":"builder","pr":42,"slug":"s1","model":"claude-opus-4-8","in":100,"out":200,"cache_read":0,"cache_write":0,"usd":"110.000000","msgs":2}
 {"ts":"2026-07-02T10:00:11Z","event":"cost","component":"review","pr":42,"slug":"s1","model":"claude-opus-4-8","in":0,"out":50,"cache_read":0,"cache_write":0,"usd":"50.000000","msgs":1}
 JNL
@@ -67,6 +68,7 @@ grep -qE 'gate_default 1' <<< "$out" || fail "default: provenance gate_default 1
 grep -qE 'Refix bounces +1' <<< "$out" || fail "default: 1 refix bounce expected\n%s" "$out"
 grep -qE 'Limit park/resume +1 / 1' <<< "$out" || fail "default: limit 1/1 expected\n%s" "$out"
 grep -qE 'Reaps +2' <<< "$out" || fail "default: 2 reaps expected\n%s" "$out"
+grep -qE 'Scope escapes +1' <<< "$out" || fail "default: 1 scope escape expected\n%s" "$out"
 grep -qE 'Cost recorded +\$160\.0000 \(2 events\)' <<< "$out" || fail "default: cost \$160.0000/2 expected\n%s" "$out"
 ok
 
@@ -77,6 +79,7 @@ grep -qE 'Merged PRs +1' <<< "$out" || fail "--pr 42: 1 merge expected\n%s" "$ou
 grep -qE 'Review verdicts +2' <<< "$out" || fail "--pr 42: 2 verdicts expected (both APPROVE)\n%s" "$out"
 grep -qE 'Refix bounces +0' <<< "$out" || fail "--pr 42: refix bounce belongs to PR 43, expect 0\n%s" "$out"
 grep -qE 'Cost recorded +\$160\.0000' <<< "$out" || fail "--pr 42: cost \$160.0000 expected\n%s" "$out"
+grep -qE 'Scope escapes +0' <<< "$out" || fail "--pr 42: scope escape carries no pr, expect 0\n%s" "$out"
 ok
 # PR 43 sees the BLOCK + the refix bounce, but no cost (no cost event for 43).
 out="$(run --pr 43)"

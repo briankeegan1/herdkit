@@ -53,10 +53,20 @@ EOF
 export JOURNAL_FILE="$T/trees/.herd/journal.jsonl"
 export HERD_JOURNAL_AUDIT_INBOX="$T/trees/.agent-watch-inbox"
 export HERD_JOURNAL_AUDIT_SEEN="$T/trees/.agent-watch-journal-audit-seen"
+export HERD_JOURNAL_AUDIT_PENDING="$T/trees/.agent-watch-journal-audit-pending"
 export HERD_APPROVALS_FILE="$T/trees/.agent-watch-approvals"
-# No PR-body source: check (g) is not what this file proves, and an empty body declares no block.
+# PR-body source: check (g) is not the main subject of this file, so the default (no per-pr override
+# file) is an empty body — declares no HUMAN-VERIFY block. (2d) below drives the merged_hv_unknown
+# no-action class through the same seam by dropping a "$pr.fail" marker.
 export HERD_JOURNAL_AUDIT_PR_BODY_CMD="bash $T/pr-body.sh"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$T/pr-body.sh"
+mkdir -p "$T/bodies"
+cat > "$T/pr-body.sh" <<'FIXTURE'
+#!/usr/bin/env bash
+pr="$1"
+[ -f "$T/bodies/$pr.fail" ] && exit 7
+[ -f "$T/bodies/$pr.md" ] && exec cat "$T/bodies/$pr.md"
+exit 0
+FIXTURE
 export HERD_JOURNAL_AUDIT_NOW="2026-08-05T16:00:00Z"
 export JOURNAL_AUDIT_WINDOW_SECS=86400
 export JOURNAL_AUDIT_DISPATCH_TTL=600
@@ -97,7 +107,7 @@ reset_surfaces() {
   rm -rf "$T/trees/.herd" 2>/dev/null || true
   mkdir -p "$T/trees/.herd"
   : > "$JOURNAL_FILE"; : > "$HERD_JOURNAL_AUDIT_INBOX"
-  rm -f "$HERD_JOURNAL_AUDIT_SEEN" "$RAILLOG" "$SCRIBELOG" "$T/rail.fail" "$T/scribe.fail"
+  rm -f "$HERD_JOURNAL_AUDIT_SEEN" "$HERD_JOURNAL_AUDIT_PENDING" "$RAILLOG" "$SCRIBELOG" "$T/rail.fail" "$T/scribe.fail"
 }
 run_audit() {  # run_audit <on|off> [extra KEY=VALUE env assignments…]
   # `env` (not a bare assignment prefix): a QUOTED "${@:2}" expansion is a command word to bash, not a
@@ -147,7 +157,8 @@ $on_findings"
 pass
 echo "PASS (1) JOURNAL_AUDIT_ACT=off is byte-identical advisory-only; on adds actions without changing findings"
 
-# ── (2) orphaned dispatch re-dispatches ONCE, then escalates ONCE, then is silent ────────────────
+# ── (2) orphaned dispatch acts ONCE, then escalates after JOURNAL_AUDIT_ESCALATE_AFTER re-observations,
+#        then is silent forever ─────────────────────────────────────────────────────────────────────
 reset_surfaces
 seed_orphan_dispatch
 out="$(run_audit on)" || fail "(2) sweep 1 exited non-zero: $out"
@@ -156,21 +167,65 @@ grep -q '^dispatch_no_outcome|' "$RAILLOG" || fail "(2) the rail must be handed 
 [ "$(count_event audit_acted)" = "1" ] || fail "(2) sweep 1 must journal exactly one audit_acted"
 grep -q '"result":"slot_freed"' "$JOURNAL_FILE" || fail "(2) the rail's result token must be journaled verbatim"
 [ "$(scribe_calls)" = "0" ] || fail "(2) a MAPPED class must not file an item on its first action"
-# Sweep 2: the finding is STILL in the journal (nothing healed it) → escalate, do NOT act again.
+# Sweep 2: the finding is STILL in the journal, but this is only the FIRST re-observation — the
+# default JOURNAL_AUDIT_ESCALATE_AFTER=2 grants one sweep of grace (HERD-564/573: escalating on the
+# very next sighting was the pre-fix bug — reverify_pending in particular needs time to land). No
+# re-act (once per key), no escalation yet.
 out="$(run_audit on)" || fail "(2) sweep 2 exited non-zero: $out"
 [ "$(rail_calls)" = "1" ] || fail "(2) sweep 2 must NOT re-drive the rail (once per key), got $(rail_calls)"
-[ "$(count_event audit_acted)" = "2" ] || fail "(2) sweep 2 must journal the escalation as an audit_acted"
-grep -q '"result":"escalated"' "$JOURNAL_FILE" || fail "(2) sweep 2 must journal result=escalated"
+[ "$(count_event audit_acted)" = "1" ] || fail "(2) sweep 2 is still within the grace window — no escalation yet"
+[ "$(scribe_calls)" = "0" ] || fail "(2) sweep 2 must not file anything yet, got $(scribe_calls)"
+# Sweep 3: the SECOND re-observation reaches JOURNAL_AUDIT_ESCALATE_AFTER=2 → escalate LOUDLY, once.
+out="$(run_audit on)" || fail "(2) sweep 3 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2) sweep 3 must NOT re-drive the rail (once per key), got $(rail_calls)"
+[ "$(count_event audit_acted)" = "2" ] || fail "(2) sweep 3 must journal the escalation as an audit_acted"
+grep -q '"result":"escalated"' "$JOURNAL_FILE" || fail "(2) sweep 3 must journal result=escalated"
 [ "$(scribe_calls)" = "1" ] || fail "(2) the escalation must file exactly one item, got $(scribe_calls)"
 grep -q 'audit-escalated:dispatch_no_outcome' "$HERD_JOURNAL_AUDIT_INBOX" || fail "(2) the escalation must be LOUD in the operator inbox"
-# Sweeps 3+: fully silent — no re-act, no second escalation, no duplicate item.
-out="$(run_audit on)" || fail "(2) sweep 3 exited non-zero: $out"
+# Sweeps 4+: fully silent — no re-act, no second escalation, no duplicate item, no more pending tracking.
 out="$(run_audit on)" || fail "(2) sweep 4 exited non-zero: $out"
+out="$(run_audit on)" || fail "(2) sweep 5 exited non-zero: $out"
 [ "$(rail_calls)" = "1" ] || fail "(2) a settled finding must never re-act, got $(rail_calls) rail call(s)"
 [ "$(count_event audit_acted)" = "2" ] || fail "(2) a settled finding must journal no further audit_acted"
 [ "$(scribe_calls)" = "1" ] || fail "(2) a settled finding must never file a second item"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(2) an escalated finding must stop being tracked: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
 pass
-echo "PASS (2) orphaned dispatch acts once, escalates once, then is permanently silent"
+echo "PASS (2) orphaned dispatch acts once, escalates after the grace window, then is permanently silent"
+
+# ── (2b) JOURNAL_AUDIT_ESCALATE_AFTER=1 reproduces the immediate-next-sighting escalate (N=1) ──────
+reset_surfaces
+seed_orphan_dispatch
+out="$(run_audit on JOURNAL_AUDIT_ESCALATE_AFTER=1)" || fail "(2b) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2b) sweep 1 must act once, got $(rail_calls)"
+out="$(run_audit on JOURNAL_AUDIT_ESCALATE_AFTER=1)" || fail "(2b) sweep 2 exited non-zero: $out"
+[ "$(count_event audit_acted)" = "2" ] || fail "(2b) with ESCALATE_AFTER=1, sweep 2 must already escalate"
+grep -q '"result":"escalated"' "$JOURNAL_FILE" || fail "(2b) sweep 2 must journal result=escalated"
+pass
+echo "PASS (2b) JOURNAL_AUDIT_ESCALATE_AFTER is a live configurable seam (1 = escalate on the very next sighting)"
+
+# ── (2c) a MAPPED finding that CLEARS after its action journals audit_finding_cleared, never escalates
+reset_surfaces
+jline "2026-08-05T13:00:00Z" '"event":"main_health","pr":900,"sha":"cafe9000","result":"red","failed":"tests/x.sh"'
+out="$(run_audit on)" || fail "(2c) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2c) sweep 1 must drive the re-verify rail once, got $(rail_calls)"
+grep -q '^red_state_stale|' "$RAILLOG" || fail "(2c) the rail must be handed the red_state_stale class: $(cat "$RAILLOG")"
+[ -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(2c) an acted mapped finding must be tracked as pending"
+# The re-verify's result LANDS: a green after the red — exactly what reconcile_main_health's own
+# cadence would eventually journal, whether the rail armed it or (reverify_pending) merely observed
+# that a check was already owed. The auditor must CONSUME this, not just stop finding the row by luck.
+jline "2026-08-05T13:05:00Z" '"event":"main_health","pr":901,"sha":"cafe9001","result":"green"'
+out="$(run_audit on)" || fail "(2c) sweep 2 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2c) a cleared finding must never re-drive the rail, got $(rail_calls)"
+grep -q '"event":"audit_finding_cleared"' "$JOURNAL_FILE" || fail "(2c) a resolved finding must journal audit_finding_cleared"
+grep -q '"class":"red_state_stale"' "$JOURNAL_FILE" || fail "(2c) the cleared event must name its class"
+grep -q 'audit-cleared:red_state_stale' "$HERD_JOURNAL_AUDIT_INBOX" || fail "(2c) a cleared finding must get an advisory inbox row"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(2c) a cleared finding must stop being tracked: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+# Further sweeps: no escalation ever fires for a key that already cleared.
+out="$(run_audit on)" || fail "(2c) sweep 3 exited non-zero: $out"
+[ "$(count_event audit_acted)" = "1" ] || fail "(2c) a cleared finding must never escalate, got $(count_event audit_acted) audit_acted event(s)"
+[ "$(scribe_calls)" = "0" ] || fail "(2c) a cleared finding must never file anything, got $(scribe_calls)"
+pass
+echo "PASS (2c) a mapped finding that resolves journals audit_finding_cleared and stops tracking"
 
 # ── (3) an UNMAPPED finding class files EXACTLY ONE deduped item, ever ──────────────────────────
 reset_surfaces
@@ -191,6 +246,44 @@ out="$(run_audit on)" || fail "(3) sweep 3 exited non-zero: $out"
 [ "$(count_event audit_acted)" = "1" ] || fail "(3) an unmapped class must journal exactly one audit_acted"
 pass
 echo "PASS (3) an unmapped finding class files exactly one deduped item and never escalates into a duplicate"
+
+# ── (3b) fixture_slug is a DELIBERATE no-action class (HERD-562): never a rail, never a filed item,
+#         and the SAME once-guard shape as everything else — a single journaled reason, ever ─────────
+reset_surfaces
+jline "2026-08-05T15:00:00Z" '"event":"reap","pr":77,"slug":"retiree","sha":"fff","reason":"merged"'
+out="$(run_audit on)" || fail "(3b) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3b) fixture_slug must never reach a rail, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3b) fixture_slug must never file a tracker item, got $(scribe_calls)"
+grep -q '"class":"fixture_slug".*"result":"no_action"' "$JOURNAL_FILE" \
+  || fail "(3b) fixture_slug must journal result=no_action: $(grep audit_acted "$JOURNAL_FILE")"
+grep -q '"event":"audit_acted".*"reason":' "$JOURNAL_FILE" || fail "(3b) the no-action must carry a reason"
+grep -q 'audit-noaction:fixture_slug' "$HERD_JOURNAL_AUDIT_INBOX" || fail "(3b) the no-action must still get an advisory inbox row"
+# The REPORT half is untouched by this — fixture_slug still shows up as an ordinary journal_audit finding.
+grep -q '"event":"journal_audit".*"kind":"fixture_slug"' "$JOURNAL_FILE" || fail "(3b) fixture_slug must still be REPORTED (advisory)"
+# Later sweeps: journaled exactly once, ever — no re-fire, no escalate, no PENDING tracking at all.
+out="$(run_audit on)" || fail "(3b) sweep 2 exited non-zero: $out"
+out="$(run_audit on)" || fail "(3b) sweep 3 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3b) fixture_slug must never reach a rail across sweeps, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3b) fixture_slug must never file across sweeps, got $(scribe_calls)"
+[ "$(grep -c '"result":"no_action"' "$JOURNAL_FILE")" = "1" ] || fail "(3b) the no-action must journal exactly once, ever"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(3b) a no-action class must never be tracked as pending"
+pass
+echo "PASS (3b) fixture_slug is a deliberate no-action class — journals a reason once, never acts on the live journal"
+
+# ── (3c) merged_hv_unknown is a DELIBERATE no-action class (HERD-563): a transient PR-body read
+#         failure is not a gap to file work against — the next sweep just re-probes ───────────────
+reset_surfaces
+jline "2026-08-05T12:00:00Z" '"event":"merge","pr":210,"slug":"hv-210","sha":"decaf210"'
+jline "2026-08-05T12:01:00Z" '"event":"reap","pr":210,"slug":"hv-210","sha":"decaf210","reason":"merged"'
+: > "$T/bodies/210.fail"     # the PR-body fetch fails → merged_hv_unknown, not merged_hv_no_approval
+out="$(run_audit on)" || fail "(3c) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3c) merged_hv_unknown must never reach a rail, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3c) merged_hv_unknown must never file a tracker item, got $(scribe_calls)"
+grep -q '"class":"merged_hv_unknown".*"result":"no_action"' "$JOURNAL_FILE" \
+  || fail "(3c) merged_hv_unknown must journal result=no_action: $(grep audit_acted "$JOURNAL_FILE")"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(3c) a no-action class must never be tracked as pending"
+pass
+echo "PASS (3c) merged_hv_unknown is a deliberate no-action class — a transient read failure never files an item"
 
 # ── (4) each mapped class routes to the rail WITH the context it needs ──────────────────────────
 reset_surfaces
@@ -267,8 +360,12 @@ jline "2026-08-05T14:00:00Z" '"event":"review_dispatched","pr":802,"sha":"aaa3",
 out="$(run_audit on HERD_JOURNAL_AUDIT_ACT_MAX=2)" || fail "(7) sweep 1 exited non-zero: $out"
 [ "$(rail_calls)" = "2" ] || fail "(7) the per-sweep budget must cap actions at 2, got $(rail_calls)"
 out="$(run_audit on HERD_JOURNAL_AUDIT_ACT_MAX=2)" || fail "(7) sweep 2 exited non-zero: $out"
-# Sweep 2 spends its budget on the escalations of the two already-acted findings AND/OR the third
-# finding's first action — either way the THIRD finding must eventually be acted on, never dropped.
+# Sweep 2's lifecycle pass re-observes the two already-acted findings (still below
+# JOURNAL_AUDIT_ESCALATE_AFTER, so no budget spent there) and the fresh budget acts on the third —
+# the THIRD finding must eventually be acted on, never dropped by the cap. Later sweeps would go on to
+# spend budget on escalating the first two (past JOURNAL_AUDIT_ESCALATE_AFTER re-observations), but
+# that is HERD_JOURNAL_AUDIT_ACT_MAX/JOURNAL_AUDIT_ESCALATE_AFTER doing their OWN job (proven by (2)
+# and (2b) above) — this test only asserts the "never dropped" half.
 out="$(run_audit on HERD_JOURNAL_AUDIT_ACT_MAX=2)" || fail "(7) sweep 3 exited non-zero: $out"
 out="$(run_audit on HERD_JOURNAL_AUDIT_ACT_MAX=2)" || fail "(7) sweep 4 exited non-zero: $out"
 [ "$(rail_calls)" = "3" ] || fail "(7) every finding must be acted on eventually (3 expected), got $(rail_calls): $(cat "$RAILLOG")"
