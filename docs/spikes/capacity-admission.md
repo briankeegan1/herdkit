@@ -2,8 +2,9 @@
 
 **Tracker:** HERD-557 — *"DESIGN: unified machine-capacity admission control for all workload
 classes."* This doc is the committed design deliverable the item calls for; cite it from HERD-557.
-**Status:** P1 shipped (suites only, behind `CAPACITY_BUDGET`); this doc also records the P2/P3 roadmap.
-**Date:** 2026-08-05
+**Status:** P1 shipped (suites only, behind `CAPACITY_BUDGET`); P2 shipped (HERD-581 — agent spawns
+join as a second ledger tenant, §6's first bullet); this doc also records the remaining P3 roadmap.
+**Date:** 2026-08-05, updated 2026-08-06 (P2)
 **Audience:** coordinator + engine maintainers
 **Grounding:** operator diagnosis 2026-08-05 (*"this is a major design flaw then, is it not"*) after
 load ~35 on 14 cores stretched a 6-minute suite to 38 minutes; external design review (`herd advise`,
@@ -176,15 +177,19 @@ The full, system-wide order this item's design conclusions specify:
 watcher tick  >  reviews / merges  >  watcher suites  >  builder-local suites  >  new spawns
 ```
 
-P1 implements the bottom two rungs — `watcher suites` and `builder-local suites` — as the two classes of
+P1 implements the middle two rungs — `watcher suites` and `builder-local suites` — as the two classes of
 one ledger tenant (`suite`). The reserved-top slice (§2.2) *is* "watcher suites" winning against
 "builder-local suites" structurally; there is no rung above it inside the P1 ledger to protect against,
-because P1 has no tick/review/merge tenant yet. §6 describes how the partition **nests** once those
-tenants exist: from a future `tick` tenant's point of view, today's whole `suite` ledger (including its
-own reserved-top) becomes something closer to the *bottom* of a larger order, and `reserved-top` grows
-from "1 fixed unit" into "N units, sub-partitioned tick > reviews/merges > watcher-suites in turn." The
-comparator function (`capacity_candidate_slots`) is written generically enough (tenant + class, not
-"suite" hardcoded into the partition math) that this is an extension, not a rewrite.
+because P1 has no tick/review/merge tenant yet. P2 (HERD-581) adds the bottom rung, `new spawns`, as its
+own tenant (`agent`, class `spawn`) rather than a third class of the `suite` tenant — spawns are a count
+resource, a different shape from suites' CPU units (§4), so they get a separate ledger/cap while still
+routing through the SAME comparator. `reviews / merges` and `watcher tick` (the top two rungs) remain
+P3. §6 describes how the partition **nests** once those tenants exist: from a future `tick` tenant's
+point of view, today's whole `suite` ledger (including its own reserved-top) becomes something closer to
+the *middle* of a larger order, and `reserved-top` grows from "1 fixed unit" into "N units, sub-
+partitioned tick > reviews/merges > watcher-suites in turn." The comparator function
+(`capacity_candidate_slots`) is written generically enough (class, not tenant, drives the partition
+match) that this is an extension, not a rewrite — P2 is the first proof of that claim.
 
 ## 4. Reserved-slice sizing (why 1 and 1, not aging, answers "how much")
 
@@ -197,10 +202,12 @@ either guarantee. `HERD_CAPACITY_RESERVED_TOP_OVERRIDE` / `HERD_CAPACITY_RESERVE
 test seams (§7's mutation-prove leg forces `reserved_top=0` to show the possession leg goes red without
 it — the partition is load-bearing, not vacuous).
 
-Per-class **flat count caps** (as opposed to the scalar CPU-unit ledger P1 implements) are noted as a
+Per-class **flat count caps** (as opposed to the scalar CPU-unit ledger P1 implements) were noted as a
 P2/P3 concern once agent leases — a genuinely different resource shape (an agent is a count, not a CPU
-fraction) — join the ledger; suites are a single homogeneous resource dimension today and don't need a
-second cap axis.
+fraction) — join the ledger; suites are a single homogeneous resource dimension and don't need a second
+cap axis. **Shipped in P2 (HERD-581):** the AGENT tenant's `spawn` class carries exactly that flat count
+cap (`REVIEW_CONCURRENCY + SPAWN_AHEAD`, no new key), routed through the same
+`capacity_candidate_slots` comparator as the SUITE tenant's CPU-unit classes — see §6.
 
 ## 5. What the external review changed (for the record)
 
@@ -225,11 +232,21 @@ HERD-531). Filing it as a roadmap item is correct; building it under HERD-557 P1
 
 ## 6. P2/P3 roadmap
 
-- **Agent leases (P2).** Builder spawns become a second ledger tenant, alongside `suite`. Spawns are a
-  *count* resource (bounded by how many concurrent builder agents make sense), not a CPU-unit one — the
-  first real motivation for the "per-class flat count caps alongside CPU units" axis noted in §4.
-  `herd-spawn-gate.sh`'s existing advisory becomes a `capacity_candidate_slots`-routed consumer instead
-  of its own independent heuristic.
+- **Agent leases (P2) — SHIPPED (HERD-581).** Builder spawns are a second ledger tenant (`agent`),
+  alongside `suite`. Spawns are a *count* resource (bounded by `REVIEW_CONCURRENCY + SPAWN_AHEAD`, no
+  new key), not a CPU-unit one — the first real use of the "per-class flat count caps alongside CPU
+  units" axis noted in §4. The lane spawn step (`herd-feature.sh` / `herd-quick.sh`) leases a `spawn`
+  class unit — routed through the SAME `capacity_candidate_slots` comparator (`builder-local|spawn` both
+  match the bottom reserved slice — "spawns stay the bottom class") — BEFORE launching the runtime, held
+  by a detached process (`capacity_agent_lease_hold`, `capacity-agent-lease-wait.sh`) that polls the
+  driver-agnostic `herd_driver_agent_liveness` and releases (journaling `capacity_lease_released`) once
+  the agent session ends — the "P1 semaphore pattern" adapted for a long-lived session instead of a
+  foreground subprocess `capacity_acquire_and_run` can `wait()` on directly. `herd-spawn-gate.sh`'s
+  existing advisory ALSO now consults the SUITE tenant (`capacity_suite_queue_saturated`): a fully
+  contended suite ledger defers a new spawn even when `REVIEW_CONCURRENCY` alone has headroom, closing
+  §1(c)'s spawning-into-idleness pathology for real. The AGENT tenant's own reserved-top slot is never
+  matched by any class that exists yet, so it stays structurally un-leasable — deliberate headroom for a
+  future higher-priority tenant (reviews/merges, next), not a bug.
 - **Reviews/merges as ledger tenants (P2/P3).** Once these exist, the reserved-top slice nests as
   described in §3 — `tick` gets first claim, `reviews/merges` next, `watcher suites` beneath that, each
   a partition of the rung above's "general" pool.
