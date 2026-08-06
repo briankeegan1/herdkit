@@ -550,3 +550,6 @@ tab-discipline.sh	sim	tests/test-sandbox-real-panes.sh
 tab-create-lint.sh	unit	tests/test-tab-discipline.sh
 TAB_DISCIPLINE	unit	tests/test-tab-discipline.sh
 TAB_DISCIPLINE	sim	tests/test-sandbox-real-panes.sh
+HEALTHCHECK_PROGRESS_LOG	unit	tests/test-healthcheck-progress-stream.sh
+HEALTHCHECK_PROGRESS_LOG	unit	tests/test-health-progress-header.sh
+HEALTHCHECK_PROGRESS_LOG	unit	tests/test-health-worker-progress-log.sh
