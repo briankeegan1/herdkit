@@ -1564,6 +1564,30 @@ def _total_health_inflight(state_dir):
 #       escalating mid-verdict. Every invocation — trusted or not — stamps HERD_HEALTH_PROVENANCE=watcher
 #       so the provenance record healthcheck.sh writes for THIS run can never later be read back as
 #       builder-local evidence (health-trust.sh's own anti-compounding rule).
+#
+# ENV-SUSPECT TIMEOUT CLASSIFICATION (HERD-546, re-hung onto this live worker by HERD-567): before
+# HERD-567, ENV_SUSPECT_TIMEOUT/HEALTH_LOAD_THRESHOLD were wired ONLY into agent-watch.sh's bash
+# _health_worker, which lost its only caller (_healthcheck_gate) at the P5b engine port — the lever
+# was configurable, defaulted correctly, unit-tested, and dead: turning it on changed nothing under
+# the shipped python engine (scripts/herd/lever-reachability-lint.sh's baseline finding, HERD-556).
+# THIS worker is the actual live suite runner (LiveGates._dispatch_health / _dispatch_merge_result),
+# so the classification is ported here, mirroring agent-watch.sh's _env_suspect_enabled /
+# _health_timeout_detail / _health_loadavg_1m / _health_sibling_suites_live / _health_load_high
+# byte-for-byte (self-contained — no sourcing, matching this script's own no-dependency style, since
+# a sourcing failure here would stall EVERY PR's health gate, not just this lever). ENV_SUSPECT_TIMEOUT
+# unset/off (default) never calls any of the _es_* helpers below — byte-inert.
+#
+# Classified while a run-1 failure is still forming its verdict: the '[env-suspect] …' marker is
+# APPENDED to the live $log (never overwriting it) the instant a timeout+load match is found, BEFORE
+# the solo retry runs — so agent-watch.sh's _health_inflight_note / _health_env_suspect_marker (the
+# render half, painted by either engine) shows it on the very next tick while the retry is still in
+# flight. On a reproduced failure the retry's own output later `mv`'s over $log (unchanged from
+# before this lever existed), so the marker is transient by design — visible only while in flight,
+# exactly like the pre-port bash behavior. The classification detail additionally lands in a
+# `$log.envsuspect` side-channel file (a single line, sanitized) so the terminal collector (`health` /
+# `_merge_result_health` in this module) can journal `health_env_suspect` once the async worker exits
+# — the log itself is not a reliable channel for that at collect time, since a reproduced failure has
+# already overwritten it by then.
 _HEALTH_WORKER_SH = r'''
 set -u
 hc="$1"; dir="$2"; out="$3"; log="$4"; base="$5"; cache="$6"; nonce="$7"; profile="${8:-}"
@@ -1581,12 +1605,61 @@ _run() {
     HERD_HEALTH_PROVENANCE=watcher \
     bash "$hc" "${args[@]}" > "$1" 2>&1
 }
+_es_on() {
+  case "$(printf '%s' "${ENV_SUSPECT_TIMEOUT:-off}" | tr '[:upper:]' '[:lower:]')" in
+    on|true|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+_es_timeout_detail() {
+  grep -m1 -E '# timeout after [0-9]+s|\(TIMEOUT after [0-9]+s\)' <<<"${1:-}" 2>/dev/null
+}
+_es_loadavg_1m() {
+  [ -n "${HERD_FAKE_LOADAVG:-}" ] && { printf '%s' "$HERD_FAKE_LOADAVG"; return 0; }
+  if [ -r /proc/loadavg ]; then awk '{print $1}' /proc/loadavg 2>/dev/null; return 0; fi
+  command -v sysctl >/dev/null 2>&1 && { sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}'; return 0; }
+  return 0
+}
+_es_siblings_live() {
+  local n=0 f pid
+  { [ -n "$cache" ] && [ -d "$cache" ]; } || { printf '0'; return 0; }
+  for f in "$cache"/.local-suite-slot-* "$cache"/.capacity-suite-live-*; do
+    [ -e "$f" ] || continue
+    case "$f" in *.lock) continue ;; esac
+    pid="$(sed -n '1p' "$f" 2>/dev/null)"
+    case "$pid" in ''|*[!0-9]*) continue ;; esac
+    kill -0 "$pid" 2>/dev/null && n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+_es_load_high() {
+  _es_on || return 1
+  local threshold load siblings
+  threshold="${HEALTH_LOAD_THRESHOLD:-4}"
+  case "$threshold" in ''|*[!0-9]*) threshold=4 ;; esac
+  load="$(_es_loadavg_1m)"
+  case "$load" in
+    ''|*[!0-9.]*) : ;;
+    *) awk -v l="$load" -v t="$threshold" 'BEGIN{exit !(l+0>=t+0)}' </dev/null && return 0 ;;
+  esac
+  siblings="$(_es_siblings_live)"
+  case "$siblings" in ''|*[!0-9]*) siblings=0 ;; esac
+  [ "$siblings" -ge 1 ]
+}
+ES_TEXT="env-suspect · timeout under load · solo re-run queued"
 _run "$log"; rc=$?
 first="$(sed -n '1p' "$log" 2>/dev/null)"
 if [ "$rc" -eq 0 ]; then
   case "$first" in "⚠️"*) line="CLEAN"$'\t'"dataenv" ;; *) line="CLEAN"$'\t'"clean" ;; esac
 else
   notok="$(grep -m1 -iE 'not ok' "$log" 2>/dev/null)"; [ -n "$notok" ] || notok="$first"
+  if _es_on; then
+    es_detail="$(_es_timeout_detail "$notok")"
+    if [ -n "$es_detail" ] && _es_load_high; then
+      printf '[env-suspect] %s\n' "$ES_TEXT" >> "$log" 2>/dev/null || true
+      printf '%s\n' "$es_detail" > "$log.envsuspect" 2>/dev/null || true
+    fi
+  fi
   _run "$log.retry"; rc2=$?
   if [ "$rc2" -eq 0 ]; then
     rm -f "$log.retry" "$log.retry.progress" 2>/dev/null || true
@@ -2160,6 +2233,30 @@ class LiveGates:
             self._main_health_pending_cache = _main_health_pending(state_dir)
         return self._main_health_pending_cache
 
+    def _collect_env_suspect(self, cand, log_path):
+        """HERD-567: the python-side half of the env-suspect port — reads the ``<log>.envsuspect``
+        side-channel _HEALTH_WORKER_SH drops the moment it classifies a run-1 timeout as env-suspect
+        (see that string's own docstring for why a side channel, not the log itself, carries this to
+        the collector), journals ``health_env_suspect`` (mirroring agent-watch.sh's ``_health_worker``
+        ``journal_append health_env_suspect dir … detail …``), and removes the marker either way. A
+        no-op — no journal line — whenever the marker is absent: every OTHER dispatch (the lever off,
+        or on but never classified) never even opens the file. Called once per terminal collect, right
+        alongside ``record_health_result`` / ``record_merge_result_verdict``."""
+        if not log_path:
+            return
+        marker = log_path + ".envsuspect"
+        try:
+            with open(marker, encoding="utf-8") as fh:
+                detail = fh.readline().strip()
+        except OSError:
+            return
+        try:
+            os.remove(marker)
+        except OSError:
+            pass
+        dir_name = os.path.basename(cand.worktree) if cand.worktree else cand.slug
+        self.journal.append("health_env_suspect", "dir", dir_name, "detail", detail)
+
     # ── health rail ────────────────────────────────────────────────────────────────────────────────
     def health(self, cand):
         # MERGE_RESULT_GATE (§6.4, HERD-296): ON diverts the ENTIRE health rail to the merge-result
@@ -2210,6 +2307,7 @@ class LiveGates:
                     # step-2 collect re-reads this exact same out-file and completes the record+rm in one
                     # shot — no re-dispatch of the underlying suite, no lost result.
                     _chaos_kill("mid_gate_collect")
+                    self._collect_env_suspect(cand, st.health_log_file(cand))
                     st.record_health_result(cand, verdict, detail)
                     st.rm(disp, inflight)
                     return verdict
@@ -2358,6 +2456,7 @@ class LiveGates:
                 tested_base = _nonce_base(nonce) or base_sha
                 verdict, _, detail = rest.partition("\t")
                 if verdict in ("CLEAN", "FLAKY", "CODEERROR"):
+                    self._collect_env_suspect(cand, st.merge_result_log_file(cand.pr, cand.sha))
                     st.record_merge_result_verdict(cand.pr, cand.sha, tested_base, verdict, detail)
                     st.rm(disp, inflight)
                     _remove_merge_tree(cand.worktree, tree)
