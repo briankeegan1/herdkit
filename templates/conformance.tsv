@@ -307,7 +307,7 @@ WATCHER_VIEW_DEPS_LABEL	unit	tests/test-watcher-views.sh
 WATCHER_SCOPE	unit	tests/test-team-mode.sh
 WATCHER_OWNER	unit	tests/test-team-mode.sh
 REVIEW_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
-REVIEW_CONCURRENCY	unit	tests/test-gate-dispatch.sh
+REVIEW_CONCURRENCY	unit	tests/test-live-engine-concurrency.sh
 NATIVE_BURST	unit	tests/test-native-burst.sh
 REVIEW_PANEL	unit	tests/test-native-burst.sh
 REVIEW_PANEL_MODELS	unit	tests/test-review-panel-models.sh
@@ -333,11 +333,16 @@ REVIEW_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_INFLIGHT_TIMEOUT	unit	tests/test-restart-safe-dispatch.sh
 HEALTH_TIMEOUT_HEADROOM	sim	scripts/herd/sim/sandbox-suite-timeout-headroom-sim.sh
 HEALTH_EARLY_REAP_SECS	unit	tests/test-health-early-reap.sh
-GATE_DISPATCH	unit	tests/test-gate-dispatch.sh
-GATE_DISPATCH	sim	tests/test-sandbox-concurrency.sh
 GATE_STATUS	unit	tests/test-gate-status.sh
 GATE_STATUS_PENDING	unit	tests/test_live_runtime.py
 DELTA_REVIEW	unit	tests/test-delta-review.sh
+DELTA_REVIEW	unit	tests/test_live_runtime.py
+WATCH_CLAUDE_PROBE_TIMEOUT	unit	tests/test-watcher-claude-hang.sh
+WATCH_CLAUDE_PROBE_TIMEOUT	unit	tests/test_live_runtime.py
+REVIEW_MODEL_ESCALATED	unit	tests/test-review-escalation.sh
+REVIEW_MODEL_ESCALATED	unit	tests/test_live_runtime.py
+REVIEW_EVIDENCE_ESCALATE_ROUNDS	unit	tests/test-review-escalation.sh
+REVIEW_EVIDENCE_ESCALATE_ROUNDS	unit	tests/test_live_runtime.py
 review-pregate.sh	unit	tests/test-review-pregate.sh
 REVIEW_PREGATE	unit	tests/test-review-pregate.sh
 REVIEW_MECH_FLOOR	unit	tests/test-review-pregate.sh
@@ -545,3 +550,6 @@ tab-discipline.sh	sim	tests/test-sandbox-real-panes.sh
 tab-create-lint.sh	unit	tests/test-tab-discipline.sh
 TAB_DISCIPLINE	unit	tests/test-tab-discipline.sh
 TAB_DISCIPLINE	sim	tests/test-sandbox-real-panes.sh
+HEALTHCHECK_PROGRESS_LOG	unit	tests/test-healthcheck-progress-stream.sh
+HEALTHCHECK_PROGRESS_LOG	unit	tests/test-health-progress-header.sh
+HEALTHCHECK_PROGRESS_LOG	unit	tests/test-health-worker-progress-log.sh

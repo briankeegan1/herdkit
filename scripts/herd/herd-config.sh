@@ -938,14 +938,12 @@ export REVIEW_MODEL_CHEAP REVIEW_MODEL_DOCS
 # nothing. An unrecognized value reads as full. Consumed by suite-shard.sh (herd_suite_scope_mode),
 # read by the project healthcheck wrapper.
 : "${HEALTH_SUITE_SCOPE:="full"}"    # HERD-532: heavy-suite test selection — diff | full
-# GATE_DISPATCH (HERD-73) — serial (default) | parallel. Governs WHEN the watcher's action pass fires
-# the pre-merge review relative to the healthcheck for a (pr,sha). serial → today's EXACT behavior,
-# byte-identical: the review dispatches only AFTER the healthcheck outcome lands, so gate wall-clock is
-# health + review. parallel → dispatch the review at the same action-pass tick the healthcheck starts,
-# so the two gates overlap. The MERGE decision is UNCHANGED either way (still requires BOTH gates green);
-# only the wall-clock overlaps. Tradeoff: a health-failed sha wastes one review run (cheap under
-# REVIEW_ESCALATE_GLOB tiering). Unknown value → serial (fail safe). Consumed by agent-watch.sh.
-: "${GATE_DISPATCH:="serial"}"   # serial (default) | parallel — see capabilities.tsv / agent-watch.sh
+# (HERD-580) GATE_DISPATCH (HERD-73) was RETIRED: it governed WHEN the watcher's action pass fired the
+# pre-merge review relative to the healthcheck, but its only consumers lived in the bash action pass
+# (_tick_act) the P5b engine port deleted — the Python core never implemented a parallel pre-dispatch
+# step (pysrc/herd/live_runtime.py's INFRA breaker docstring has the full audit). Removed rather than
+# ported: with no reachable caller left in either engine, keeping the key would document a lever that
+# does nothing.
 # DELTA_REVIEW (HERD-204) — off (default) | on. Skip a full pre-merge re-review when a PR's NEW head
 # sha differs from its last review-PASSED sha ONLY by a merge of DEFAULT_BRANCH (a pure INTEGRATION
 # push: the newly-merged main commits are already-reviewed main, and the merge itself carries no
@@ -957,8 +955,10 @@ export REVIEW_MODEL_CHEAP REVIEW_MODEL_DOCS
 # journals review_carried_forward) instead of re-reviewing. CONSERVATIVE + FAIL-CLOSED: any authored
 # change beyond the merge, a non-trivial/conflicted merge, a missing sha/worktree, or any inability to
 # prove integration-only → a normal full review. off (default) → byte-inert: no probe, no carry, the
-# review-once gate is unchanged. Unknown value → off (fail safe). Consumed by agent-watch.sh.
-: "${DELTA_REVIEW:="off"}"       # off (default) | on — see capabilities.tsv / agent-watch.sh
+# review-once gate is unchanged. Unknown value → off (fail safe). Consumed by pysrc/herd/live_runtime.py
+# (the shipped live review dispatch, HERD-580 port); the bash body (agent-watch.sh) is unreachable since
+# the P5b engine port and is kept only for its own unit test.
+: "${DELTA_REVIEW:="off"}"       # off (default) | on — see capabilities.tsv / pysrc/herd/live_runtime.py
 : "${REVIEW_AUTOFIX:="false"}"   # auto-bounce BLOCK reviews to the builder agent (default off; set true to dogfood)
 : "${REFIX_MAX_ROUNDS:="3"}"     # max auto-refix rounds per RAIL (review | health | stale); a rail's budget is refunded when its red resolves, and a derived per-PR ceiling of 3x bounds the whole PR; exhausting either escalates to needs-you
 : "${REFIX_COMPLETE_MIN:="10"}"  # HERD-420: minutes after a refix wake (refix_wake_result woke=1) before the watcher checks the SAME (pr,sha) actually SHIPPED — a woke=1 only proves the agent's pane came back to "working", not that it committed+pushed (PR #531: bounced, edited a file, declared done, never pushed; the PR sat blocked indefinitely with nobody watching). Past this window, if the agent reads done/idle again with no new sha on the PR, the watcher journals refix_incomplete and re-bounces ONCE through the SAME rail's REFIX_MAX_ROUNDS budget (no parallel path) with a "finish your uncommitted work" prompt; budget exhaustion escalates to the standard needs-you row. Default 10 (ships ON — this closes a proven silent-failure class); 0 is a real opt-out (byte-identical to pre-HERD-420: the once-guard just holds silently). Consumed by pysrc/herd/live_runtime.py (review + health rails; the only rails whose bounce dispatch is live post-P5-cutover)
@@ -1093,11 +1093,13 @@ export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
 # before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
 # claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang
 # it cannot see. When armed, the watcher probes `claude --version` under a HARD timeout ONCE per tick
-# before dispatching; a timeout HOLDS review/refix for that tick with a loud row + a journal infra_event
-# (the doctor's own `claude responds` probe reports the same hang at diagnosis time). 0 = OFF (byte-inert;
-# no probe exec, no journal, behavior byte-identical); N>=1 = probe timeout in seconds. Consumed by
-# agent-watch.sh. Only a genuine timeout counts as a hang — a broken/absent claude is fail-soft (never
-# holds the queue). A small value like 5 is a conservative arm for unattended runs.
+# before dispatching; a timeout HOLDS review dispatch for that tick with a loud row + a journal
+# infra_event (the doctor's own `claude responds` probe reports the same hang at diagnosis time). 0 =
+# OFF (byte-inert; no probe exec, no journal, behavior byte-identical); N>=1 = probe timeout in seconds.
+# Consumed by pysrc/herd/live_runtime.py (the shipped live review dispatch, HERD-580 port); the bash
+# body (agent-watch.sh) is unreachable since the P5b engine port and is kept only for its own unit test.
+# Only a genuine timeout counts as a hang — a broken/absent claude is fail-soft (never holds the queue).
+# A small value like 5 is a conservative arm for unattended runs.
 : "${WATCH_CLAUDE_PROBE_TIMEOUT:="0"}"  # 0/unset = off (byte-inert); N>=1 = `claude --version` probe timeout (seconds)
 
 # ── Claude Code custom endpoint (HERD-171) ───────────────────────────────────

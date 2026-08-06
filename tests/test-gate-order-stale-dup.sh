@@ -9,7 +9,7 @@
 # This suite pins BOTH halves of the fix:
 #
 #   (1) STRUCTURAL — in agent-watch.sh's action pass, the `_stale_dup_gate_step` call on $candsha
-#       precedes BOTH `_predispatch_review_if_parallel` and `_healthcheck_gate`. This is the ordering
+#       precedes BOTH `_review_gate_step` and `_healthcheck_gate`. This is the ordering
 #       invariant itself; the behavioral checks below cannot observe it (the action pass is inline in
 #       the main loop, past the AGENT_WATCH_LIB source cutoff).
 #   (2) STALE-BASE HOLD — driven through a faithful replay of that call order against a real git
@@ -48,7 +48,7 @@ command -v git >/dev/null 2>&1 || fail "git required"
 # retained as pure, side-effect-honest HELPERS, and the behavioral checks (2–8) below replay their call
 # order faithfully. So here assert the helpers still exist and that no bash action pass lingers.
 ( AGENT_WATCH_LIB=1 . "$WATCH" >/dev/null 2>&1
-  declare -F _stale_dup_gate_step _predispatch_review_if_parallel _healthcheck_gate >/dev/null ) \
+  declare -F _stale_dup_gate_step _review_gate_step _healthcheck_gate >/dev/null ) \
   || fail "(1) the stale-dup/review/health gate helpers must survive the cutover (retained for the checks below + the sim)"
 grep -q . <<< "$(grep -F -n -- '_tick_act' "$WATCH" | awk '{ rest=substr($0,index($0,":")+1); if (rest !~ /^[[:space:]]*#/) print }')" \
   && fail "(1) the deleted bash action pass (_tick_act) must not be referenced in code — the gate order is Python-owned now"
@@ -111,7 +111,6 @@ export WORKTREES_DIR="$T/trees"; mkdir -p "$T/trees"
 export HERD_CONFIG_FILE="$T/no-such-config"
 export JOURNAL_FILE="$T/journal.jsonl"; : > "$JOURNAL_FILE"
 export DEFAULT_BRANCH="main"
-export GATE_DISPATCH=parallel          # so the review pre-dispatch is live, not a no-op
 export REVIEW_CONCURRENCY=4
 export HERD_REVIEW_BIN="$STUB_REVIEW"
 # This PR carries no tracker ref → the DUPLICATE leg is skipped fail-soft; STALE BASE is the subject.
@@ -120,7 +119,7 @@ export HERD_STALE_DUP_BODY_FILE="$BODY"
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 
-for fn in _stale_dup_gate_step stale_dup_check _predispatch_review_if_parallel _handle_stale_dup; do
+for fn in _stale_dup_gate_step stale_dup_check _review_gate_step _handle_stale_dup; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
 ok "(1b) _stale_dup_gate_step is lib-visible"
@@ -144,7 +143,7 @@ _healthcheck_gate() {
 action_pass() {
   local prnum="$1" slug="$2" dir="$3" candsha="$4" branch="$5" idx=0
   _stale_dup_gate_step "$prnum" "$slug" "$dir" "$candsha" "$branch" "$idx" || return 1
-  _predispatch_review_if_parallel "$prnum" "$slug" "$candsha"
+  _review_gate_step "$prnum" "$slug" "$candsha" >/dev/null
   _HC_RESULT=""; _healthcheck_gate "$prnum" "$slug" "$dir" "$idx" "$candsha"
   # The pre-merge re-verify hands us $rsha; here the head never moves (a mid-tick push is not the
   # subject — the BASE tip moving is). The pre-merge leg is not retyped: PREMERGE_SRC is the literal

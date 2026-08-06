@@ -2099,13 +2099,33 @@ def _make_stale_base_repo(tmp):
     return feat_dir, feat_sha
 
 
+class _StaleDupHermeticHoldSource(LiveHoldSource):
+    """LiveHoldSource twin for TestStaleDupGate (HERD-596): the class means to prove ONLY the
+    stale-dup gate (:func:`_stale_dup_check`, which already honors the ``HERD_STALE_DUP_*_FILE``
+    seams below) — never the separate ``hv_body`` human-verify read, which has no seam of its own
+    and shells straight out to a REAL ``gh pr view``. On the maintainer's authenticated box that
+    call happens to succeed against whatever the fixture's pr# resolves to in the real repo,
+    masking the miss; on an unauthenticated/gh-less CI runner it fails per HERD-237's fail-CLOSED
+    contract, forcing every candidate to HOLD before the stale-dup gate is even reached — which
+    happened to match the already-HOLD/ESCALATE/BLOCK-expecting tests below but broke the two
+    MERGE-expecting ones (CI-environment-specific: same sha, same fixtures, red only where `gh`
+    can't reach a real PR). Stub the read to always succeed with an empty, non-human-verify body;
+    ``approved()`` stays the real ledger read (hermetic already — nothing in this class writes an
+    approval row)."""
+
+    def hv_body(self, pr):
+        return "", 0
+
+
 class TestStaleDupGate(LiveCase):
     """HERD-566 (P5b HERD-561 child 1/2): the deterministic duplicate-ref / stale-base file-overlap
     pre-merge gate (HERD-188), restored into the live decide path — its only bash caller
     (agent-watch.sh:_stale_dup_gate_step) lost its wiring at the P5b port (HERD-556 reachability
     lint), so every merge under ENGINE_IMPL=python has run with NEITHER hold. LIVE-ONLY (gated on
     ``hold_source is not None``, exactly like cross-seat): every OTHER test in this module passes no
-    hold_source and so never shells to `gh`/`git` for this gate — proved directly below."""
+    hold_source and so never shells to `gh`/`git` for this gate — proved directly below. Uses
+    :class:`_StaleDupHermeticHoldSource`, not the bare :class:`LiveHoldSource`, so this class's own
+    hermeticity claim actually holds (HERD-596)."""
 
     def setUp(self):
         super().setUp()
@@ -2125,7 +2145,7 @@ class TestStaleDupGate(LiveCase):
         actuator = actuator or DryRunActuator(journal)
         scenario = {"candidates": [self.one(**cand_kwargs)], "config": config}
         t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
-                     state=state, hold_source=LiveHoldSource(state, config))
+                     state=state, hold_source=_StaleDupHermeticHoldSource(state, config))
         res = t.run()
         return res, events(self.jpath)
 
@@ -2233,7 +2253,7 @@ class TestStaleDupGate(LiveCase):
                                             health="CLEAN", review="PASS", agent_status="dead")],
                    "config": config}
         t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
-                     state=state, hold_source=LiveHoldSource(state, config))
+                     state=state, hold_source=_StaleDupHermeticHoldSource(state, config))
         res = t.run()
         ev = events(self.jpath)
         self.assertEqual(res["outcomes"]["7"], "ESCALATE")
@@ -7062,6 +7082,418 @@ class TestReviewFastPath(LiveCase):
                 if want:
                     self.assertEqual(lat[0]["verdict"], "PASS")
                     self.assertGreaterEqual(int(lat[0]["secs"]), 0)
+
+
+def _make_delta_review_repo(tmp, name, authored_after_merge=False):
+    """A repo where `feat` branches off `main`, `main` then advances, and `feat` merges `main` back in —
+    a pure integration merge unless `authored_after_merge` amends it with a post-merge edit. Returns
+    (repo_dir, old_sha, new_sha): `old_sha` is feat's pre-merge head (the "last-passed" carry source),
+    `new_sha` is the merge commit (or its amended twin). Mirrors tests/test-delta-review.sh's
+    build_integration() fixture, single repo dir with serial checkouts (no worktrees needed — the git
+    plumbing under test reads objects by sha, not working-tree state)."""
+    d = os.path.join(tmp, name)
+    _git_init_repo(d)
+    subprocess.run(["git", "-C", d, "checkout", "-q", "-b", "feat"], check=True)
+    with open(os.path.join(d, "feature.txt"), "w", encoding="utf-8") as fh:
+        fh.write("branch work\n")
+    subprocess.run(["git", "-C", d, "add", "feature.txt"], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-q", "-m", "feat work"], check=True)
+    old = subprocess.check_output(["git", "-C", d, "rev-parse", "HEAD"]).decode().strip()
+    subprocess.run(["git", "-C", d, "checkout", "-q", "main"], check=True)
+    with open(os.path.join(d, "mainfile.txt"), "w", encoding="utf-8") as fh:
+        fh.write("main advance\n")
+    subprocess.run(["git", "-C", d, "add", "mainfile.txt"], check=True)
+    subprocess.run(["git", "-C", d, "commit", "-q", "-m", "main advance"], check=True)
+    subprocess.run(["git", "-C", d, "checkout", "-q", "feat"], check=True)
+    subprocess.run(["git", "-C", d, "merge", "-q", "--no-edit", "main"], check=True)
+    if authored_after_merge:
+        with open(os.path.join(d, "feature.txt"), "a", encoding="utf-8") as fh:
+            fh.write("sneaky authored change\n")
+        subprocess.run(["git", "-C", d, "add", "feature.txt"], check=True)
+        subprocess.run(["git", "-C", d, "commit", "-q", "--amend", "--no-edit"], check=True)
+    new = subprocess.check_output(["git", "-C", d, "rev-parse", "HEAD"]).decode().strip()
+    return d, old, new
+
+
+class TestDeltaReviewCarryForward(LiveCase):
+    """HERD-580: port DELTA_REVIEW (HERD-204) into the live core. agent-watch.sh's own implementation
+    (_maybe_carry_forward_review) has had no reachable caller since the P5b engine port — its only
+    caller was the dead _review_gate_step — so this is a fresh Python implementation, exercised here
+    directly against LiveGates.review() (not FixtureGates) with REAL git repos, mirroring
+    tests/test-delta-review.sh's own fixtures. The bash body is kept only for its own unit test."""
+
+    def _gates(self, config):
+        state = LiveState(state_dir=self.tmp)
+        journal = LiveJournal(self.jpath)
+        return LiveGates(self.tmp, state, journal, config=config), state, journal
+
+    def test_integration_only_merge_carries_forward_without_dispatch(self):
+        d, old, new = _make_delta_review_repo(self.tmp, "dr1")
+        gates, state, _ = self._gates({"DELTA_REVIEW": "on"})
+        state.record_review(11, old, "PASS", "reviewer", "")
+        cand = LiveCandidate(11, new, slug="feat", worktree=d)
+        v = gates.review(cand)
+        self.assertEqual(v, "PASS")
+        self.assertEqual(state.recorded_review(11, new), "PASS")
+        self.assertEqual(state.recorded_review_source(11, new), "carried-forward")
+        self.assertFalse(os.path.exists(state.review_inflight_file(cand)))
+        ev = [o for o in events(self.jpath) if o["event"] == "review_carried_forward"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["pr"], 11)
+        self.assertEqual(ev[0]["from_sha"], old)
+
+    def test_lever_off_dispatches_normally(self):
+        d, old, new = _make_delta_review_repo(self.tmp, "dr2")
+        gates, state, _ = self._gates({})
+        state.record_review(12, old, "PASS", "reviewer", "")
+        cand = LiveCandidate(12, new, slug="feat", worktree=d)
+        sub = TestReviewFastPath._Sub({})
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            v = gates.review(cand)
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(v, WAIT)
+        self.assertEqual(len(sub.popens), 1)
+        self.assertNotEqual(state.recorded_review_source(12, new), "carried-forward")
+
+    def test_authored_change_beyond_merge_never_carries_forward(self):
+        d, old, new = _make_delta_review_repo(self.tmp, "dr3", authored_after_merge=True)
+        gates, state, _ = self._gates({"DELTA_REVIEW": "on"})
+        state.record_review(13, old, "PASS", "reviewer", "")
+        cand = LiveCandidate(13, new, slug="feat", worktree=d)
+        sub = TestReviewFastPath._Sub({})
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            v = gates.review(cand)
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(v, WAIT, "an authored edit beyond the merge must dispatch a full review")
+        self.assertEqual(len(sub.popens), 1)
+        self.assertEqual([o for o in events(self.jpath) if o["event"] == "review_carried_forward"], [])
+
+    def test_no_prior_pass_never_carries_forward(self):
+        d, _old, new = _make_delta_review_repo(self.tmp, "dr4")
+        gates, state, _ = self._gates({"DELTA_REVIEW": "on"})
+        cand = LiveCandidate(14, new, slug="feat", worktree=d)
+        sub = TestReviewFastPath._Sub({})
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            v = gates.review(cand)
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(v, WAIT)
+        self.assertEqual(len(sub.popens), 1)
+
+    def test_unparseable_lever_value_is_off(self):
+        self.assertFalse(LR._delta_review_enabled({"DELTA_REVIEW": "yes"}))
+        self.assertFalse(LR._delta_review_enabled({}))
+        self.assertTrue(LR._delta_review_enabled({"DELTA_REVIEW": "on"}))
+
+
+class TestReviewModelEscalation(LiveCase):
+    """HERD-580: port REVIEW_MODEL_ESCALATED / REVIEW_EVIDENCE_ESCALATE_ROUNDS (agent-watch.sh's
+    _maybe_arm_review_escalation and the review dispatch's arm consumption) into the live core. Both
+    keys' only consumers hung off the dead bash review pass since P5b; tests/test-review-escalation.sh
+    pins the bash shape (kept for its own unit test, unreachable in production).
+
+    The ARM side is driven through LiveTick (FixtureGates review=BLOCK across rounds, mirroring
+    TestRefixWakeVerification's multi-round pattern — a fresh sha per round, same PR, so the once-guard
+    never suppresses a round). The CONSUME side is driven directly through LiveGates.review(), the real
+    live dispatch — the arm is a plain per-PR marker file, so both halves interoperate through the SAME
+    LiveState exactly as the two bash halves did.
+    """
+
+    def _walk(self, pr, sha, config=None, **kw):
+        cfg = dict({"MERGE_POLICY": "auto", "REFIX_MAX_ROUNDS": "5"}, **(config or {}))
+        j = LiveJournal(os.path.join(self.tmp, "walk-%s-%s.jsonl" % (pr, sha)))
+        cand = dict({"review": "BLOCK", "health": "CLEAN", "agent_status": "idle"}, pr=pr, sha=sha, **kw)
+        t = LiveTick(cfg, FixtureDiscovery({"candidates": [cand], "config": cfg}),
+                     FixtureGates({"candidates": [cand], "config": cfg}),
+                     DryRunActuator(j), j, state=LiveState(self.tmp))
+        return t.run(), events(j.path)
+
+    def test_two_block_rounds_arm_the_escalation_marker(self):
+        state = LiveState(self.tmp)
+        res1, _ = self._walk(21, "sha-r1")
+        self.assertEqual(res1["outcomes"]["21"], "BLOCK")
+        self.assertFalse(os.path.exists(state.review_escalate_file(21)),
+                         "one BLOCK round must not arm (default threshold is 2)")
+        res2, _ = self._walk(21, "sha-r2")
+        self.assertEqual(res2["outcomes"]["21"], "BLOCK")
+        self.assertTrue(os.path.exists(state.review_escalate_file(21)),
+                        "a second failed REVIEW round must arm the escalation marker")
+
+    def test_lifetime_count_survives_a_rail_reset_between_bounces(self):
+        # PR #711 review finding: arming must use the LIFETIME review-bounce count
+        # (D.refix_round_count_kind), not the rail's reset-zeroable round_num. Reproduces the exact
+        # counter-example: bounce (rail=1, lifetime=1) -> review PASSes, resetting the rail (rail=0,
+        # lifetime=1, unchanged — a reset never refunds the lifetime count) -> a LATER sha bounces
+        # review again (rail=1, lifetime=2) -> must still arm at the default threshold of 2, even
+        # though the RAIL count alone never reaches 2 across this sequence.
+        state = LiveState(self.tmp)
+        res1, _ = self._walk(25, "sha-a")                       # review BLOCK -> rail=1, lifetime=1
+        self.assertEqual(res1["outcomes"]["25"], "BLOCK")
+        self.assertFalse(os.path.exists(state.review_escalate_file(25)))
+
+        res2, _ = self._walk(25, "sha-b", review="PASS")        # review PASS -> resets the rail to 0
+        self.assertNotEqual(res2["outcomes"]["25"], "BLOCK")
+        self.assertFalse(os.path.exists(state.review_escalate_file(25)),
+                         "a PASS must never arm anything on its own")
+
+        res3, _ = self._walk(25, "sha-c")                       # review BLOCK again -> rail=1, lifetime=2
+        self.assertEqual(res3["outcomes"]["25"], "BLOCK")
+        self.assertTrue(os.path.exists(state.review_escalate_file(25)),
+                        "the LIFETIME count (2) must arm even though the rail-budget round number is "
+                        "only 1 at this bounce (the rail was reset by the intervening PASS)")
+
+    def test_health_rounds_never_arm_review_escalation(self):
+        # REVIEW_EVIDENCE_ESCALATE_ROUNDS counts REVIEW-kind bounces ONLY — a healthcheck bounce is
+        # evidence about the SUITE, not the reviewer, and must never arm an Opus re-review.
+        state = LiveState(self.tmp)
+        self._walk(22, "h1", health="CODEERROR", review="PASS")
+        self._walk(22, "h2", health="CODEERROR", review="PASS")
+        self.assertFalse(os.path.exists(state.review_escalate_file(22)))
+
+    def test_custom_threshold_honored(self):
+        state = LiveState(self.tmp)
+        res, _ = self._walk(23, "sha-x", config={"REVIEW_EVIDENCE_ESCALATE_ROUNDS": "1"})
+        self.assertEqual(res["outcomes"]["23"], "BLOCK")
+        self.assertTrue(os.path.exists(state.review_escalate_file(23)),
+                        "threshold=1 must arm on the FIRST failed round")
+
+    def test_garbage_threshold_never_arms(self):
+        state = LiveState(self.tmp)
+        cfg = {"REVIEW_EVIDENCE_ESCALATE_ROUNDS": "banana"}
+        for sha in ("g1", "g2", "g3"):
+            self._walk(24, sha, config=cfg)
+        self.assertFalse(os.path.exists(state.review_escalate_file(24)),
+                         "a non-numeric SET threshold must fail safe to 'never arm', matching bash's "
+                         "`[ N -ge garbage ]` erroring to a non-zero test rather than defaulting to 2")
+
+    def _gates(self, config):
+        state = LiveState(state_dir=self.tmp)
+        journal = LiveJournal(self.jpath)
+        return LiveGates(self.tmp, state, journal, config=config), state, journal
+
+    def test_armed_escalation_forces_the_model_and_consumes_the_marker(self):
+        gates, state, _ = self._gates({"REVIEW_MODEL_ESCALATED": "opus-test"})
+        open(state.review_escalate_file(31), "w").close()
+        cand = LiveCandidate(31, "shaE", slug="feat-esc")
+        sub = TestReviewFastPath._Sub({})
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            v = gates.review(cand)
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(v, WAIT)
+        self.assertEqual(len(sub.popens), 1)
+        self.assertEqual(sub.popens[0][1]["env"].get("HERD_REVIEW_MODEL"), "opus-test")
+        self.assertFalse(os.path.exists(state.review_escalate_file(31)), "the arm must be one-shot")
+        esc = [o for o in events(self.jpath) if o["event"] == "review_escalated"]
+        self.assertEqual(len(esc), 1)
+        self.assertEqual(esc[0]["model"], "opus-test")
+
+    def test_armed_escalation_default_model_is_opus(self):
+        gates, state, _ = self._gates({})
+        open(state.review_escalate_file(32), "w").close()
+        cand = LiveCandidate(32, "shaF", slug="feat-esc2")
+        sub = TestReviewFastPath._Sub({})
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            gates.review(cand)
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(sub.popens[0][1]["env"].get("HERD_REVIEW_MODEL"), "claude-opus-4-8")
+
+    def test_no_marker_dispatches_on_the_ordinary_tier(self):
+        gates, state, _ = self._gates({"REVIEW_MODEL_ESCALATED": "opus-test"})
+        cand = LiveCandidate(33, "shaG", slug="feat-esc3")
+        sub = TestReviewFastPath._Sub({})
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            gates.review(cand)
+        finally:
+            LR.subprocess = orig
+        self.assertNotEqual(sub.popens[0][1]["env"].get("HERD_REVIEW_MODEL"), "opus-test")
+        self.assertEqual([o for o in events(self.jpath) if o["event"] == "review_escalated"], [])
+
+    def test_queued_dispatch_leaves_the_arm_intact(self):
+        # Consume ONLY when actually dispatching — a QUEUED tick must leave the marker armed so the
+        # escalation still lands once a concurrency slot frees (mirrors bash's own placement note).
+        gates, state, _ = self._gates({"REVIEW_CONCURRENCY": "1"})
+        open(state.review_escalate_file(34), "w").close()
+        other = LiveCandidate(999, "shaOther", slug="feat-other")
+        _marker_write(state.review_inflight_file(other), os.getpid())
+        cand = LiveCandidate(34, "shaH", slug="feat-esc4")
+        v = gates.review(cand)
+        self.assertEqual(v, WAIT)
+        self.assertTrue(os.path.exists(state.review_escalate_file(34)),
+                        "a QUEUED tick must never consume the arm")
+
+    def test_hung_claude_leaves_the_arm_intact_and_recovers_escalated(self):
+        # PR #711 review finding: the hang probe sat BELOW the escalation-consume block, so a HUNG tick
+        # deleted the one-shot marker without ever dispatching — the recovery tick then ran on the
+        # cheap/default tier instead of Opus, silently defeating the escalation the arm existed for.
+        # The hang gate must sit ABOVE the consume block so a HUNG tick returns WAIT untouched.
+        gates, state, journal = self._gates({"WATCH_CLAUDE_PROBE_TIMEOUT": "5",
+                                             "REVIEW_MODEL_ESCALATED": "opus-test"})
+        open(state.review_escalate_file(35), "w").close()
+        cand = LiveCandidate(35, "shaI", slug="feat-esc5")
+        hang_sub = TestClaudeExecHangProbe._HangSub()
+        orig_sub, orig_which = LR.subprocess, LR.shutil.which
+        LR.subprocess = hang_sub
+        LR.shutil.which = lambda name: "/usr/bin/claude"
+        try:
+            v = gates.review(cand)
+        finally:
+            LR.subprocess = orig_sub
+            LR.shutil.which = orig_which
+        self.assertEqual(v, WAIT)
+        self.assertEqual(hang_sub.popens, [], "no reviewer may dispatch while claude is hung")
+        self.assertTrue(os.path.exists(state.review_escalate_file(35)),
+                        "a HUNG tick must never consume the one-shot escalation arm")
+        self.assertEqual([o for o in events(self.jpath) if o["event"] == "review_escalated"], [],
+                         "no escalation dispatch happened, so no review_escalated event either")
+        held = [o for o in events(self.jpath) if o["event"] == "review_escalation_held"]
+        self.assertEqual(len(held), 1, "the held episode must be auditable")
+        self.assertEqual(held[0]["pr"], 35)
+
+        # Recovery tick: claude responds again — the SAME (untouched) arm now escalates as intended.
+        # A FRESH LiveGates instance, exactly as a real recovery tick would construct one (the hang
+        # memo is scoped to one tick/instance, so reusing `gates` here would just replay its cached
+        # HUNG verdict rather than genuinely re-probing).
+        gates2, _, _ = self._gates({"WATCH_CLAUDE_PROBE_TIMEOUT": "5", "REVIEW_MODEL_ESCALATED": "opus-test"})
+        sub2 = TestReviewFastPath._Sub({})
+        LR.subprocess = sub2
+        LR.shutil.which = lambda name: "/usr/bin/claude"
+        try:
+            v2 = gates2.review(cand)
+        finally:
+            LR.subprocess = orig_sub
+            LR.shutil.which = orig_which
+        self.assertEqual(v2, WAIT)
+        self.assertEqual(len(sub2.popens), 1)
+        self.assertEqual(sub2.popens[0][1]["env"].get("HERD_REVIEW_MODEL"), "opus-test")
+        self.assertFalse(os.path.exists(state.review_escalate_file(35)), "now consumed, one-shot")
+        esc = [o for o in events(self.jpath) if o["event"] == "review_escalated"]
+        self.assertEqual(len(esc), 1)
+        self.assertEqual(esc[0]["model"], "opus-test")
+
+
+class TestClaudeExecHangProbe(LiveCase):
+    """HERD-580: port WATCH_CLAUDE_PROBE_TIMEOUT (HERD-108, agent-watch.sh's _claude_exec_hung) into
+    the live core: a wedged `claude` binary would otherwise burn a REVIEW_CONCURRENCY slot forever
+    (LiveGates._dispatch_review's Popen never returns a verdict). agent-watch.sh's own probe has had NO
+    production caller since the bash action pass (_tick_act) that would have run it was deleted at
+    P5b — this is a fresh port into LiveGates.review(), not a call-out to the bash body (kept for its
+    own unit test, tests/test-watcher-claude-hang.sh)."""
+
+    class _HangSub:
+        """subprocess stand-in whose .run() always times out — proves the probe holds dispatch."""
+        DEVNULL = subprocess.DEVNULL
+        TimeoutExpired = subprocess.TimeoutExpired
+
+        def __init__(self):
+            self.run_calls = 0
+            self.popens = []
+
+        def run(self, argv, **k):
+            self.run_calls += 1
+            raise self.TimeoutExpired(argv, k.get("timeout"))
+
+        def Popen(self, *a, **k):
+            self.popens.append((a, k))
+            raise AssertionError("must never dispatch a reviewer while claude is hung")
+
+    def _gates(self, config):
+        state = LiveState(state_dir=self.tmp)
+        journal = LiveJournal(self.jpath)
+        return LiveGates(self.tmp, state, journal, config=config), state, journal
+
+    def _cand(self, pr, sha):
+        return LiveCandidate(pr, sha, slug="feat-probe-%s" % pr)
+
+    def _with_which(self, present):
+        orig = LR.shutil.which
+        LR.shutil.which = (lambda name: "/usr/bin/claude") if present else (lambda name: None)
+        return orig
+
+    def test_disabled_by_default_never_probes_or_holds(self):
+        gates, state, _ = self._gates({})
+        sub = TestReviewFastPath._Sub({})
+        orig = LR.subprocess
+        LR.subprocess = sub
+        try:
+            v = gates.review(self._cand(41, "shaP1"))
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(v, WAIT)
+        self.assertEqual(len(sub.popens), 1, "0 (default) must dispatch normally — no probe exec")
+
+    def test_timeout_holds_dispatch_and_probes_at_most_once_per_tick(self):
+        gates, state, _ = self._gates({"WATCH_CLAUDE_PROBE_TIMEOUT": "5"})
+        sub = self._HangSub()
+        orig_sub, orig_which = LR.subprocess, self._with_which(True)
+        LR.subprocess = sub
+        try:
+            v1 = gates.review(self._cand(41, "shaP1"))
+            v2 = gates.review(self._cand(42, "shaP2"))   # a second candidate, SAME tick/gates instance
+        finally:
+            LR.subprocess = orig_sub
+            LR.shutil.which = orig_which
+        self.assertEqual(v1, WAIT)
+        self.assertEqual(v2, WAIT)
+        self.assertEqual(sub.popens, [], "no reviewer may dispatch while claude is hung")
+        self.assertEqual(sub.run_calls, 1, "memoized once per tick (LiveGates instance), not per candidate")
+        hang = [o for o in events(self.jpath) if o.get("reason") == "claude-exec-hang"]
+        self.assertEqual(len(hang), 1, "one journal event per hang episode, not per candidate")
+        self.assertTrue(os.path.exists(state.claude_hang_state_file()))
+
+    def test_recovery_clears_the_marker_and_journals_once(self):
+        gates, state, _ = self._gates({"WATCH_CLAUDE_PROBE_TIMEOUT": "5"})
+        with open(state.claude_hang_state_file(), "w", encoding="utf-8") as fh:
+            fh.write("12345\n")
+        sub = TestReviewFastPath._Sub({})
+        orig_sub, orig_which = LR.subprocess, self._with_which(True)
+        LR.subprocess = sub
+        try:
+            v = gates.review(self._cand(43, "shaP3"))
+        finally:
+            LR.subprocess = orig_sub
+            LR.shutil.which = orig_which
+        self.assertEqual(v, WAIT)
+        self.assertEqual(len(sub.popens), 1, "a responsive claude must dispatch normally")
+        self.assertFalse(os.path.exists(state.claude_hang_state_file()))
+        cleared = [o for o in events(self.jpath) if o.get("reason") == "claude-exec-hang-cleared"]
+        self.assertEqual(len(cleared), 1)
+
+    def test_absent_claude_is_fail_soft_not_a_hang(self):
+        gates, state, _ = self._gates({"WATCH_CLAUDE_PROBE_TIMEOUT": "5"})
+        sub = TestReviewFastPath._Sub({})
+        orig_sub, orig_which = LR.subprocess, self._with_which(False)
+        LR.subprocess = sub
+        try:
+            v = gates.review(self._cand(44, "shaP4"))
+        finally:
+            LR.subprocess = orig_sub
+            LR.shutil.which = orig_which
+        self.assertEqual(v, WAIT)
+        self.assertEqual(len(sub.popens), 1)
+        self.assertEqual([o for o in events(self.jpath)
+                          if "claude-exec-hang" in str(o.get("reason", ""))], [])
+
+    def test_garbage_and_zero_timeout_are_both_disabled(self):
+        for raw in ("0", "", "banana", "-5"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(LR._claude_probe_secs({"WATCH_CLAUDE_PROBE_TIMEOUT": raw}))
+        self.assertEqual(LR._claude_probe_secs({"WATCH_CLAUDE_PROBE_TIMEOUT": "5"}), 5)
 
 
 class TestGhRateLimitClassification(unittest.TestCase):
