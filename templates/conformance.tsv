@@ -450,6 +450,7 @@ scripts/herd/layout-reconcile.sh	unit	tests/test-layout-reconcile.sh
 TASK_PANE_VIEW	unit	tests/test-task-spec-pane.sh
 DOCTOR_STARTUP_HINT	unit	tests/test-doctor-point-of-need.sh
 scripts/herd/task-spec-view.sh	unit	tests/test-task-spec-pane.sh
+scripts/herd/health-pane-view.sh	unit	tests/test-health-pane-view.sh
 HERD_THEME	unit	tests/test-theme.sh
 scripts/herd/theme.sh	unit	tests/test-theme.sh
 .herd/themes	unit	tests/test-theme.sh

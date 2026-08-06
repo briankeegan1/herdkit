@@ -798,6 +798,11 @@ except Exception:
   # mode) then has to mint a REAL herdr tab+pane, pinned into THIS scenario's disposable workspace via
   # WORKSPACE_NAME (so it can never land in the runner's own control room), stamped `health·<slug>` and
   # tailing the live log. Killing the suite and re-running the same reconcile must take it away again.
+  # HERD-568: this leg's slug is deliberately NOT "rp-builder" — _health_builder_tab now ALSO falls back
+  # to `herdr agent list`, and "rp-builder" names the REAL live builder agent registered above (tab
+  # $BUILD_TAB). Reusing that slug here would silently turn this into a split-placement case (still a
+  # pass, but no longer proving what this leg claims to: the STANDALONE fallback when NO builder tab —
+  # by any lookup — exists at all). "hc-nobuilder-suite" has neither a .herd-tabs row nor a live agent.
   if [ -n "$WSID" ]; then
     step healthpanecreate "health pane is CREATED for an OBSERVED in-flight suite, then retired (engine-agnostic reconcile, real pane)"
     HC_T="$ART/healthcreatetrees"; mkdir -p "$HC_T/.herd"
@@ -833,14 +838,16 @@ except Exception:
         # The observed discovery record the console rows are rendered from: this PR lives in this
         # worktree under this slug. mergeStateStatus BLOCKED on purpose — the exact state a PR under
         # `require herd/gates` sits in WHILE its suite runs, i.e. the branch the old hook never saw.
-        FEATS=("$REPO"$'\037'"rp-builder"$'\037'"feat/rp-builder"$'\037'"$HC_PR"$'\037'"MERGEABLE"$'\037'"BLOCKED"$'\037'"working"$'\037'"$HC_SHA"$'\037'"me"$'\037'"branch"$'\037'""$'\037'"0")
+        FEATS=("$REPO"$'\037'"hc-nobuilder-suite"$'\037'"feat/hc-nobuilder-suite"$'\037'"$HC_PR"$'\037'"MERGEABLE"$'\037'"BLOCKED"$'\037'"working"$'\037'"$HC_SHA"$'\037'"me"$'\037'"branch"$'\037'""$'\037'"0")
         _reconcile_health_panes
       )
     }
     _hc_reconcile arm; HC_RC=$?
-    HC_PANE=""; HC_TAB=""; HC_LABEL=""
-    [ -f "$HC_REG" ] && read -r HC_PANE HC_TAB HC_LABEL < "$HC_REG"
-    [ -n "$HC_PANE" ] && { PANES_CREATED=$((PANES_CREATED+1)); TABS_CREATED=$((TABS_CREATED+1)); }
+    # HERD-568: the registry row is now "<pane> <tab> <placement> <label>" (placement = split | tab) —
+    # read it in full so HC_LABEL is the actual health·<slug> stamp, not the placement token.
+    HC_PANE=""; HC_TAB=""; HC_PLACEMENT=""; HC_LABEL=""
+    [ -f "$HC_REG" ] && read -r HC_PANE HC_TAB HC_PLACEMENT HC_LABEL < "$HC_REG"
+    [ -n "$HC_PANE" ] && { PANES_CREATED=$((PANES_CREATED+1)); [ "$HC_PLACEMENT" = tab ] && TABS_CREATED=$((TABS_CREATED+1)); }
     HC_SEEN="no"; HC_SEEN_LABEL=""
     if [ -n "$HC_PANE" ]; then
       _i=0
@@ -851,13 +858,13 @@ except Exception:
       done
     fi
     HC_JRN=no; grep -q '"event":"health_pane_spawned"' "$HC_JOURNAL" 2>/dev/null && HC_JRN=yes
-    if [ "$HC_RC" = 0 ] && [ "$HC_SEEN" = yes ] && [ "$HC_LABEL" = "health·rp-builder" ] \
-       && [ "$HC_SEEN_LABEL" = "health·rp-builder" ] && [ "$HC_JRN" = yes ]; then
+    if [ "$HC_RC" = 0 ] && [ "$HC_SEEN" = yes ] && [ "$HC_LABEL" = "health·hc-nobuilder-suite" ] \
+       && [ "$HC_SEEN_LABEL" = "health·hc-nobuilder-suite" ] && [ "$HC_JRN" = yes ] && [ "$HC_PLACEMENT" = tab ]; then
       checkpoint health_pane_created_from_observed_suite pass \
         "live inflight marker + log alone (python-shaped dispatch, PR BLOCKED) minted real pane $HC_PANE labelled '$HC_SEEN_LABEL'; health_pane_spawned journaled"
     else
       checkpoint health_pane_created_from_observed_suite fail \
-        "no pane minted for the observed suite (rc=$HC_RC pane='$HC_PANE' present=$HC_SEEN row_label='$HC_LABEL' live_label='$HC_SEEN_LABEL' journaled=$HC_JRN)"
+        "no pane minted for the observed suite (rc=$HC_RC pane='$HC_PANE' present=$HC_SEEN row_label='$HC_LABEL' live_label='$HC_SEEN_LABEL' placement='$HC_PLACEMENT' journaled=$HC_JRN)"
     fi
 
     # Idempotent + round trip: a second tick must not duplicate the pane; once the suite ends (holder
@@ -880,6 +887,131 @@ except Exception:
       checkpoint health_pane_roundtrip_on_same_reconcile fail \
         "create/retire round trip broke (pane='$HC_PANE' rc2=$HC_RC2 duplicated=$HC_DUP gone=$HC_GONE row_dropped=$HC_DROPPED)"
     fi
+  fi
+
+  # ── HEALTH-PANE PLACEMENT (HERD-568): SPLIT inside a LIVE builder tab, never a fresh standalone one ──
+  # The two checkpoints above prove the invariant fires; this proves WHERE the pane lands. Reuses the
+  # REAL "rp-builder" tab ($BUILD_TAB / $BUILD_PANE) already standing from the builder_tab step above as
+  # the live-builder fixture: a .herd-tabs row naming it is exactly what herd-feature.sh / herd-quick.sh
+  # write, so _health_builder_tab resolves it and the reconcile must split off $BUILD_TAB's ROOT pane
+  # ($BUILD_PANE) instead of minting a fresh tab — asserted by TAB ID EQUALITY, the sim's ground truth.
+  if [ -n "$WSID" ] && [ -n "${BUILD_TAB:-}" ] && [ -n "$BUILD_PANE" ]; then
+    step healthpanesplit "health pane SPLITS inside a live builder tab (real pane, tab id equality)"
+    HS_T="$ART/healthsplittrees"; mkdir -p "$HS_T/.herd"
+    HS_PR=559; HS_SHA="hssha559"
+    HS_REG="$HS_T/.health-pane-registry-$HS_PR-$HS_SHA"
+    HS_JOURNAL="$ART/hs-journal.jsonl"; : > "$HS_JOURNAL"
+    printf 'rp-builder %s builder\n' "$BUILD_TAB" > "$HS_T/.herd-tabs"
+    sleep 120 </dev/null >/dev/null 2>&1 & HS_HOLDER=$!
+    disown "$HS_HOLDER" 2>/dev/null || true
+    printf 'suite: running…\n' > "$HS_T/.health-log-$HS_PR-$HS_SHA"
+    _hs_reconcile() {
+      (
+        export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+               PROJECT_ROOT="$REPO" WORKTREES_DIR="$HS_T" DEFAULT_BRANCH=main HEALTH_PANE=on \
+               HERD_DISPOSABLE_WORKSPACE=1 WORKSPACE_NAME="$WS_LABEL" JOURNAL_FILE="$HS_JOURNAL"
+        # shellcheck source=/dev/null
+        . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+        [ "${1:-}" = "arm" ] && _marker_write "$(_health_inflight_file "$HS_PR-$HS_SHA")" "$HS_HOLDER"
+        FEATS=("$REPO"$'\037'"rp-builder"$'\037'"feat/rp-builder"$'\037'"$HS_PR"$'\037'"MERGEABLE"$'\037'"BLOCKED"$'\037'"working"$'\037'"$HS_SHA"$'\037'"me"$'\037'"branch"$'\037'""$'\037'"0")
+        _reconcile_health_panes
+      )
+    }
+    _hs_reconcile arm; HS_RC=$?
+    HS_PANE=""; HS_TAB=""; HS_PLACEMENT=""; HS_LABEL=""
+    [ -f "$HS_REG" ] && read -r HS_PANE HS_TAB HS_PLACEMENT HS_LABEL < "$HS_REG"
+    [ -n "$HS_PANE" ] && PANES_CREATED=$((PANES_CREATED+1))   # a real split pane — no new tab (reuses $BUILD_TAB)
+    HS_SEEN="no"
+    if [ -n "$HS_PANE" ]; then
+      _i=0
+      while [ "$_i" -lt 25 ]; do
+        [ "$(_hp_present "$HS_PANE")" = yes ] && { HS_SEEN=yes; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+    fi
+    HS_JRN=no; grep -q '"event":"health_pane_spawned".*"placement":"split"' "$HS_JOURNAL" 2>/dev/null && HS_JRN=yes
+    HS_NOFALLBACK=yes; grep -q "no-builder-tab" "$HS_JOURNAL" 2>/dev/null && HS_NOFALLBACK=no
+    if [ "$HS_RC" = 0 ] && [ "$HS_SEEN" = yes ] && [ "$HS_PANE" != "$BUILD_PANE" ] && [ "$HS_TAB" = "$BUILD_TAB" ] \
+       && [ "$HS_PLACEMENT" = split ] && [ "$HS_LABEL" = "health·rp-builder" ] && [ "$HS_JRN" = yes ] && [ "$HS_NOFALLBACK" = yes ]; then
+      checkpoint health_pane_split_in_builder_tab pass \
+        "health pane $HS_PANE split INTO the live builder tab $BUILD_TAB (== \$BUILD_TAB); no fresh tab minted"
+    else
+      checkpoint health_pane_split_in_builder_tab fail \
+        "rc=$HS_RC seen=$HS_SEEN pane='$HS_PANE' (root='$BUILD_PANE') tab='$HS_TAB' (want '$BUILD_TAB') placement='$HS_PLACEMENT' label='$HS_LABEL' journaled=$HS_JRN no_fallback=$HS_NOFALLBACK"
+    fi
+    # Retire it like any other ended suite — must NOT take $BUILD_TAB or $BUILD_PANE down with it.
+    kill "$HS_HOLDER" 2>/dev/null || true
+    rm -f "$HS_T/.health-inflight-$HS_PR-$HS_SHA"
+    _hs_reconcile; HS_RC2=$?
+    HS_GONE=no; _i=0
+    while [ "$_i" -lt 25 ]; do
+      [ "$(_hp_present "${HS_PANE:-none}")" = no ] && { HS_GONE=yes; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+    HS_BUILD_SURVIVED=no; [ "$(_hp_present "$BUILD_PANE")" = yes ] && HS_BUILD_SURVIVED=yes
+    if [ "$HS_GONE" != yes ] || [ "$HS_BUILD_SURVIVED" != yes ]; then
+      checkpoint health_pane_split_in_builder_tab fail \
+        "retire on outcome broke the split leg (gone=$HS_GONE builder_pane_survived=$HS_BUILD_SURVIVED)"
+    fi
+  fi
+
+  # ── HEALTH-PANE PLACEMENT (HERD-568): FALLBACK when the .herd-tabs row's tab no longer exists ────────
+  # A .herd-tabs row can outlive the tab it names (the builder retired, the row not yet pruned). The
+  # split leg above proves the happy path; this proves the DEGRADE path — _herd_herdr_tab_root_pane
+  # finds no pane for a dead tab id, so the spawn must fall through to the standalone-tab fallback and
+  # journal WHY (reason=no-builder-tab), never silently produce no pane at all. Guarded on $BUILD_PANE
+  # too (not just $WSID) — that is what _hp_present, defined in the builder-tab step above, requires.
+  if [ -n "$WSID" ] && [ -n "$BUILD_PANE" ]; then
+    step healthpanefallback "health pane FALLS BACK to a standalone tab when its .herd-tabs row's tab is gone, journaled"
+    HG_T="$ART/healthfallbacktrees"; mkdir -p "$HG_T/.herd"
+    HG_PR=560; HG_SHA="hgsha560"
+    HG_REG="$HG_T/.health-pane-registry-$HG_PR-$HG_SHA"
+    HG_JOURNAL="$ART/hg-journal.jsonl"; : > "$HG_JOURNAL"
+    printf 'reaped-rp-builder tGoneFakeNoSuchTab builder\n' > "$HG_T/.herd-tabs"
+    sleep 120 </dev/null >/dev/null 2>&1 & HG_HOLDER=$!
+    disown "$HG_HOLDER" 2>/dev/null || true
+    printf 'suite: running…\n' > "$HG_T/.health-log-$HG_PR-$HG_SHA"
+    (
+      export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+             PROJECT_ROOT="$REPO" WORKTREES_DIR="$HG_T" DEFAULT_BRANCH=main HEALTH_PANE=on \
+             HERD_DISPOSABLE_WORKSPACE=1 WORKSPACE_NAME="$WS_LABEL" JOURNAL_FILE="$HG_JOURNAL"
+      # shellcheck source=/dev/null
+      . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+      _marker_write "$(_health_inflight_file "$HG_PR-$HG_SHA")" "$HG_HOLDER"
+      FEATS=("$REPO"$'\037'"reaped-rp-builder"$'\037'"feat/reaped-rp-builder"$'\037'"$HG_PR"$'\037'"MERGEABLE"$'\037'"BLOCKED"$'\037'"working"$'\037'"$HG_SHA"$'\037'"me"$'\037'"branch"$'\037'""$'\037'"0")
+      _reconcile_health_panes
+    ); HG_RC=$?
+    HG_PANE=""; HG_TAB=""; HG_PLACEMENT=""; HG_LABEL=""
+    [ -f "$HG_REG" ] && read -r HG_PANE HG_TAB HG_PLACEMENT HG_LABEL < "$HG_REG"
+    [ -n "$HG_PANE" ] && { PANES_CREATED=$((PANES_CREATED+1)); TABS_CREATED=$((TABS_CREATED+1)); }
+    HG_SEEN=no
+    if [ -n "$HG_PANE" ]; then
+      _i=0
+      while [ "$_i" -lt 25 ]; do
+        [ "$(_hp_present "$HG_PANE")" = yes ] && { HG_SEEN=yes; break; }
+        _i=$((_i+1)); sleep 0.2
+      done
+    fi
+    HG_JRN=no; grep -q '"event":"infra_event".*"component":"health_pane".*"reason":"no-builder-tab"' "$HG_JOURNAL" 2>/dev/null && HG_JRN=yes
+    if [ "$HG_RC" = 0 ] && [ "$HG_SEEN" = yes ] && [ "$HG_PLACEMENT" = tab ] && [ "$HG_TAB" != "tGoneFakeNoSuchTab" ] \
+       && [ "$HG_LABEL" = "health·reaped-rp-builder" ] && [ "$HG_JRN" = yes ]; then
+      checkpoint health_pane_fallback_reaped_builder_tab pass \
+        "a gone .herd-tabs tab fell back to a fresh standalone tab $HG_TAB; reason=no-builder-tab journaled"
+    else
+      checkpoint health_pane_fallback_reaped_builder_tab fail \
+        "rc=$HG_RC seen=$HG_SEEN pane='$HG_PANE' tab='$HG_TAB' placement='$HG_PLACEMENT' label='$HG_LABEL' journaled=$HG_JRN"
+    fi
+    # Cleanup: retire it so no tab leaks past this scenario.
+    kill "$HG_HOLDER" 2>/dev/null || true
+    rm -f "$HG_T/.health-inflight-$HG_PR-$HG_SHA"
+    (
+      export AGENT_WATCH_LIB=1 HERD_CONFIG_FILE="$ART/no-such-config" \
+             PROJECT_ROOT="$REPO" WORKTREES_DIR="$HG_T" DEFAULT_BRANCH=main HEALTH_PANE=on \
+             HERD_DISPOSABLE_WORKSPACE=1 WORKSPACE_NAME="$WS_LABEL" JOURNAL_FILE="$HG_JOURNAL"
+      # shellcheck source=/dev/null
+      . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
+      _reconcile_health_panes
+    ) || true
   fi
 
   # ── TAB DISCIPLINE (HERD-569): the tab bar is RECONCILED, and allowed tabs are never touched ──────
