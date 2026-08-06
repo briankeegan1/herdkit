@@ -213,6 +213,7 @@ watcher-exempt.sh	unit	tests/test-watcher-exempt.sh
 context-guard.sh	unit	tests/test-context-guard.sh
 suite-shard.sh	unit	tests/test-suite-shard.sh
 suite-shard.sh	unit	tests/test-suite-scope.sh
+scope-escape.sh	unit	tests/test-scope-escape.sh
 health-trust.sh	unit	tests/test-health-trust.sh
 health-trust.sh	unit	tests/test_live_runtime.py
 HEALTH_TRUST_BUILDER	unit	tests/test-health-trust.sh
