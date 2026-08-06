@@ -1256,6 +1256,50 @@ class LiveState:
         except Exception:
             pass
 
+    # gh rate-limit backoff substrate (HERD-582) ──────────────────────────────────────────────────
+    # GLOBAL (not sha-keyed), like the breaker ledger above: one line, ``<until_epoch>``, the moment a
+    # tick may next attempt a REMOTE (gh) call. Written when a tick classifies a gh failure as a rate
+    # limit (never on a genuine fault, agent-watch.sh:epoch_to_hhmm renders the SAME file for the
+    # console's calm row) and read at the TOP of every tick so a still-active backoff window skips the
+    # gh round-trip entirely rather than re-drawing the same rejection tick after tick.
+
+    def gh_rate_limit_path(self):
+        return self._p(".agent-watch-gh-rate-limit")
+
+    def gh_rate_limited_until(self):
+        """The epoch a rate-limit backoff window ends, or 0 (no window / unreadable / no state dir)."""
+        path = self.gh_rate_limit_path()
+        if not path or not os.path.exists(path):
+            return 0
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return int(fh.readline().strip())
+        except Exception:
+            return 0
+
+    def set_gh_rate_limited_until(self, until):
+        """Persist the backoff window end. No-op w/o a state dir — a sim/dry-run tick carries no
+        cross-tick memory, same as every other ledger above."""
+        path = self.gh_rate_limit_path()
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%d\n" % int(until))
+        except Exception:
+            pass
+
+    def clear_gh_rate_limited(self):
+        """Drop the backoff marker on a clean (non-rate-limited) discovery — the recovery path."""
+        path = self.gh_rate_limit_path()
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
     # approvals substrate ──────────────────────────────────────────────────────────────────────────
     # THE SAME flat ledger `herd-approve.sh` reads and writes (approvals.sh: one seam, one answer):
     # rows are `<epoch> <state> <pr#> <sha>` with state ∈ awaiting | approved | hv-informed, at
@@ -1842,6 +1886,75 @@ def _pool_scoped(cands):
     return [c for c in cands if _is_worktree(c.worktree)]
 
 
+# ── gh rate-limit classification (HERD-582) ───────────────────────────────────────────────────────
+# The live incident this fixes (2026-08-06 02:06): a GraphQL bucket exhausted after a 50-merge day made
+# discover_via_graphql's ``gh`` call exit non-zero. Before this, that CalledProcessError propagated
+# straight out of LiveTick.run() to `main`, which is exit-1/fault territory (engine-version.sh:
+# herd_engine_live_tick returns 1 on ANY non-zero Python exit) — so a wait-with-a-known-reset rang the
+# bash watchdog's fault streak exactly like a genuine engine death, past _ENGINE_FAULT_MAX (3) into a
+# loud 'ENGINE DOWN · manual intervention' banner + an operator page. A rate limit is not a fault: it
+# is BACKOFF with a published reset time. Two known shapes are reclassified (fail-soft — anything else
+# is unparseable and keeps today's genuine-fault behavior verbatim):
+#   • GraphQL: the error text names the rate limit (gh's GraphQL client surfaces the API's "rate
+#     limit ... exceeded" message on 200-with-errors and on non-zero exits alike).
+#   • REST: an HTTP 403 whose response carries ``X-RateLimit-Remaining: 0``.
+_RATE_LIMIT_TEXT_RE = re.compile(r"rate limit", re.IGNORECASE)
+_RATE_LIMIT_REST_RE = re.compile(r"x-ratelimit-remaining:\s*0", re.IGNORECASE)
+_RATE_LIMIT_403_RE = re.compile(r"\b403\b")
+
+
+def _looks_gh_rate_limited(text):
+    """True iff ``text`` (a failed gh call's combined stdout+stderr) carries either rate-limit
+    signature (HERD-582): the GraphQL error text, or a REST 403 with a zeroed remaining-quota header.
+    Fail-soft — an auth failure, network blip, or malformed query matches neither and keeps the
+    genuine-fault path."""
+    if not text:
+        return False
+    if _RATE_LIMIT_TEXT_RE.search(text):
+        return True
+    return bool(_RATE_LIMIT_REST_RE.search(text) and _RATE_LIMIT_403_RE.search(text))
+
+
+class GhRateLimited(Exception):
+    """Raised by a gh wrapper in place of the underlying ``CalledProcessError`` once its failure is
+    classified as a rate limit (HERD-582). ``reset_at`` is the epoch the budget resets (``None`` when
+    the cheap follow-up probe itself failed — fail-soft; the caller then applies a default cooldown)."""
+
+    def __init__(self, reset_at=None):
+        super().__init__("gh rate limit exceeded")
+        self.reset_at = reset_at
+
+
+def _gh_rate_limit_reset():
+    """One cheap REST call (``gh api rate_limit``) for the epoch the exhausted budget resets.
+    Best-effort: ANY failure (the probe itself rate-limited, network, parse) returns ``None`` rather
+    than raising — a reset-time lookup failing must never itself fault the tick."""
+    try:
+        out = subprocess.run(["gh", "api", "rate_limit", "-q", ".rate.reset"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return int(out.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _reraise_gh_failure(exc):
+    """Given a failed gh ``CalledProcessError``, raise :class:`GhRateLimited` when its output matches a
+    known rate-limit shape, else re-raise ``exc`` unchanged — genuine failures keep the fault path.
+    Always raises; never returns."""
+    text = "%s\n%s" % (getattr(exc, "stdout", "") or "", getattr(exc, "stderr", "") or "")
+    if _looks_gh_rate_limited(text):
+        raise GhRateLimited(reset_at=_gh_rate_limit_reset())
+    raise exc
+
+
+# Cushion past GitHub's own reported reset so a fresh tick doesn't race its clock; the fallback when
+# the cheap reset probe itself failed (fail-soft — never block backoff on a second gh call succeeding).
+_GH_RATE_LIMIT_BUFFER_SECONDS = 30
+_GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS = 300
+
+
 # ── discovery: where candidates come from ─────────────────────────────────────────────────────────
 
 def discover_via_graphql(repo=None, limit=50):
@@ -1850,9 +1963,11 @@ def discover_via_graphql(repo=None, limit=50):
     LIVE ONLY — shells out to ``gh api graphql``. Replaces the bash tree's per-PR ``gh`` fan-out with a
     single query for every open PR's number, head sha, base ref, and merge state, so N candidates cost
     ONE request, not N. ``stale`` is derived from ``mergeStateStatus == BEHIND`` (the PR is behind its
-    base and must rebuild before it can merge). Raises ``subprocess.CalledProcessError`` /
-    ``json.JSONDecodeError`` on a transport/parse failure — the caller (the ``--tick`` entrypoint)
-    catches it and returns non-zero so the bash supervisor falls back for that tick.
+    base and must rebuild before it can merge). Raises :class:`GhRateLimited` on a classified rate
+    limit (HERD-582 — the caller treats this as BACKOFF, never a fault) or the raw
+    ``subprocess.CalledProcessError`` / ``json.JSONDecodeError`` on any other transport/parse failure;
+    the ``--tick`` entrypoint catches the latter and returns non-zero so the bash supervisor's fault
+    streak still trips for a genuine outage.
 
     Never called under ``--dry-run`` (that path uses :class:`FixtureDiscovery`), so a test never runs
     ``gh``.
@@ -1864,11 +1979,14 @@ def discover_via_graphql(repo=None, limit=50):
         "assignees(first:10){nodes{login}} labels(first:20){nodes{name}}}}}}"
     )
     owner, name = _repo_owner_name(repo)
-    out = subprocess.run(
-        ["gh", "api", "graphql", "-f", "query=%s" % query,
-         "-F", "owner=%s" % owner, "-F", "name=%s" % name, "-F", "n=%d" % int(limit)],
-        capture_output=True, text=True, check=True,
-    )
+    try:
+        out = subprocess.run(
+            ["gh", "api", "graphql", "-f", "query=%s" % query,
+             "-F", "owner=%s" % owner, "-F", "name=%s" % name, "-F", "n=%d" % int(limit)],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        _reraise_gh_failure(exc)
     data = json.loads(out.stdout)
     nodes = (((data.get("data") or {}).get("repository") or {})
              .get("pullRequests") or {}).get("nodes") or []
@@ -2029,15 +2147,20 @@ def _select_candidates(cands, config):
 
 
 def _repo_owner_name(repo=None):
-    """``(owner, name)`` for the current repo — ``repo`` arg (``owner/name``) else ``gh repo view``."""
+    """``(owner, name)`` for the current repo — ``repo`` arg (``owner/name``) else ``gh repo view``
+    (REST). A classified rate limit (HERD-582 — e.g. a 403 with ``X-RateLimit-Remaining: 0``) raises
+    :class:`GhRateLimited`; any other failure raises the raw ``CalledProcessError`` unchanged."""
     if repo and "/" in repo:
         owner, name = repo.split("/", 1)
         return owner, name
-    out = subprocess.run(
-        ["gh", "repo", "view", "--json", "owner,name",
-         "-q", "[.owner.login,.name]|@tsv"],
-        capture_output=True, text=True, check=True,
-    )
+    try:
+        out = subprocess.run(
+            ["gh", "repo", "view", "--json", "owner,name",
+             "-q", "[.owner.login,.name]|@tsv"],
+            capture_output=True, text=True, check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        _reraise_gh_failure(exc)
     parts = out.stdout.strip().split("\t")
     return (parts[0], parts[1]) if len(parts) == 2 else ("", "")
 
@@ -5297,9 +5420,33 @@ class LiveTick:
                 self.journal.append("hold_comment_superseded", "pr", cand.pr, "sha", cand.sha,
                                     "old_sha", cand.sha, "slug", cand.slug, "reason", reason)
 
+    def _rate_limited_summary(self, until):
+        """The calm, non-faulting tick result for a gh rate-limit backoff window (HERD-582): no
+        candidates walked, no gate/merge dispatch — REMOTE legs are skipped until ``until`` (an epoch).
+        Never raises, so ``main`` exits 0 and the bash watchdog's fault streak is untouched, exactly as
+        a genuine outage must NOT be (that path still raises and still faults)."""
+        return {"outcomes": {}, "merged": [], "held": [], "pending": [], "journal": self.journal.path,
+                "rate_limited": True, "rate_limited_until": until}
+
     def run(self):
         """Run one tick over all discovered candidates; return the summary."""
-        candidates = self.discovery.discover()
+        # gh rate-limit backoff (HERD-582), checked BEFORE any discovery call: a still-active window
+        # from a PRIOR tick's classified rate limit skips the gh round-trip entirely rather than
+        # re-drawing the same rejection tick after tick — local legs (bash's render/reconcile/sweeps)
+        # keep running regardless, since they never go through this Python tick at all.
+        until = self.state.gh_rate_limited_until()
+        now = int(_now_epoch())
+        if until and now < until:
+            return self._rate_limited_summary(until)
+        try:
+            candidates = self.discovery.discover()
+        except GhRateLimited as exc:
+            reset = exc.reset_at if exc.reset_at is not None else now + _GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+            until = reset + _GH_RATE_LIMIT_BUFFER_SECONDS
+            self.state.set_gh_rate_limited_until(until)
+            self.journal.append("engine_rate_limited", "reset", reset, "until", until)
+            return self._rate_limited_summary(until)
+        self.state.clear_gh_rate_limited()
         self.journal.append("live_tick_start", "candidates", len(candidates), "impl", "python",
                             "merge_policy", self._merge_policy)
         # Discovery → supersession-cancel (§2.4/§6.1): before the gate walk, TERM the doomed in-flight

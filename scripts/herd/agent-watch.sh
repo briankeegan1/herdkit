@@ -893,6 +893,7 @@ UNGATED_PR_SECTION_ROWS=""  # HERD-460: the UNCONDITIONAL "ungated PRs" truth se
 ADOPT_ORPHAN_SECTION_ROWS=""  # HERD-526: the "adopted but not discovered" alarm rows (empty unless an adopted PR failed its discovery proof → render omits it)
 ENGINE_DOWN_ROW=""     # HERD-306: the "engine down · manual intervention" alarm row set by the engine watchdog past a fault streak (empty while the Python engine is ticking)
 ENGINE_PAUSE_ROW=""    # HERD-347: the "⏸ engine paused by operator" banner set by _engine_tick_watchdog while ENGINE_PAUSE=on (empty — byte-identical console — while the lever is off/unset)
+ENGINE_RATE_LIMIT_ROW=""  # HERD-582: the calm "gh rate-limited until HH:MM" row set by _engine_tick_watchdog while live_runtime.py's backoff marker is active (empty — byte-identical console — outside a backoff window)
 CELEBRATE=""            # HERD-147 flair: post-merge celebration line(s) for the current tick (empty when off/none)
 PASTURE=""             # HERD-147 flair: the pasture-header line rendering the in-flight herd by state (empty when off/none)
 DISPLAY=()
@@ -3041,6 +3042,13 @@ render() {
   # lever is off/unset — the ship default — so this adds NO always-on row.
   if [ -n "${ENGINE_PAUSE_ROW:-}" ]; then
     frame="${frame}  ${C_YELLOW}engine${C_RESET}"$'\n'"${ENGINE_PAUSE_ROW}"$'\n'
+  fi
+  # gh RATE-LIMITED calm row (HERD-582) — a KNOWN, reset-timed backoff, not a fault: pinned below the
+  # operator pause but above the engine-down alarm (a rate limit is calmer than either). Set by
+  # _engine_tick_watchdog from the SAME backoff marker live_runtime.py's LiveState writes when it
+  # classifies a gh discovery failure as a rate limit; empty (byte-identical console) outside a window.
+  if [ -n "${ENGINE_RATE_LIMIT_ROW:-}" ]; then
+    frame="${frame}  ${C_YELLOW}engine${C_RESET}"$'\n'"${ENGINE_RATE_LIMIT_ROW}"$'\n'
   fi
   # ENGINE DOWN alarm (HERD-306) — the LOUDEST row, pinned above even the default-branch alarm. Set by
   # _engine_tick_watchdog when the SOLE (Python) engine core has faulted past its tolerance: no gates or
@@ -16812,6 +16820,37 @@ _engine_paused() {
   esac
 }
 
+# ── gh RATE-LIMIT calm row (HERD-582) ────────────────────────────────────────────────────────────
+# The classification itself happens entirely in Python: live_runtime.py's discover_via_graphql is the
+# ONLY gh call on the tick's candidate-discovery path (P5b deleted the bash action pass, HERD-306), so
+# it is the sole place a GraphQL bucket exhaustion can be observed and is where HERD-582 detects it
+# (GraphQL rate-limit error text; REST 403 + X-RateLimit-Remaining: 0) and journals engine_rate_limited
+# with the reset stamp. Bash's job is narrower: render the calm row from the SAME backoff marker
+# LiveState just wrote/cleared this tick, so the console reads one classification, not two.
+#
+# SWEEP (the rest of this file's gh-polling legs): every other bash gh call already treats ANY
+# non-zero gh (offline, rate-limited, auth blip) identically — an empty result, a bare `return 0`, an
+# `|| true` (see _gh_timeout's contract comment, ~line 249: "gh's own non-zero exits (rate-limit, 404,
+# auth) pass straight through and are NOT journaled"). That is already the fail-soft posture a rate
+# limit needs — none of those legs ever turned a rate limit into a false fault/alarm the way the
+# now-fixed discovery leg did, so none of them need a second classifier.
+#
+# _gh_rate_limited_until — the epoch a backoff window ends, or empty (no window / no state dir /
+# unreadable/non-numeric marker — fail-soft, same posture as every other flat-ledger reader in this
+# file). Reads $TREES/$WORKTREES_DIR/.agent-watch-gh-rate-limit — the EXACT path/format
+# LiveState.gh_rate_limit_path() (live_runtime.py) writes, so this is a pure read, never a second
+# gh call and never a journal parse.
+_gh_rate_limited_until() {
+  local dir f v
+  dir="${TREES:-${WORKTREES_DIR:-}}"
+  [ -n "$dir" ] || return 0
+  f="$dir/.agent-watch-gh-rate-limit"
+  [ -r "$f" ] || return 0
+  v="$(head -n1 "$f" 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) return 0 ;; esac
+  printf '%s' "$v"
+}
+
 _engine_tick_watchdog() {
   # OPERATOR EMERGENCY PAUSE (HERD-347) — checked FRESH each tick, BEFORE the engine core runs. With
   # ENGINE_PAUSE=on the Python live tick is SKIPPED entirely (zero gate/merge/refix dispatch), and the
@@ -16850,6 +16889,17 @@ _engine_tick_watchdog() {
     attempt=$(( attempt + 1 ))
   done
   if [ -n "$ok" ]; then
+    # gh RATE-LIMITED calm row (HERD-582) — a clean exit covers BOTH a genuinely quiet tick and a
+    # tick the Python core classified as a known, reset-timed backoff (never a fault either way, see
+    # _gh_rate_limited_until's header). Read the SAME marker LiveTick.run just wrote/cleared this
+    # tick: still-active ⇒ paint the calm row; expired/absent ⇒ empty (byte-identical console).
+    local _grl_until
+    _grl_until="$(_gh_rate_limited_until)"
+    if [ -n "$_grl_until" ] && [ "$_grl_until" -gt "$(date +%s)" ]; then
+      ENGINE_RATE_LIMIT_ROW="    ${C_YELLOW}⏳ ${C_BOLD}gh rate-limited${C_RESET}${C_YELLOW} · backing off remote (gh) legs until ${C_DIM}$(epoch_to_hhmm "$_grl_until")${C_RESET}${C_YELLOW} — local legs continue · not counted as a fault${C_RESET}"$'\n'
+    else
+      ENGINE_RATE_LIMIT_ROW=""
+    fi
     # Clean tick. If we had been declared down, announce the recovery once and clear the alarm.
     if [ -n "$_ENGINE_DOWN_DECLARED" ]; then
       journal_append engine_recovered after_fault_streak "$_ENGINE_FAULT_STREAK"
