@@ -42,11 +42,25 @@
 #   Detection alone leaves the engine stuck in the seam between rails: every stall class that DOES
 #   auto-resolve has an owner (refix, stale-base, wedge, dead-builder, limit-park, resurrect), but a
 #   finding here has none — it renders and waits for a human. With JOURNAL_AUDIT_ACT=on each class is
-#   mapped to ONE bounded action (see the ACT section at the bottom of this file and the rails in
-#   scripts/herd/journal-act.sh), and any class with NO mapped action auto-files ONE dedup-keyed
-#   tracker item, so a gap becomes WORK instead of another report. Each action fires at most ONCE per
-#   finding key across every seat (shared-pool once-guard); a finding still standing afterwards
-#   escalates loudly, exactly once. Every action is journaled `audit_acted class=… result=…`.
+#   routed to exactly ONE of three policies (the shipped mapping, `_ja_act_mapped` / `_ja_act_no_action_reason`
+#   in the ACT section below — a class never falls through to a default):
+#     MAPPED    → ONE bounded action via the rail in scripts/herd/journal-act.sh.
+#     NO-ACTION → a deliberate, journaled no-op (HERD-562/HERD-563): a class whose finding is real but
+#                 not itself actionable work — `fixture_slug` (evidence of test/fixture pollution
+#                 reaching a live journal, not a gap to file a tracker item against) and
+#                 `merged_hv_unknown` (a transient PR-body-fetch failure; the next sweep re-probes on
+#                 its own). Journals `audit_acted result=no_action reason=…` exactly once and NEVER
+#                 files, escalates, or re-fires for that key.
+#     UNMAPPED  → any other class auto-files ONE dedup-keyed tracker item via the scribe, so a gap
+#                 becomes WORK instead of another report.
+#   Each MAPPED action fires at most ONCE per finding key across every seat (shared-pool once-guard).
+#   ACT-THEN-CLEAR (HERD-564/HERD-573): a mapped action is tracked (HERD_JOURNAL_AUDIT_PENDING) until
+#   its finding is resolved one way or the other — every sweep re-checks each tracked key against the
+#   FRESH replay: absent ⇒ the action worked, journal `audit_finding_cleared`, stop tracking; still
+#   present ⇒ one more re-observation, and past JOURNAL_AUDIT_ESCALATE_AFTER rounds (default 2) escalate
+#   loudly exactly once (journal + inbox row + filed item) and stop tracking either way. An action never
+#   just goes silent: it always resolves to `audit_finding_cleared` or an `escalated` `audit_acted`.
+#   Every action is journaled `audit_acted class=… result=…`.
 #
 # BINDING CONSTRAINTS:
 #   • ADVISORY BY DEFAULT — with JOURNAL_AUDIT_ACT off (the default) this auditor never gates a merge,
@@ -89,6 +103,12 @@
 #                                 action ever reaches a real control room.
 #   HERD_JOURNAL_AUDIT_SCRIBE_CMD the TRACKER-FILING seam for an unmapped/escalated finding, invoked
 #                                 as `<cmd> "<request>"`. Defaults to `bash scribe.sh`.
+#   HERD_JOURNAL_AUDIT_PENDING    ACT-THEN-CLEAR ledger path (HERD-564/573) — one row per finding key
+#                                 this seat has acted on and is still watching for clearance-or-escalate.
+#                                 Default $WORKTREES_DIR/.agent-watch-journal-audit-pending.
+#   JOURNAL_AUDIT_ESCALATE_AFTER  re-observations a mapped-class finding may survive, still standing,
+#                                 before escalating (default 2). 1 reproduces the pre-HERD-564 behavior
+#                                 (escalate on the very next sighting).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=/dev/null
@@ -129,8 +149,11 @@ command -v python3 >/dev/null 2>&1 || exit 0
 
 INBOX="${HERD_JOURNAL_AUDIT_INBOX:-${WORKTREES_DIR:-/tmp}/.agent-watch-inbox}"
 SEEN="${HERD_JOURNAL_AUDIT_SEEN:-${WORKTREES_DIR:-/tmp}/.agent-watch-journal-audit-seen}"
-# Ensure parent dirs exist so inbox/seen writes never fail the advisory path.
-mkdir -p "$(dirname "$INBOX")" "$(dirname "$SEEN")" 2>/dev/null || true
+# ACT-THEN-CLEAR ledger (HERD-564/573) — see the ACT section below. Only ever written when
+# JOURNAL_AUDIT_ACT=on; empty/absent is the byte-inert default state.
+PENDING="${HERD_JOURNAL_AUDIT_PENDING:-${WORKTREES_DIR:-/tmp}/.agent-watch-journal-audit-pending}"
+# Ensure parent dirs exist so inbox/seen/pending writes never fail the advisory path.
+mkdir -p "$(dirname "$INBOX")" "$(dirname "$SEEN")" "$(dirname "$PENDING")" 2>/dev/null || true
 
 _num_or() {
   case "${1:-}" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac
@@ -694,9 +717,6 @@ if [ -n "$HV_FINDINGS" ]; then
   fi
 fi
 
-# Clean / empty findings → silent (no journal spam on a healthy seat).
-[ -n "$FINDINGS" ] || exit 0
-
 # ── emit: dedup via seen-ledger, then journal + inbox ────────────────────────
 _inbox_append() {
   # Same TSV shape as agent-watch.sh _inbox_record:
@@ -757,6 +777,12 @@ _inbox_append() {
 # (mirrors _MAIN_HEALTH_DIED_MAX); HERD_JOURNAL_AUDIT_ACT_MAX is a test seam, not an operator knob.
 _JA_ACT_MAX="$(_num_or "${HERD_JOURNAL_AUDIT_ACT_MAX:-}" 3)"
 _JA_ACT_SPENT=0
+# Re-observations a MAPPED finding may survive, still standing, before the lifecycle pass escalates it
+# (HERD-564/573; see _ja_act_lifecycle_pass below). Shares the SAME per-sweep budget as a fresh action
+# — an escalation is a real scribe shellout, not a free journal line, so it must never be exempt from
+# the "BOUNDED PER SWEEP" bound above. HERD_JOURNAL_AUDIT_ACT_MAX is still per-sweep total, not
+# per-class; JOURNAL_AUDIT_ESCALATE_AFTER is the SEPARATE "how many sweeps of grace" knob.
+_JA_ESCALATE_AFTER="$(_num_or "${JOURNAL_AUDIT_ESCALATE_AFTER:-}" 2)"
 
 # _ja_act_enabled — true iff JOURNAL_AUDIT_ACT opts in. Default OFF; any unrecognized value reads as
 # off (fail toward dormant — mirrors _ja_enabled above and every other ship-dormant lever).
@@ -812,6 +838,32 @@ _ja_act_mapped() {
   esac
 }
 
+# _ja_act_no_action_reason <kind> — prints a reason and returns 0 iff <kind> is a DELIBERATE no-action
+# class (HERD-562/HERD-563): the finding is real and stays REPORTED (the advisory half above is
+# unaffected), but it is not itself a gap to route anywhere — neither to a rail (nothing to heal) nor
+# to the scribe (filing it would be noise, not work). Checked BEFORE `_ja_act_mapped`'s unmapped
+# fallthrough so these two classes can never fall into the generic "file a tracker item" path:
+#   fixture_slug        — evidence that a TEST/SIM fixture wrote to the LIVE journal (see
+#                          tests/test-sim-journal-hermeticity.sh), not evidence of a production gap.
+#                          The fix is a hermeticity guard on the leaking fixture, not a filed item
+#                          every time its slug shows up in a bounded replay window.
+#   merged_hv_unknown    — the PR body fetch failed (a transient `gh`/network hiccup); the NEXT sweep
+#                          re-probes on its own (the seen-ledger only memoizes a SETTLED verdict, never
+#                          an unknown one — see the (g) check above), so filing a permanent item for a
+#                          transient read failure would be pure noise.
+# This is a SHIPPED (hardcoded) mapping, not a config key — same posture as _ja_act_mapped just above.
+_ja_act_no_action_reason() {
+  case "$1" in
+    fixture_slug)
+      printf 'known-fixture slug — evidence of test/fixture pollution reaching the live journal, not a gap to file work against'
+      ;;
+    merged_hv_unknown)
+      printf 'PR body unreadable (transient fetch failure) — the next sweep re-probes on its own; filing a permanent item for a transient read would be noise'
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 # _ja_act_rail <kind> <key> <ctx> — drive the mapped rail, print its one-word result token.
 # HERD_JOURNAL_AUDIT_ACT_CMD is the seam (invoked as `<cmd> <kind> <key> <ctx…>`); it defaults to the
 # live journal-act.sh. Bounded by `timeout` where coreutils has it — a rail that hangs (a wedged
@@ -861,7 +913,21 @@ _ja_file_item() {
 # byte-identical output) while JOURNAL_AUDIT_ACT is off.
 _ja_act() {
   _ja_act_enabled || return 0
-  local _aa_kind="$1" _aa_key="$2" _aa_summary="$3" _aa_ctx="${4:-}" _aa_result=""
+  local _aa_kind="$1" _aa_key="$2" _aa_summary="$3" _aa_ctx="${4:-}" _aa_result="" _aa_reason=""
+  # DELIBERATE NO-ACTION (HERD-562/HERD-563): own guard, own single journal line, NEVER escalates or
+  # files — checked first and returns before touching the shared per-sweep budget or the
+  # audit_act::/audit_escalate:: guards the mapped/unmapped paths below share.
+  if _aa_reason="$(_ja_act_no_action_reason "$_aa_kind")"; then
+    _ja_act_once "audit_noaction::${_aa_key}" || return 0
+    journal_append audit_acted \
+      class "$_aa_kind" \
+      key "$_aa_key" \
+      result no_action \
+      reason "$_aa_reason" \
+      component audit
+    _inbox_append "audit-noaction:${_aa_kind}" "no-action (${_aa_reason}) · ${_aa_summary}"
+    return 0
+  fi
   # Per-sweep budget spent → leave this finding for the next sweep. Checked BEFORE the once-guard so a
   # skipped finding does not burn its at-most-once claim without acting on it.
   [ "$_JA_ACT_SPENT" -lt "$_JA_ACT_MAX" ] 2>/dev/null || return 0
@@ -869,6 +935,11 @@ _ja_act() {
     _JA_ACT_SPENT=$((_JA_ACT_SPENT + 1))
     if _ja_act_mapped "$_aa_kind"; then
       _aa_result="$(_ja_act_rail "$_aa_kind" "$_aa_key" "$_aa_ctx")"
+      # ACT-THEN-CLEAR (HERD-564/573): start tracking this key so a LATER sweep can prove the action
+      # actually resolved the finding (audit_finding_cleared) instead of it firing once and the
+      # finding just going quiet. See _ja_act_lifecycle_pass below, which owns clear-or-escalate for
+      # everything appended here — this file is deliberately append-only.
+      printf '%s\t%s\t0\t%s\n' "$_aa_key" "$_aa_kind" "$_aa_summary" >> "$PENDING" 2>/dev/null || true
     else
       # No rail owns this class: filing IS the action, and it is TERMINAL — burn the escalation guard
       # in the same breath so a class that keeps being found can never file a second item.
@@ -883,22 +954,88 @@ _ja_act() {
     _inbox_append "audit-act:${_aa_kind}" "auto-action ${_aa_result} · ${_aa_summary}"
     return 0
   fi
-  # Acted already, and the finding is STILL standing → escalate LOUDLY, exactly once.
-  _ja_act_once "audit_escalate::${_aa_key}" || return 0
-  _JA_ACT_SPENT=$((_JA_ACT_SPENT + 1))
-  if _ja_file_item "$_aa_kind" "$_aa_key" "$_aa_summary" escalated; then
-    _aa_result="escalated"
-  else
-    _aa_result="escalate_file_failed"
-  fi
-  journal_append audit_acted \
-    class "$_aa_kind" \
-    key "$_aa_key" \
-    result "$_aa_result" \
-    component audit
-  _inbox_append "audit-escalated:${_aa_kind}" "ESCALATED — auto-action did not clear it · ${_aa_summary}"
+  # Already acted (or already claimed this sweep) — _ja_act_lifecycle_pass below is the ONLY place a
+  # mapped finding's clear-or-escalate fires from now on. Re-entering here must never re-act, re-file,
+  # or re-escalate.
   return 0
 }
+
+# _ja_act_lifecycle_pass — ACT-THEN-CLEAR (HERD-564/573). Resolves every key in the PENDING ledger
+# (populated by _ja_act's mapped-rail branch above) against what THIS sweep's fresh replay actually
+# found:
+#   ABSENT from $FINDINGS  → the world proved the action worked (a reap landed, a green cleared the
+#                            red, a wake_result was journaled, a gate slot's re-dispatch resolved the
+#                            dispatch, …). Journal `audit_finding_cleared` and stop tracking.
+#   STILL PRESENT           → one more re-observation. Below JOURNAL_AUDIT_ESCALATE_AFTER rounds, just
+#                            re-store the incremented count and wait. At/past it, escalate LOUDLY
+#                            exactly once (journal + inbox row + filed item, the SAME shape the old
+#                            immediate-next-sighting escalate used) and stop tracking either way.
+# This is what closes the loop the pre-HERD-564 code left open: an action fired once and the finding
+# either sat mute forever (nothing ever said "this actually got fixed") or escalated on its very next
+# sighting regardless of whether the rail's effect had had time to land — a false alarm for
+# red_state_stale's `reverify_pending` result in particular, which explicitly defers to
+# reconcile_main_health's OWN cadence rather than forcing anything itself.
+#
+# Runs BEFORE the main findings loop (and even when $FINDINGS comes back empty — a fully-resolved
+# journal must still close out everything this seat was tracking) and shares the SAME per-sweep
+# `_JA_ACT_SPENT`/`_JA_ACT_MAX` budget as a fresh action, so an escalation storm can never turn one
+# sweep into a wall of scribe shellouts either.
+_ja_act_lifecycle_pass() {
+  [ -s "$PENDING" ] || return 0
+  local _lp_live _lp_tmp _lp_key _lp_kind _lp_count _lp_summary _lp_result
+  _lp_live="$(printf '%s\n' "$FINDINGS" | awk -F'\t' 'NF{print $2}')"
+  _lp_tmp="$(mktemp "${PENDING}.XXXXXX" 2>/dev/null || true)"
+  [ -n "$_lp_tmp" ] || return 0
+  : > "$_lp_tmp"
+  while IFS=$'\t' read -r _lp_key _lp_kind _lp_count _lp_summary; do
+    [ -n "$_lp_key" ] || continue
+    if ! grep -qxF -- "$_lp_key" <<<"$_lp_live" 2>/dev/null; then
+      journal_append audit_finding_cleared \
+        class "$_lp_kind" \
+        key "$_lp_key" \
+        observations "${_lp_count:-0}" \
+        component audit
+      _inbox_append "audit-cleared:${_lp_kind}" "finding cleared · ${_lp_summary}"
+      continue
+    fi
+    _lp_count=$(( ${_lp_count:-0} + 1 ))
+    if [ "$_lp_count" -ge "$_JA_ESCALATE_AFTER" ]; then
+      if [ "$_JA_ACT_SPENT" -lt "$_JA_ACT_MAX" ] 2>/dev/null; then
+        if _ja_act_once "audit_escalate::${_lp_key}"; then
+          _JA_ACT_SPENT=$((_JA_ACT_SPENT + 1))
+          if _ja_file_item "$_lp_kind" "$_lp_key" "$_lp_summary" escalated; then
+            _lp_result="escalated"
+          else
+            _lp_result="escalate_file_failed"
+          fi
+          journal_append audit_acted \
+            class "$_lp_kind" \
+            key "$_lp_key" \
+            result "$_lp_result" \
+            component audit
+          _inbox_append "audit-escalated:${_lp_kind}" "ESCALATED — auto-action did not clear it · ${_lp_summary}"
+        fi
+        # Either WE just escalated, or the guard was already claimed (another seat/sweep beat us to
+        # it) — either way the escalation is SETTLED, so stop tracking rather than re-checking a guard
+        # that will never again return true.
+        continue
+      fi
+      # Past the escalate threshold but this sweep's budget is spent — defer to the next sweep rather
+      # than skip the escalation outright (BOUNDED PER SWEEP, nothing dropped: same shape as the
+      # fresh-action budget check in _ja_act above).
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$_lp_key" "$_lp_kind" "$_lp_count" "$_lp_summary" >> "$_lp_tmp"
+  done < "$PENDING"
+  mv -f "$_lp_tmp" "$PENDING" 2>/dev/null || rm -f "$_lp_tmp" 2>/dev/null
+}
+
+if _ja_act_enabled; then
+  _ja_act_lifecycle_pass
+fi
+
+# Clean / empty findings → silent (no journal spam on a healthy seat). Checked AFTER the lifecycle
+# pass above so a sweep that just cleared/escalated its last pending finding still exits quietly here.
+[ -n "$FINDINGS" ] || exit 0
 
 n_new=0
 while IFS=$'\t' read -r kind key summary ctx; do
