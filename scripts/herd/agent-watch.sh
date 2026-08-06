@@ -13978,6 +13978,11 @@ _reconcile_wedged_builder() {
 #      'escalated' and journal finish_stall_escalated — the re-task did not finish the job.
 #   3. 'escalated' is terminal: the needs-you row keeps rendering, nothing fires again, until the slug
 #      escapes (a PR opens, the agent starts working, or the signature clears).
+#
+# HERD-574: finish_stall_detected/finish_stall_escalated also carry kind=uncommitted (dirty tracked
+# tree — the fix-hermetic-guard-taint incident: modified files, never committed) vs kind=unpushed
+# (clean tree, commits ahead of origin) — a single at-a-glance dimension over the commits/dirty fields
+# already journaled, so a journal consumer can filter/count by work-signature without recomputing it.
 
 # _finish_stall_min — FINISH_STALL_MIN in whole minutes on stdout + rc 0, or rc 1 (nothing printed)
 # when the leg is OFF: unset, empty, non-numeric, or <= 0. A typo can never turn this on.
@@ -14312,7 +14317,7 @@ _reconcile_finish_stall() {
   local _rfs_slug="$1" _rfs_wt="$2" _rfs_astatus="$3" _rfs_branch="$4"
   _finish_stall_enabled || { printf 'OFF'; return 0; }
   local _rfs_now _rfs_grace _rfs_rec _rfs_first="" _rfs_state="" _rfs_commits=0 _rfs_dirty=0 \
-        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict _rfs_mark_out _rfs_mark_epoch _rfs_mark_state
+        _rfs_haswork=0 _rfs_limit=0 _rfs_verdict _rfs_mark_out _rfs_mark_epoch _rfs_mark_state _rfs_kind
   _rfs_now="$(_now)"
   _rfs_grace="$(_finish_stall_grace_secs)"
   case "$_rfs_astatus" in
@@ -14325,6 +14330,13 @@ _reconcile_finish_stall() {
       fi
       ;;
   esac
+  # HERD-574: the single at-a-glance work-signature dimension for the journal — kind=uncommitted for
+  # a dirty tracked tree (the fix-hermetic-guard-taint incident: modified files, never committed),
+  # kind=unpushed for a clean tree sitting on commits ahead of its own remote. Computed once here from
+  # the SAME commits/dirty probe already run above, so FIRST_STALL and SECOND_STALL both journal the
+  # identical classification for one (slug, anchor) stall — never recomputed, never drifting between
+  # the two events for the same incident.
+  _rfs_kind="unpushed"; [ "$_rfs_dirty" = "1" ] && _rfs_kind="uncommitted"
   _rfs_rec="$(_finish_stall_record "$_rfs_slug")"
   if [ -n "$_rfs_rec" ]; then
     IFS=$'\t' read -r _rfs_first _rfs_state <<< "$_rfs_rec"
@@ -14348,7 +14360,7 @@ _reconcile_finish_stall() {
       fi ;;
     FIRST_STALL)
       journal_append finish_stall_detected slug "$_rfs_slug" first_seen "${_rfs_first:-$_rfs_now}" \
-        commits "$_rfs_commits" dirty "$_rfs_dirty"
+        commits "$_rfs_commits" dirty "$_rfs_dirty" kind "$_rfs_kind"
       # DRYRUN is checked BEFORE the once-guard, never after: the guard marks the action SPENT, and a
       # dry run must never spend it — an operator who explores with AGENT_WATCH_DRYRUN=1 and then
       # disables it must still get the real nudge on the next tick, not find it silently pre-consumed
@@ -14368,7 +14380,7 @@ _reconcile_finish_stall() {
               "${_rfs_slug}: unfinished work with no PR — finish-line nudge delivered, agent is working again" default ;;
           *)
             _finish_stall_state "$_rfs_slug" escalated
-            journal_append finish_stall_escalated slug "$_rfs_slug" reason "wake failed"
+            journal_append finish_stall_escalated slug "$_rfs_slug" reason "wake failed" kind "$_rfs_kind"
             herd_driver_notify "⚠️ builder stalled before opening a PR: ${_rfs_slug}" \
               "${_rfs_slug}: work exists (uncommitted or unpushed) but the agent stopped and the auto re-task did not land — push + open the PR by hand" default ;;
         esac
@@ -14376,7 +14388,7 @@ _reconcile_finish_stall() {
     SECOND_STALL)
       if _finish_stall_action_once "$_rfs_slug" "escalate:${_rfs_first:-$_rfs_now}"; then
         _finish_stall_state "$_rfs_slug" escalated
-        journal_append finish_stall_escalated slug "$_rfs_slug" reason "stalled again after re-task"
+        journal_append finish_stall_escalated slug "$_rfs_slug" reason "stalled again after re-task" kind "$_rfs_kind"
         herd_driver_notify "⚠️ builder stalled again before opening a PR: ${_rfs_slug}" \
           "${_rfs_slug}: re-tasked once already but stopped again with work still unshipped — push + open the PR by hand" default
       fi ;;
