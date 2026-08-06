@@ -51,6 +51,7 @@ Role summarized from each file's top-of-file comment.
 - `governance-hook.sh` — governance-hook.sh <target> — the SESSION-TIME governance enforcer rendered into a project's
 - `governance.sh` — the SHARED, read-only governance EXTRACTION + MAPPING helpers (HERD-119 / HERD-125).
 - `handoff.sh` — the shared format + emitter for the BUILDER HANDOFF SUMMARY (HERD-106, research G4).
+- `health-pane-view.sh` — health-pane-view.sh <log-path> [inflight-marker] — the HEALTH_PANE (HERD-313/HERD-568) view command:
 - `health-trust.sh` — THE shared SHA-MATCHED BUILDER-LOCAL HEALTH TRUST library (HERD-531).
 - `healthcheck.sh` — healthcheck.sh <worktree-dir> [--oneline] [--heavy|--light|--auto] — is the change clean?
 - `herd-advise.sh` — herd-advise.sh "<question>" [context…] — a MID-FLIGHT strong-model ADVISOR a builder calls for a
@@ -172,7 +173,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-feature.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-preflight.sh` → `driver.sh`, `engine-version.sh`
 - `herd-quick.sh` → `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
-- `herd-resolve.sh` → `driver.sh`, `herd-config.sh`, `resolver-pane.sh`
+- `herd-resolve.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`, `resolver-pane.sh`
 - `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
 - `herd-watch.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
 - `journal-act.sh` → `agent-watch.sh`, `journal.sh`
