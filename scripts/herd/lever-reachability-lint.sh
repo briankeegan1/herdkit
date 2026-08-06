@@ -39,6 +39,28 @@
 #       reading as "nothing to see here".
 #     • A python-side consumer. os.environ has no dead-function class; the port is the live path.
 #
+#   PARTIAL, verified (HERD-584): the three refix-bounce autofix levers — REVIEW_AUTOFIX,
+#   HEALTHCHECK_AUTOFIX, STALE_BASE_AUTOFIX — read differently under python despite sharing the same
+#   PARTIAL shape (a live bin/herd prose site, a dead bash `_*_autofix_enabled`/`_handle_*` site):
+#     • REVIEW_AUTOFIX / HEALTHCHECK_AUTOFIX have ZERO pysrc consumers. The python decide path's
+#       three-way review/health refix bounce (`LiveTick._bounce_and_wake`, HERD-358) fires
+#       UNCONDITIONALLY on a BLOCK/CODEERROR verdict — it does not read either key at all — so under
+#       ENGINE_IMPL=python these two levers are cosmetic no-ops: setting either true or false changes
+#       nothing. journal proof the bounce itself is live regardless: tests/test_live_runtime.py's
+#       TestRefixWakeVerification asserts `refix_bounce`/`refix_wake_result` for both rails on every
+#       tick with a red verdict. This is a real, disclosed gap, not an oversight — herd-config.sh still
+#       defaults both keys and bin/herd's posture prose still reads on them for a bash-driver project,
+#       so they stay PARTIAL rather than a finding this guard cannot phrase as "inert".
+#     • STALE_BASE_AUTOFIX gates a REAL python behavioral difference: `_stale_base_autofix_enabled`
+#       (pysrc/herd/live_runtime.py) is read on the stale-dup gate's LIVE-ONLY path and the lever off
+#       is a hard HOLD-no-bounce no-op — on drives the same three-way bounce, PLUS (HERD-584)
+#       `LiveTick._stale_no_wake_fallback` dispatching the existing conflict resolver
+#       (`herd-resolve.sh`) when no live builder is on the pane to bounce. journal proof:
+#       tests/test_live_runtime.py's TestStaleDupGate (bounce/resolver-dispatch/escalate) and
+#       TestLiveDispatchResolver (the herd-resolve.sh shell-out shape). It reads PARTIAL for the same
+#       mechanical reason as its siblings (a dead bash `_stale_base_autofix_enabled` still exists in
+#       agent-watch.sh) but is, unlike them, a genuinely live lever.
+#
 # THE SCAN SURFACE, and why it is asymmetric (a guard that scans the wrong surface reports clean while
 # the defect sits in what it does not scan — the failure mode this file exists to end):
 #

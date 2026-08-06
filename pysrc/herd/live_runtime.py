@@ -3102,6 +3102,10 @@ _HV_BODY_TIMEOUT = 15
 # _HV_BODY_TIMEOUT: bounded so a stuck gh/driver call costs at most one tick, never a hang.
 _HOLD_COMMENT_TIMEOUT = 15
 _HOLD_NOTIFY_TIMEOUT = 15
+# herd-resolve.sh returns as soon as the resolver's tab/pane is up — it does not block for the
+# resolver's own run — but it chains several herdr calls (+ an optional free-port scan), so it gets a
+# wider bound than the single-shot gh/notify calls above.
+_RESOLVER_DISPATCH_TIMEOUT = 30
 
 
 def _hv_steps_text(cand):
@@ -3292,6 +3296,12 @@ class DryRunActuator:
             woke = bool(getattr(cand, "wake_succeeds", True))
             return WakeResult(status, "working" if woke else status, woke)
         return WakeResult(status, status, False)
+
+    def dispatch_resolver(self, cand):
+        """Dry-run twin of :meth:`LiveActuator.dispatch_resolver` (HERD-584): no ``herd-resolve.sh``
+        spawn — reports success so a dry-run tick's outcome (bounce via resolver, not an escalation)
+        matches what the live path would decide, without shelling out."""
+        return True
 
     def post_gate_status(self, cand):
         """PURE no-op twin of the herd/gates commit-status post: no network, no ledger, no journal —
@@ -4112,6 +4122,26 @@ class LiveActuator:
         status_after, _ = self._agent_lookup(slug)
         return WakeResult(status_before, status_after or status_before, False)
 
+    def dispatch_resolver(self, cand):
+        """Best-effort, fire-and-forget spawn of the EXISTING conflict resolver
+        (``scripts/herd/herd-resolve.sh``) for a stale-base hold with nobody to bounce (HERD-584,
+        mirrors ``agent-watch.sh``'s ``spawn_resolver``). ``herd-resolve.sh`` itself returns as soon as
+        the resolver's tab/pane is up — it never blocks for the resolver agent's own run — so this call
+        is bounded the same conservative way every other driver-seam shell-out in this module is. Never
+        raises: a failed dispatch (missing script, herdr unavailable, a non-worktree slug) is read by
+        the caller as "nobody healed this", which falls through to the honest needs-you escalation the
+        same way a wake that never landed does."""
+        env = dict(os.environ)
+        env["HERD_RESOLVE_PR"] = str(cand.pr)
+        env["HERD_RESOLVE_SHA"] = str(cand.sha)
+        try:
+            out = subprocess.run(["bash", self._script("herd-resolve.sh"), str(cand.slug)],
+                                 capture_output=True, text=True, env=env,
+                                 timeout=_RESOLVER_DISPATCH_TIMEOUT)
+        except Exception:
+            return False
+        return out.returncode == 0
+
     def peek_status(self, cand):
         """HERD-420: a READ-ONLY pane-status read for the post-bounce completion check — the same
         fresh ``herdr agent list`` roster :meth:`wake_builder` consults, but never types into the
@@ -4354,7 +4384,7 @@ class LiveTick:
                                               kind, "review"),
                                           cand.sha, cand.pr))
 
-    def _bounce_and_wake(self, cand, kind, round_num, rule, prompt=None):
+    def _bounce_and_wake(self, cand, kind, round_num, rule, prompt=None, no_wake_fallback=None):
         """Record the bounce, ALWAYS verify + journal the wake, and escalate immediately (with the
         round refunded) when nobody actually woke (HERD-370).
 
@@ -4372,6 +4402,13 @@ class LiveTick:
              RIGHT HERE, in this same tick, naming the slug so a human knows who to re-task by hand, and
              REFUNDS the round via a ``reset`` ledger row: an unwoken bounce spent no real attempt, so it
              must not count against the rail's budget (a later, ACTUALLY-woken bounce starts clean).
+
+        ``no_wake_fallback``, when given, is tried BEFORE that escalation: a callable taking ``cand``
+        and returning True iff it durably handled the "nobody woke" case itself (and already journaled
+        its own record of doing so) — that still counts as a live bounce (:data:`BLOCK`, the round is
+        NOT refunded) rather than an escalation. Only the stale-base rail passes one today (HERD-584:
+        dispatch the existing conflict resolver rather than escalate a MECHANICAL fix to a human); the
+        health/review rails pass none, so their no-wake path is unchanged.
 
         Returns :data:`BLOCK` (bounce landed on a live builder, wait for its push) or :data:`ESCALATE`
         (nobody is on it — needs-you). ``prompt`` overrides the canned re-task text — the HERD-420
@@ -4394,6 +4431,12 @@ class LiveTick:
         self.journal.append("refix_bounce", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                             "round", round_num, "agent_status_before", status_before,
                             "rule", rule, "location", "")
+        if not wake.woke and no_wake_fallback is not None and no_wake_fallback(cand):
+            self.journal.append("refix_wake_result", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "round", round_num, "agent_status_before", status_before,
+                                "agent_status_after", wake.status_after or "unknown",
+                                "woke", 0, "escalated", "false")
+            return BLOCK
         escalated = not wake.woke
         self.journal.append("refix_wake_result", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                             "round", round_num, "agent_status_before", status_before,
@@ -4409,6 +4452,24 @@ class LiveTick:
                             "slug", cand.slug, "kind", kind, "reason", "no-live-builder",
                             "agent_status", wake.status_after or status_before)
         return ESCALATE
+
+    def _stale_no_wake_fallback(self, cand):
+        """The stale-base rail's ``no_wake_fallback`` for :meth:`_bounce_and_wake` (HERD-584): nobody
+        is on the live pane to re-task with the merge-up, so dispatch the EXISTING conflict resolver
+        (``herd-resolve.sh``) instead of escalating a MECHANICAL fix straight to a human — mirrors
+        ``agent-watch.sh``'s ``_handle_stale_dup`` "NO LIVE BUILDER" branch, which reaches for the same
+        tool. Requires an existing worktree to resolve in place; without one there is nothing to heal,
+        so the caller's normal no-wake escalation stands unchanged. A failed dispatch (herdr down, the
+        script missing) reads the same way: nobody healed this."""
+        if not cand.worktree or not os.path.isdir(cand.worktree):
+            return False
+        if not self.actuator.dispatch_resolver(cand):
+            return False
+        self.journal.append("stale_base_autofix_bounce", "pr", cand.pr, "sha", cand.sha,
+                            "slug", cand.slug,
+                            "reason", "no live builder — dispatched the conflict resolver to merge "
+                            "the base")
+        return True
 
     _DONE_IDLE_STATUSES = ("done", "idle")
 
@@ -4810,7 +4871,8 @@ class LiveTick:
                     "Resolve any conflicts PRESERVING both sides' intent, run the healthcheck, then "
                     "push (normal push, NEVER force, NEVER push to the default branch).\n"
                     "Why: %s" % (cand.pr, _sd_base, _sd_base, _sd_reason))
-                return self._bounce_and_wake(cand, "stale", _sd_round, "stale", prompt=_sd_prompt)
+                return self._bounce_and_wake(cand, "stale", _sd_round, "stale", prompt=_sd_prompt,
+                                             no_wake_fallback=self._stale_no_wake_fallback)
 
         # 1b. stale/dup gate (deterministic-cheap): a behind-base PR HOLDS — parking is always safe.
         if cand.stale:
