@@ -157,6 +157,11 @@ case "$CLASS" in
     # mutex-guarded and dry-run-inert. It frees the slot a dead/timed-out worker still holds; the
     # next tick's gate step owns the re-dispatch (with its own retry budget + infra breaker), which
     # is why this action re-dispatches exactly ONCE and can never loop.
+    # HERD-607: the sweep itself has no heartbeat blind spot to close — it walks $TREES/.review-inflight-*
+    # and .health-inflight-* markers by GLOB, never by the finding's pr/sha/slug context, so it was
+    # already a no-op for a heartbeat dispatch (engine_live_dispatched carries neither marker). The
+    # real fix is upstream: journal-audit.sh's detector no longer emits dispatch_no_outcome for a
+    # dispatch with no pr and no slug, so this arm is never even reached for one.
     _sweep_gate_corpses >/dev/null 2>&1 || true
     printf 'slot_freed\n'
     ;;

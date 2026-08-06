@@ -9,7 +9,8 @@
 #
 # Checks (the N12 set, plus the HERD-272 human-verify rule):
 #   (a) merge without a later reap for the same pr (or slug)
-#   (b) a *_dispatched event with no terminal outcome past a family TTL
+#   (b) a *_dispatched event with no terminal outcome past a family TTL (heartbeat dispatches with
+#       neither a pr nor a slug — e.g. engine_live_dispatched — are exempt; see HERD-607)
 #   (c) a refix_bounce with no matching refix_wake_result (same pr + sha + round)
 #   (d) a red state (main_health result=red) older than a TTL with no later green
 #   (e) pushed=no never followed by a later pushed=yes (codemap/symbol_index refresh)
@@ -340,11 +341,16 @@ for m in merges:
 def is_dispatched(name):
     return bool(name) and str(name).endswith("_dispatched")
 
+# HERD-607: a dispatch finding needs work identity (a pr or a slug); a heartbeat like
+# engine_live_dispatched has neither and never gets a terminal event by design.
+def has_work_identity(ev):
+    return bool(ev.get("pr")) or bool(ev.get("slug"))
+
 TERMINALS = {
     "review_dispatched": {"verdict_recorded", "review_skipped", "review_carried_forward"},
 }
 
-dispatches = [e for e in events if is_dispatched(e.get("event"))]
+dispatches = [e for e in events if is_dispatched(e.get("event")) and has_work_identity(e)]
 for d in dispatches:
     if age_secs(now, d["_ts"]) < dispatch_ttl:
         continue

@@ -208,6 +208,23 @@ out="$(run_audit on)" || fail "(2b) audit exited non-zero: $out"
 pass
 echo "PASS (2b) review_dispatched with no terminal → finding"
 
+# ── (2b') HERD-607: engine_live_dispatched heartbeat (no pr, no slug) is exempt ──────────────────
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"engine_live_dispatched","surface":"python","engine_level":3,"engine_min":3'
+out="$(run_audit on)" || fail "(2b') audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b') engine_live_dispatched heartbeat must never produce dispatch_no_outcome, got $(count_audit dispatch_no_outcome); $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b') engine_live_dispatched heartbeat (no pr/slug) never fires dispatch_no_outcome"
+
+# ── (2b'') HERD-607: heartbeat alongside a real no-terminal dispatch → only the real one fires ────
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"engine_live_dispatched","surface":"python","engine_level":3,"engine_min":3'
+jline "2026-07-09T12:00:05Z" '"event":"review_dispatched","pr":9,"sha":"real1","pid":5,"model":"opus"'
+out="$(run_audit on)" || fail "(2b'') audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b'') expected exactly 1 dispatch_no_outcome (the real dispatch, not the heartbeat), got $(count_audit dispatch_no_outcome); $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b'') heartbeat + real dispatch → only the real dispatch fires, byte-identical"
+
 # ── (2c) refix_bounce without refix_wake_result ──────────────────────────────
 reset_surfaces
 jline "2026-07-09T12:00:00Z" '"event":"refix_bounce","pr":8,"sha":"bbb","slug":"s","round":1'
