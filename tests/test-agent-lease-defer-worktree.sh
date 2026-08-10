@@ -26,7 +26,39 @@ FEATURE="$HERE/../scripts/herd/herd-feature.sh"
 CAPLEDGER="$HERE/../scripts/herd/capacity-ledger.sh"
 FLOCKRUN="$HERE/../scripts/herd/capacity_flock_run.py"
 
-T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+T="$(mktemp -d)"
+# HERD-614: an ADMITTED lease (part (b) below) backgrounds+disowns capacity_agent_lease_hold
+# (capacity-ledger.sh) — BY DESIGN it outlives the `bash "$QUICK"`/`bash "$FEATURE"` subprocess that
+# spawned it, tracking the (fixture) agent's liveness via capacity-agent-lease-wait.sh, which polls
+# herd_driver_agent_liveness (real `herdr agent list`/`herdr pane list` calls) for up to
+# HERD_CAPACITY_AGENT_START_TIMEOUT_SECS (default 60s) before giving up — since the fixture "agent"
+# never actually shows alive in the herdr stub's roster. Left alone, that detached process keeps
+# polling long after THIS script's own asserts finish and its trap deletes $T (including $BIN/herdr),
+# so its later polls fall through PATH to whatever tripwire stub the outer daemon-hermeticity sandbox
+# (.herd/healthcheck.project.sh / tests/herd.bats) has shadowed in — an unattributable
+# 'leak: suite herdr agent list'/'pane list'. Reap it explicitly before cleanup instead of shrinking
+# the production timeout knobs: capacity_agent_lease_reserve's own admitted-vs-busy detection depends
+# on the SAME background holder staying alive through its ~0.4s settle window (a busy attempt dies in
+# microseconds; only a real admission survives that long), so racing capacity-agent-lease-wait.sh's
+# timeout against that window breaks the very assertion this test proves. pkill -f matches on the
+# leaf script + this run's OWN slugs (lease-deny-q/-f — never reused outside this file), never a
+# sibling test's fixture, wherever the disowned process was reparented to.
+reap_lease_waiters() {
+  local pat i
+  for pat in "capacity-agent-lease-wait.sh lease-deny-q" "capacity-agent-lease-wait.sh lease-deny-f"; do
+    pkill -9 -f "$pat" >/dev/null 2>&1 || true
+    # Confirm death (bounded ~2s) before returning — SIGKILL delivery is async, and this test's own
+    # HOME="$T" makes python3 populate its bytecode cache under $T, so proceeding straight to `rm -rf
+    # "$T"` while the just-killed capacity_flock_run.py parent is still unwinding can race a live write.
+    i=0
+    while [ "$i" -lt 20 ] && pgrep -f "$pat" >/dev/null 2>&1; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+  done
+}
+cleanup() { reap_lease_waiters; rm -rf "$T"; }
+trap cleanup EXIT
 fail(){ echo "FAIL: $1" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || fail "python3 required"
 command -v git    >/dev/null 2>&1 || fail "git required"
