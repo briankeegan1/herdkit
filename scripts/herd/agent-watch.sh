@@ -919,22 +919,43 @@ PASTURE=""             # HERD-147 flair: the pasture-header line rendering the i
 DISPLAY=()
 FLAIR_STATE=()         # HERD-147 flair: one state-token per DISPLAY row (parallel index), read by build_pasture
 
+# HERD-619 leg (b): epoch of the last time render() actually repainted the terminal (frame changed and
+# the printf succeeded). Empty until the first repaint — build_header never fabricates a "stale" claim
+# before a real paint has happened to measure against.
+_LAST_PAINT_EPOCH=""
+# Internal tuning, not an operator knob (mirrors _ANOMALY_MIN_SAMPLES/_ANOMALY_THRESHOLD_PCT): roughly
+# N=5 ticks at the ~4s outer-loop cadence. A header older than this names its own staleness instead of
+# silently claiming "live".
+_RENDER_STALE_AGE_SECS=20
+
 # build_header — the title row + a full-width rule.
+# HERD-619: the timestamp now carries SECONDS (was "live · HH:MM") and, when this process's last
+# completed screen paint is older than _RENDER_STALE_AGE_SECS, a visible "stale" qualifier — a frame
+# that names its own age cannot silently lie the way a bare "live · HH:MM" could while the render loop
+# sat behind a slow `gh` call or a stalled engine tick (grounded in the 4-day ghost MAIN RED, operator
+# report 2026-08-10).
 build_header() {
-  hhmm="$(date +%H:%M)"
+  local _bh_epoch _bh_stale=""
+  _bh_epoch="$(_now_epoch)"
+  hhmm="$(epoch_to_hhmmss "$_bh_epoch")"
+  if [ -n "${_LAST_PAINT_EPOCH:-}" ] && [ $(( _bh_epoch - _LAST_PAINT_EPOCH )) -ge "$_RENDER_STALE_AGE_SECS" ]; then
+    _bh_stale=" ${C_YELLOW}· stale ${C_BOLD}$(_fmt_age $(( _bh_epoch - _LAST_PAINT_EPOCH )))${C_RESET}"
+  fi
   rlabel="live"; [ -n "$DRYRUN" ] && rlabel="dry-run"
   cols="$(tput cols 2>/dev/null || echo 56)"
   [ "$cols" -lt 40 ] && cols=40
   [ "$cols" -gt 64 ] && cols=64
-  rcells=$(( ${#rlabel} + 3 + 5 ))
+  rcells=$(( ${#rlabel} + 3 + 8 ))
   pad=$(( cols - 13 - rcells )); [ "$pad" -lt 1 ] && pad=1
   spaces="$(printf '%*s' "$pad" '')"
-  HDR_LINE=" ${C_BOLD}${C_CYAN}🐑 herd watch${C_RESET}${spaces}${C_DIM}${rlabel} · ${hhmm}${C_RESET}"
+  HDR_LINE=" ${C_BOLD}${C_CYAN}🐑 herd watch${C_RESET}${spaces}${C_DIM}${rlabel} · ${hhmm}${C_RESET}${_bh_stale}"
   RULE=" ${C_DIM}$(python3 -c "print('═'*$cols)")${C_RESET}"
 }
 
 # epoch_to_hhmm <epoch> — HH:MM from a Unix timestamp; BSD/macOS (-r) and GNU/Linux (-d @) safe.
 epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev/null || echo '--:--'; }
+# epoch_to_hhmmss <epoch> — HH:MM:SS from a Unix timestamp (HERD-619); same BSD/GNU fallback shape.
+epoch_to_hhmmss() { date -r "$1" +%H:%M:%S 2>/dev/null || date -d "@$1" +%H:%M:%S 2>/dev/null || echo '--:--:--'; }
 # reverse_file <path> — print lines in reverse order; tac (GNU/Linux) or tail -r (BSD/macOS).
 reverse_file() { tac "$1" 2>/dev/null || tail -r "$1" 2>/dev/null; }
 
@@ -3210,7 +3231,7 @@ render() {
   fi
   if [ "$frame" != "$last_frame" ]; then
     clear
-    if printf '%b' "$frame"; then last_frame="$frame"; fi
+    if printf '%b' "$frame"; then last_frame="$frame"; _LAST_PAINT_EPOCH="$(_now_epoch)"; fi
   fi
 }
 
@@ -3250,6 +3271,64 @@ _first_frame_paint() {
   # Feeds the ANOMALY_BASELINES rail (ship-dormant off it; see _phase_anomaly_observe) so a first
   # frame that regresses back toward the slow-probe hold this fix removes is caught automatically.
   _phase_anomaly_observe first_frame "first frame" "$(( _ff_elapsed_ms / 1000 ))"
+}
+
+# _render_pass_desync_check — HERD-619 leg (a). At the END of each render pass (called right after the
+# tick's own `render` in _tick_render_reconcile, see docs/engine-debug-topology.md's chain-anatomy
+# note), reverify that the frame render() just painted still agrees with the LIVE ledgers it was built
+# from. build_main_health/build_tracker_drift/build_builder_notes captured MAIN_HEALTH/TRACKER_DRIFT/
+# BUILDER_NOTES_ROWS near the TOP of this same tick; between that read and this check the tick has made
+# arbitrarily many `gh` calls and walked the whole FEATS loop — real wall-clock during which another
+# writer (a concurrent tracker-state sweep, a MAIN RED that just healed) can move the SAME ledger this
+# tick already read. Grounded in the 4-day ghost MAIN RED (operator report 2026-08-10): the pane kept
+# painting a red row the live ledger no longer backed, and nothing ever said so.
+#
+# Recomputes each section's PRESENCE bit fresh from the ledger and compares it to what was actually
+# painted. A mismatch never repaints or self-corrects anything — the NEXT tick's ordinary build_* +
+# render already does that — it only journals `pane_desync`, naming the diverging section, so the drift
+# is on the record even when nobody is looking at the pane the moment it happens. Journal-only,
+# fail-soft, never a crash: every read below is a bounded ledger scan via the SAME helpers the builders
+# use, so a missing file or unreadable ledger just reads as "no rows" on both sides rather than
+# aborting the tick.
+_render_pass_desync_check() {
+  local _rpd_now_main="0" _rpd_now_tracker="0" _rpd_now_notes="0"
+  local _rpd_painted_main="0" _rpd_painted_tracker="0" _rpd_painted_notes="0"
+
+  [ -s "${MAIN_HEALTH_STATE:-}" ] 2>/dev/null && _rpd_now_main="1"
+  [ -n "$(herd_console_section_tracker "${TRACKER_HEAL_FILE:-}" 3 _tracker_heal_row "${TRACKER_HEAL_ACK:-}" 2>/dev/null)" ] \
+    && _rpd_now_tracker="1"
+  [ -n "$(herd_console_section "${BUILDER_NOTES_LEDGER:-}" 5 herd_console_classify_builder_note _builder_note_row "${BUILDER_NOTES_ACK:-}" 2>/dev/null)" ] \
+    && _rpd_now_notes="1"
+
+  [ -n "${MAIN_HEALTH:-}" ] && _rpd_painted_main="1"
+  [ -n "${TRACKER_DRIFT:-}" ] && _rpd_painted_tracker="1"
+  [ -n "${BUILDER_NOTES_ROWS:-}" ] && _rpd_painted_notes="1"
+
+  [ "$_rpd_painted_main" = "$_rpd_now_main" ] \
+    || journal_append pane_desync section main_red painted "$_rpd_painted_main" ledger "$_rpd_now_main"
+  [ "$_rpd_painted_tracker" = "$_rpd_now_tracker" ] \
+    || journal_append pane_desync section tracker_healed painted "$_rpd_painted_tracker" ledger "$_rpd_now_tracker"
+  [ "$_rpd_painted_notes" = "$_rpd_now_notes" ] \
+    || journal_append pane_desync section builder_notes painted "$_rpd_painted_notes" ledger "$_rpd_now_notes"
+  return 0
+}
+
+# _render_pass_frame_age_journal <t0-ms> — HERD-619 leg (c). Journals `render_pass frame_age_ms=<N>`
+# for the wall-clock span from <t0-ms> (a _now_ms reading stamped right after _render_pass_clock_begin,
+# before this pass's first build_* read) to right now (called immediately after this pass's own
+# `render`), and feeds the SAME ANOMALY_BASELINES call every other HERD-496 measurement point uses
+# (_phase_anomaly_observe tick_cadence/first_frame/review/…) — so render latency joins tick cadence on
+# the one rail an operator already watches, ship-dormant off ANOMALY_BASELINES.
+# <t0-ms> empty or non-numeric (a caller that never ran _render_pass_clock_begin/stamped t0 first) is a
+# silent no-op — never a fabricated measurement.
+_render_pass_frame_age_journal() {
+  local _rpf_t0="${1:-}" _rpf_age_ms
+  case "$_rpf_t0" in ''|*[!0-9]*) return 0 ;; esac
+  _rpf_age_ms=$(( $(_now_ms) - _rpf_t0 ))
+  [ "$_rpf_age_ms" -ge 0 ] || _rpf_age_ms=0
+  journal_append render_pass frame_age_ms "$_rpf_age_ms"
+  _phase_anomaly_observe render_pass "render pass" "$(( _rpf_age_ms / 1000 ))"
+  return 0
 }
 
 # already_merged — moved to work-units/git-pr.sh (HERD-398, Phase 3 work-unit extraction).
@@ -3695,6 +3774,15 @@ _review_registry_file() { printf '%s' "$TREES/.review-registry-$1-$2"; }
 # COUNT 4 / case 4a pins this away in its own fixture; nothing pinned it in the live watcher before).
 _now_epoch() {
   printf '%s' "${HERD_FAKE_NOW:-${HERD_NOW_EPOCH:-$(date +%s)}}"
+}
+
+# _now_ms — milliseconds since the epoch off a RAW (never HERD_FAKE_NOW-pinned) wall clock. Used only
+# to MEASURE elapsed real time across a span (HERD-619's render_pass frame_age_ms, mirroring
+# _first_frame_paint's own inline python3 clock) — never as a "what time is it" seam, which stays
+# _now_epoch/_now so render-pass age readers keep agreeing with each other under HERD-491's pin.
+# Fails soft to 0 on a python3-less box, same as _first_frame_paint's idiom.
+_now_ms() {
+  python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo 0
 }
 
 # _render_pass_clock_begin / _render_pass_clock_end (HERD-491) — pin HERD_FAKE_NOW for the DURATION of
@@ -17445,6 +17533,11 @@ _tick_render_reconcile() {
   # _render_pass_clock_begin. Released right after `render` below, so the action/reconcile phases
   # that follow keep observing a live clock exactly as before this fix.
   _render_pass_clock_begin
+  # HERD-619 leg (c): a RAW (never HERD_FAKE_NOW-pinned) ms clock bracketing the WHOLE render pass —
+  # every build_* call, the `gh` fetches, and the FEATS loop below — so frame_age_ms right after
+  # `render` reflects real wall-clock, not the pin. See _now_ms's own header for why this is a
+  # separate seam from _now_epoch.
+  _RENDER_PASS_T0_MS="$(_now_ms)"
   # HERD-281: reset the per-tick headroom-approaching signal before the corpse sweep sets it.
   _HEALTH_HEADROOM_APPROACHING=""
   # RESTART-SAFE GATE HYGIENE (HERD-185), FIRST thing each tick: free any slot held by a dead/timed-out
@@ -18026,6 +18119,12 @@ EOF
   fi
 
   render
+  # HERD-619 leg (a): at the END of this render pass, reverify the frame just painted still agrees
+  # with the live ledgers it was built from. Journal-only — see _render_pass_desync_check's own header.
+  _render_pass_desync_check
+  # HERD-619 leg (c): frame_age_ms — the render pass's real wall-clock span (t0 pinned above, right
+  # before build_header's first read; measured here, right after the frame it fed just painted).
+  _render_pass_frame_age_journal "${_RENDER_PASS_T0_MS:-}"
   # HERD-491: release the render-pass clock pin now that the frame is painted — Phase B/C below read
   # a live clock again, unchanged from before this fix.
   _render_pass_clock_end
