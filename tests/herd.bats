@@ -28,6 +28,17 @@ setup() {
     . "$REPO/scripts/herd/hermetic-env-scrub.sh"
     herd_hermetic_env_scrub "$REPO/scripts/herd/herd-config.sh"
   fi
+  # HERD-614: name THIS test in the HERD-189 daemon-hermeticity guard's leak log. The guard's tripwire
+  # stubs (herdr/claude/codex/osascript/notify-send, shadowed onto PATH by .herd/healthcheck.project.sh
+  # around the whole `bats tests/*.bats` invocation) record "${HERMETIC_TEST:-suite}" per reach — the
+  # bats-absent tests/test-*.sh fallback already sets HERMETIC_TEST=<basename> per test, but the bats
+  # invocation never set it per test, so every bats-run leak fell back to the whole "suite" and was
+  # undebuggable. BATS_TEST_DESCRIPTION is populated by bats-core before setup() runs (bats-exec-test
+  # evaluates the preprocessed source, which sets it, before calling setup) and covers every test shape
+  # in this file — inline structural, bespoke shellout, sim, and HERD-295 dynamic-discovered — with one
+  # export, no per-block edits. A bare `bats tests/herd.bats` run (no HERD_HERMETIC_GUARD armed) is
+  # unaffected: nothing reads HERMETIC_TEST when the guard is not armed.
+  export HERMETIC_TEST="${BATS_TEST_DESCRIPTION:-bats}"
 }
 
 # ── inline structural blocks (no single tests/test-*.sh to shell out to) ─────────────────────────
