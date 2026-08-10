@@ -94,7 +94,11 @@ Repeat forever. Each cycle, in order:
    immediately. **Do not stop to report progress between cycles, and do not ask permission.**
    Before a wake cycle spawns a large fleet, raise `REVIEW_CONCURRENCY`/`HEALTH_CONCURRENCY` to
    match it first — see that skill's **§ Pipeline throughput & scaling** for the knobs, the
-   queued-vs-stalled diagnosis, and the spawn-gate formula.
+   queued-vs-stalled diagnosis, and the spawn-gate formula. Under `HEALTH_SOURCE=ci` (same section)
+   there is no local health queue to raise at all — the PR's own CI conclusion IS the verdict — but a
+   red there still needs the same read: `ci_infra_transient` in the journal is a PLATFORM outage that
+   auto-reruns and must NEVER be re-tasked to a builder, while `ci_health_fallback` means CI could not
+   answer and the local suite is carrying the gate after all.
 3. **No open work** → **idle-wait, do not stop.** Wait **20–30 minutes**, then wake and go back to
    step 1. Use whatever wait facility your runtime provides (a self-paced wakeup or timer if you
    have one; otherwise a single bounded `sleep` in one shell call). Never busy-poll: an idle cycle

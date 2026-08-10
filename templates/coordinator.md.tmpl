@@ -595,6 +595,37 @@ immediately (see *Workflow settings* above).
 **Scaling rule.** `REVIEW_CONCURRENCY`/`HEALTH_CONCURRENCY` default for a 2–3 builder herd — raise
 both to match fleet size BEFORE spawning a large one, not after the gates back up.
 
+**`HEALTH_SOURCE` — the knob that removes the health queue entirely (HERD-578).** The three knobs
+above all divide a fixed local capacity; this one changes WHERE the verdict comes from.
+
+| Value | What the watcher does |
+|---|---|
+| `local` (default) | dispatches the local healthcheck suite per `(pr, sha)`, serialized behind `HEALTH_CONCURRENCY` — that run is the verdict |
+| `ci` | dispatches NOTHING locally and reads the PR's OWN GitHub Actions conclusion for its exact head sha as the verdict |
+
+Under `ci` there is no `health-check · queued (N ahead)` row to diagnose, because no local slot is
+consumed at all — PR gate latency collapses to CI's own wall-clock. The five mappings, all from one
+shared implementation (`pysrc/herd/ci_verdict.py`, read by the watcher rail AND the main-health CI
+leg AND `CI_FAST_BOUNCE`, so they can never disagree):
+
+- **green** checks-run for the head sha → `CLEAN`, merges through the ordinary rails.
+- **red naming a real test** → `CODEERROR`, bounced on the SAME `kind=health` rail (same once-guard,
+  same `REFIX_MAX_ROUNDS` budget) `HEALTHCHECK_AUTOFIX` uses for a local red — one rail, not two —
+  with the test CI named carried into the re-task prompt.
+- **pending / cancelled-chain** → WAIT, never a red (the row is qualified with the cancelled count).
+- **platform-infra red** (Actions outage: *Failed to resolve action download info*, *Service
+  Unavailable*, a job never acquired by a runner) → `WAIT` + ONE bounded, journaled
+  `gh run rerun --failed`, and NEVER a `CODEERROR`. **Do not re-task a builder for one of these** —
+  `ci_infra_transient` in the journal means the platform failed, not the diff.
+- **CI absent / gh unreachable** → falls back to the local suite and journals `ci_health_fallback`.
+  A fleet still burning health slots under `HEALTH_SOURCE=ci` is this line: check it before assuming
+  the lever is inert.
+
+Set it with `herd config set --local HEALTH_SOURCE ci`, and only in a repo whose CI genuinely runs
+the same suite on every PR head sha (an authenticated `gh` with Actions read + rerun access is
+required). The verdict is a per-tick RECONCILED READ — polled fresh each tick, never a dispatched
+collector that can die holding it — so a watcher restart mid-gate costs one re-read, nothing more.
+
 **The spawn-gate formula.** A lane HOLDS a new spawn when in-flight builders already exceed
 `REVIEW_CONCURRENCY + SPAWN_AHEAD` and the review pipeline is saturated. `spawn.sh` queues a held
 spawn durably — nothing is lost — and the watcher drains the queue as slots free. `HERD_FORCE_SPAWN=1`

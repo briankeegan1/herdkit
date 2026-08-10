@@ -129,7 +129,7 @@ reset_state() {
   : > "$STUB_PANE_RUN_LOG"; : > "$REFIX_STATE"; : > "$JOURNAL_FILE"; : > "$GH_CALLS"
   DISPLAY=(); DRYRUN=""; STUB_AGENT_EMPTY=""; STUB_LIVENESS=alive
   export STUB_AGENT_NAME="slug-a" STUB_AGENT_STATUS="idle" STUB_PANE_ID="pane-a"
-  unset HERD_CI_FASTBOUNCE_IDENTITY CI_FAST_BOUNCE GH_RUNS GH_LOG_FAILED
+  unset HERD_CI_FASTBOUNCE_IDENTITY HERD_CI_FASTBOUNCE_CLASS CI_FAST_BOUNCE GH_RUNS GH_LOG_FAILED
 }
 CI_SUM='CI failed: suite(macos)'
 WT="$T/trees/slug-a"; mkdir -p "$WT"
@@ -276,5 +276,35 @@ _handle_ci_fastbounce 70 slug-a shaH 0 "$WT" feat/a "$CI_SUM" || fail "(11) a fr
 [ "$(runs)" = "2" ] || fail "(11) expected a second bounce after the rail reset (got $(runs))"
 ok "(11) a local CLEAN retracts the shared health rail via the existing reset"
 
+# ── (12) HERD-609/HERD-578: a PLATFORM-INFRA red is not a code red — no bounce, and the journal says
+#         WHY it declined (infra-transient), not the generic ci-log-unreadable. Grounded in the
+#         2026-08-06 GitHub Actions outage: every failed job died before a test ran, so there is
+#         nothing for the builder to reproduce and a bounce would burn a real refix round. ────────
+reset_state
+export CI_FAST_BOUNCE=on HERD_CI_FASTBOUNCE_IDENTITY="" \
+       HERD_CI_FASTBOUNCE_CLASS=$'infra\tfailed to resolve action download info'
+_handle_ci_fastbounce 80 slug-a shaI 0 "$WT" feat/a "$CI_SUM" && fail "(12) an infra red must return 1 (no bounce)"
+[ "$(runs)" = "0" ] || fail "(12) an infra red must never bounce the builder"
+[ "$(refix_rail_count 80 health)" = "0" ] || fail "(12) an infra red must not consume a refix round"
+grep -q '"reason":"infra-transient"' "$JOURNAL_FILE" \
+  || fail "(12) an infra red must be journaled as infra-transient, not ci-log-unreadable"
+grep -q 'failed to resolve action download info' "$JOURNAL_FILE" \
+  || fail "(12) the journal must carry the platform signature it matched"
+ok "(12) a platform-infra CI red declines with reason=infra-transient — never a bounce, never a code red"
+
+# ── (12b) the SAME shared mapping, end to end through gh: no test seam, real run-list + log ───────
+reset_state
+export CI_FAST_BOUNCE=on
+unset HERD_CI_FASTBOUNCE_IDENTITY HERD_CI_FASTBOUNCE_CLASS
+export GH_RUNS='[{"headSha":"shaI2","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":9101}]'
+export GH_LOG_FAILED=$'setup\tError: Failed to resolve action download info. Error: Service Unavailable\n'
+[ -z "$(_ci_fastbounce_identity feat/a shaI2)" ] || fail "(12b) an infra-only log must yield NO identity"
+_CLASS="$(_ci_fastbounce_class feat/a shaI2)"
+case "$_CLASS" in infra*) : ;; *) fail "(12b) expected an infra class, got: [$_CLASS]" ;; esac
+_handle_ci_fastbounce 81 slug-a shaI2 0 "$WT" feat/a "$CI_SUM" && fail "(12b) infra must return 1"
+[ "$(runs)" = "0" ] || fail "(12b) infra must never bounce"
+grep -q '"reason":"infra-transient"' "$JOURNAL_FILE" || fail "(12b) must journal infra-transient"
+ok "(12b) the infra classification rides the SHARED mapping (herd.ci_verdict) end to end via gh"
+
 echo
-echo "ALL PASS ($pass checks) — CI_FAST_BOUNCE (HERD-495)"
+echo "ALL PASS ($pass checks) — CI_FAST_BOUNCE (HERD-495) + infra-transient (HERD-609/HERD-578)"
