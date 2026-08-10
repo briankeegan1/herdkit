@@ -8496,7 +8496,20 @@ _main_health_clear() {
       ci) printf '%s\x1f%s\x1f%s\x1f%s\n' "$_mc_pv_sha" "$_mc_pv_since" "$_mc_other" ""           > "$MAIN_HEALTH_STATE" 2>/dev/null || true ;;
       *)  printf '%s\x1f%s\x1f%s\x1f%s\n' "$_mc_pv_sha" "$_mc_pv_since" ""           "$_mc_other" > "$MAIN_HEALTH_STATE" 2>/dev/null || true ;;
     esac
-    [ -n "$_mc_own" ] && journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result partial_clear kind "$_mc_kind"
+    # HERD-612 leg 4 (review BLOCK): journal UNCONDITIONALLY. The old `[ -n "$_mc_own" ]` guard meant
+    # that a green collected in a scope which was NOT itself standing red ended its dispatch chain with
+    # NO terminal main_health event AT ALL — and that is the ROUTINE case in this feature's own target
+    # composition: with MAIN_HEALTH_CI_GATE on and a CI-scoped red standing (field4 set, field3 empty),
+    # every later local-suite green lands here with an empty _mc_own. The ENGINE was right both times
+    # (nothing to clear, nothing to re-fire, the row stays up for the live CI red); the JOURNAL was
+    # incomplete, and a reconciler reading it — journal-audit's dispatch_no_outcome scan, which THIS PR
+    # extends to this rail — can only read "no terminal" as "stranded", raising a false, unclearable
+    # finding per merged sha for the whole duration of a CI-red window. A verdict that was collected
+    # must SAY so. `cleared` keeps the distinction the guard was carrying: yes = this scope really was
+    # red and is now clear; no = it was already clear, so this green moved nothing.
+    local _mc_didclear=no; [ -n "$_mc_own" ] && _mc_didclear=yes
+    journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result partial_clear kind "$_mc_kind" \
+      cleared "$_mc_didclear"
     return 0
   fi
   rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true

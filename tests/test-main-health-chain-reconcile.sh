@@ -36,6 +36,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="$HERE/../scripts/herd/agent-watch.sh"
+# Resolved HERE, before the source below: agent-watch.sh defines its own $HERE, so a path built from it
+# further down would point inside scripts/herd instead of the repo root.
+AUDIT="$HERE/../scripts/herd/journal-audit.sh"
 
 # Pin our own precondition (HERD-458): a CONFIGURED caller can leave ambient MAIN_HEALTH_* / HEALTH_*
 # exported, which every cadence assertion below would otherwise inherit instead of the unset default.
@@ -201,6 +204,41 @@ _main_health_ci_leg
 [ ! -s "$MAIN_HEALTH_CI_STATE" ] || fail "(1) a partial clear kept the anchor for a CI red that is gone"
 ok "(1) a PARTIAL clear (CI cleared, local still red) drops the anchor — only a refusal keeps it"
 
+# EVERY collected verdict journals a TERMINAL for its own sha — including the one that clears nothing.
+# Review BLOCK on the first cut of this PR: with a CI-scoped red standing (field4 set, field3 empty) —
+# the HERD-434 "5 PRs merged while CI stayed red" composition this feature exists for — a later local
+# suite going GREEN reaches _main_health_clear with an EMPTY own-identity, took the partial branch, and
+# journaled NOTHING (the partial_clear line was guarded on the own-identity being non-empty). The engine
+# was right (nothing to clear, the row stays up for the live CI red) but its dispatch chain ended with
+# no terminal event at all, so leg 4's auditor could only read it as STRANDED — a false, unclearable
+# finding per merged sha for the whole CI-red window. The journal must record a collected verdict even
+# when that verdict moved nothing.
+reset_state
+pin_red "$PINNED" "77" "" "CI build: FAILURE"          # CI-scoped red standing, no local identity
+printf '%s FAILURE 0\n' "$PINNED" > "$MAIN_HEALTH_CI_STATE"
+chain "$DESCENDANT" 830
+mhlog "$DESCENDANT" "✅ HEALTHCHECK CLEAN"
+_reconcile_main_health_chains
+_collect_main_health
+[ "$(jcount '"sha":"'"$DESCENDANT"'"')" -ge 1 ] || fail "(1) the collected local green journaled NOTHING for its own sha — its dispatch chain has no terminal"
+[ "$(jcount '"sha":"'"$DESCENDANT"'","result":"partial_clear"')" -eq 1 ] || fail "(1) the local green did not journal a partial_clear terminal: $(cat "$JOURNAL_FILE")"
+grep -q '"cleared":"no"' "$JOURNAL_FILE" || fail "(1) the terminal does not record that this scope was already clear (nothing was moved)"
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(1) the local green wiped the standing CI red"
+[ "$(ledger_field 4)" = "CI build: FAILURE" ] || fail "(1) the CI identity did not survive a local-scope green: '$(ledger_field 4)'"
+[ "$(ncount 'main green')" -eq 0 ] || fail "(1) a partial (local-only) clear falsely notified full recovery"
+ok "(1) a green collected in a scope that was NOT red still journals a terminal (cleared=no) — no chain ends silent"
+
+# …and the terminal is honest the other way too: when this scope really was red, cleared=yes.
+reset_state
+pin_red "$PINNED" "77" "app/greet.test.sh" "CI build: FAILURE"
+chain "$DESCENDANT" 831
+mhlog "$DESCENDANT" "✅ HEALTHCHECK CLEAN"
+_reconcile_main_health_chains
+_collect_main_health
+grep -q '"cleared":"yes"' "$JOURNAL_FILE" || fail "(1) a green that really did clear the local identity was not recorded as cleared=yes"
+[ -z "$(ledger_field 3)" ] || fail "(1) the local identity was not cleared: '$(ledger_field 3)'"
+ok "(1) the same terminal distinguishes a real clear (cleared=yes) from a no-op one (cleared=no)"
+
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
 # (2) ORPHAN-RECONCILE: a CI-scoped ledger row with no anchor self-heals
 # ════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -225,6 +263,18 @@ export GH_RUNS='[{"headSha":"'"$DESCENDANT"'","status":"COMPLETED","conclusion":
 _main_health_ci_leg
 [ ! -s "$MAIN_HEALTH_STATE" ] || fail "(2) the self-healed anchor still could not be cleared by a descendant green"
 ok "(2) end-to-end: orphan → reconciled anchor → the very next descendant green retires the row"
+
+# The conclusion token is round-tripped VERBATIM, whatever case it carries. Production is UPPERCASE —
+# pysrc/herd/ci_verdict.py uppercases every conclusion (classify_runs: str(...).upper()) before the fail
+# bucket builds "CI <workflow>: <conclusion>" — so the uppercase fixture above IS the live shape; this
+# lowercase pass exists so the reconstruction can never quietly become case-normalizing, which would
+# make the rebuilt anchor differ from the fail bucket's own line and cost one extra re-render.
+reset_state
+pin_red "$PINNED" "77" "" "CI build: failure"
+rm -f "$MAIN_HEALTH_CI_STATE"
+_main_health_ci_anchor_reconcile
+grep -q " failure 0$" "$MAIN_HEALTH_CI_STATE" || fail "(2) the conclusion token was case-normalized instead of round-tripped: $(cat "$MAIN_HEALTH_CI_STATE")"
+ok "(2) the conclusion is restored verbatim in either case (production uppercases via ci_verdict.py)"
 
 # The qualified (starvation) identity shape carries its own cancelled count back into the anchor.
 reset_state
@@ -455,6 +505,55 @@ settle
 ok "(5) with MAIN_HEALTH_RECHECK_MINS armed the ordinary cadence owns the re-verify; the one-shot stays silent"
 
 MAIN_HEALTH_RECHECK_ONESHOT=off
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# (4) CROSS-CHECK: the REAL auditor against the REAL engine's OWN journal
+# ════════════════════════════════════════════════════════════════════════════════════════════════════
+# Leg 4 asserts a property OF the journal ("every dispatched chain reaches a terminal") while the engine
+# is what WRITES that journal, so proving each half against its own hand-written fixture proves nothing
+# about the pair. That gap is not theoretical: it is exactly how the first cut of this PR shipped a
+# false-finding bug (a partial clear that journaled nothing) — and replaying a real journal through the
+# real scanner immediately turned up a SECOND one the fixtures could not see (a terminal written in the
+# same whole-second as its dispatch read as "not later"). So the auditor is driven here over the journal
+# the engine above actually produced, never a transcription of it.
+audit_strand_findings() {
+  local _au_now _au_n
+  # An hour ahead of the events this test just wrote, so every dispatch is past the TTL.
+  _au_now="$(date -u -v+1H +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"
+  rm -f "$T/audit-seen" "$T/audit-inbox"
+  JOURNAL_AUDIT=on JOURNAL_AUDIT_ACT=off \
+  HERD_JOURNAL_AUDIT_INBOX="$T/audit-inbox" HERD_JOURNAL_AUDIT_SEEN="$T/audit-seen" \
+  HERD_APPROVALS_FILE="$T/audit-approvals" HERD_JOURNAL_AUDIT_PR_BODY_CMD="/usr/bin/true" \
+  HERD_JOURNAL_AUDIT_NOW="$_au_now" JOURNAL_AUDIT_DISPATCH_TTL=1 JOURNAL_AUDIT_RED_TTL=999999 \
+  JOURNAL_AUDIT_MERGE_GRACE=999999 JOURNAL_AUDIT_PUSHED_GRACE=999999 \
+    bash "$AUDIT" >/dev/null 2>&1
+  _au_n="$(grep -c '"kind":"dispatch_no_outcome"' "$JOURNAL_FILE" 2>/dev/null)" || _au_n=0
+  printf '%s' "${_au_n:-0}"
+}
+[ -f "$AUDIT" ] || fail "(4) journal-audit.sh not found at $AUDIT"
+
+# THE COMPOSITION THE REVIEW BLOCKED ON: a CI-scoped red standing while the local suite goes green on a
+# newer sha, collected through the real collector. Every merged sha does this for the whole duration of
+# a CI-red window, so a false finding here is not an edge case — it is a per-merge alarm.
+reset_state
+pin_red "$PINNED" "78" "" "CI build: FAILURE"
+printf '%s FAILURE 0
+' "$PINNED" > "$MAIN_HEALTH_CI_STATE"
+printf 'green\n' > "$HC_MODE"
+_main_health_dispatch 78 "$DESCENDANT" observed-sha || fail "(4) setup: the suite did not dispatch"
+settle
+[ "$(jcount '"sha":"'"$DESCENDANT"'","result":"dispatched"')" -eq 1 ] || fail "(4) setup: no dispatch event to reconcile"
+[ -s "$MAIN_HEALTH_STATE" ] || fail "(4) setup: the local green wiped the standing CI red"
+[ "$(audit_strand_findings)" -eq 0 ] || fail "(4) the REAL auditor called a completed chain stranded: $(cat "$JOURNAL_FILE")"
+ok "(4) cross-check: a real collected-under-CI-red chain raises ZERO dispatch_no_outcome findings"
+
+# The auditor is not merely silent — it still catches the real thing. A dispatch the engine journals and
+# nothing ever collects (journaled through the engine's OWN emitter, so the shape is authentic) is the
+# Aug-7 strand, and it must still surface.
+reset_state
+journal_append main_health pr 812 sha "$DEAD_SHA" result dispatched pid 999999 provenance observed-sha
+[ "$(audit_strand_findings)" -eq 1 ] || fail "(4) a genuinely stranded chain went unreported: $(cat "$JOURNAL_FILE")"
+ok "(4) cross-check: a genuinely stranded chain still surfaces as dispatch_no_outcome"
 
 # ── unit floor: the log classifier both new paths route through ──────────────────────────────────────
 LOGT="$T/classify.log"

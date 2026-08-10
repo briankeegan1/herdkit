@@ -239,6 +239,56 @@ grep -q '0f50601' "$JOURNAL_FILE" || fail "(2b''') the finding does not name the
 pass
 echo "PASS (2b''') main_health result=dispatched with no terminal → dispatch_no_outcome"
 
+# THE CI-RED WINDOW, which is this leg's own target composition (review BLOCK on the first cut): with a
+# CI-scoped red standing, every later local-suite green is collected and journals `partial_clear` with
+# cleared=no — it moved nothing, because the scope it owns was not the red one. That IS a completed
+# chain, and reading it as stranded fabricated one unclearable finding per merged sha for the whole
+# duration of a CI-red window — the exact incident this rail exists to report on.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+jline "2026-07-09T12:05:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"partial_clear","kind":"local","cleared":"no"'
+out="$(run_audit on)" || fail "(2b3a) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b3a) a green collected under a standing CI red was reported STRANDED; $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b3a) a partial_clear that cleared nothing still closes the chain (the CI-red window)"
+
+# COMPLETENESS IS NOT AN ALLOW-LIST. What closes a chain is defined as "not one of the results that
+# START one", so a terminal this scan has never heard of can never be reported as a strand. The reverse
+# rule would put this scan one new result token away from fabricating alarms about completed work.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+jline "2026-07-09T12:05:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"some_future_terminal"'
+out="$(run_audit on)" || fail "(2b3b) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b3b) an unrecognized terminal was reported as a strand; $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b3b) an unrecognized terminal result closes the chain (deny-list, never an allow-list)"
+
+# …but the results that START a run never close one. chain_collected (HERD-612 leg 3) is the sharp
+# case: it means the dead worker's result file was written, NOT that the collector has routed it — the
+# real terminal lands a tick later, and treating the hand-off as an outcome would hide a collector that
+# then died itself.
+for _start in recheck chain_collected; do
+  reset_surfaces
+  jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+  jline "2026-07-09T12:05:00Z" "\"event\":\"main_health\",\"pr\":\"?\",\"sha\":\"0f50601\",\"result\":\"$_start\""
+  out="$(run_audit on)" || fail "(2b3c) audit exited non-zero: $out"
+  [ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b3c) result=$_start closed a chain it only re-started; $(cat "$JOURNAL_FILE")"
+done
+pass
+echo "PASS (2b3c) recheck / chain_collected re-start a chain, they never close one"
+
+# SAME-SECOND TERMINAL. Journal ts is whole-second, so a verdict that lands fast — or simply an unlucky
+# second boundary — shares its dispatch's timestamp. A ts-strict "later" reported that as a strand;
+# found by replaying a REAL engine journal through this scanner instead of trusting a fixture. "Later"
+# is the journal's own order.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"partial_clear","kind":"local","cleared":"no"'
+out="$(run_audit on)" || fail "(2b3d) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b3d) a terminal in the SAME second as its dispatch was not seen; $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b3d) a terminal sharing its dispatch's timestamp still closes the chain (order, not clock)"
+
 # Every terminal result the rail can actually write CLOSES the chain — including the fail-soft ones
 # (checkout-moved, sandbox-unavailable, died-cap all journal result=infra_event), and including a
 # partial_clear (one identity cleared while the other stays red). None of these may be a finding.
