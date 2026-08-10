@@ -74,6 +74,23 @@ EOF
   printf '%s\tcalm' "${_cs_epoch:-}"
 }
 
+# herd_console_classify_intent_escalation <line>
+#   ("<epoch>\t<intent_id>\t<slug>\t<lane>\t<ref>\t<reason>", HERD-630)
+#   Prints "<epoch>\tloud". An escalated spawn intent is a decision the coordinator made that the
+#   engine REFUSED to execute — the operator has to re-ground and re-publish it, so it must not quietly
+#   age off the console the way a builder note does. It leaves the display two ways, both explicit and
+#   both journaled: `herd intents ack <n>`, or the watcher's own age-to-retired sweep
+#   (agent-watch.sh's _intent_escalations_retire) once the row is past CONSOLE_ROW_RETENTION. The
+#   HERD-613 lesson is why both exist in the same slice: a loud row with no clearing path is not a
+#   safety feature, it is a permanent-red generator.
+herd_console_classify_intent_escalation() {
+  local _cs_epoch
+  IFS=$'\t' read -r _cs_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tloud' "${_cs_epoch:-}"
+}
+
 # herd_console_acked <ack-file> <line>  → 0 when this exact ledger line has been acknowledged.
 herd_console_acked() {
   local _cs_ack="${1:-}" _cs_line="$2"

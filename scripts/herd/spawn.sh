@@ -14,6 +14,7 @@
 #   spawn.sh <slug> quick  "<task text>"
 #   spawn.sh <slug> feature "<task text>"
 #   HERD_SPAWN_AFTER=<slug|pr#> spawn.sh <slug> feature "<task>"   # HELD until the dep merges (HERD-94)
+#   HERD_SPAWN_PRIO=<n> spawn.sh <slug> feature "<task>"           # drains in band <n> (HERD-630)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
@@ -52,6 +53,19 @@ ITEM_REF="${HERD_CLAIM_ID:-${HERD_ITEM_REF:-}}"
 # and an intent enqueued by an OLDER engine (no sidecar) still drains correctly (empty = no dependency).
 AFTER="${HERD_SPAWN_AFTER:-}"
 AFTER="${AFTER#\#}"
+
+# Priority band (HERD-630, Phase 1 of HERD-625) — an OPTIONAL non-negative integer; the drain serves
+# the LOWEST band first and stays FIFO by INTENT_ID within a band. Rides its own SIDECAR
+# ($INTENT_ID.prio) exactly as .ref and .after do, for exactly the same reason: the .req body's
+# slug/lane/task parse is POSITIONAL AND FROZEN (docs/spikes/coordinator-work-queue.md §3.2), so an
+# intent enqueued by an older engine — or drained by one — must keep working with no sidecar at all.
+# Absent (the default) = no sidecar written, no output change, and the intent drains in the default
+# band: byte-for-byte a pre-HERD-630 enqueue. A non-numeric value is dropped rather than written, so a
+# typo degrades to today's FIFO instead of publishing a priority nobody intended. The band is only
+# CONSULTED when INTENT_QUEUE=on — writing one on an unarmed project is inert, which is what makes the
+# key safe to arm later against a queue that already carries bands.
+PRIO="${HERD_SPAWN_PRIO:-}"
+case "$PRIO" in ''|*[!0-9]*) PRIO="" ;; esac
 
 # Enqueue atomically (temp then mv); filename sorts FIFO so oldest is drained first. The tracker ref
 # rides in a SIDECAR ($INTENT_ID.ref) rather than the .req body, so the positional slug/lane/task
@@ -97,9 +111,10 @@ _spawn_next_seq() {
 INTENT_ID="$(date +%s)-$(printf '%010d' "$(_spawn_next_seq)")-$$"
 [ -n "$ITEM_REF" ] && printf '%s\n' "$ITEM_REF" > "$Q/$INTENT_ID.ref"
 [ -n "$AFTER" ] && printf '%s\n' "$AFTER" > "$Q/$INTENT_ID.after"
+[ -n "$PRIO" ] && printf '%s\n' "$PRIO" > "$Q/$INTENT_ID.prio"
 tmp=$(mktemp "$Q/.tmp.XXXXXX")
 printf '%s\n%s\n%s\n' "$SLUG" "$LANE" "$TASK" > "$tmp"
 mv "$tmp" "$Q/$INTENT_ID.req"
 
-printf '🚀 queued: %s (%s)%s%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}" "${AFTER:+  after: $AFTER}"
+printf '🚀 queued: %s (%s)%s%s%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}" "${AFTER:+  after: $AFTER}" "${PRIO:+  prio: $PRIO}"
 printf 'INTENT_ID %s\n' "$INTENT_ID"

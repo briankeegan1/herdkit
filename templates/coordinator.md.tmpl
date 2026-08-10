@@ -662,6 +662,34 @@ collector that can die holding it — so a watcher restart mid-gate costs one re
 spawn durably — nothing is lost — and the watcher drains the queue as slots free. `HERD_FORCE_SPAWN=1`
 (or a leading `--force`) bypasses the hold for a genuinely urgent item and journals the bypass.
 
+**Queue the whole plan, not just the next item** (`INTENT_QUEUE=on`, HERD-630). The spawn queue has
+always externalized spawn EXECUTION; what still waited on a live coordinator turn was spawn
+SELECTION. With the lever armed you enqueue the ranked plan ONCE and the watcher drains it as slots
+free, whether or not this seat is between turns:
+
+    HERD_ITEM_REF=<id> HERD_SPAWN_PRIO=10 bash {{SCRIPTS_DIR}}/spawn.sh <slug> feature "<task>"
+
+- **`HERD_SPAWN_PRIO=<n>` is a BAND, lowest first**, FIFO by enqueue order within a band. Unmarked
+  intents share a default band, so a queue where you published no priorities is exactly today's FIFO
+  — arming the lever alone re-orders nothing. Leave gaps (10/20/30) so you can slot work between
+  bands later without restamping the queue.
+- **The queue consumes an order; it never computes one.** Ranking the backlog is yours. Re-ordering
+  mid-drain is a re-read of the whole program — a coordinator act, not something to delegate.
+- **Stale intents refuse themselves.** Before launching, the drain re-reads the item's tracker state:
+  an item that shipped since you queued it is skipped (`spawn_skipped reason=re-ground`) and the
+  drain moves to the next candidate — no worktree, branch or agent. An intent that sat undrained past
+  `INTENT_TTL` (default 1 day) does not launch at all: it ESCALATES to a loud `spawn intents`
+  needs-you row, because a builder run against a day-old plan costs a full run plus a bounced PR.
+- **Clear escalations, don't ignore them.** `herd intents` lists them; re-queue what still matters,
+  then `herd intents ack <n>` (or `ack all`). A row you never touch retires itself after the normal
+  2 h retention, journaling `spawn_intent_retired` with its ref.
+- **Countermand before it claims:** `bash {{SCRIPTS_DIR}}/spawn-step.sh cancel <intent-id>` retires a
+  still-pending intent atomically (exit 3 means the drain already claimed it — countermand the
+  BUILDER instead: close the PR, retire the worktree, release the claim).
+- **NOT multi-seat safe yet.** Each watcher sizes its spawn budget from its own worktree roster, so
+  two seats draining one pool can each admit up to their own cap. Arm it on one seat until Phase 4
+  leases the slot through the machine-wide capacity tenant.
+
 **Standing duty.** When engine mechanics or workflow behavior change, updating the affected skill
 template is part of FINISHING that change — a stale section here is a rail a seat will follow into
 a wrong action.

@@ -79,6 +79,30 @@ ok
 
 export STUB_SPAWN_LOG="$T/spawns.log"; : > "$STUB_SPAWN_LOG"
 
+# await_dispatch <extended-regex> — wait (bounded) for the REVIEWER's own log line.
+#
+# The dispatch is BACKGROUNDED: _dispatch_review forks the reviewer through _bg_new_session, then
+# writes the inflight marker and returns, so _review_gate_step echoes RUNNING as soon as the fork is
+# recorded — BEFORE the child has necessarily been scheduled to run its first statement. Sampling the
+# child's log the instant the parent returns is therefore a RACE on fork+exec latency, and it is
+# exactly the race that turned this file red on a loaded 6-way ubuntu CI shard (PR #742) while every
+# other shard and every local run stayed green.
+#
+# The right repair is to fix the PROBE's invariant, not to retry the check: the assertion here is
+# "the reviewer WAS dispatched", and the honest observable for that is the child's line ARRIVING, not
+# it having arrived within one scheduler quantum. A reviewer that genuinely never runs still fails
+# this — it just takes the full window to say so. (The two synchronous observables the PARENT owns,
+# the RUNNING token and the inflight marker, are asserted separately at each call site and are not
+# subject to this; only the child's side effect is.)
+await_dispatch() {
+  local _ad_re="$1" _ad_n=0
+  while [ "$_ad_n" -lt 200 ]; do              # 200 × 0.05s = 10s ceiling
+    grep -qE "$_ad_re" "$STUB_SPAWN_LOG" 2>/dev/null && return 0
+    sleep 0.05; _ad_n=$(( _ad_n + 1 ))
+  done
+  return 1
+}
+
 # git helpers ────────────────────────────────────────────────────────────────
 gc() { git -C "$1" "${@:2}"; }
 init_repo() {
@@ -126,6 +150,10 @@ for _ in 1 2 3; do
   review_verdict 101 "$NEW1" >/dev/null 2>&1 || DELTA_REVIEW=on _review_gate_step 101 slug-int "$NEW1" >/dev/null
 done
 [ ! -s "$STUB_SPAWN_LOG" ] || fail "(a2) a carried sha must never dispatch a reviewer on later ticks"
+# …anchored on the marker the PARENT writes SYNCHRONOUSLY (_dispatch_review) as well as on the child's
+# log, so this absence claim cannot pass merely because a wrongly-forked reviewer had not logged yet.
+[ ! -f "$(_review_inflight_file 101 "$NEW1")" ] \
+  || fail "(a2) a carried sha wrote a review inflight marker — a reviewer WAS dispatched"
 [ "$(awk -v p=101 -v s="$NEW1" '$2==p && $3==s' "$REVIEW_STATE" | grep -c .)" -eq 1 ] \
   || fail "(a2) duplicate ledger rows accumulated for the carried sha"
 ok
@@ -142,7 +170,7 @@ export STUB_DELAY=2 STUB_VERDICT="REVIEW: PASS"
 step="$(DELTA_REVIEW=on _review_gate_step 102 slug-code "$NEW2")"
 [ "$step" = "RUNNING" ] || fail "(b) an authored change must dispatch a full review (got '$step')"
 [ -f "$(_review_inflight_file 102 "$NEW2")" ] || fail "(b) full review must write an inflight marker"
-grep -q '^102 slug-code$' "$STUB_SPAWN_LOG" || fail "(b) reviewer was not dispatched for a real change"
+await_dispatch '^102 slug-code$' || fail "(b) reviewer was not dispatched for a real change"
 [ -z "$(review_verdict 102 "$NEW2" || true)" ] || fail "(b) no verdict should be carried for a real change yet"
 ok
 export STUB_DELAY=0
@@ -153,7 +181,7 @@ record_review 103 "$OLD3" PASS reviewer
 : > "$STUB_SPAWN_LOG"; export STUB_DELAY=2
 step="$(DELTA_REVIEW=off _review_gate_step 103 slug-off "$NEW3")"
 [ "$step" = "RUNNING" ] || fail "(c) DELTA_REVIEW=off must run the full review even for a pure merge (got '$step')"
-grep -q '^103 slug-off$' "$STUB_SPAWN_LOG" || fail "(c) off mode did not dispatch the reviewer"
+await_dispatch '^103 slug-off$' || fail "(c) off mode did not dispatch the reviewer"
 [ "$(review_verdict 103 "$NEW3" || true)" != "PASS" ] || fail "(c) off mode must not carry forward"
 # unknown value behaves exactly like off
 _delta_review_enabled() { case "${DELTA_REVIEW:-off}" in on|On|ON) return 0;; *) return 1;; esac; }  # (sanity: definition intact)
