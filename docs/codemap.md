@@ -279,6 +279,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HEALTH_INFLIGHT_TIMEOUT` → `bin/herd`, `agent-watch.sh`, `lifecycle.sh`, `sweep.sh`
 - `HEALTH_LOAD_THRESHOLD` → `agent-watch.sh`
 - `HEALTH_PANE` → `agent-watch.sh`
+- `HEALTH_SOURCE` → —
 - `HEALTH_SUITE_SCOPE` → `suite-shard.sh`
 - `HEALTH_TIMEOUT_HEADROOM` → `agent-watch.sh`
 - `HEALTH_TRUST_BUILDER` → `health-trust.sh`
