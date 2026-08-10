@@ -3746,43 +3746,100 @@ picks it up on the next \`git pull\` + \`herd update\`. Single-file diff; the no
 # post-render summary in `herd upgrade`/`herd update`. Prints the missing-key report and RETURNS 1 when
 # any manifest config key is unassigned, 0 (one quiet ok line) when in sync. NEVER calls exit, so the
 # upgrade path can print the summary without aborting.
+#
+# HERD-621 perf note: this used to walk the manifest key-by-key, forking a `grep` (membership test)
+# plus an `awk` each for _config_example_default and _config_when_to_surface PER missing key. With the
+# manifest at 300+ config rows and a freshly-scaffolded (or hermetic-test) project missing most of them,
+# that was several hundred process forks on every single `herd upgrade`/`herd update` — cheap on a fast
+# box, but on macOS's stock bash 3.2 (the shell CI actually runs) the fork overhead alone pushed
+# test-cli-update.sh (nine end-to-end `herd update` runs) past its 120s budget. The one awk pass below
+# reads .herd/config, capabilities.tsv and config.example ONCE and emits only the missing rows —
+# key/has-default/default/when, tab-separated — so the bash loop that prints the report forks nothing.
+# Field-for-field this replicates _config_template_keys / _config_example_default /
+# _config_when_to_surface's exact parsing rules (including the "first match wins" and malformed-quote
+# fallback quirks), so the printed report is byte-identical to before.
 _config_sync_report() {
   local cfg="$1" caps="$2" example="$3"
-  # Keys the operator has actually assigned in .herd/config (active KEY= lines; comments skipped) —
-  # reuse the same assigned-key parser the upgrade adoption path uses, so "assigned" means the same
-  # thing everywhere.
-  local assigned; assigned="$(_config_template_keys "$cfg")"
-  # Walk the manifest's config keys in manifest order; collect the ones not assigned.
-  local missing="" key
-  while IFS= read -r key; do
-    [ -n "$key" ] || continue
-    grep -qxF "$key" <<<"$assigned" && continue
-    missing="${missing:+$missing }$key"
-  done < <(_config_manifest_config_keys "$caps")
+  local rows
+  rows="$(awk -F'\t' -v cfgfile="$cfg" '
+    BEGIN {
+      while ((getline cline < cfgfile) > 0) {
+        l = cline
+        sub(/^[[:space:]]+/, "", l)
+        if (l ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+          k = l; sub(/=.*/, "", k)
+          assigned[k] = 1
+        }
+      }
+      close(cfgfile)
+    }
+    FNR==NR {
+      if ($2 == "config") {
+        n++
+        order[n] = $1
+        if (!($1 in whn_set)) { whn[$1] = $4; whn_set[$1] = 1 }
+      }
+      next
+    }
+    {
+      eline = $0
+      sub(/^[[:space:]]*#?[[:space:]]*/, "", eline)
+      if (match(eline, /^[A-Za-z_][A-Za-z0-9_]*=/)) {
+        ek = substr(eline, 1, RLENGTH - 1)
+        if (!(ek in defset)) {
+          ev = substr(eline, RLENGTH + 1)
+          matched = 0
+          if (ev ~ /^"/) {
+            rest = substr(ev, 2); q = index(rest, "\"")
+            if (q > 0) { defval[ek] = substr(rest, 1, q - 1); defset[ek] = 1; matched = 1 }
+          }
+          if (!matched) {
+            sub(/[[:space:]]+#.*/, "", ev)
+            sub(/[[:space:]]+$/, "", ev)
+            defval[ek] = ev
+            defset[ek] = 1
+          }
+        }
+      }
+    }
+    END {
+      # Field separator is 0x1f (unit separator), not a tab: bash IFS-splitting special-cases tab
+      # (like space/newline) to collapse runs and drop empty fields, so a key with an EMPTY default
+      # sitting between two tab separators would vanish and shift every field after it left. 0x1f is
+      # not in that whitespace set, so an empty field survives the bash `read` below untouched.
+      for (i = 1; i <= n; i++) {
+        k = order[i]
+        if (!(k in assigned)) {
+          hd = (k in defset) ? 1 : 0
+          printf "%s\037%s\037%s\037%s\n", k, hd, defval[k], whn[k]
+        }
+      }
+    }
+  ' "$caps" "$example")"
 
-  if [ -z "$missing" ]; then
+  if [ -z "$rows" ]; then
     ok "config in sync — every engine config key is assigned in .herd/config ($cfg)"
     return 0
   fi
 
-  local n; n="$(printf '%s\n' $missing | grep -c .)"
+  local n; n="$(printf '%s\n' "$rows" | grep -c .)"
   say "${c_bold}$n engine config key(s) documented by the manifest but MISSING from .herd/config${c_rst}  ($cfg)"
   say "${c_dim}each rides its built-in default; apply the ones this project cares about with 'herd config set <KEY> <VALUE>' — this command never writes:${c_rst}"
   say ""
   # No secret-masking here: the default VALUES come from the defaults template, which is ZERO-SECRET by
   # contract (credentials live only in .herd/secrets). Masking on the name heuristic would only false-
   # positive legitimate keys whose name contains a secret-shaped substring (e.g. TOKEN_MODE → "TOKEN").
-  local def whn
-  for key in $missing; do
-    if def="$(_config_example_default "$example" "$key")"; then
+  local key hasdef def whn
+  while IFS=$'\037' read -r key hasdef def whn; do
+    [ -n "$key" ] || continue
+    if [ "$hasdef" = "1" ]; then
       printf '  %s%-26s%s default="%s"\n' "$c_bold" "$key" "$c_rst" "$def"
     else
       # Not in the defaults template — an advanced knob whose fallback lives in the engine scripts.
       printf '  %s%-26s%s default=%s(engine built-in)%s\n' "$c_bold" "$key" "$c_rst" "$c_dim" "$c_rst"
     fi
-    whn="$(_config_when_to_surface "$caps" "$key")"
     [ -n "$whn" ] && printf '    %s↳ %s%s\n' "$c_dim" "$whn" "$c_rst"
-  done
+  done <<< "$rows"
   return 1
 }
 
