@@ -5360,9 +5360,14 @@ for line in sys.stdin:
 #      _backend_add_item, skipping items whose title already appears in the new backend's open
 #      list (idempotent re-runs). --migrate / --no-migrate decide non-interactively; a tty is
 #      asked. Titles carry a '(migrated from <old>)' suffix so provenance survives.
-#   4. FREEZE: leaving the file backend stamps $BACKLOG_FILE with a dated frozen-archive banner —
+#   4. RECONCILE INTENTS (HERD-624): resolve or retire every PENDING post-merge reconcile intent
+#      (agent-watch.sh's $WORKTREES_DIR/.agent-watch-merged ledger) still carrying an OLD-backend
+#      ref, while that backend is still reachable — see _backend_switch_reconcile_intents. Otherwise
+#      a merged PR's stuck "reconcile pending" console row nags forever once SCRIBE_BACKEND flips
+#      and the ref can never resolve again.
+#   5. FREEZE: leaving the file backend stamps $BACKLOG_FILE with a dated frozen-archive banner —
 #      the file becomes history, not the work source, and should say so to every future reader.
-#   5. RESTART the backlog viewer pane (best-effort — it binds its backend at process start) and
+#   6. RESTART the backlog viewer pane (best-effort — it binds its backend at process start) and
 #      journal a backend_switched event.
 cmd_backend() {
   local sub="${1:-}"; [ "$#" -gt 0 ] && shift
@@ -5370,6 +5375,76 @@ cmd_backend() {
     switch) cmd_backend_switch "$@" ;;
     *) die "usage: herd backend switch <file|github|linear|jira|changelog> [--migrate|--no-migrate] [--yes]" ;;
   esac
+}
+
+# _backend_switch_reconcile_intents <old> <new> — HERD-624: before this switch is done, resolve or
+# retire any PENDING post-merge reconcile intent (agent-watch.sh's $WORKTREES_DIR/.agent-watch-merged
+# ledger — "<epoch> <pr#> <slug> [ref]") still carrying an OLD-backend ref. The problem: a merged PR
+# whose tracker item never got confirmed Done shows a loud "reconcile pending" console row (HERD-438)
+# that tracker-state-sweep.sh can heal only through the ACTIVE backend — once SCRIBE_BACKEND flips, a
+# ref minted under the OLD backend can never resolve there again, and the row nags forever (the
+# operator report that opened this item). Two resolutions, tried against the OLD backend while it is
+# STILL fully configured (this runs before `cmd_config set` flips SCRIBE_BACKEND):
+#   (a) the old backend confirms the item CLOSED (its own read — e.g. a file-backend ✅ line in the
+#       about-to-be-frozen BACKLOG.md archive), or, for a backend with a real update op, this call
+#       COMPLETES the mark-shipped right now, while it can still reach it. Either way the ref is
+#       ledgered DONE — the exact 3-column row tracker-state-sweep.sh itself writes — so
+#       build_reconcile_pending / _pms_tracker_ledgered treat it as confirmed post-switch.
+#   (b) neither is possible (a read-only backend like `file` with the item still open, or the probe
+#       fails outright) — RETIRE it: one `tracker_reconcile_retired` journal event (ref + reason
+#       "retired: pre-switch ref") and a terminal 4-column `retired` ledger row — the SAME terminal
+#       marker tracker-state-sweep.sh's own age-to-retired leg (HERD-624 leg 2) writes, so a future
+#       sweep never re-probes it and console-section.sh ages its note out through the normal CALM
+#       retention window instead of nagging forever (see console-section.sh / agent-watch.sh).
+# Bounded to the last 50 landed rows (mirrors build_reconcile_pending's own recency window) and fully
+# fail-soft: any single row's probe error just leaves it pending for the next tracker-state-sweep to
+# retry — this NEVER blocks or fails the switch itself.
+_backend_switch_reconcile_intents() {
+  local old="$1" new="$2"
+  local state="${WORKTREES_DIR:-}/.agent-watch-merged"
+  local ledger="${WORKTREES_DIR:-}/.agent-watch-tracker-swept"
+  local old_backend_file="$SCRIPTS_DIR/backends/${old}.sh"
+  { [ -n "${WORKTREES_DIR:-}" ] && [ -s "$state" ] && [ -f "$old_backend_file" ]; } || return 0
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/journal.sh" 2>/dev/null || true
+  local epoch pr slug ref n_done=0 n_retired=0 resolved
+  while read -r epoch pr slug ref; do
+    [ -n "${epoch:-}" ] && [ -n "${ref:-}" ] || continue
+    if [ -s "$ledger" ] && awk -v r="$ref" \
+         '($2==r && NF==3) || ($2==r && NF==4 && $4=="retired"){f=1} END{exit !f}' "$ledger" 2>/dev/null
+    then
+      continue    # already confirmed Done, or already retired — nothing to do
+    fi
+    resolved="$(
+      cd "$PROJECT_ROOT" 2>/dev/null || exit 1
+      # shellcheck source=/dev/null
+      . "$old_backend_file" 2>/dev/null || exit 1
+      ITEM_STATE=""
+      _backend_item_state "$ref" >/dev/null 2>&1
+      if [ "${ITEM_STATE:-}" = "closed" ]; then
+        printf 'closed'; exit 0
+      fi
+      if command -v _backend_update_state >/dev/null 2>&1; then
+        HERD_COMPONENT="backend-switch" HERD_TW_PR="$pr" _BACKEND_RESULT=""
+        export HERD_COMPONENT HERD_TW_PR
+        _backend_update_state "$ref" done >/dev/null 2>&1 || true
+        [ "${_BACKEND_RESULT:-}" = "DONE" ] && { printf 'done'; exit 0; }
+      fi
+      exit 1
+    )" 2>/dev/null || true
+    if [ -n "$resolved" ]; then
+      printf '%s %s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$ref" "$pr" >> "$ledger" 2>/dev/null || true
+      n_done=$((n_done + 1))
+    else
+      printf '%s %s %s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$ref" "$pr" retired >> "$ledger" 2>/dev/null || true
+      { command -v journal_append >/dev/null 2>&1 && journal_append tracker_reconcile_retired \
+          ref "$ref" pr "$pr" component backend-switch reason "retired: pre-switch ref"; } || true
+      n_retired=$((n_retired + 1))
+    fi
+  done < <(tail -n 50 "$state" 2>/dev/null)
+  [ "$((n_done + n_retired))" -gt 0 ] \
+    && say "backend switch: reconciled $n_done pending merge-reconcile intent(s), retired $n_retired unresolvable pre-switch ref(s) [HERD-624]"
+  return 0
 }
 
 cmd_backend_switch() {
@@ -5591,7 +5666,10 @@ EOF
     say "migrated $migrated item(s) into $target${skipped:+ ($skipped already present, skipped)}"
   fi
 
-  # ── 4. frozen-archive banner when leaving the file backend ────────────────────────────────────
+  # ── 4. HERD-624: resolve/retire pending post-merge reconcile intents carrying an OLD-backend ref ─
+  _backend_switch_reconcile_intents "$current" "$target" || true
+
+  # ── 5. frozen-archive banner when leaving the file backend ────────────────────────────────────
   if [ "$current" = "file" ] && [ "$target" != "file" ] && [ -f "$PROJECT_ROOT/$BACKLOG_FILE" ] \
      && ! grep -q 'FROZEN ARCHIVE' "$PROJECT_ROOT/$BACKLOG_FILE"; then
     local _tmp; _tmp="$(mktemp)"
@@ -5603,7 +5681,7 @@ EOF
     say "stamped $BACKLOG_FILE as a frozen archive"
   fi
 
-  # ── 5. restart the backlog viewer + journal ───────────────────────────────────────────────────
+  # ── 6. restart the backlog viewer + journal ───────────────────────────────────────────────────
   # The viewer binds SCRIBE_BACKEND at process start; best-effort restart, loud hint if it can't.
   if ! "$HERDKIT_HOME/bin/herd" pane backlog >/dev/null 2>&1; then
     warn "could not restart the backlog pane — run 'herd pane backlog' (and if it still shows the old backend, close the stale viewer process first)"

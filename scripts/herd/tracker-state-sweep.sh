@@ -67,6 +67,20 @@
 # non-github backend, the shape check above would misclassify it before ever probing — no backend in
 # this repo uses bare-number identifiers today.
 #
+# HERD-624 (evidence: after a file→github backend switch, a merged PR's Refs: line still names the
+# OLD backend's ref shape — the tracker-state-sweep re-probes it against the NEW backend forever,
+# marks it `unresolvable` correctly (HERD-411/HERD-502), but that ledgered row has no path off the
+# console: agent-watch.sh's "reconcile pending" section only treats a 3-column `done` row as
+# confirmed, so the row nags permanently). THREE LEGS close this: (a) `herd backend switch` itself
+# resolves or retires every pending reconcile intent BEFORE the flip, while the old backend can still
+# answer for it (bin/herd's cmd_backend_switch); (b) _tsweep_age_unresolvable_to_retired below ages a
+# standing `unresolvable` ref to a terminal `retired` marker after _TSWEEP_RETIRE_AFTER sweeps —
+# the HERD-613-leg-3 lesson ("a row nobody can act on needs a terminal, quiet path") applied here
+# too, and console-section.sh classifies `retired` as CALM so it ages off-screen normally instead of
+# staying loud forever; (c) _tsweep_ref_backend_mismatch now also runs pr-ref.sh's shared per-backend
+# SHAPE check (HERD-613), so a `herd backend switch` survivor ref classifies unresolvable on sight
+# instead of burning _TSWEEP_UNRESOLVABLE_AFTER retries first.
+#
 # Hermetic seams (default to the real gh/backend; the tests override them):
 #   HERD_TSWEEP_PRS_FILE      file of "<pr#>\t<ref>" lines, bypassing gh AND the body-parse entirely.
 #   HERD_TSWEEP_PRS_JSON_FILE file of RAW `gh pr list --json number,body` output — exercises the real
@@ -120,6 +134,18 @@ UNRESOLVED_FILE="${HERD_TSWEEP_UNRESOLVED_FILE:-$WORKTREES_DIR/.agent-watch-trac
 # ledgered off. Small on purpose: this is a backstop for a ref the backend provably cannot see, not a
 # retry budget for a slow network — a genuinely transient blip clears the streak on its next success.
 _TSWEEP_UNRESOLVABLE_AFTER=3
+# RETIRE_FILE (HERD-624 LEG 2) — a "<ref> <count>" counter PARALLEL to $UNRESOLVED_FILE, reusing its
+# exact bump/clear shape, but counting SWEEPS a ref has sat `unresolvable` in $LEDGER (not resolve
+# attempts — an unresolvable ref is never re-probed, so there is nothing left to retry). See
+# _tsweep_age_unresolvable_to_retired.
+RETIRE_FILE="${HERD_TSWEEP_RETIRE_FILE:-$WORKTREES_DIR/.agent-watch-tracker-retire-counts}"
+# Sweeps an `unresolvable` ref sits ledgered before it graduates to the terminal `retired` marker.
+# Deliberately looser than _TSWEEP_UNRESOLVABLE_AFTER: `unresolvable` already means "the backend can
+# never see this," so `retired` is not a second correctness gate — it exists purely to move a
+# permanently-loud console row (HERD-502's `escalated` note, and agent-watch.sh's "reconcile pending"
+# row) to a terminal, CALM-aging state once the ref has been visibly given-up-on for a while, not on
+# the very next tick.
+_TSWEEP_RETIRE_AFTER=5
 
 # ── backend resolution (mirrors scribe-step.sh / _reconcile_via_ref) ──────────
 BACKEND_DIR="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
@@ -227,16 +253,33 @@ _tsweep_probe_and_heal() {
 }
 
 # ── HERD-411: unresolvable-ref classification ───────────────────────────────────
-# _tsweep_ref_backend_mismatch REF — true when REF is shaped like a bare GitHub issue ref (optionally
-# `#`-prefixed digits, e.g. `#514` or `514`) while the ACTIVE backend is not github. Every non-github
-# backend's identifiers carry a non-numeric key (HERD-411, PROJ-7, a changelog slug) — a bare number
-# can only ever resolve against github, so probing it through any other backend is provably wasted,
-# not a transient miss. See the file-header LATENT HAZARD note.
+# _tsweep_ref_backend_mismatch REF — true when REF can PROVABLY never resolve under the ACTIVE
+# SCRIBE_BACKEND. Two independent checks:
+#   (1) the original HERD-411 case: REF is shaped like a bare GitHub issue ref (optionally
+#       `#`-prefixed digits, e.g. `#514` or `514`) while the active backend is not github. Every
+#       non-github backend's identifiers carry a non-numeric key (HERD-411, PROJ-7, a changelog
+#       slug) — a bare number can only ever resolve against github. Kept as its own branch (rather
+#       than folded into (2)) because it must also fire under a backend with NO fixed shape at all
+#       (pr-ref.sh's shape table only names linear/jira/github) — see the file-header LATENT HAZARD
+#       note and tests/test-tracker-state-sweep.sh case (9), which exercises exactly this under a
+#       shape-less "stub" backend.
+#   (2) HERD-624: the shared per-backend SHAPE check (pr-ref.sh, HERD-613) — a ref that fails the
+#       ACTIVE backend's own known fixed shape can never be a native id under it. This generalizes
+#       (1) beyond bare numbers: a `herd backend switch` survivor ref minted under the OLD backend
+#       (a linear/jira `HERD-123` under a new github backend, or a file-backend title slug under
+#       any shaped backend — file/changelog define no fixed shape, so pr-ref.sh's own "NO SHAPE
+#       TEST" invariant already exempts a ref surviving INTO one of those) is caught on sight,
+#       exactly like (1), instead of burning _TSWEEP_UNRESOLVABLE_AFTER silent retries against a
+#       backend it was never minted for. One shared parser, not a second one.
 _tsweep_ref_backend_mismatch() {
-  local bare="${1#\#}"
-  [ -n "$bare" ] || return 1
-  case "$bare" in *[!0-9]*) return 1 ;; esac
-  [ "${SCRIBE_BACKEND:-file}" = "github" ] && return 1
+  local ref="$1" backend="${SCRIBE_BACKEND:-file}" bare="${1#\#}"
+  [ -n "$ref" ] || return 1
+  case "$bare" in
+    '') ;;
+    *[!0-9]*) ;;
+    *) [ "$backend" = "github" ] || return 0 ;;
+  esac
+  herd_pr_ref_shape_ok "$ref" "$backend" && return 1
   return 0
 }
 
@@ -314,6 +357,82 @@ _tsweep_mark_unresolvable() {
   # console slots and 11+ journal events for a ref that could never resolve).
   _tsweep_note escalated "$ref" "$pr" unknown
   echo "tracker-state-sweep: $ref is unresolvable ($reason) — ledgered; no further sweeps will probe it."
+}
+
+# ── HERD-624 LEG 2: age a standing `unresolvable` ref to a terminal `retired` state ────────────────
+# The problem this closes: once _tsweep_mark_unresolvable ledgers a ref, _tsweep_ledgered skips it on
+# every future sweep — correct (no more wasted backend reads), but it means the ref's `escalated`
+# console note (HERD-502, deliberately LOUD-forever, because most escalations are a real standing
+# problem) and any downstream "reconcile pending" row (agent-watch.sh's build_reconcile_pending, which
+# only treats a 3-column `done` ledger row as confirmed) never have a path off the screen. That is
+# fine for a genuine, ongoing drift — but for a `herd backend switch` survivor (HERD-624: a ref minted
+# under a backend that is no longer active) it is a PERMANENT false alarm nobody can ever act on, the
+# exact HERD-613-leg-3 lesson ("a row nobody can ever act on must have a terminal, quiet path")
+# applied to reconcile intents instead of shape-invalid refs.
+#
+# _tsweep_retire_count/_bump/_clear mirror _tsweep_unresolved_count/_bump/_clear exactly (same file
+# shape, same tiny footprint — only refs actively aging appear).
+_tsweep_retire_count() {
+  [ -s "$RETIRE_FILE" ] || { printf '0'; return 0; }
+  local n
+  n="$(awk -v r="$1" '$1==r{print $2; exit}' "$RETIRE_FILE" 2>/dev/null)"
+  case "${n:-}" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$n" ;; esac
+}
+_tsweep_retire_bump() {
+  local ref="$1" n dir
+  n="$(_tsweep_retire_count "$ref")"; n=$((n + 1))
+  dir="${RETIRE_FILE%/*}"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || { printf '%s' "$n"; return 0; }
+  if [ -s "$RETIRE_FILE" ]; then
+    awk -v r="$ref" '$1!=r{print}' "$RETIRE_FILE" > "$RETIRE_FILE.tmp" 2>/dev/null \
+      && mv "$RETIRE_FILE.tmp" "$RETIRE_FILE"
+  fi
+  printf '%s %s\n' "$ref" "$n" >> "$RETIRE_FILE" 2>/dev/null || true
+  printf '%s' "$n"
+}
+_tsweep_retire_clear() {
+  [ -s "$RETIRE_FILE" ] || return 0
+  awk -v r="$1" '$1!=r{print}' "$RETIRE_FILE" > "$RETIRE_FILE.tmp" 2>/dev/null \
+    && mv "$RETIRE_FILE.tmp" "$RETIRE_FILE" || true
+}
+
+# _tsweep_retired REF — true iff REF already carries a terminal 4-column `retired` row in $LEDGER.
+_tsweep_retired() {
+  [ -n "${1:-}" ] || return 1
+  [ -s "$LEDGER" ] || return 1
+  awk -v r="$1" '$2==r && NF==4 && $4=="retired"{f=1} END{exit !f}' "$LEDGER" 2>/dev/null
+}
+
+# _tsweep_mark_retired REF PR — journal ONE tracker_reconcile_retired event (the ref survives in the
+# journal + the ledger even though the console row will age out), ledger a terminal 4-column `retired`
+# row (reusing _tsweep_record's existing marker column — byte-compatible with every other 3/4-column
+# reader), and write ONE calm `retired` console note. console-section.sh classifies `retired` as CALM
+# (age out after CONSOLE_ROW_RETENTION), unlike `escalated`'s deliberate loud-forever — this is the
+# whole point of the leg.
+_tsweep_mark_retired() {
+  local ref="$1" pr="$2"
+  journal_append tracker_reconcile_retired ref "$ref" pr "$pr" component sweep \
+    reason "retired: pre-switch ref"
+  _tsweep_record "$ref" "$pr" retired
+  _tsweep_note retired "$ref" "$pr" unknown
+  _tsweep_retire_clear "$ref"
+  echo "tracker-state-sweep: $ref retired (HERD-624) — its unresolvable state has aged out; the console row will clear on the normal calm retention window."
+}
+
+# _tsweep_age_unresolvable_to_retired — the per-sweep pass: every DISTINCT ref currently ledgered
+# `unresolvable` (and not already `retired`) has sat there N sweeps; once that reaches
+# _TSWEEP_RETIRE_AFTER it graduates. Runs unconditionally (independent of _merged_refs/gh) because it
+# operates purely on $LEDGER's own already-ledgered rows, not on a fresh PR scan.
+_tsweep_age_unresolvable_to_retired() {
+  [ -s "$LEDGER" ] || return 0
+  local ref pr n
+  while IFS=' ' read -r _ ref pr _marker; do
+    [ -n "${ref:-}" ] && [ "${_marker:-}" = "unresolvable" ] || continue
+    _tsweep_retired "$ref" && continue
+    n="$(_tsweep_retire_bump "$ref")"
+    [ "$n" -ge "$_TSWEEP_RETIRE_AFTER" ] && _tsweep_mark_retired "$ref" "$pr"
+  done < <(awk 'NF==4 && $4=="unresolvable"{print}' "$LEDGER" 2>/dev/null | awk '!seen[$2]++')
+  return 0
 }
 
 # ── console-note surface (the watcher renders the last lines) ──────────────────
@@ -462,6 +581,11 @@ while IFS=$'\t' read -r pr ref; do
       fi ;;
   esac
 done < <(_merged_refs)
+
+# HERD-624 LEG 2: age any ref that has sat `unresolvable` in $LEDGER long enough to a terminal
+# `retired` state. Independent of the scan above (it reads $LEDGER's own rows, not a fresh PR list),
+# so it still runs on a sweep that finds nothing new to heal.
+_tsweep_age_unresolvable_to_retired
 
 if [ "$healed" -eq 0 ] && [ "$failed" -eq 0 ] && [ "$unresolvable" -eq 0 ]; then
   echo "tracker-state-sweep: no tracker drift — $scanned merged ref(s) scanned, $checked re-checked, all Done. Nothing to heal."

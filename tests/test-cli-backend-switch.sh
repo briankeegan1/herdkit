@@ -333,4 +333,63 @@ grep -q "API unreachable" <<<"$out6c" && fail "a local exec failure must NOT be 
 [ -s "$CURLLOG" ] && fail "a local payload-build failure must never reach curl ($out6c)"
 pass
 
+# ── Case 7: HERD-624 — switch-time reconcile-intent resolution/retirement. A PENDING post-merge
+#    reconcile intent (agent-watch.sh's .agent-watch-merged ledger) carrying an OLD-backend (file) ref
+#    is resolved or retired BEFORE the flip, while the file backend can still read it. Refs use the
+#    file backend's real single-token slug shape (pr-ref.sh test (4): "healthcheck-sha-cache" — a
+#    `Refs:` line only ever captures ONE whitespace-delimited token) and appear verbatim in BACKLOG.md
+#    so the file backend's own substring lookup (_file_line_for_slug) resolves them:
+#      • a ref matching an already-✅-shipped BACKLOG.md line resolves → ledgered DONE (3 columns).
+#      • a ref matching a still-open (🚧) line has no update path on the read-only file backend →
+#        RETIRED (4 columns, `retired: pre-switch ref`) — and the switch itself still succeeds.
+P8="$T/proj8"; mkdir -p "$P8/.herd" "$T/trees8"
+cat > "$P8/.herd/config" <<EOF
+PROJECT_ROOT="$P8"
+WORKSPACE_NAME="testws8"
+SCRIBE_BACKEND="file"
+BACKLOG_FILE="BACKLOG.md"
+WORKTREES_DIR="$T/trees8"
+EOF
+cat > "$P8/BACKLOG.md" <<'EOF'
+# proj8 — backlog
+## Now
+- 🚧 wiring-the-feedback-loop
+## Recently shipped
+- ✅ fix-the-login-crash
+EOF
+cat > "$T/trees8/.agent-watch-merged" <<'EOF'
+1700000000 601 shipped-slug fix-the-login-crash
+1700000001 602 open-slug wiring-the-feedback-loop
+EOF
+: > "$GHLOG"
+export GH_FAKE_LIST='[]'
+out7="$( cd "$P8" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" JOURNAL_FILE="$T/trees8/journal.jsonl" \
+           bash "$HERD" backend switch github --no-migrate </dev/null 2>&1 )" \
+  || fail "file→github switch with pending reconcile intents exited non-zero: $out7"
+unset GH_FAKE_LIST
+grep -q 'SCRIBE_BACKEND="github"' "$P8/.herd/config" || fail "(7) config was not flipped to github ($out7)"
+LEDGER8="$T/trees8/.agent-watch-tracker-swept"
+[ -f "$LEDGER8" ] || fail "(7) no reconcile-intent ledger was written ($out7)"
+awk '$2=="fix-the-login-crash" && NF==3{f=1} END{exit !f}' "$LEDGER8" \
+  || fail "(7) the already-shipped ref was not ledgered DONE (3 columns): $(cat "$LEDGER8")"
+awk '$2=="wiring-the-feedback-loop" && NF==4 && $4=="retired"{f=1} END{exit !f}' "$LEDGER8" \
+  || fail "(7) the still-open, unresolvable-via-file ref was not RETIRED (4 columns): $(cat "$LEDGER8")"
+grep -q "reconciled 1 pending merge-reconcile intent(s), retired 1 unresolvable pre-switch ref(s)" <<<"$out7" \
+  || fail "(7) the switch summary did not report the reconcile/retire counts ($out7)"
+grep -q '"event":"tracker_reconcile_retired"' "$T/trees8/journal.jsonl" \
+  || fail "(7) no tracker_reconcile_retired journal event ($(cat "$T/trees8/journal.jsonl" 2>/dev/null))"
+grep -q '"ref":"wiring-the-feedback-loop"' "$T/trees8/journal.jsonl" \
+  || fail "(7) tracker_reconcile_retired event does not name the retired ref"
+grep -q '"reason":"retired: pre-switch ref"' "$T/trees8/journal.jsonl" \
+  || fail "(7) tracker_reconcile_retired event missing its reason"
+pass
+# idempotent: re-running with the SAME (already-flipped) backend is the usual same-backend no-op, and
+# a re-run of just the reconcile pass over an already-resolved ledger must never duplicate rows.
+LEDGER8_BEFORE="$(cat "$LEDGER8")"
+out7b="$( cd "$P8" && PATH="$BIN:$PATH" GH_FAKE_LOG="$GHLOG" JOURNAL_FILE="$T/trees8/journal.jsonl" \
+            bash "$HERD" backend switch github </dev/null 2>&1 )" || fail "(7) re-run exited non-zero: $out7b"
+grep -q "already on" <<<"$out7b" || fail "(7) re-running the same backend should say 'already on' ($out7b)"
+[ "$(cat "$LEDGER8")" = "$LEDGER8_BEFORE" ] || fail "(7) a same-backend no-op must never touch the reconcile-intent ledger"
+pass
+
 echo "ALL PASS ($PASS checks)"
