@@ -196,7 +196,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `retirement.sh` → `agent-watch.sh`, `journal.sh`
 - `scribe-step.sh` → `create-retry.sh`, `drainer-liveness.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
-- `spawn-step.sh` → `herd-config.sh`
+- `spawn-step.sh` → `herd-config.sh`, `journal.sh`
 - `spawn.sh` → `herd-config.sh`, `journal.sh`
 - `stale-dup-gate.sh` → `derived-files.sh`, `pr-ref.sh`
 - `status.sh` → `watcher-exempt.sh`
@@ -297,6 +297,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`, `journal-audit-replay.sh`, `posture-lint.sh`
 - `INFRA_BREAKER_COOLDOWN` → `agent-watch.sh`
 - `INFRA_BREAKER_MAX` → `agent-watch.sh`
+- `INTENT_QUEUE` → —
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
 - `JOURNAL_AUDIT` → `agent-watch.sh`, `journal-audit.sh`
 - `JOURNAL_AUDIT_ACT` → `journal-audit.sh`
