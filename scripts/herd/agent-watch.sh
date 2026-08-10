@@ -608,8 +608,9 @@ BUILDER_NOTES_ACK="$TREES/.agent-watch-builder-notes-acked"
 BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # Phase-anomaly console surface (HERD-496). ANOMALY_BASELINES compares a just-completed phase
 # instance's wall-clock duration against a rolling median/p95 baseline (pysrc/herd/store.py); a
-# reading past 2x its own LEARNED p95 appends one row here ("<epoch>\t<phase>\t<seconds>\t<p95>"),
-# rendered newest-first by build_phase_anomalies (calm — it ages out after CONSOLE_ROW_RETENTION,
+# reading past 2x its own LEARNED p95 appends one row here ("<epoch>\t<phase>\t<seconds>\t<p95>",
+# a 5th "load_qualified" field when HERD-618's under-load margin applies — see below), rendered
+# newest-first by build_phase_anomalies (calm — it ages out after CONSOLE_ROW_RETENTION,
 # same as a builder note). Ship-dormant: off (default) never appends, so the ledger stays empty and
 # render() adds nothing (byte-identical console).
 ANOMALY_LEDGER="$TREES/.agent-watch-phase-anomalies"
@@ -8859,6 +8860,25 @@ _anomaly_baselines_enabled() {
 # operator knobs: no config key, no manifest row.
 _ANOMALY_MIN_SAMPLES=5        # never judge a phase off a baseline that has not learned enough yet
 _ANOMALY_THRESHOLD_PCT=200    # an instance must exceed 2x its own LEARNED p95 to count as anomalous
+_ANOMALY_LOAD_MARGIN_PCT=200  # HERD-618: under load, the FILING bar widens to 2x the normal threshold
+                              # (i.e. 4x p95) — an exceedance short of that still journals/paints, tagged
+                              # load_qualified, but withholds the tracker filing. Ship-dormant with the
+                              # rest of ANOMALY_BASELINES; internal tuning, not an operator knob.
+
+# _anomaly_load_high — true iff this box's loadavg1m is at/above HEALTH_LOAD_THRESHOLD (default 4)
+# right now. Reuses the SAME probe + config key ENV_SUSPECT_TIMEOUT (HERD-546) already ships
+# (_health_loadavg_1m / HEALTH_LOAD_THRESHOLD) but is NOT gated on ENV_SUSPECT_TIMEOUT itself — the
+# phase-anomaly rail has its own ANOMALY_BASELINES lever, so this reads the load signal independent of
+# whether the timeout-classification lever happens to also be on. Fail-soft: an unreadable/unparseable
+# loadavg reads as "not high" — a blind probe must never widen the filing bar on a guess.
+_anomaly_load_high() {
+  local _alh_load _alh_threshold
+  _alh_threshold="$(herd_numeric HEALTH_LOAD_THRESHOLD 4)"
+  case "$_alh_threshold" in ''|*[!0-9]*) _alh_threshold=4 ;; esac
+  _alh_load="$(_health_loadavg_1m)"
+  case "$_alh_load" in ''|*[!0-9.]*) return 1 ;; esac
+  awk -v l="$_alh_load" -v t="$_alh_threshold" 'BEGIN{exit !(l+0>=t+0)}' </dev/null
+}
 
 # _phase_duration_observe <phase> <seconds> — record one completed phase instance's wall-clock
 # duration against its rolling baseline (pysrc/herd/store.py phase_duration_observe) and print the
@@ -8876,16 +8896,20 @@ _phase_duration_observe() {
 }
 
 # _phase_anomaly_row <ledger-line> — render ONE anomaly ledger line ("<epoch>\t<phase>\t<seconds>\t
-# <p95>") as a calm advisory console row, e.g. "health-check 28m — p95 19m".
+# <p95>[\t<tag>]") as a calm advisory console row, e.g. "health-check 28m — p95 19m". HERD-618: a 5th
+# field of "load_qualified" (the box was contended when this reading fired, so filing was withheld)
+# appends a dim tag; any other/absent 5th field renders exactly as before.
 _phase_anomaly_row() {
-  local epoch phase secs p95
-  IFS=$'\t' read -r epoch phase secs p95 <<EOF
+  local epoch phase secs p95 tag
+  IFS=$'\t' read -r epoch phase secs p95 tag <<EOF
 $1
 EOF
   [ -n "${phase:-}" ] || return 1
-  printf '    %s⏱ %s%s%s %s%s%s — p95 %s%s' \
+  local qtag=""
+  [ "${tag:-}" = "load_qualified" ] && qtag="${C_DIM} · load-qualified${C_RESET}"
+  printf '    %s⏱ %s%s%s %s%s%s — p95 %s%s%s' \
     "$C_YELLOW" "$C_BOLD" "$phase" "$C_RESET" "$C_YELLOW" "$(_fmt_age "${secs:-0}")" "$C_RESET" \
-    "$(_fmt_age "${p95:-0}")" "$C_RESET"
+    "$(_fmt_age "${p95:-0}")" "$C_RESET" "$qtag"
 }
 
 # build_phase_anomalies — the "phase anomalies" console section: the newest 5 STILL-RELEVANT ledger
@@ -9028,9 +9052,19 @@ _anomaly_file_stamp() {
 #       write — so sleep neither files nor pollutes the baseline (_interval_spans_wake);
 #   (b) a repeat filing for the SAME phase inside ANOMALY_FILE_COOLDOWN_SECS still journals and still
 #       paints its row, but withholds the tracker filing (journaled result=cooldown).
+# HERD-618 adds a third, same chokepoint, same shape: this box's own p95 baselines skew toward the
+# quiet-box conditions they were learned under, so a marginal exceedance under HEAVY DRAIN LOAD is
+# systematically a load artifact, not a regression (GROUNDED: two false-filed tick-cadence items on
+# 2026-08-10 under a ~11 15m-loadavg on 14 cores, for readings only marginally past their p95). While
+# this box looks contended (_anomaly_load_high, reusing ENV_SUSPECT_TIMEOUT's own
+# loadavg1m/HEALTH_LOAD_THRESHOLD probe — HERD-546 — independent of whether that lever is itself on),
+# the FILING bar widens to _ANOMALY_LOAD_MARGIN_PCT of the normal threshold (default 2x, i.e. 4x p95):
+# short of that widened bar the reading still journals and still paints its row (tagged
+# load_qualified so the signal stays visible), only the tracker filing is withheld.
 _phase_anomaly_observe() {
   local _pa_phase="$1" _pa_label="$2" _pa_secs="$3"
   local _pa_stats _pa_median _pa_p95 _pa_n _pa_threshold _pa_id _pa_mark_rc _pa_now
+  local _pa_load_qualified=0 _pa_widened _pa_tag=""
   _anomaly_baselines_enabled || return 0
   case "$_pa_secs" in ''|*[!0-9]*) return 0 ;; esac
   # HERD-512(a): a measured interval that a machine suspend/wake boundary falls inside is wall clock,
@@ -9051,10 +9085,25 @@ EOF
   _pa_threshold=$(( _pa_p95 * _ANOMALY_THRESHOLD_PCT / 100 ))
   [ "$_pa_secs" -gt "$_pa_threshold" ] || return 0          # under threshold — silent, byte-inert
 
+  # HERD-618: an exceedance that clears the normal threshold but falls short of the WIDENED under-load
+  # threshold, while the box is contended right now, is "load-qualified" — journaled and painted, but
+  # not filed. A quiet box, or an exceedance beyond the widened margin even under load, is unaffected.
+  if _anomaly_load_high; then
+    _pa_widened=$(( _pa_threshold * _ANOMALY_LOAD_MARGIN_PCT / 100 ))
+    [ "$_pa_secs" -gt "$_pa_widened" ] || _pa_load_qualified=1
+  fi
+  [ "$_pa_load_qualified" = "1" ] && _pa_tag=$'\tload_qualified'
+
   journal_append phase_anomaly phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" \
     median "${_pa_median:-0}" n "$_pa_n"
-  printf '%s\t%s\t%s\t%s\n' "$(_now_epoch)" "$_pa_label" "$_pa_secs" "$_pa_p95" >> "$ANOMALY_LEDGER" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s%s\n' "$(_now_epoch)" "$_pa_label" "$_pa_secs" "$_pa_p95" "$_pa_tag" >> "$ANOMALY_LEDGER" 2>/dev/null || true
   herd_console_trim "$ANOMALY_LEDGER" "$ANOMALY_LEDGER_MAX"
+
+  if [ "$_pa_load_qualified" = "1" ]; then
+    journal_append phase_anomaly_filed phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" \
+      result load_qualified threshold "$_pa_widened"
+    return 0
+  fi
 
   # HERD-512(b): the row and the journal line above are already painted — only the TRACKER filing is
   # rate-limited, so a phase that stays degraded tells the story once instead of once per tick.
