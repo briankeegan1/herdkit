@@ -220,14 +220,17 @@ WTLIST="$(git -C "$REPO" worktree list)"
 grep -qF "$WT" <<<"$WTLIST" || fail "(w) the new worktree is not registered on the project's worktree list — invisible to the watcher's FEATS walk: $WTLIST"
 ok "(w) the drained spawn produced a REAL worktree the watcher's FEATS walk (git worktree list) discovers"
 
-# The externalized task spec threads the failing identity as the tracker ref (HERD_ITEM_REF), same
-# guarantee HERD-482 hardened for the enqueue half — now proven all the way to the file the builder
-# actually reads, PLUS the per-worktree ref marker the watcher's merge-time reconcile consults.
+# HERD-613: under the file backend (no synchronous create available to this tick), the spawn carries
+# NO ref at all — the raw failing identity ("app/greet.test.sh") is NOT a tracker id, and threading it
+# as HERD_ITEM_REF is exactly the bug that left PRs 712/719 with an unresolvable-forever ESCALATED
+# tracker-heal row. The externalized task spec must therefore carry NO 'Refs:' line, and NO
+# .herd-ref-$SLUG marker — an untracked spawn, byte-identical to any other ref-less spawn, proven all
+# the way to the file the builder actually reads.
 SPEC="$TREES_DIR/$SLUG.task.md"
 [ -s "$SPEC" ] || fail "(w) no externalized task spec written at $SPEC"
-grep -qF "Refs: app/greet.test.sh" "$SPEC" || fail "(w) the task spec does not instruct a 'Refs: app/greet.test.sh' line — HERD_ITEM_REF was not threaded through the drain: $(cat "$SPEC")"
-[ "$(cat "$TREES_DIR/.herd-ref-$SLUG" 2>/dev/null)" = "app/greet.test.sh" ] || fail "(w) .herd-ref-$SLUG does not carry the failing identity — merge-time reconcile would fuzzy-match instead of resolving by ref"
-ok "(w) the failing identity threads through the drain into the builder's task spec and the .herd-ref marker"
+grep -qF "Refs:" "$SPEC" && fail "(w) HERD-613: the task spec carries a 'Refs:' line despite no real tracker id being available — the raw failing identity leaked through: $(cat "$SPEC")"
+[ -e "$TREES_DIR/.herd-ref-$SLUG" ] && fail "(w) HERD-613: .herd-ref-$SLUG exists despite no real tracker id being available: $(cat "$TREES_DIR/.herd-ref-$SLUG" 2>/dev/null)"
+ok "(w) with no real tracker id available, the spawn is untracked end to end — never the raw failing identity as a ref (HERD-613)"
 
 # The builder tab registers in .herd-tabs (the tab-leak-guard / sweep allowlist) — the OTHER surface
 # that must know this pane is engine-created, not a stray tab a human opened.

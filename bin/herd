@@ -2455,6 +2455,102 @@ EOF
   say "acked ${c_bold}${count}${c_rst} builder note$([ "$count" = 1 ] || printf 's') · console cleared (journal keeps the history)"
 }
 
+# ── herd tracker-heals: list / acknowledge the tracker-heal console rows (HERD-613 LEG 3) ────────
+# tracker-state-sweep.sh writes one row per heal ACTION (healed/failed/escalated) to
+# .agent-watch-tracker-heals; the watcher renders the newest 3 STILL-RELEVANT ones as the "tracker
+# healed" console section (build_tracker_drift). A `failed`/`escalated` row is LOUD (HERD-243: it
+# never ages out on its own) — before this command the ONLY way off the console was a fresh `healed`
+# row for the SAME ref, which an unresolvable ref (a shape-invalid `Refs:` value — HERD-613 LEG 2) can
+# NEVER produce. `herd tracker-heals` lists the rows currently on the console (newest first,
+# numbered); `herd tracker-heals ack <n>` / `ack all` clears one immediately by recording its exact
+# ledger line in an ack sidecar (mirrors `herd notes ack`) — the ledger itself, and the journal, are
+# untouched. tracker-state-sweep.sh's own auto-retire leg (HERD-613 LEG 3) does the SAME thing
+# automatically for an escalated row whose ref fails the shape guard; this command is the manual path
+# for everything else (e.g. a genuinely-unresolvable-but-valid-shaped ref an operator has investigated
+# and wants off the console).
+cmd_tracker_heals() {
+  local sub="list"
+  case "${1:-}" in
+    -h|--help) say "usage: herd tracker-heals [list] | herd tracker-heals ack <n|all>"; return 0 ;;
+    "") ;;
+    list|ack) sub="$1"; shift ;;
+    *) die "herd tracker-heals: unknown subcommand $1 (usage: herd tracker-heals [list] | herd tracker-heals ack <n|all>)" ;;
+  esac
+
+  _journal_load_config
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/console-section.sh"
+  local ledger="$WORKTREES_DIR/.agent-watch-tracker-heals"
+  local ack="$WORKTREES_DIR/.agent-watch-tracker-heals-acked"
+
+  # The rows still on the console: newest first, aged-out (a `healed` row past CONSOLE_ROW_RETENTION),
+  # superseded (HERD-284/HERD-502: a same-ref healed/escalated row supersedes older failed rows) and
+  # already-acked rows dropped. ONE shared decision (herd_console_visible_lines_tracker) with the
+  # watcher, so this list can never disagree with what the operator is looking at.
+  local visible
+  visible="$(herd_console_visible_lines_tracker "$ledger" "$CONSOLE_LEDGER_MAX" "$ack")"
+
+  if [ -z "$visible" ]; then
+    say "no tracker-heal rows on the console"
+    return 0
+  fi
+
+  local n=0 line epoch status ref pr state hhmm
+  epoch_to_hhmm() { date -r "$1" +%H:%M 2>/dev/null || date -d "@$1" +%H:%M 2>/dev/null || echo '--:--'; }
+  if [ "$sub" = "list" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      n=$((n+1))
+      epoch="" status="" ref="" pr="" state=""
+      read -r epoch status ref pr state <<EOF
+$line
+EOF
+      hhmm="$(epoch_to_hhmm "${epoch:-0}")"
+      local glyph="⚠️"
+      case "$status" in healed) glyph="🩹" ;; escalated) glyph="⛔" ;; esac
+      say "  ${c_bold}${n}${c_rst}  ${glyph} ${c_bold}${ref}${c_rst}  ${status} · PR #${pr} (${state}) (${hhmm})"
+    done <<< "$visible"
+    say ""
+    say "ack a handled row with: herd tracker-heals ack <n>   (or: herd tracker-heals ack all)"
+    return 0
+  fi
+
+  # ── ack ──────────────────────────────────────────────────────────────────────────────────────
+  local which="${1:-}"
+  [ -n "$which" ] || die "usage: herd tracker-heals ack <n|all>"
+  local total; total="$(printf '%s\n' "$visible" | grep -c .)"
+  local picked=""
+  case "$which" in
+    all) picked="$visible" ;;
+    ''|*[!0-9]*) die "herd tracker-heals ack: <n> must be a number or 'all' (got: $which)" ;;
+    *)
+      [ "$which" -ge 1 ] && [ "$which" -le "$total" ] \
+        || die "herd tracker-heals ack: no row #$which (${total} on the console — run: herd tracker-heals)"
+      picked="$(printf '%s\n' "$visible" | sed -n "${which}p")"
+      ;;
+  esac
+  [ -n "$picked" ] || die "herd tracker-heals ack: nothing to acknowledge"
+
+  local dir="${ack%/*}"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || die "herd tracker-heals ack: cannot create $dir"
+  printf '%s\n' "$picked" >> "$ack" 2>/dev/null || die "herd tracker-heals ack: cannot write $ack"
+
+  # An ack for a line the ledger has already evicted is dead weight — keep only acks that still
+  # correspond to a live ledger row, then bound the sidecar.
+  if [ -s "$ledger" ] && [ -s "$ack" ]; then
+    local tmp="$ack.tmp.$$"
+    if grep -Fxf "$ledger" "$ack" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$ack" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+      rm -f "$tmp" 2>/dev/null
+    fi
+  fi
+  herd_console_trim "$ack"
+
+  local count; count="$(printf '%s\n' "$picked" | grep -c .)"
+  say "acked ${c_bold}${count}${c_rst} tracker-heal row$([ "$count" = 1 ] || printf 's') · console cleared (ledger keeps the history)"
+}
+
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
 # per-key metadata — including the optional 5th "requires" column (watcher | render | blank) — are
@@ -8745,6 +8841,7 @@ case "${1:-help}" in
   advise)  shift; _herd_require_project_config; cmd_advise "$@" ;;
   note)    shift; cmd_note "$@" ;;
   notes)   shift; cmd_notes "$@" ;;
+  tracker-heals) shift; cmd_tracker_heals "$@" ;;
   config)  shift; cmd_config "$@" ;;
   theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;
