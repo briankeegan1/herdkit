@@ -15,8 +15,10 @@
 #   (a) an OPEN item ALREADY claimed by someone else, loosely matching the failing identity, is found
 #       and the claim attempt comes back ALREADY — journals main_health_autofix result=dedup_claimed,
 #       files NO redundant scribe item, enqueues NO builder.
-#   (b) no matching OPEN item at all — byte-identical to pre-HERD-543: files the scribe item, journals
-#       result=enqueued, enqueues one builder, threading the raw failing identity as its ref.
+#   (b) no matching OPEN item at all — files the scribe item, journals result=enqueued, enqueues one
+#       builder. HERD-613 (post-dates HERD-543): under the file backend (no synchronous create), the
+#       spawned intent carries NO ref sidecar at all — never the raw failing identity, which is not a
+#       tracker id and would otherwise ride into the builder's own PR as a bogus 'Refs:' line.
 #   (c) an OPEN item loosely matching but UNCLAIMED — claimed synchronously and REUSED (no redundant
 #       scribe filing), threading the newly-claimed item's own ref (not the raw identity) into the
 #       spawn intent.
@@ -159,9 +161,9 @@ reconcile_main_health; settle
 [ "$(spawn_reqs)" -eq 1 ] || fail "(b) no matching item did not still spawn a builder: $(ls "$SPAWN_Q" 2>/dev/null)"
 [ -s "$SCRIBE_LOG" ] || fail "(b) no matching item skipped filing the scribe item"
 REQ_B="$(latest_req)"
-[ "$(cat "${REQ_B%.req}.ref" 2>/dev/null)" = "app/greet.test.sh" ] \
-  || fail "(b) with no existing item the spawn's ref should still be the raw failing identity: $(cat "${REQ_B%.req}.ref" 2>/dev/null)"
-ok "(b) with no matching OPEN item, the spawn leg files+enqueues exactly as before HERD-543"
+[ ! -f "${REQ_B%.req}.ref" ] \
+  || fail "(b) HERD-613: with no real tracker id available (file backend, no sync create), the spawn must carry NO ref sidecar — got: $(cat "${REQ_B%.req}.ref" 2>/dev/null)"
+ok "(b) with no matching OPEN item, the spawn leg files+enqueues untracked — never the raw failing identity as a ref (HERD-613)"
 
 # ── (c) an OPEN item loosely matching but UNCLAIMED — claim it and reuse it (no duplicate filing) ───
 reset_state

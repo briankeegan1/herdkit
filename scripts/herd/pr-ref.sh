@@ -72,11 +72,60 @@
 # The decoration class `[\s#*>-]` is written with `-` LAST so it is a literal, not a range, in both
 # python and the egrep fallback below.
 HERD_PR_REF_PY='
+import os
 import re
 _PR_REF_PLACEHOLDER = {"none", "n/a", "na"}
 _PR_REF_TRAILING = ".,;:!)]}*"
 # leading decoration (heading/list/quote/bold) · "refs:" · a closing bold · the token
 _PR_REF_LINE = re.compile(r"^[\s#*>-]*refs:\**\s*(\S+)", re.IGNORECASE)
+
+# HERD-613: per-backend tracker-id SHAPE, for the backends whose identifiers truly have ONE fixed
+# shape (uppercase-letters-dash-digits for linear/jira, e.g. HERD-123; optional-hash-digits for
+# github, e.g. #45). A backend not named here (the default `file` backend, whose item ref IS a title
+# slug — see test (4) in tests/test-pr-ref-parse.sh — plus changelog and anything future) is EXEMPT:
+# this is a NARROWING of, never a repeal of, the pr-ref.sh "NO SHAPE TEST" invariant from HERD-522 —
+# the shape question still belongs to the backend, never the engine, for every backend that has no
+# one fixed shape.
+_PR_REF_BACKEND_SHAPES = {
+    "linear": re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$"),
+    "jira":   re.compile(r"^[A-Z][A-Z0-9]*-[0-9]+$"),
+    "github": re.compile(r"^#?[0-9]+$"),
+}
+# The FIND-anywhere counterpart, used to pull a real ref out of free-form text (a backend create
+# call'"'"'s own URL/identifier output) rather than out of an anchored `Refs:` line — see
+# pr_ref_find_in_text. Linear/jira URLs embed the identifier as its own path segment
+# (".../issue/HERD-123/some-title-slug"); github issue-create returns ".../issues/<num>".
+_PR_REF_BACKEND_FIND = {
+    "linear": re.compile(r"\b([A-Z][A-Z0-9]*-[0-9]+)\b"),
+    "jira":   re.compile(r"\b([A-Z][A-Z0-9]*-[0-9]+)\b"),
+    "github": re.compile(r"/issues/([0-9]+)\b|(?:^|[\s#])([0-9]+)\s*$"),
+}
+
+def _pr_ref_backend():
+    return (os.environ.get("SCRIBE_BACKEND") or "file").strip().lower()
+
+def pr_ref_shape_ok(token, backend=None):
+    """True when <token> conforms to <backend>'"'"'s known tracker-id SHAPE (HERD-613), or when the
+    backend defines no fixed shape at all — that stays quiet-by-design (see _PR_REF_BACKEND_SHAPES)."""
+    pat = _PR_REF_BACKEND_SHAPES.get((backend or _pr_ref_backend()))
+    return True if pat is None else bool(pat.match(token))
+
+def pr_ref_find_in_text(text, backend=None):
+    """Best-effort: the FIRST substring of <text> that conforms to <backend>'"'"'s tracker-id SHAPE —
+    for pulling a real ref out of a backend create call'"'"'s own output (a URL or bare identifier),
+    NEVER out of a PR body (pr_ref_from_body owns that, anchored at a `Refs:` line). "" when the
+    backend defines no fixed shape or none is found; callers must treat that as UNKNOWN and never
+    fabricate a ref from it."""
+    pat = _PR_REF_BACKEND_FIND.get((backend or _pr_ref_backend()))
+    if pat is None or not text:
+        return ""
+    m = pat.search(text)
+    if not m:
+        return ""
+    for g in m.groups():
+        if g:
+            return g
+    return m.group(0)
 # DECLARATION-SHAPED, the alarm'"'"'s wider net: `refs:` is the first WORD on the line, whatever sits in
 # front of it, so long as none of it is a word itself. That admits every decoration this parser does
 # NOT yet know — a numbered list (`1. Refs:`), a table cell (`| Refs: |`), an HTML tag
@@ -106,6 +155,7 @@ def pr_ref_declared_none(line):
     return bool(tok) and (tok.startswith("<") or tok.lower() in _PR_REF_PLACEHOLDER)
 
 def pr_ref_from_body(body):
+    backend = _pr_ref_backend()
     for line in _pr_ref_decomment(body).splitlines():
         if not _PR_REF_LINE.match(line):
             continue
@@ -113,6 +163,14 @@ def pr_ref_from_body(body):
         # scanning for a later line (pre-HERD-522 semantics, preserved exactly).
         tok = _pr_ref_token(line)
         if not tok or tok.startswith("<") or tok.lower() in _PR_REF_PLACEHOLDER:
+            return ""
+        # HERD-613: a token that does not conform to the ACTIVE backend'"'"'s known tracker-id shape is
+        # never a literal ref — treated exactly like an empty/placeholder token so the caller (the
+        # silent-miss alarm below) reports it instead of a builder or the tracker-heal sweep ever
+        # probing it. PRs 712/719: an auto-spawned builder wrote a comma-joined list of failing TEST
+        # FILENAMES as its own `Refs:` line — a non-empty token that used to parse clean and then sat
+        # forever as an unresolvable ESCALATED tracker-heal row with no operator clear path.
+        if not pr_ref_shape_ok(tok, backend):
             return ""
         return tok
     return ""
@@ -126,11 +184,14 @@ def pr_ref_all_from_body(body):
     question ("which trackers does this PR carry"), so a stray placeholder line among several real
     refs should not blank out the real ones."""
     seen = []
+    backend = _pr_ref_backend()
     for line in _pr_ref_decomment(body).splitlines():
         if not _PR_REF_LINE.match(line):
             continue
         tok = _pr_ref_token(line)
         if not tok or tok.startswith("<") or tok.lower() in _PR_REF_PLACEHOLDER:
+            continue
+        if not pr_ref_shape_ok(tok, backend):    # HERD-613: skip this line, keep scanning others
             continue
         if tok not in seen:
             seen.append(tok)
@@ -223,4 +284,31 @@ herd_pr_ref_unparsed_line() {
   printf '%s' "$body" | python3 -c "$HERD_PR_REF_PY"'
 import sys
 sys.stdout.write(pr_ref_unparsed_line(sys.stdin.read()))' 2>/dev/null || true
+}
+
+# herd_pr_ref_shape_ok <token> [backend] — HERD-613: true (exit 0) when <token> conforms to
+# [backend]'s (default: $SCRIBE_BACKEND, else "file") known tracker-id shape, or when that backend
+# defines no fixed shape at all. The shell-side entry point to pr_ref_shape_ok. Fail-soft: no python3
+# → trusts the token (exit 0) — a shape probe that cannot run must never manufacture a false alarm.
+herd_pr_ref_shape_ok() {
+  local _sok_tok="$1" _sok_backend="${2:-${SCRIBE_BACKEND:-file}}"
+  command -v python3 >/dev/null 2>&1 || return 0
+  TOK="$_sok_tok" BACKEND="$_sok_backend" python3 -c "$HERD_PR_REF_PY"'
+import os, sys
+sys.exit(0 if pr_ref_shape_ok(os.environ["TOK"], os.environ["BACKEND"]) else 1)' 2>/dev/null
+}
+
+# herd_pr_ref_find_in_text <backend> — read free-form text on stdin (a backend create call's OWN
+# URL/identifier output — NEVER a PR body; herd_pr_ref_from_body owns that job), print the FIRST
+# substring conforming to <backend>'s tracker-id shape, or nothing when the backend has no fixed shape
+# or none is found. The shell-side entry point to pr_ref_find_in_text. Callers must treat empty output
+# as UNKNOWN and never fabricate a ref from it. Fail-soft: no python3 → prints nothing.
+herd_pr_ref_find_in_text() {
+  local _fit_backend="${1:-${SCRIBE_BACKEND:-file}}" _fit_text
+  _fit_text="$(cat)"
+  [ -n "$_fit_text" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  printf '%s' "$_fit_text" | BACKEND="$_fit_backend" python3 -c "$HERD_PR_REF_PY"'
+import os, sys
+sys.stdout.write(pr_ref_find_in_text(sys.stdin.read(), os.environ.get("BACKEND")))' 2>/dev/null || true
 }

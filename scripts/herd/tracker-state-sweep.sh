@@ -112,6 +112,9 @@ case "$LIMIT" in ''|*[!0-9]*) LIMIT=50 ;; esac
 
 LEDGER="${HERD_TSWEEP_LEDGER:-$WORKTREES_DIR/.agent-watch-tracker-swept}"
 NOTE_FILE="${HERD_TSWEEP_NOTE_FILE:-$WORKTREES_DIR/.agent-watch-tracker-heals}"
+# ACK_FILE (HERD-613 LEG 3) — the SAME ack sidecar agent-watch.sh's TRACKER_HEAL_ACK / bin/herd's
+# `herd tracker-heals ack` write/read; this sweep is the ONLY auto-writer (the auto-retire leg below).
+ACK_FILE="${HERD_TSWEEP_ACK_FILE:-$WORKTREES_DIR/.agent-watch-tracker-heals-acked}"
 UNRESOLVED_FILE="${HERD_TSWEEP_UNRESOLVED_FILE:-$WORKTREES_DIR/.agent-watch-tracker-unresolved-counts}"
 # Consecutive resolve-failures a ref tolerates (silent retry) before it is classified unresolvable and
 # ledgered off. Small on purpose: this is a backstop for a ref the backend provably cannot see, not a
@@ -345,6 +348,64 @@ _tsweep_record() {
     printf '%s %s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$1" "$2" >> "$LEDGER" 2>/dev/null || true
   fi
 }
+
+# ── HERD-613 LEG 3: one-time migration — drop two known-malformed historical rows ──────────────────
+# PRs 712/719 (epochs 1785994821 / 1785998819) escalated on a comma-joined TEST-FILENAME "ref" — never
+# a tracker id — before LEG 2's shape guard existed to keep it out of NOTE_FILE in the first place, and
+# before the auto-retire leg below existed to clear it off the console. Named by epoch, NOT a live
+# pattern match — a genuine future escalation must never be silently swept by a broad filter. Idempotent:
+# once these two rows are gone, every future run is a no-op (nothing matches, the file is untouched).
+_TSWEEP_MIGRATE_DROP_EPOCHS="1785994821 1785998819"
+_tsweep_migrate_drop_epochs() {
+  [ -s "$NOTE_FILE" ] || return 0
+  local e hit=0
+  for e in $_TSWEEP_MIGRATE_DROP_EPOCHS; do
+    grep -q "^${e} " "$NOTE_FILE" 2>/dev/null && hit=1
+  done
+  [ "$hit" -eq 1 ] || return 0
+  local tmp="$NOTE_FILE.tmp.$$"
+  EPOCHS="$_TSWEEP_MIGRATE_DROP_EPOCHS" awk '
+    BEGIN { n = split(ENVIRON["EPOCHS"], a, " "); for (i = 1; i <= n; i++) drop[a[i]] = 1 }
+    !($1 in drop)
+  ' "$NOTE_FILE" > "$tmp" 2>/dev/null && mv "$tmp" "$NOTE_FILE" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  echo "tracker-state-sweep: HERD-613 one-time migration — dropped the two known-malformed PR-712/719 heal rows."
+}
+
+# ── HERD-613 LEG 3: auto-retire — an escalated row whose ref FAILS the shape guard clears itself ───
+# tracker-state-sweep.sh's own _tsweep_mark_unresolvable (HERD-502) writes exactly ONE `escalated` row
+# per ref it gives up on — necessarily loud (console-section.sh never ages an escalated row out on its
+# own), because most escalations are a real, standing problem an operator must see. But a ref that
+# FAILS pr-ref.sh's HERD-613 per-backend shape guard can never be a real tracker id in the first place
+# (PRs 712/719's comma-joined test filenames) — no operator action will ever make it resolve, so
+# leaving it loud forever just trains the operator to ignore the section. Auto-ack it: the SAME
+# mechanism `herd tracker-heals ack` uses (an exact ledger-line match in ACK_FILE), so the console
+# clears immediately while the ledger — and the journal's original tracker_state_unresolvable event —
+# keep the full history. GUARDRAIL: a VALID-shaped ref that genuinely will not resolve is untouched by
+# this loop — it stays loud, exactly as HERD-502 designed it, because only a shape-invalid ref can ever
+# reach this branch.
+_tsweep_auto_retire_shape_invalid() {
+  [ -s "$NOTE_FILE" ] || return 0
+  local backend="${SCRIBE_BACKEND:-file}" line epoch status ref rest dir
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    epoch="" status="" ref="" rest=""
+    read -r epoch status ref rest <<EOF
+$line
+EOF
+    [ "${status:-}" = "escalated" ] || continue
+    [ -n "${ref:-}" ] || continue
+    herd_pr_ref_shape_ok "$ref" "$backend" && continue    # a valid-shaped ref stays loud — never touched
+    herd_console_acked "$ACK_FILE" "$line" && continue     # already acked (manually or a prior sweep)
+    dir="${ACK_FILE%/*}"
+    [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || continue
+    printf '%s\n' "$line" >> "$ACK_FILE" 2>/dev/null || continue
+    echo "tracker-state-sweep: auto-retired escalated row for '$ref' — its ref fails the SCRIBE_BACKEND=$backend shape guard and can never resolve (HERD-613)."
+  done < "$NOTE_FILE"
+  herd_console_trim "$ACK_FILE"
+}
+
+_tsweep_migrate_drop_epochs
+_tsweep_auto_retire_shape_invalid
 
 # ── run ────────────────────────────────────────────────────────────────────────
 if ! _tsweep_backend_supported; then

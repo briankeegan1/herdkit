@@ -723,7 +723,9 @@ spawn_reqs() { ls "$SPAWN_Q"/*.req 2>/dev/null | wc -l | tr -d ' '; }
 latest_req() { ls -t "$SPAWN_Q"/*.req 2>/dev/null | sed -n '1p'; }
 
 # (o) a FRESH honest local red under MAIN_HEALTH_AUTOFIX=spawn both files the scribe item AND
-# dispatches a tracked+claimed quick-lane spawn, carrying the failing identity as HERD_ITEM_REF.
+# dispatches a tracked+claimed quick-lane spawn. HERD-613: under the file backend (the default here,
+# no synchronous create available to this tick) the spawn carries NO ref sidecar — the raw failing
+# identity is not a tracker id, and threading it as HERD_ITEM_REF is the exact PRs-712/719 bug.
 reset_state
 MAIN_HEALTH_AUTOFIX=spawn
 printf 'red-file\n' > "$HC_MODE"
@@ -737,8 +739,9 @@ REQ_O="$(latest_req)"
 grep -q "^main-red-${SHASPAWN:0:8}-" "$REQ_O" || fail "(o) the spawn slug does not embed the red sha: $(cat "$REQ_O")"
 [ "$(sed -n '2p' "$REQ_O")" = "quick" ] || fail "(o) the spawn did not use the quick lane: $(cat "$REQ_O")"
 grep -q 'app/greet.test.sh' "$REQ_O" || fail "(o) the spawn task does not name the failing test: $(cat "$REQ_O")"
-[ "$(cat "${REQ_O%.req}.ref" 2>/dev/null)" = "app/greet.test.sh" ] || fail "(o) the spawn's tracker ref is not the failing identity: $(cat "${REQ_O%.req}.ref" 2>/dev/null)"
-ok "(o) MAIN_HEALTH_AUTOFIX=spawn files the scribe item AND dispatches a tracked+claimed quick-lane spawn"
+[ ! -e "${REQ_O%.req}.ref" ] \
+  || fail "(o) HERD-613: the spawn carries a ref sidecar despite no real tracker id being available: $(cat "${REQ_O%.req}.ref" 2>/dev/null)"
+ok "(o) MAIN_HEALTH_AUTOFIX=spawn files the scribe item AND dispatches an untracked quick-lane spawn — never the raw failing identity as a ref (HERD-613)"
 
 # (p) the SAME identity's dedup'd reproduction never spawns a SECOND builder — spawn rides the exact
 # shared-pool once-per-identity claim the file-only path already relies on.
