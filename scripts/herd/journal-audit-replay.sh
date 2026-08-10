@@ -239,6 +239,50 @@ for d in dispatches:
 # this leg still raised a finding. `events` is built in file order and sorted STABLY, so the index is
 # the journal's own order and is exact where the clock is not.
 MH_NON_TERMINAL = {"dispatched", "recheck", "chain_collected"}
+
+# TERMINATED-SUPERSEDED (HERD-631). $MAIN only ever moves forward, so a LATER `dispatched` for a
+# DIFFERENT sha is the rail explicitly starting a fresh chain for a new observed head — it is the
+# signal that the OLDER sha's own chain was abandoned, not stalled. If that fresh chain (or whichever
+# sha eventually supersedes IT) reaches a genuine terminal, the older sha's missing terminal is
+# EXPLAINED — a completed chain wearing a stale sha, not an outcome-less one. Grounded in three real
+# corpses (HERD-627/628/629): dispatches at a816294 (11:43), 0541883 (12:23), 18d7e7f (14:19), each
+# re-dispatched before completing, with a green finally collected at 18d7e7f (14:45) — a816294 and
+# 0541883 are terminal-superseded.
+#
+# DELIBERATELY NOT "any later terminal on any other sha closes this one": a bare terminal for an
+# unrelated sha with no EXPLICIT dispatch chaining it to this one is not evidence the rail itself
+# advanced past this sha — see the regression below (a stray green on an unrelated sha, with no
+# intervening dispatch, must never paper over a genuinely dead worker; that is exactly how the live
+# corpse hid in the first place).
+def _mh_chain_terminates(start_i, start_sha):
+    """True iff walking forward from start_i, a chain of explicit `dispatched` events for
+    successively different shas eventually reaches one with its own genuine (non-MH_NON_TERMINAL)
+    terminal — i.e. main superseded start_sha and the fresh chain it superseded to actually finished."""
+    cur_sha, cur_i, chain_seen = start_sha, start_i, {start_sha}
+    while True:
+        nxt = None
+        for j in range(cur_i + 1, len(events)):
+            e = events[j]
+            if str(e.get("event") or "") != "main_health" or str(e.get("result") or "") != "dispatched":
+                continue
+            nsha = str(e.get("sha") or "")
+            if not nsha or nsha in chain_seen:
+                continue
+            nxt = (j, nsha)
+            break
+        if nxt is None:
+            return False
+        next_i, next_sha = nxt
+        chain_seen.add(next_sha)
+        for e in events[next_i + 1:]:
+            if str(e.get("event") or "") != "main_health" or str(e.get("sha") or "") != next_sha:
+                continue
+            res = str(e.get("result") or "")
+            if res and res not in MH_NON_TERMINAL:
+                return True
+        cur_sha, cur_i = next_sha, next_i
+
+_mh_stranded = []  # (ts, sha, pr) candidates — collapsed to at most one finding below (HERD-631 leg a)
 for _mh_i, d in [(i, e) for i, e in enumerate(events)
                  if str(e.get("event") or "") == "main_health" and str(e.get("result") or "") == "dispatched"]:
     if age_secs(now, d["_ts"]) < dispatch_ttl:
@@ -256,12 +300,27 @@ for _mh_i, d in [(i, e) for i, e in enumerate(events)
         if res and res not in MH_NON_TERMINAL:
             ok = True
             break
-    if not ok:
-        pr = d.get("pr")
-        key = "dispatch_no_outcome|main_health|sha=%s" % sha
-        summary = "main_health dispatch with no terminal · sha=%s pr=%s" % (sha[:8], pr if pr is not None else "?")
-        findings.append(("dispatch_no_outcome", key, summary,
-                         ctx(pr=pr, sha=sha, event="main_health")))
+    if ok:
+        continue
+    if _mh_chain_terminates(_mh_i, sha):
+        continue                      # terminal-superseded (HERD-631) — not outcome-less
+    _mh_stranded.append((d["_ts"], sha, d.get("pr")))
+
+# SHA-AGNOSTIC DEDUP (HERD-631 leg a). The root of a stranded main_health chain is the RAIL — there is
+# only one $MAIN — not any one sha, so at most ONE open dispatch_no_outcome item exists for this class
+# at a time, refreshed each sweep with the NEWEST offending sha rather than filing one duplicate per
+# corpse (the pre-fix behavior that produced HERD-627/628/629 for what was really one gap). Dropping
+# the sha from the key is what makes the once-guards and PENDING tracking downstream hold that
+# property: a second sha under this same class matches the SAME tracked key and refreshes it rather
+# than opening (or escalating into) a second item.
+if _mh_stranded:
+    _mh_stranded.sort(key=lambda t: t[0])
+    _mh_ts, _mh_sha, _mh_pr = _mh_stranded[-1]
+    key = "dispatch_no_outcome|main_health"
+    summary = "main_health dispatch with no terminal · sha=%s pr=%s" % (
+        _mh_sha[:8], _mh_pr if _mh_pr is not None else "?")
+    findings.append(("dispatch_no_outcome", key, summary,
+                     ctx(pr=_mh_pr, sha=_mh_sha, event="main_health")))
 
 # ── (c) refix_bounce without refix_wake_result ──────────────────────────────
 bounces = [e for e in events if e.get("event") == "refix_bounce"]
@@ -305,6 +364,7 @@ for b in bounces:
 reds = [e for e in events if e.get("event") == "main_health" and str(e.get("result") or "") == "red"]
 greens = [e for e in events if e.get("event") == "main_health" and str(e.get("result") or "") == "green"]
 seen_red_sha = set()
+_red_stale = []  # (ts, sha, pr, failed) candidates — collapsed to at most one finding below (HERD-631 leg a)
 for r in reds:  # events (and this filtered view) are already chronological — see events.sort() above
     sha = str(r.get("sha") or "")
     # An event with no sha at all can't be deduped against its siblings without risking merging two
@@ -318,10 +378,19 @@ for r in reds:  # events (and this filtered view) are already chronological — 
     # Cleared if any green lands after this (the earliest) red for this sha.
     ok = any(g["_ts"] > r["_ts"] for g in greens)
     if not ok:
-        key = "red_state_stale|sha=%s" % (sha or "unknown")
-        summary = "MAIN RED older than TTL · sha=%s failed=%s" % (
-            (sha[:8] if sha else "?"), str(r.get("failed") or r.get("detail") or "")[:60])
-        findings.append(("red_state_stale", key, summary, ctx(pr=r.get("pr"), sha=sha)))
+        _red_stale.append((r["_ts"], sha, r.get("pr"), str(r.get("failed") or r.get("detail") or "")[:60]))
+
+# SHA-AGNOSTIC DEDUP (HERD-631 leg a). $MAIN is a single branch, so the root of a standing red is the
+# RAIL, not any one sha — collapse every simultaneously-stale sha down to at most ONE open
+# red_state_stale item, refreshed each sweep with the newest offending sha (the HERD-610/611
+# duplications are the fixture for this same shape). Dropping the sha from the key is what lets the
+# once-guards / PENDING tracking downstream hold a single tracked finding across shifting corpses.
+if _red_stale:
+    _red_stale.sort(key=lambda t: t[0])
+    _r_ts, _r_sha, _r_pr, _r_failed = _red_stale[-1]
+    key = "red_state_stale"
+    summary = "MAIN RED older than TTL · sha=%s failed=%s" % ((_r_sha[:8] if _r_sha else "?"), _r_failed)
+    findings.append(("red_state_stale", key, summary, ctx(pr=_r_pr, sha=_r_sha)))
 
 # ── (k) gates passed but no merge older than TTL (HERD-334) ──────────────────
 # A `gate_status` (state=success, context=herd/gates) event is the engine's marker for "all gates

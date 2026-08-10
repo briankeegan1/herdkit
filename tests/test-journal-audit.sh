@@ -321,6 +321,30 @@ out="$(run_audit on)" || fail "(2b6) audit exited non-zero: $out"
 pass
 echo "PASS (2b6) a re-dispatch of the same sha is not a terminal (and both dispatches key one finding)"
 
+# ── (2b7) HERD-631 leg b: TERMINATED-SUPERSEDED — three real corpses (HERD-627/628/629) silenced,
+#          a genuinely-stuck dispatch after them still fires exactly once ─────────────────────────
+# The three real journal sequences: dispatches at a816294 (11:43), 0541883 (12:23), 18d7e7f (14:19),
+# each re-dispatched before completing (main advanced past it before its own terminal landed), with a
+# green FINALLY collected at 18d7e7f (14:45). None of the three is outcome-less — the chain completed,
+# just under a later sha than the ones that got abandoned along the way.
+reset_surfaces
+jline "2026-07-09T11:43:00Z" '"event":"main_health","pr":"?","sha":"a816294","result":"dispatched","pid":1001'
+jline "2026-07-09T12:23:00Z" '"event":"main_health","pr":"?","sha":"0541883","result":"dispatched","pid":1002'
+jline "2026-07-09T14:19:00Z" '"event":"main_health","pr":"?","sha":"18d7e7f","result":"dispatched","pid":1003'
+jline "2026-07-09T14:45:00Z" '"event":"main_health","pr":"?","sha":"18d7e7f","result":"green"'
+# A genuinely-stuck dispatch AFTER the resolved chain — never superseded, never terminaled: this one
+# must still fire. Proves leg b silences only the corpses, never a real stall.
+jline "2026-07-09T15:00:00Z" '"event":"main_health","pr":"?","sha":"cafefeed99","result":"dispatched","pid":1004'
+out="$(run_audit on)" || fail "(2b7) audit exited non-zero: $out"
+findings_2b7="$(grep '"event":"journal_audit"' "$JOURNAL_FILE")"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b7) expected exactly 1 dispatch_no_outcome (the genuinely-stuck one), got $(count_audit dispatch_no_outcome); $(cat "$JOURNAL_FILE")"
+grep -q 'cafefeed' <<<"$findings_2b7" || fail "(2b7) the surviving finding must name the genuinely-stuck sha: $findings_2b7"
+grep -q 'a816294' <<<"$findings_2b7" && fail "(2b7) a816294 is terminal-superseded — it must never surface: $findings_2b7"
+grep -q '0541883' <<<"$findings_2b7" && fail "(2b7) 0541883 is terminal-superseded — it must never surface: $findings_2b7"
+true
+pass
+echo "PASS (2b7) HERD-631: terminal-superseded main_health corpses never fire; a genuinely-stuck dispatch after them still does"
+
 # ── (2c) refix_bounce without refix_wake_result ──────────────────────────────
 reset_surfaces
 jline "2026-07-09T12:00:00Z" '"event":"refix_bounce","pr":8,"sha":"bbb","slug":"s","round":1'

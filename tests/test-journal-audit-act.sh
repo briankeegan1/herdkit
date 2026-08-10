@@ -278,6 +278,55 @@ out="$(run_audit on)" || fail "(2d) sweep 4 exited non-zero: $out"
 pass
 echo "PASS (2d) red_state_stale re-confirmations of the same sha dedupe to one tracked finding and converge (HERD-597)"
 
+# ── (2e) HERD-631 leg a: SHA-AGNOSTIC DEDUP — a SECOND sha under the SAME main_health
+#         dispatch_no_outcome class refreshes the ONE tracked finding instead of triggering a second
+#         action or a second filed item (the pre-fix shape that produced HERD-627/628/629: three
+#         distinct shas of what was really one gap, each escalating into its own duplicate item) ──────
+reset_surfaces
+jline "2026-08-05T12:00:00Z" '"event":"main_health","pr":"?","sha":"aaaa1111","result":"dispatched","pid":1'
+out="$(run_audit on)" || fail "(2e) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2e) sweep 1 must drive the rail exactly once, got $(rail_calls)"
+grep -q '^dispatch_no_outcome|dispatch_no_outcome|main_health|' "$RAILLOG" || fail "(2e) the rail must be handed the bucketed (sha-less) key: $(cat "$RAILLOG")"
+[ "$(wc -l < "$HERD_JOURNAL_AUDIT_PENDING" | tr -cd '0-9')" = "1" ] || fail "(2e) sweep 1 must track exactly one pending row, got: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+# A SECOND, distinct sha — a fresh corpse under the SAME rail (main_health), still unresolved. This
+# must refresh the ONE tracked finding, never act again and never file a second item.
+jline "2026-08-05T12:30:00Z" '"event":"main_health","pr":"?","sha":"bbbb2222","result":"dispatched","pid":2'
+out="$(run_audit on)" || fail "(2e) sweep 2 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2e) a second sha under the same class must NOT re-drive the rail, got $(rail_calls)"
+[ "$(wc -l < "$HERD_JOURNAL_AUDIT_PENDING" | tr -cd '0-9')" = "1" ] || fail "(2e) a second sha under the same class must still track exactly ONE pending row, got: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+[ "$(scribe_calls)" = "0" ] || fail "(2e) a second sha under the same class must not file anything yet, got $(scribe_calls)"
+[ "$(count_event audit_acted)" = "1" ] || fail "(2e) sweep 2 is within the grace window — no escalation yet"
+# A third sha, past JOURNAL_AUDIT_ESCALATE_AFTER=2 re-observations of the SAME tracked finding →
+# escalate LOUDLY exactly once — for the single tracked row, never per-sha.
+jline "2026-08-05T13:00:00Z" '"event":"main_health","pr":"?","sha":"cccc3333","result":"dispatched","pid":3'
+out="$(run_audit on)" || fail "(2e) sweep 3 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2e) escalation must never re-drive the rail, got $(rail_calls)"
+[ "$(count_event audit_acted)" = "2" ] || fail "(2e) sweep 3 must escalate the single tracked finding"
+grep -q '"result":"escalated"' "$JOURNAL_FILE" || fail "(2e) sweep 3 must journal result=escalated"
+[ "$(scribe_calls)" = "1" ] || fail "(2e) three distinct shas of one class must file exactly ONE item, got $(scribe_calls)"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(2e) an escalated finding must stop being tracked: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+pass
+echo "PASS (2e) HERD-631: a second/third sha under the same main_health dispatch_no_outcome class refreshes the one tracked finding instead of filing duplicates"
+
+# ── (2f) HERD-631 leg a, red_state_stale flavor: a red on a SECOND, DIFFERENT sha (no green in
+#         between) refreshes the same tracked finding rather than opening a second one ────────────────
+reset_surfaces
+jline "2026-08-05T12:00:00Z" '"event":"main_health","pr":900,"sha":"dddd4444","result":"red","failed":"tests/a.sh"'
+out="$(run_audit on)" || fail "(2f) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2f) sweep 1 must drive the re-verify rail once, got $(rail_calls)"
+[ "$(wc -l < "$HERD_JOURNAL_AUDIT_PENDING" | tr -cd '0-9')" = "1" ] || fail "(2f) sweep 1 must track exactly one pending row, got: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+# main advances to a DIFFERENT sha that is ALSO red — still the same standing incident, not a second one.
+jline "2026-08-05T12:30:00Z" '"event":"main_health","pr":901,"sha":"eeee5555","result":"red","failed":"tests/a.sh"'
+out="$(run_audit on)" || fail "(2f) sweep 2 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2f) a red on a different sha must NOT re-drive the rail, got $(rail_calls)"
+[ "$(wc -l < "$HERD_JOURNAL_AUDIT_PENDING" | tr -cd '0-9')" = "1" ] || fail "(2f) a red on a different sha must still track exactly ONE pending row, got: $(cat "$HERD_JOURNAL_AUDIT_PENDING")"
+jline "2026-08-05T13:00:00Z" '"event":"main_health","pr":902,"sha":"ffff6666","result":"red","failed":"tests/a.sh"'
+out="$(run_audit on)" || fail "(2f) sweep 3 exited non-zero: $out"
+[ "$(count_event audit_acted)" = "2" ] || fail "(2f) sweep 3 must escalate the single tracked finding"
+[ "$(scribe_calls)" = "1" ] || fail "(2f) three distinct shas of one standing red must file exactly ONE item, got $(scribe_calls)"
+pass
+echo "PASS (2f) HERD-631: a red on a different sha refreshes the one tracked red_state_stale finding instead of filing duplicates"
+
 # ── (3) an UNMAPPED finding class files EXACTLY ONE deduped item, ever ──────────────────────────
 reset_surfaces
 jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'      # pushed_no_unresolved: no rail
