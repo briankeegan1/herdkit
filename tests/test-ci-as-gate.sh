@@ -152,7 +152,7 @@ export GH_CALLS="$T/cxl/gh-calls.log"; mkdir -p "$T/cxl"; : > "$GH_CALLS"
 OUT="$(PATH="$BIN:$PATH" drive cxl 4 shaC)" || fail "(4) driver errored"
 grep -q '"4": *"PENDING"' <<< "$OUT" || fail "(4) a cancelled chain must WAIT (got: $OUT)"
 grep -q '"reason":"ci-cancelled-chain"' "$T/cxl/j.jsonl" || fail "(4) must journal ci-cancelled-chain"
-grep -q '"detail":"2 newer runs cancelled"' "$T/cxl/j.jsonl" \
+grep -q '"detail":"2 cancelled runs — awaiting a completed run"' "$T/cxl/j.jsonl" \
   || fail "(4) the WAIT must be QUALIFIED with the cancelled count, not a bare wait"
 grep -q '"verdict":"CODEERROR"' "$T/cxl/j.jsonl" && fail "(4) a cancelled run must NEVER read as a red"
 ok "(4) cancelled-run chain → WAIT, qualified with the cancelled count"

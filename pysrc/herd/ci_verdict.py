@@ -245,7 +245,7 @@ def map_verdict(scan, failure=None):
       ``(WAIT,      "ci-infra-transient", "<signature>")``      → caller may rerun ONCE (bounded)
       ``(WAIT,      "ci-log-unreadable",  "<workflow>: <conclusion>")``
       ``(WAIT,      "ci-pending",         "")``
-      ``(WAIT,      "ci-cancelled-chain", "<n> newer runs cancelled")``  (qualified, never a red)
+      ``(WAIT,      "ci-cancelled-chain", "<n> cancelled runs — awaiting a completed run")``
       ``(WAIT,      "ci-no-run-yet",      "")``
       ``(LOCAL,     "ci-absent",          "")``                 → fall back to the local suite, loudly
 
@@ -267,7 +267,8 @@ def map_verdict(scan, failure=None):
     if bucket == "cancelled":
         n = int((scan or {}).get("cancelled", 0) or 0)
         return (WAIT, "ci-cancelled-chain",
-                "%d newer runs cancelled" % n if n else "run cancelled — awaiting a completed run")
+                ("%d cancelled runs — awaiting a completed run" % n) if n
+                else "run cancelled — awaiting a completed run")
     if bucket == "pending":
         return (WAIT, "ci-pending", "")
     if bucket == "none":

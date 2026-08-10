@@ -7808,7 +7808,7 @@ class TestCiVerdictMapping(unittest.TestCase):
         scan = CVD.classify_runs(runs, "a")
         verdict, reason, detail = CVD.map_verdict(scan)
         self.assertEqual((verdict, reason), (CVD.WAIT, "ci-cancelled-chain"))
-        self.assertEqual(detail, "2 newer runs cancelled")
+        self.assertEqual(detail, "2 cancelled runs — awaiting a completed run")
 
     # ── classify_failure_log: code red vs platform outage ─────────────────────────────────────────
     def test_real_test_output_is_a_code_red(self):
