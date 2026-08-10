@@ -372,7 +372,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_PREGATE` → `agent-watch.sh`, `herd-review.sh`, `review-pregate.sh`
 - `REVIEW_TIERING` → —
 - `RUBRIC_FILE` → `herd-review.sh`
-- `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `herd-claim.sh`, `scribe-step.sh`, `status.sh`, `sweep.sh`, `tracker-state-sweep.sh`
+- `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `herd-claim.sh`, `pr-ref.sh`, `scribe-step.sh`, `status.sh`, `sweep.sh`, `tracker-state-sweep.sh`
 - `SCRIBE_LINGER_SECS` → `scribe-step.sh`, `scribe.sh`
 - `SCRIBE_POLL` → `scribe-step.sh`
 - `SHARE_LINKS` → `bin/herd`, `agent-watch.sh`, `new-feature.sh`
