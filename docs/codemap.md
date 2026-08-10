@@ -35,6 +35,7 @@ Role summarized from each file's top-of-file comment.
 - `console-section.sh` — THE shared bounded-console-section helper (HERD-243).
 - `context-guard.sh` — THE ONE shared INVOCATION-CONTEXT check (HERD-269): a builder's worktree may
 - `coordinator.sh` — (re)launch the coordinator herdr tab as a 2-pane control room:
+- `core-surface.sh` — THE shared CORE-SURFACE implementation (HERD-577): which diffs touch the
 - `cost.sh` — the herdkit TOKEN/COST SUMMER: the measurement precursor to the efficiency program.
 - `create-retry.sh` — the DURABLE RETRY QUEUE for failed tracker-item CREATES (HERD-267).
 - `dep-watcher.sh` — persistent per-project dependency-watcher singleton.
@@ -154,7 +155,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `core-surface.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -244,11 +245,12 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `COORDINATOR_AUTONOMY` → `bin/herd`
 - `COORDINATOR_CMD` → `bin/herd`, `coordinator.sh`, `derived-files.sh`
 - `COORDINATOR_WATCHDOG` → `agent-watch.sh`
+- `CORE_SURFACE_GLOB` → `core-surface.sh`
 - `CREATE_RETRY_MAX` → `create-retry.sh`
 - `CREATE_SELFHEAL` → `create-retry.sh`
 - `DEAD_BUILDER_AUTORESPAWN` → `agent-watch.sh`
 - `DEAD_GRACE_MIN` → `agent-watch.sh`
-- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `config-viability.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `retirement.sh`, `review-pregate.sh`, `status.sh`, `sweep.sh`
+- `DEFAULT_BRANCH` → `bin/herd`, `agent-watch.sh`, `config-viability.sh`, `core-surface.sh`, `healthcheck.sh`, `herd-feature.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `new-feature.sh`, `retirement.sh`, `review-pregate.sh`, `status.sh`, `sweep.sh`
 - `DELETE_BRANCH_ON_MERGE` → `bin/herd`, `retirement.sh`, `git-pr.sh`
 - `DELTA_REVIEW` → `agent-watch.sh`
 - `DENY_PATHS` → `bin/herd`
