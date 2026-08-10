@@ -574,6 +574,26 @@ _BUDGET_DRAIN_PAUSED=""
 # Stall TTL for a held spawn intent (seconds; 0 disables stall surfacing). REUSES dep-watcher's
 # DEP_STALE_TTL so operators tune one knob; default mirrors dep-watcher.sh (86400 = 1 day).
 DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
+# ── Escalated spawn intents (HERD-630 · Phase 1 of HERD-625) ─────────────────────────────────────
+# INTENT_TTL — seconds an intent may sit UNDRAINED before the drain refuses to launch it and escalates
+# instead (docs/spikes/coordinator-work-queue.md §4.2/§4.3). Deliberately an internal constant with an
+# env seam, NOT a config key: HERD-630 ships behind exactly ONE operator lever (INTENT_QUEUE), and a
+# second knob nobody has yet needed to turn is a surface to keep in sync for no gain. 0 disables the
+# expiry entirely (the same "0 = off" shape DEP_STALE_TTL / AGING_PR_TTL use); the default mirrors
+# DEP_STALE_TTL at one day, which is the doc's own bound ("a plan whose premises are a day old").
+# Read only while INTENT_QUEUE=on, so an unarmed watcher never evaluates it.
+INTENT_TTL="${INTENT_TTL:-86400}"
+#   • INTENT_ESCALATION_LEDGER — one TAB-separated row per escalated intent
+#     ("<epoch>\t<intent_id>\t<slug>\t<lane>\t<ref>\t<reason>"), appended by _drain_spawn_queue and
+#     rendered newest-first by build_intent_escalations as a LOUD needs-you row.
+#   • INTENT_ESCALATION_ACK — the ACK ledger: one verbatim row per escalation the operator has handled
+#     via `herd intents ack <n|all>`, PLUS the rows the age-to-retired sweep retires on its own. Same
+#     mechanism `herd notes ack` / `herd tracker-heals ack` use (an exact ledger-line match), so the
+#     three clearing surfaces can never disagree.
+# Both stay ABSENT — hence a byte-identical console — on any watcher where no intent ever escalated,
+# which is every watcher with INTENT_QUEUE off (the ship default).
+INTENT_ESCALATION_LEDGER="$TREES/.agent-watch-intent-escalations"
+INTENT_ESCALATION_ACK="$TREES/.agent-watch-intent-escalations-acked"
 # Operator-inbox surfaces (HERD-184). Two files, both under $TREES, both untouched when OPERATOR_INBOX
 # is off (byte-inert):
 #   • INBOX_LEDGER — one TAB-separated entry per surfaced cross-seat comment
@@ -907,6 +927,7 @@ RECONCILE_PENDING=""    # HERD-438: "reconcile pending" section rows (empty when
 TRACKER_DRIFT=""
 REF_UNPARSED_ROWS=""    # HERD-522: the "unlinked merges" section rows (empty when every merged PR's Refs: parsed)
 SPAWN_HOLDS=""
+INTENT_ESCALATION_ROWS=""  # HERD-630: the "spawn intents" needs-you section rows (empty unless an intent escalated → render omits it)
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
 UNGATED_PR_SECTION_ROWS=""  # HERD-460: the UNCONDITIONAL "ungated PRs" truth section rows (empty when none → render omits it)
@@ -1291,6 +1312,93 @@ build_spawn_holds() {
   # Swap in the pruned ledger (drops rows for vanished intents) so it can't grow unbounded.
   if [ -n "$kept" ]; then mv -f "$kept" "$SPAWN_HELD_STATE" 2>/dev/null || rm -f "$kept" 2>/dev/null; fi
   [ -n "$rows" ] && SPAWN_HOLDS="$rows"
+}
+
+# ── Escalated spawn intents (HERD-630) ────────────────────────────────────────────────────────────
+# The drain escalates an intent it REFUSES to launch (today: one reason — it aged past INTENT_TTL, so
+# its premises are stale enough that launching a builder against them costs more than not launching
+# one). That decision has to reach the operator, because re-publishing the intent is a coordinator act
+# the engine will never take on its own. Three surfaces, all in this slice by design:
+#
+#   • _intent_escalation_row / build_intent_escalations — the LOUD needs-you row (it never ages out on
+#     its own; see herd_console_classify_intent_escalation).
+#   • `herd intents ack <n|all>` (bin/herd) — the operator's immediate clearing path.
+#   • _intent_escalations_retire — the AGE-TO-RETIRED path: past CONSOLE_ROW_RETENTION the row auto-acks
+#     itself, journals `spawn_intent_retired` WITH its ref so the evidence outlives the console, and
+#     GCs the terminal queue files it was pointing at.
+#
+# HERD-613 leg 3 and HERD-624 leg 2 are the grounding for shipping all three together: an escalated
+# tracker-heal row stood loud for 4+ days because no ack path existed, and mark-shipped intents with
+# retired-backend refs warned forever until an operator hand-edited a ledger. Terminal must mean
+# terminal — queued, executed, cancelled or retired, with every one reachable from what precedes it.
+
+# _intent_escalation_row — render ONE escalation ledger line
+# ("<epoch>\t<intent_id>\t<slug>\t<lane>\t<ref>\t<reason>") as a needs-you row.
+_intent_escalation_row() {
+  local epoch id slug lane ref reason hhmm sl
+  IFS=$'\t' read -r epoch id slug lane ref reason <<EOF
+$1
+EOF
+  [ -n "${id:-}" ] || return 1
+  hhmm="$(epoch_to_hhmm "$epoch")"
+  sl="$(_slug_cell "${slug:-?}")"
+  printf '    %s⛔%s %s%s%s %sneeds-you · spawn intent escalated: %s%s · re-ground and re-queue it, then `herd intents ack`%s %s%s%s' \
+    "$C_RED" "$C_RESET" "$C_RED" "$sl" "$C_RESET" "$C_RED" "${reason:-escalated}" \
+    "${ref:+ (${ref})}" "$C_RESET" "$C_DIM" "$hhmm" "$C_RESET"
+}
+
+# _intent_escalations_retire — the AGE-TO-RETIRED sweep. An escalation row past CONSOLE_ROW_RETENTION
+# leaves the console the SAME way an operator ack takes it off (an exact ledger-line match appended to
+# the ack sidecar — tracker-state-sweep.sh's _tsweep_auto_retire_shape_invalid is the precedent), and
+# journals `spawn_intent_retired` carrying the intent's ref so the evidence survives the display. Then
+# it GCs the terminal queue files (<id>.escalated / <id>.cancelled and their sidecars) that row was the
+# console face of, so the pool cannot accumulate terminal records forever either.
+#
+# Byte-inert with no ledger: one `[ -s ]` and it returns, which is every watcher that has never
+# escalated an intent (i.e. every watcher with INTENT_QUEUE off). Fail-soft throughout — a ledger that
+# cannot be read or an ack file that cannot be written is never an error, just an un-retired row.
+_intent_escalations_retire() {
+  [ -s "$INTENT_ESCALATION_LEDGER" ] || return 0
+  local now line epoch id slug lane ref reason age dir q
+  now="$(_now_epoch)"
+  case "$now" in ''|*[!0-9]*) return 0 ;; esac
+  q="$TREES/spawn-queue"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    epoch="" id="" slug="" lane="" ref="" reason=""
+    IFS=$'\t' read -r epoch id slug lane ref reason <<EOF
+$line
+EOF
+    [ -n "${id:-}" ] || continue
+    case "${epoch:-}" in ''|*[!0-9]*) continue ;; esac
+    age=$(( now - epoch ))
+    [ "$age" -ge 0 ] || continue                    # clock skew → leave it loud
+    [ "$age" -gt "$CONSOLE_ROW_RETENTION" ] || continue
+    if ! herd_console_acked "$INTENT_ESCALATION_ACK" "$line"; then
+      dir="${INTENT_ESCALATION_ACK%/*}"
+      [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || continue
+      printf '%s\n' "$line" >> "$INTENT_ESCALATION_ACK" 2>/dev/null || continue
+      journal_append spawn_intent_retired intent "$id" slug "${slug:-}" lane "${lane:-}" \
+        ref "${ref:-}" reason "${reason:-escalated}" age "$age"
+    fi
+    rm -f "$q/$id.escalated" "$q/$id.cancelled" "$q/$id.ref" "$q/$id.after" "$q/$id.prio" 2>/dev/null || true
+  done < "$INTENT_ESCALATION_LEDGER"
+  herd_console_trim "$INTENT_ESCALATION_ACK"
+  return 0
+}
+
+# build_intent_escalations — the "spawn intents" console section: the newest 3 STILL-RELEVANT
+# escalations, newest first. Empty (INTENT_ESCALATION_ROWS="") when the ledger is absent/empty — or
+# when every row has been acked or retired — so render() omits the section entirely and the console is
+# byte-identical on any watcher that has never escalated an intent.
+build_intent_escalations() {
+  INTENT_ESCALATION_ROWS=""
+  _intent_escalations_retire
+  local rows
+  rows="$(herd_console_section "$INTENT_ESCALATION_LEDGER" 3 \
+    herd_console_classify_intent_escalation _intent_escalation_row "$INTENT_ESCALATION_ACK")"
+  [ -n "$rows" ] && INTENT_ESCALATION_ROWS="${rows}"$'\n'
+  return 0
 }
 
 # build_engine_note — the QUIET 'engine outdated' console note (HERD-179). One dim line, and only when
@@ -3140,6 +3248,14 @@ render() {
   fi
   if [ -n "${SPAWN_HOLDS:-}" ]; then
     frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
+  fi
+  # SPAWN INTENTS (HERD-630) — intents the drain REFUSED to launch (aged past INTENT_TTL). Sits
+  # directly under "spawn holds" because it is the same queue seen at its terminal end: a hold is
+  # waiting, an escalation has given up and needs the coordinator to re-ground it. Empty on every
+  # watcher that has never escalated an intent — which is every watcher with INTENT_QUEUE off — so the
+  # console is byte-identical while the lever is dormant.
+  if [ -n "${INTENT_ESCALATION_ROWS:-}" ]; then
+    frame="${frame}  ${C_RED}spawn intents${C_RESET}"$'\n'"${INTENT_ESCALATION_ROWS}"$'\n'
   fi
   # ENGINE OUTDATED note (HERD-179) — one quiet line under ENGINE_AUTOUPDATE=check|auto when the local
   # engine is below the project's ENGINE_MIN. Empty (byte-identical console) otherwise.
@@ -17568,6 +17684,7 @@ _tick_render_reconcile() {
   build_tracker_drift
   build_ref_unparsed        # HERD-522: merged PRs whose `refs:` line parsed to nothing (empty when none)
   build_spawn_holds
+  build_intent_escalations  # HERD-630: escalated spawn intents + their age-to-retired sweep (empty when none)
   build_engine_note
   build_engine_seat_note   # HERD-308: the dual-engine HALT/coexistence row (empty unless a mismatch)
   build_main_health
@@ -18504,8 +18621,65 @@ _spawn_clear_held() {
 # The task payload is read as the REMAINDER of the claim stream (not one line): task text may be
 # multi-line and `read -r` would silently truncate it to its first line before the builder saw it.
 #
+# INTENT POLICY (HERD-630, Phase 1 of HERD-625 — docs/spikes/coordinator-work-queue.md): under
+# INTENT_QUEUE=on the loop gains TWO refusal legs, both evaluated on a CLAIMED candidate before any
+# worktree/branch/agent exists, and both TERMINAL-SKIP-AND-CONTINUE rather than tick-stopping failures:
+#   • RE-GROUND (§4.2) — an intent authored hours ago is re-checked against the item's CURRENT tracker
+#     state. Today a stale pick still spawns a lane, whose own herd_claim_or_abort HERD-117 guard
+#     refuses it — correct, but only after the lane has been launched, and the drain then reads that
+#     refusal as a generic hard failure. Doing the read HERE makes the outcome exactly what the doc
+#     specifies: drop this candidate, journal spawn_skipped, and move to the NEXT candidate in priority
+#     order, with nothing created.
+#   • TTL (§4.3) — an intent that sat undrained past INTENT_TTL escalates instead of launching, because
+#     a builder started against a day-stale plan costs a full run plus a bounced PR and fails silently.
+# Both legs are strictly gated on the lever, so an unarmed watcher issues no tracker read, evaluates no
+# clock, and takes byte-identically the path it took before this change.
+#
 # Fail-soft: a malformed intent is skipped with a logged warning — never crashes the watcher loop.
 # Skipped entirely in dry-run mode (intents remain pending; no lane is spawned).
+
+# _intent_escalate <claimed-path> <intent-id> <slug> <lane> <ref> <reason> — retire a claimed intent to
+# its terminal `escalated` state and raise the operator-facing row. ONE place does all four halves
+# (queue transition, journal, console ledger, hold-row cleanup) so an escalation can never land on the
+# console without its journal evidence, or vice versa. The ack + age-to-retired paths that clear the
+# row live in build_intent_escalations / _intent_escalations_retire and `herd intents ack` — shipped in
+# this same slice by the HERD-613 lesson. Fail-soft: a queue transition that does not take (the claim
+# vanished under us) journals spawn_claim_lost and writes NO row, so the console never advertises an
+# escalation that did not happen.
+_intent_escalate() {
+  local _ie_claimed="$1" _ie_id="$2" _ie_slug="$3" _ie_lane="$4" _ie_ref="$5" _ie_reason="$6"
+  if ! bash "$HERE/spawn-step.sh" escalate "$_ie_claimed" "$_ie_reason" >/dev/null 2>&1; then
+    journal_append spawn_claim_lost slug "$_ie_slug" lane "$_ie_lane" action escalate
+    return 0
+  fi
+  journal_append spawn_intent_escalated intent "$_ie_id" slug "$_ie_slug" lane "$_ie_lane" \
+    ref "$_ie_ref" reason "$_ie_reason"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "$_ie_id" "$_ie_slug" "$_ie_lane" "$_ie_ref" "$_ie_reason" \
+    >> "$INTENT_ESCALATION_LEDGER" 2>/dev/null || true
+  herd_console_trim "$INTENT_ESCALATION_LEDGER"
+  _spawn_clear_held "$_ie_id"
+  return 0
+}
+
+# _intent_reground_closed <ref> — 0 when the tracker item behind <ref> is in a TERMINAL state (Done /
+# Canceled) and this intent must therefore NOT launch. Reuses herd-claim.sh's read-only
+# _herd_state_dispatch — the SAME backend read herd_claim_or_abort's HERD-117 guard performs a moment
+# later inside the lane — so the drain and the lane can never disagree about what "already done" means.
+#
+# Everything that is not a definitive `closed` returns 1 (launch): an open or in-progress item, an
+# UNREADABLE state, a backend with no state op, an absent dispatcher (a harness that extracted this
+# function alone), or a refless intent. Tracker flakiness must never stall the queue — the lane's own
+# guard is still behind this as the authoritative refusal. HERD_FORCE_SPAWN=1 skips the read entirely,
+# the same deliberate override every other spawn gate honors.
+_intent_reground_closed() {
+  local _irc_ref="${1:-}" _irc_parsed
+  [ -n "$_irc_ref" ] || return 1
+  case "${HERD_FORCE_SPAWN:-}" in 1|true|yes|on|ON|On) return 1 ;; esac
+  command -v _herd_state_dispatch >/dev/null 2>&1 || return 1
+  _irc_parsed="$(_herd_state_dispatch "$_irc_ref" 2>/dev/null || true)"
+  [ "${_irc_parsed%%$'\t'*}" = "closed" ]
+}
+
 _drain_lane_worker() {
   local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5"
   local _dlw_out="" _dlw_rc=0 _dlw_bin="$HERE/herd-quick.sh"
@@ -18643,6 +18817,26 @@ _drain_spawn_queue() {
           _dsq_held+=("$_dsq_claimed")
           continue
         fi
+        # HERD-630 §4.3 — TTL AGING. Checked here, BELOW the dependency hold and ABOVE the launch-slot
+        # check, and the position is the design:
+        #   • below the hold, because a dependency-held intent is not stale-because-forgotten — it is
+        #     waiting BY DESIGN and already has its own loud rail (build_spawn_holds going `stalled`
+        #     past DEP_STALE_TTL). Expiring it here would double-surface one condition on two rails and
+        #     silently retire a plan whose dependency is simply slow;
+        #   • above the launch-slot check, so an expired intent escalates on the tick it is observed
+        #     even while a lane is in flight — a busy fleet must not defer the operator's news.
+        # It does NOT spend the launch slot (nothing launched) but DOES spend budget, so the walk stays
+        # bounded exactly as every other skip leg bounds it.
+        # The `type` guard around the lever read is the same shape the herd_numeric resolution below
+        # uses, and for the same reason: herd-config.sh owns the ONE truthiness rule and a live watcher
+        # always has it sourced, but the hermetic tests extract this function ALONE — a missing resolver
+        # must read as OFF (the byte-identical FIFO), silently, never as an error.
+        if type herd_intent_queue_on >/dev/null 2>&1 && herd_intent_queue_on \
+           && bash "$HERE/spawn-step.sh" expired "$_dsq_claimed" "$INTENT_TTL" >/dev/null 2>&1; then
+          _intent_escalate "$_dsq_claimed" "$_dsq_id" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" \
+            "aged past INTENT_TTL (${INTENT_TTL}s) undrained"
+          _dsq_n=$(( _dsq_n + 1 )); continue
+        fi
         # The launch slot is already spent this tick (a lane is running). Release this intent with the
         # dependency-held ones and re-claim it next tick — FIFO order is preserved by the INTENT_ID
         # filenames. It still SPENDS budget, so a long queue is walked at most _dsq_budget deep per
@@ -18650,6 +18844,22 @@ _drain_spawn_queue() {
         # so a release is only ever announced on the tick that acts on it.
         if [ "$_dsq_can_launch" != "1" ]; then
           _dsq_held+=("$_dsq_claimed")
+          _dsq_n=$(( _dsq_n + 1 )); continue
+        fi
+        # HERD-630 §4.2 — RE-GROUND, the last check before anything is created. The decision to build
+        # this item was made when the coordinator ranked the backlog, possibly hours ago; the item may
+        # have shipped since. TERMINAL-SKIP-AND-CONTINUE: consume this candidate (retrying cannot change
+        # the answer), journal it, and let the loop claim the NEXT candidate in priority order — which
+        # can still launch this tick, because the launch slot was never spent. No worktree, no branch,
+        # no agent. Placed BELOW the launch-slot check so a tick with no slot free issues no backend
+        # read at all, and ABOVE the spawn_released announce so a re-ground skip never announces a
+        # release it is about to discard.
+        if type herd_intent_queue_on >/dev/null 2>&1 && herd_intent_queue_on \
+           && _intent_reground_closed "$_dsq_ref"; then
+          bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "re-ground: $_dsq_ref is already Done/Canceled" >/dev/null 2>&1 || true
+          journal_append spawn_skipped slug "$_dsq_slug" lane "$_dsq_lane" \
+            reason "re-ground: item already done" ref "$_dsq_ref"
+          _spawn_clear_held "$_dsq_id"
           _dsq_n=$(( _dsq_n + 1 )); continue
         fi
         # Dependency met (or none). If this intent had been held on a prior tick, announce the release

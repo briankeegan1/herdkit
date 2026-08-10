@@ -242,7 +242,16 @@ EXEMPT_NAMES = {
                                  # capabilities.tsv `env` rows, not `config`), read in healthcheck.sh
                                  # (tees the suite's live output into it) and .herd/healthcheck.project.sh
                                  # — a cross-file env-passthrough contract, not a .herd/config knob
-    "HERDKIT_HOME", "HERDR_MIN_VERSION", "ITEM_STATE", "ITEM_UPDATED",
+    "HERDKIT_HOME", "HERDR_MIN_VERSION",
+    "INTENT_TTL",  # HERD-630: agent-watch.sh's staleness bound for an UNDRAINED spawn intent (default
+                   # 86400s, 0 disables). The declare-or-exempt choice is EXEMPT, deliberately: the
+                   # work-queue slice ships behind exactly ONE operator lever (INTENT_QUEUE, declared),
+                   # and this bound is only ever evaluated while that lever is on. A second manifest row
+                   # for a knob no fleet has yet needed to turn is one more surface to keep in sync for
+                   # no operator gain — the same call console-section.sh's CONSOLE_ROW_RETENTION /
+                   # CONSOLE_LEDGER_MAX make above. Promote it to a real key if and when a fleet
+                   # genuinely needs a different bound (docs/spikes/coordinator-work-queue.md §4.2)
+    "ITEM_STATE", "ITEM_UPDATED",
     "WATCHER_RESURRECT_LIB",  # watcher-resurrect.sh lib-mode test seam (HERD-489), same shape as
                               # DEP_WATCHER_LIB above — never a .herd/config knob
     "JOURNAL_FILE", "JOURNAL_MAX_BYTES", "LEDGER_FILE", "LOG", "MAIN", "MAIN_HEALTH", "NO_COLOR",

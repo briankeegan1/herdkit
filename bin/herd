@@ -2551,6 +2551,101 @@ EOF
   say "acked ${c_bold}${count}${c_rst} tracker-heal row$([ "$count" = 1 ] || printf 's') · console cleared (ledger keeps the history)"
 }
 
+# ── herd intents: list / acknowledge the ESCALATED spawn intents on the console (HERD-630) ───────
+# Under INTENT_QUEUE=on the watcher's spawn-queue drain REFUSES to launch an intent that aged past
+# INTENT_TTL: it retires the intent to a terminal `escalated` state and writes one row to
+# .agent-watch-intent-escalations, which the console renders as a LOUD needs-you row (it never ages out
+# on its own — the coordinator has to re-ground and re-publish the intent, and only a human can decide
+# that). `herd intents` lists the rows currently on the console (newest first, numbered);
+# `herd intents ack <n>` / `ack all` clears one immediately by recording its exact ledger line in an ack
+# sidecar — the same mechanism `herd notes ack` / `herd tracker-heals ack` use, so the three surfaces
+# can never disagree. The ledger and the journal are untouched: `herd log` still has every escalation.
+# The watcher's own age-to-retired sweep (agent-watch.sh's _intent_escalations_retire) does the SAME
+# thing automatically once a row is past CONSOLE_ROW_RETENTION, journaling `spawn_intent_retired` with
+# the intent's ref; this command is the immediate path for a row an operator has already handled.
+#
+# Shipping the ack WITH the escalation is deliberate (HERD-613 leg 3): an escalated tracker-heal row
+# stood loud on the console for 4+ days precisely because no clearing path came with it.
+cmd_intents() {
+  local sub="list"
+  case "${1:-}" in
+    -h|--help) say "usage: herd intents [list] | herd intents ack <n|all>"; return 0 ;;
+    "") ;;
+    list|ack) sub="$1"; shift ;;
+    *) die "herd intents: unknown subcommand $1 (usage: herd intents [list] | herd intents ack <n|all>)" ;;
+  esac
+
+  _journal_load_config
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/console-section.sh"
+  local ledger="$WORKTREES_DIR/.agent-watch-intent-escalations"
+  local ack="$WORKTREES_DIR/.agent-watch-intent-escalations-acked"
+
+  # The escalations still on the console: newest first, already-acked (by hand or by the watcher's
+  # age-to-retired sweep) dropped. ONE shared decision (herd_console_visible_lines) with the watcher,
+  # so this list can never disagree with what the operator is looking at.
+  local visible
+  visible="$(herd_console_visible_lines "$ledger" "$CONSOLE_LEDGER_MAX" \
+    herd_console_classify_intent_escalation "$ack")"
+
+  if [ -z "$visible" ]; then
+    say "no escalated spawn intents on the console"
+    return 0
+  fi
+
+  local n=0 line epoch id slug lane ref reason hhmm
+  if [ "$sub" = "list" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      n=$((n+1))
+      epoch="" id="" slug="" lane="" ref="" reason=""
+      IFS=$'\t' read -r epoch id slug lane ref reason <<EOF
+$line
+EOF
+      hhmm="$(date -r "${epoch:-0}" +%H:%M 2>/dev/null || date -d "@${epoch:-0}" +%H:%M 2>/dev/null || echo '--:--')"
+      say "  ${c_bold}${n}${c_rst}  ⛔ ${c_bold}${slug}${c_rst} (${lane})${ref:+  ${ref}}  ${reason} (${hhmm})"
+    done <<< "$visible"
+    say ""
+    say "re-ground and re-queue what still matters (HERD_SPAWN_PRIO=<n> bash ${SCRIPTS_DIR}/spawn.sh …), then: herd intents ack <n>   (or: herd intents ack all)"
+    return 0
+  fi
+
+  # ── ack ──────────────────────────────────────────────────────────────────────────────────────
+  local which="${1:-}"
+  [ -n "$which" ] || die "usage: herd intents ack <n|all>"
+  local total; total="$(printf '%s\n' "$visible" | grep -c .)"
+  local picked=""
+  case "$which" in
+    all) picked="$visible" ;;
+    ''|*[!0-9]*) die "herd intents ack: <n> must be a number or 'all' (got: $which)" ;;
+    *)
+      [ "$which" -ge 1 ] && [ "$which" -le "$total" ] \
+        || die "herd intents ack: no row #$which (${total} on the console — run: herd intents)"
+      picked="$(printf '%s\n' "$visible" | sed -n "${which}p")"
+      ;;
+  esac
+  [ -n "$picked" ] || die "herd intents ack: nothing to acknowledge"
+
+  local dir="${ack%/*}"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || die "herd intents ack: cannot create $dir"
+  printf '%s\n' "$picked" >> "$ack" 2>/dev/null || die "herd intents ack: cannot write $ack"
+
+  # An ack for a line the ledger has already evicted is dead weight — keep only acks that still
+  # correspond to a live ledger row, then bound the sidecar.
+  if [ -s "$ledger" ] && [ -s "$ack" ]; then
+    local tmp="$ack.tmp.$$"
+    if grep -Fxf "$ledger" "$ack" > "$tmp" 2>/dev/null; then
+      mv "$tmp" "$ack" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+    else
+      rm -f "$tmp" 2>/dev/null
+    fi
+  fi
+  herd_console_trim "$ack"
+
+  local count; count="$(printf '%s\n' "$picked" | grep -c .)"
+  say "acked ${c_bold}${count}${c_rst} escalated spawn intent$([ "$count" = 1 ] || printf 's') · console cleared (ledger keeps the history)"
+}
+
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
 # per-key metadata — including the optional 5th "requires" column (watcher | render | blank) — are
@@ -8899,6 +8994,7 @@ case "${1:-help}" in
   note)    shift; cmd_note "$@" ;;
   notes)   shift; cmd_notes "$@" ;;
   tracker-heals) shift; cmd_tracker_heals "$@" ;;
+  intents) shift; cmd_intents "$@" ;;
   config)  shift; cmd_config "$@" ;;
   theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;

@@ -988,6 +988,43 @@ export REVIEW_MODEL_CHEAP REVIEW_MODEL_DOCS
 # nothing. An unrecognized value reads as full. Consumed by suite-shard.sh (herd_suite_scope_mode),
 # read by the project healthcheck wrapper.
 : "${HEALTH_SUITE_SCOPE:="full"}"    # HERD-532: heavy-suite test selection — diff | full
+# INTENT_QUEUE (HERD-630, Phase 1 of HERD-625; design doc docs/spikes/coordinator-work-queue.md) — the
+# durable spawn queue's INTENT POLICY: off (default, ship-dormant) | on. GROUNDING (the doc's §1.1,
+# read back from the 2026-08-10 journal): the spawn queue already externalizes spawn EXECUTION but not
+# spawn SELECTION, so a slot freed while the coordinator is between turns is repaired by nobody —
+# 4 h 36 m of idle review slot inside a 7 h 45 m drain, bimodally ~30-60 s when a turn happened to be
+# live and 24-144 min when one was not. The latency is seat presence, not engine throughput.
+#
+# off → `spawn-step.sh next` serves intents by the untouched `ls -1 <q>/*.req | sort` FIFO, no .prio
+#   sidecar is ever read, no re-ground read is issued, no intent can expire and no escalation ledger is
+#   ever written — byte-for-byte the pre-HERD-630 drain, including its argv, its journal lines and its
+#   queue file layout (tests/test-spawn-queue-drain.sh passes unmodified as the proof).
+# on → FOUR behaviors engage, all of them over the SAME queue directory and the same claim primitives:
+#   (1) PRIORITY ORDER — an intent's optional .prio sidecar (spawn.sh's HERD_SPAWN_PRIO) names a band;
+#       lowest drains first, FIFO by INTENT_ID within a band (the HERD-443 invariant). An intent with
+#       no sidecar lands in the default band, so a queue where nobody published a priority is STILL
+#       today's FIFO — arming the lever alone re-orders nothing.
+#   (2) DRAIN-TIME RE-GROUNDING (§4.2) — an intent authored hours ago is re-checked against the item's
+#       CURRENT tracker state before it launches. A Done/Canceled item is a TERMINAL SKIP-AND-CONTINUE:
+#       journal `spawn_skipped reason=re-ground`, drop that candidate, move to the next in priority
+#       order — no worktree, branch or agent is created. Fail-soft: an unreadable state launches as
+#       today (tracker flakiness must never stall the queue).
+#   (3) INTENT_TTL AGING (§4.3) — an intent that sat undrained past the TTL does NOT launch; it
+#       escalates to a terminal state with a LOUD needs-you row. Launching a builder against a
+#       day-stale plan costs a full run plus a bounced PR, and fails silently.
+#   (4) The `cancel` op (§4.4 level 1) — `spawn-step.sh cancel <intent-id>` countermands a still-
+#       unclaimed intent atomically, racing the drain's own claim safely.
+# Every escalated row ships WITH its clearing path in the same slice — `herd intents ack <n|all>` plus
+# an automatic age-to-retired sweep — because HERD-613 leg 3 proved an escalation surface with no
+# clearing surface is a permanent-red generator, not a safety feature.
+#
+# NOT MULTI-SEAT SAFE, and deliberately not described as such: each watcher still computes its spawn
+# budget from its OWN FEATS roster, so two seats draining one pool can each admit up to their own cap.
+# Phase 4 closes that by leasing through the HERD-581 `agent` capacity tenant. A single-seat drain
+# behaves exactly as today. An unrecognized value reads as off (fail toward the byte-identical FIFO).
+# Consumed by scripts/herd/spawn-step.sh (ordering + terminal ops) and agent-watch.sh
+# (_drain_spawn_queue's re-ground / TTL legs, and the escalation console section).
+: "${INTENT_QUEUE:="off"}"           # HERD-630: durable spawn-queue intent policy — off (FIFO) | on
 # (HERD-580) GATE_DISPATCH (HERD-73) was RETIRED: it governed WHEN the watcher's action pass fired the
 # pre-merge review relative to the healthcheck, but its only consumers lived in the bash action pass
 # (_tick_act) the P5b engine port deleted — the Python core never implemented a parallel pre-dispatch
@@ -2130,6 +2167,20 @@ herd_numeric() {
       printf '%s' "$_hn_val"
       return 0
       ;;
+  esac
+}
+
+# herd_intent_queue_on — THE resolver for the INTENT_QUEUE lever (HERD-630): 0 when armed, 1 when off.
+# Lives here, in the file BOTH consumers already source (scripts/herd/spawn-step.sh's queue mechanics
+# and agent-watch.sh's drain), so the two can never disagree about whether the priority policy is in
+# effect — a per-surface copy of one rule is what docs/multi-seat-doctrine.md Rule 2 calls a
+# correctness defect. Any unrecognized value reads as OFF: fail toward the byte-identical FIFO drain.
+# Reads the LIVE env var on every call, so a test (or a mid-process override) is honored, exactly as
+# herd_numeric/herd_enum do.
+herd_intent_queue_on() {
+  case "$(printf '%s' "${INTENT_QUEUE:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
