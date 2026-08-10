@@ -278,13 +278,31 @@ def events():
         return [json.loads(l) for l in fh if l.strip()]
 
 
+# drive <cond> until it is true or <timeout> real seconds elapse — a WALL-CLOCK deadline (mirrors
+# tests/test-merge-result-gate-sim.sh's poll_health), never a blind tick count. The health/merge-result
+# verdict is produced by a REAL detached subprocess (materializes a git tree, runs the stub health
+# command); a bare back-to-back tick loop with no pacing can run all N ticks in well under the
+# subprocess's own completion time on a fast box, seeing WAIT forever and never observing the result
+# CI happens to have time to produce between ticks. Sleeping between ticks gives the worker real time
+# to finish regardless of machine speed.
+def drive(cond, timeout=30.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        run_tick()
+        if cond():
+            return True
+        time.sleep(0.05)
+    return False
+
+
 # ── drive ticks until PR 1 and PR 2 have landed and PR 3 has hit its conflict ────────────────────────
-for _ in range(60):
-    run_tick()
+def _pr1_pr2_landed_pr3_conflicted():
     conflict_evs = [e for e in events() if e.get("event") == "merge_result_conflict"
                     and str(e.get("pr")) == "3"]
-    if 1 in merged_prs and 2 in merged_prs and conflict_evs:
-        break
+    return 1 in merged_prs and 2 in merged_prs and bool(conflict_evs)
+
+
+drive(_pr1_pr2_landed_pr3_conflicted, timeout=30.0)
 
 record("bounded_train_slots", merged_prs[:2] == [1, 2],
        "first landings=%r (expected [1, 2], one per window, no lapping)" % (merged_prs[:2],))
@@ -295,10 +313,17 @@ record("no_lapping_in_journal", merge_order == sorted(merge_order),
        "journal merge order=%r (must already be ascending)" % (merge_order,))
 
 # ── PR 3 must now be conflict-held, and PR 4/5/6 (individually green) must NOT be allowed past it ──
-for _ in range(15):
-    run_tick()
-
-held_prs = {int(pr) for pr, a in run_tick()["outcomes"].items() if a == "HOLD"}
+# A real-time settle window (not a fixed tick count — see drive() above) so PR 4/5/6's own async health
+# dispatches have wall-clock time to resolve into a stable HOLD before we sample outcomes: keep ticking
+# until a SINGLE tick's outcomes show all three HELD, or 20s pass (held_prs then reflects the last tick,
+# and the record() below fails honestly on a genuine regression rather than a premature sample).
+held_prs = set()
+_settle_deadline = time.time() + 20.0
+while time.time() < _settle_deadline:
+    held_prs = {int(pr) for pr, a in run_tick()["outcomes"].items() if a == "HOLD"}
+    if {4, 5, 6} <= held_prs:
+        break
+    time.sleep(0.05)
 record("conflict_head_blocks_later",
        3 not in merged_prs and not ({4, 5, 6} & set(merged_prs)) and {4, 5, 6} <= held_prs,
        "merged=%r held=%r (PR 3 must still be open+conflict-held; 4/5/6 must be HELD, not merged)"
@@ -332,10 +357,7 @@ shas[3] = rev_parse(origin, "pr-3")
 worktrees[3] = os.path.join(T, "wt-pr-3-v2")
 git(origin, "worktree", "add", "-q", "--detach", worktrees[3], shas[3])
 
-for _ in range(60):
-    if not open_prs:
-        break
-    run_tick()
+drive(lambda: not open_prs, timeout=40.0)
 
 record("rearm_and_drain", open_prs == [] and sorted(merged_prs) == [1, 2, 3, 4, 5, 6],
        "open=%r merged=%r (every PR must land exactly once)" % (open_prs, sorted(merged_prs)))
