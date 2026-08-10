@@ -317,6 +317,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MAIN_HEALTH_AUTOFIX` → `agent-watch.sh`
 - `MAIN_HEALTH_CI_GATE` → `agent-watch.sh`
 - `MAIN_HEALTH_RECHECK_MINS` → `agent-watch.sh`
+- `MAIN_HEALTH_RECHECK_ONESHOT` → `agent-watch.sh`
 - `MAIN_HEALTH_TICK` → `agent-watch.sh`
 - `MCP_PROVISION` → `bin/herd`
 - `MERGE_FAIRNESS` → `agent-watch.sh`
