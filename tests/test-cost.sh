@@ -10,6 +10,8 @@
 #   (5) `herd cost` aggregates multiple journal events → correct per-PR totals, by-component /
 #       by-model rollups, total spend, and cost-per-merged-PR
 #   (6) `herd cost --pr N` drills into one PR; empty journal → friendly message, exit 0
+#   (8) every distinct model ref in a fixture engine journal's cost events has a BUILTIN_PRICES row
+#       (HERD-623 regression guard — an unpriced model silently zeros its cost)
 #
 # Fully hermetic: writes only under a mktemp dir, uses fixture transcripts + a fixture journal, and
 # NEVER reads a real transcript or touches the live watcher/panes/real HOME.
@@ -280,5 +282,30 @@ grep -qiE 'no transcript dir|nothing to add' <<< "$nod_out" || fail "herd cost -
 grep -qE 'Session total .*: +\$110\.0000' <<< "$nod_out" || fail "herd cost --full: with no agents, session total == merge total\n$nod_out"
 ok
 unset HERD_COST_PRICE_FILE HERD_TRANSCRIPT_ROOT
+
+# ── (8) every distinct model ref in a fixture engine journal's cost events has a price-table row ──
+# Regression guard for HERD-623 (unpriced claude-opus-5 events silently zeroed the daily digest and
+# BUDGET_DAILY enforcement). Builds a fixture ENGINE JOURNAL spanning the current model lineup and
+# checks each against the REAL BUILTIN_PRICES table (no HERD_COST_PRICE_FILE stub) — by reusing
+# _COST_PY_CORE's own price_of(), so this test can never drift from what cost_report_dir /
+# cost_report_full actually price.
+unset HERD_COST_PRICE_FILE
+MJOURNAL="$T/models-journal.jsonl"
+cat > "$MJOURNAL" <<'JNL'
+{"ts":"2026-08-01T00:00:00Z","event":"cost","component":"builder","pr":1,"slug":"a","model":"claude-opus-5","in":1,"out":1,"cache_read":0,"cache_write":0,"usd":"0.000000","msgs":1}
+{"ts":"2026-08-01T00:00:01Z","event":"cost","component":"builder","pr":2,"slug":"b","model":"claude-opus-4-8","in":1,"out":1,"cache_read":0,"cache_write":0,"usd":"0.000000","msgs":1}
+{"ts":"2026-08-01T00:00:02Z","event":"cost","component":"builder","pr":3,"slug":"c","model":"claude-sonnet-5","in":1,"out":1,"cache_read":0,"cache_write":0,"usd":"0.000000","msgs":1}
+{"ts":"2026-08-01T00:00:03Z","event":"cost","component":"review","pr":3,"slug":"c","model":"claude-sonnet-4-6","in":1,"out":1,"cache_read":0,"cache_write":0,"usd":"0.000000","msgs":1}
+{"ts":"2026-08-01T00:00:04Z","event":"cost","component":"builder","pr":4,"slug":"d","model":"claude-fable-5","in":1,"out":1,"cache_read":0,"cache_write":0,"usd":"0.000000","msgs":1}
+JNL
+python3 -c "$_COST_PY_CORE
+import json, sys
+models = sorted({json.loads(l)['model'] for l in open(sys.argv[1]) if json.loads(l).get('event') == 'cost'})
+missing = [m for m in models if price_of(m) is None]
+assert not missing, 'no BUILTIN_PRICES row for: %s' % missing
+assert len(models) >= 5, 'fixture journal is too thin: %r' % models
+print('ok:', models)
+" "$MJOURNAL" || fail "cost.sh: every model ref in the fixture journal's cost events must have a BUILTIN_PRICES row"
+ok
 
 echo "PASS test-cost.sh ($pass checks)"

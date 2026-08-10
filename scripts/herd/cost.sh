@@ -59,7 +59,7 @@ _COST_SCRIBE_FINGERPRINT='You are the BACKLOG SCRIBE'
 _COST_RESEARCHER_FINGERPRINT='You are the RESEARCH DRAINER'
 
 # ── PERISHABLE PRICE TABLE ────────────────────────────────────────────────────────────────────
-# ⚠️ VERIFY AGAINST CURRENT PRICING — as of 2026-06-24.
+# ⚠️ VERIFY AGAINST CURRENT PRICING — as of 2026-08-10.
 # Source: the bundled `claude-api` skill's "Current Models" table (cached 2026-06-24), which mirrors
 # platform.claude.com/docs/en/pricing. Per-MILLION-token USD, input / output, by model id.
 # When Anthropic changes prices or ships a new model, UPDATE THIS TABLE and bump the date above.
@@ -89,10 +89,11 @@ CACHE_READ_MULT = 0.10          # cache read ~= 0.1x input price
 CACHE_WRITE_5M_MULT = 1.25      # 5-minute-TTL cache write = 1.25x input price
 CACHE_WRITE_1H_MULT = 2.00      # 1-hour-TTL cache write = 2.0x input price
 
-# PERISHABLE — verify against current pricing (as of 2026-06-24). Per-million-token USD.
+# PERISHABLE — verify against current pricing (as of 2026-08-10). Per-million-token USD.
 BUILTIN_PRICES = {
     "claude-fable-5":     {"in": 10.0, "out": 50.0},
     "claude-mythos-5":    {"in": 10.0, "out": 50.0},
+    "claude-opus-5":      {"in": 5.0,  "out": 25.0},
     "claude-opus-4-8":    {"in": 5.0,  "out": 25.0},
     "claude-opus-4-7":    {"in": 5.0,  "out": 25.0},
     "claude-opus-4-6":    {"in": 5.0,  "out": 25.0},
