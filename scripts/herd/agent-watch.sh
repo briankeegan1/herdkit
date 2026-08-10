@@ -1054,6 +1054,9 @@ _reconcile_pending_row() {
 # is omitted — already converged, nothing to show. Byte-inert (RECONCILE_PENDING stays empty, section
 # omitted) on the `file` backend (no update-state op to confirm against, same carve-out
 # _tsweep_backend_supported uses), with no $STATE rows, or once every recent merge has converged.
+# HERD-624: a ref the tracker sweep has given up on FOR GOOD (a terminal `retired` ledger row —
+# _pms_tracker_retired) is ALSO omitted, even though it was never confirmed Done — otherwise a `herd
+# backend switch` survivor ref nags "reconcile pending" on this console forever with no way to clear.
 # Pure local-file reads (no network, no backend sourcing) — safe to call every render tick.
 build_reconcile_pending() {
   RECONCILE_PENDING=""
@@ -1063,6 +1066,7 @@ build_reconcile_pending() {
   while read -r epoch pr slug ref; do
     [ -n "${epoch:-}" ] && [ -n "${ref:-}" ] || continue
     _pms_tracker_ledgered "$ref" && continue      # tracker sweep already confirmed it Done
+    _pms_tracker_retired "$ref" && continue       # tracker sweep gave up on it for good (HERD-624)
     _pms_journal_has reconcile "$pr" && continue  # this seat's own fast-path reconcile already ran
     rows="${rows}$(_reconcile_pending_row "$epoch" "$pr" "$ref")"$'\n'
   done < <(reverse_file "$STATE" | head -5)  # pipe-ok: head in a command or process substitution; pipeline status not gated
@@ -1102,7 +1106,10 @@ build_blocked() {
 # retries next sweep) — either way the drift is VISIBLE, never a silent correction (HERD-86). An
 # `escalated` row (HERD-502) is loud too, but glyphed distinctly: it means the sweep has GIVEN UP
 # on this ref (N-failure backoff — no further sweeps will probe it), a different, more final
-# condition than "still retrying" and worth telling apart at a glance.
+# condition than "still retrying" and worth telling apart at a glance. A `retired` row (HERD-624) is
+# calm dim: the TERMINAL state an `escalated` ref ages into once tracker-state-sweep.sh gives up on
+# it for good (a `herd backend switch` survivor ref, most commonly) — settled, not a correction, so
+# it ages off the console like `healed` instead of staying loud forever like `escalated`.
 _tracker_heal_row() {
   local epoch status ref pr state hhmm glyph color
   local IFS=$' \t\n'
@@ -1114,6 +1121,7 @@ EOF
   case "$status" in
     healed)    glyph='🩹'; color="$C_GREEN" ;;
     escalated) glyph='⛔'; color="$C_RED"   ;;
+    retired)   glyph='🗑'; color="$C_DIM"   ;;
     *)         glyph='⚠️'; color="$C_RED"   ;;
   esac
   printf '    %s%s%s %s%s%s %s%s%s %s#%s was %s · %s%s' \
@@ -11000,6 +11008,20 @@ _pms_tracker_ledgered() {
   [ -n "${1:-}" ] || return 1
   [ -s "$TRACKER_SWEEP_LEDGER" ] || return 1
   awk -v r="$1" '$2==r && NF==3{f=1} END{exit !f}' "$TRACKER_SWEEP_LEDGER" 2>/dev/null
+}
+
+# _pms_tracker_retired <ref> — true iff tracker-state-sweep.sh has ledgered this ref TERMINALLY
+# `retired` (HERD-624 leg 2: an `unresolvable` ref that has aged out for good — most commonly a `herd
+# backend switch` survivor that can never resolve under the new backend). Deliberately a SEPARATE
+# predicate from _pms_tracker_ledgered, not folded into it: `retired` is not "confirmed Done" (this
+# item may never actually have shipped its tracker-side bookkeeping), it is "the sweep will never
+# probe this again, and the operator has been told" — build_reconcile_pending needs to stop nagging
+# about it, but must never conflate the two ledger shapes (mirrors the NF==3 vs NF==4 distinction
+# _pms_tracker_ledgered's own docstring already draws for `unresolvable`).
+_pms_tracker_retired() {
+  [ -n "${1:-}" ] || return 1
+  [ -s "$TRACKER_SWEEP_LEDGER" ] || return 1
+  awk -v r="$1" '$2==r && NF==4 && $4=="retired"{f=1} END{exit !f}' "$TRACKER_SWEEP_LEDGER" 2>/dev/null
 }
 
 # _pms_reconcile_handled <pr#> <sha> — the DEFER predicate for the one hook with a shared side effect.

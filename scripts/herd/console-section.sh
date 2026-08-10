@@ -46,8 +46,12 @@ herd_console_row_visible() {
 }
 
 # herd_console_classify_tracker_heal <line>   ("<epoch> <status> <ref> <pr> <found-state>")
-#   Prints "<epoch>\t<calm|loud>". A `healed` row is calm (the drift was auto-corrected); anything
-#   else is a FAILED heal — loud, and it stays on screen until the sweep succeeds.
+#   Prints "<epoch>\t<calm|loud>". A `healed` row is calm (the drift was auto-corrected); a `retired`
+#   row (HERD-624: tracker-state-sweep.sh's terminal state for a ref that will NEVER resolve — e.g. a
+#   `herd backend switch` survivor) is calm too, on purpose — it is not a correction, but it is a
+#   settled, no-further-action outcome, exactly the HERD-613-leg-3 lesson that a row nobody can act on
+#   needs a path off the screen. Anything else is a FAILED or GIVEN-UP-ON heal — loud, and it stays on
+#   screen until the sweep succeeds (or, for `escalated`, forever, by HERD-502 design).
 herd_console_classify_tracker_heal() {
   local _cs_epoch _cs_status _cs_rest
   local IFS=$' \t\n'
@@ -55,8 +59,8 @@ herd_console_classify_tracker_heal() {
 $1
 EOF
   case "${_cs_status:-}" in
-    healed) printf '%s\tcalm' "${_cs_epoch:-}" ;;
-    *)      printf '%s\tloud' "${_cs_epoch:-}" ;;
+    healed|retired) printf '%s\tcalm' "${_cs_epoch:-}" ;;
+    *)              printf '%s\tloud' "${_cs_epoch:-}" ;;
   esac
 }
 
@@ -123,7 +127,10 @@ herd_console_section() {
 #   same ref are dropped. HERD-502: an `escalated` row (the sweep gave up on this ref after N
 #   consecutive failures — tracker-state-sweep.sh's _tsweep_mark_unresolvable) supersedes the same
 #   way, so a ref's whole `failed` history collapses to the one row that explains its final outcome.
-#   Display-only and fail-soft — a missing or malformed ref never hides a row.
+#   HERD-624: a `retired` row (the terminal state an `escalated` ref ages into —
+#   _tsweep_mark_retired) joins the same accumulator too, so the older `escalated` row is superseded
+#   by its own later `retired` row instead of both rendering. Display-only and fail-soft — a missing
+#   or malformed ref never hides a row.
 herd_console_visible_lines_tracker() {
   local _cs_file="$1" _cs_limit="$2" _cs_ack="${3:-}"
   [ -s "$_cs_file" ] || return 0
@@ -143,7 +150,7 @@ EOF
 $_cs_line
 EOF
     case "${_cs_status:-}" in
-      healed|escalated)
+      healed|escalated|retired)
         if [ -n "${_cs_ref:-}" ]; then
           # HERD-490: a SECOND healed row for a ref already recorded healed (newest-first, so this
           # is an OLDER duplicate — e.g. the same merged PR healed twice across sweep runs) is
@@ -151,7 +158,9 @@ EOF
           # identical heal twice for one ref. HERD-502: an `escalated` row (the sweep gave up on
           # this ref) joins the same accumulator, so it supersedes older `failed` rows for the ref
           # too — the whole point being ONE distinct row survives, not the failed history plus a
-          # new escalated row on top of it.
+          # new escalated row on top of it. HERD-624: `retired` joins too (a ref's terminal state,
+          # reached AFTER an `escalated` row — so newest-first, the `retired` row is seen FIRST and
+          # the older `escalated` row it superseded is then dropped, same mechanism).
           case "${_cs_healed}" in *" ${_cs_ref} "*) continue ;; esac
           _cs_healed="${_cs_healed}${_cs_ref} "
         fi
