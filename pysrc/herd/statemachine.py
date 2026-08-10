@@ -134,6 +134,10 @@ MERGE_RESULT_CONFLICT = "merge_result_conflict"  # HERD-296/§6.4: the merged (h
                                                   # like a stale-base hold, never a bounce/BLOCK.
 CROSS_SEAT_BLOCK = "cross_seat_block"  # HERD-247/HERD-446: a standing foreign BLOCK on this exact sha
                                        # holds a blessed candidate — this seat's PASS is not a resolution.
+CORE_SIM_RED = "core_sim_red"          # HERD-577: a CORE-surface diff whose sandbox-sim scorecard is not
+                                       # green — a real defect, so it BLOCKs on its own refix rail.
+CORE_SURFACE_WAIT = "core_surface_wait"  # HERD-577: a BLESSED core diff that is not this tick's core
+                                         # front — held until the core diff ahead of it lands (§6.3 shape).
 
 EVENTS = (
     BREAKER_OPEN, BREAKER_CLOSE, STALE_DETECTED, BASE_FRESH,
@@ -142,6 +146,7 @@ EVENTS = (
     REFIX_BOUNCE, REFIX_EXHAUSTED, BLESSING_POSTED,
     DECIDE_MERGE, DECIDE_HOLD, DECIDE_OBSERVE, APPROVED, MERGE_REFUSED, MERGE_FROZEN, QUEUE_WAIT,
     NEW_SHA, SIBLING_RESTALE, MERGE_RESULT_CONFLICT, CROSS_SEAT_BLOCK,
+    CORE_SIM_RED, CORE_SURFACE_WAIT,
 )
 
 # The two events that supersede a subject from ANY non-terminal state (§2.4 new-sha cancel; §6.1
@@ -190,6 +195,14 @@ _BASE_TRANSITIONS = {
     (REVIEW, REVIEW_PASS): BLESSED,
     (REVIEW, REVIEW_BLOCK): BLOCKED,
     (REVIEW, REVIEW_INFRA): REVIEW,
+    # HERD-577 (CORE_SURFACE_GLOB, ship-dormant): the core-surface SCORECARD leg sits between the
+    # health rail and the reviewer, so a candidate that fails it is in REVIEW when the red lands. A
+    # red scorecard is a real defect (the engine provably does not work end to end with this diff),
+    # so it takes the SAME BLOCKED fork every other rail red takes — bounce while budget remains,
+    # needs-you once it is spent — on its own `coresim` ledger rail. Ship-dormant: live_runtime emits
+    # this ONLY when CORE_SURFACE_GLOB is non-empty AND the diff matches it, so with the lever off
+    # (the default) this row is unreachable.
+    (REVIEW, CORE_SIM_RED): BLOCKED,
 
     # BLOCKED — a rail found a real defect (§2.2 BLOCK). The bounce/escalate fork is decided by the
     # refix budget (§4, via :func:`classify_block`): a bounce re-gates the builder's fix (a fresh
@@ -222,6 +235,13 @@ _BASE_TRANSITIONS = {
     # shared check (live_runtime._cross_seat_block_standing), reused at both the merge decision and the
     # gate-status setter (LiveActuator.post_gate_status).
     (BLESSED, CROSS_SEAT_BLOCK): HOLD,
+    # HERD-577 leg 2 CORE-DIFF SERIALIZATION: a BLESSED candidate whose diff touches the core surface
+    # and is NOT this tick's core front is held until the core diff ahead of it lands — the same
+    # merge_frozen/queue_wait shape, scoped to core-glob matches. Two individually-green core diffs
+    # can still be mutually incompatible, and no per-PR gate can see that; landing them one at a time
+    # re-gates the second against a base containing the first. Ship-dormant: emitted ONLY when
+    # CORE_SURFACE_GLOB is non-empty, so with the lever off this row is unreachable.
+    (BLESSED, CORE_SURFACE_WAIT): HOLD,
 
     # HOLD — a gates-green PR awaiting a human/coordinator signal (§5.4 human-verify, §5.5 approval).
     # The hold is loud and owned (§5.6); an approval clears it to merge. A hold is sha-keyed, so a

@@ -339,10 +339,21 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `ci_health_skipped` | pr, sha, slug, reason(merge-result-gate) | port `live_runtime.py:LiveGates.health` (HERD-578 — `MERGE_RESULT_GATE=on` outranks `HEALTH_SOURCE=ci`, whose branch-CI run cannot attest a head-merged-with-base suite; recorded rather than silently ignored) |
 | `ci_infra_transient` | pr, sha, slug, run_id, signature, result(rerun\|bounded\|failed) | port `live_runtime.py:LiveGates._ci_infra_rerun` (HERD-609 — a CI red whose failed jobs name no test and carry a PLATFORM signature. Never a code red; gets ONE bounded `gh run rerun --failed` per run id, and `result` records whether this tick performed it, was held by the bound, or had gh refuse) |
 
-`merge_result_gate` (pr, sha, slug, base, verdict — §6.4, HERD-296) and `merge_queue_hold` /
-`merge_queue_window` (pr, sha, slug, front_pr — §6.3, HERD-273) are Python-port-only additions with
-no bash anchor by design: both items are folded into the port, never built in the retired bash
-action pass (`pysrc/herd/live_runtime.py`, anchored in §6.3/§6.4).
+| `core_surface_dispatched` | pr, sha, slug, pid, scenarios, paths, log_path | port `live_runtime.py:LiveGates._dispatch_core_surface` (§6.5, HERD-577 — the sandbox-sim worker proving a CORE diff was launched; `scenarios` names what is being run and `paths` the core files that required it) |
+| `core_surface_scorecard` | pr, sha, slug, verdict(PASS\|FAIL\|SKIP), detail, log_path | port `live_runtime.py:LiveGates.core_surface` (§6.5 — a worker's nonce-matched scorecard verdict collected into the sha-keyed cache. `SKIP` means NOTHING ran, never "it passed") |
+| `core_surface_gate` | pr, sha, slug, result(pass\|fail), reason | port `live_runtime.py:LiveTick._walk` (§6.5 — the DECIDE-path leg's own outcome, journaled once per (pr, sha); a `fail` is followed by a `coresim`-rail `refix_bounce`) |
+| `core_surface_queued` | pr, sha, slug, limit | port `live_runtime.py:LiveGates.core_surface` (§6.5 — a core diff waiting on the single project-wide sim slot; a phase, journaled once per (pr, sha), never per poll) |
+| `core_surface_pending` | pr, sha, slug | port `live_runtime.py:LiveTick._walk` (§6.5 — the sim is dispatched/in flight; the §3.4 phase-not-event rule, once per (pr, sha)) |
+| `core_surface_skipped` | pr, sha, slug, reason(no-state-dir\|no-scenario-resolved) | port `live_runtime.py:LiveGates._dispatch_core_surface` (§6.5 — LOUD by contract: the gate proved nothing, and that must never read as a pass) |
+| `core_surface_unreadable` | pr, sha, slug, worktree, detail | port `live_runtime.py:LiveGates.core_surface_paths` (§6.5 — the diff could not be read, so the candidate is gated AS core: the STRICT direction for a gate key, recorded rather than assumed) |
+| `core_surface_hold` / `core_surface_window` | pr, sha, slug, front_pr, reason · window: front_pr, front_sha, eligible | port `live_runtime.py:LiveTick._walk` / `:_core_prepass` (§6.5 leg 2 — the core-diff serialization: exactly the `merge_queue_hold`/`merge_queue_window` shape, scoped to core-glob matches) |
+| `core_surface_refix_escalated` | pr, sha, slug, rounds, reason | port `live_runtime.py:LiveTick._walk` (§6.5 — the `coresim` rail's refix budget is spent and the scorecard is still red: needs-you) |
+
+`merge_result_gate` (pr, sha, slug, base, verdict — §6.4, HERD-296), `merge_queue_hold` /
+`merge_queue_window` (pr, sha, slug, front_pr — §6.3, HERD-273) and every `core_surface_*` above
+(§6.5, HERD-577) are Python-port-only additions with no bash anchor by design: all three items are
+folded into the port, never built in the retired bash action pass (`pysrc/herd/live_runtime.py`,
+anchored in §6.3/§6.4/§6.5).
 
 ### 3.5 Deliberately unproduced event names (HERD-442)
 
@@ -781,6 +792,58 @@ and the hermetic sim `tests/test-merge-result-gate-sim.sh` (real git, two textua
 that are each individually green but semantically incompatible once merged, plus a genuinely
 conflicting third). §6.3's ordered queue reuses this verifier verbatim as its per-slot check, with
 the base generalized to the virtual tip as described there.
+
+### 6.5 HERD-577 — core-surface gate (scorecard requirement + core serialization)
+
+**Live state. IMPLEMENTED** (Python port only, `CORE_SURFACE_GLOB`, ship-dormant default empty:
+`live_runtime.py:_core_surface_glob`/`_core_surface_enabled`). The grounding is a blast-radius
+observation, not a policy preference: every compound failure this engine has had lives in roughly
+**six** load-bearing files — the gate loop / dispatch / verdict-cache regions of `agent-watch.sh`,
+the decide + health paths of `live_runtime.py`, `ci_verdict.py`, `healthcheck.sh`,
+`.herd/healthcheck.project.sh`, and `herd-review.sh`'s dispatch — while 40+ other merges a week flow
+through the same gate harmlessly. A uniform gate therefore spends the same proof budget on a TSV row
+edit and on a rewrite of the merge decision.
+
+The match, the seam→scenario map and the scorecard read are **one shared implementation**,
+`scripts/herd/core-surface.sh` (multi-seat doctrine Rule 2), which the port EXECUTES (`paths`,
+`scenarios-for`, `run`) and the console SOURCES — never a second hand-rolled glob match.
+
+**Leg 1 — the scorecard gate.** `LiveGates.core_surface` is a THIRD gate rail with the same
+async dispatch/collect/in-flight/sha-cache discipline as health (`.core-surface-*` in `$TREES`, a
+HERD-349 dispatch nonce, ONE worker in flight project-wide). `LiveTick._walk` consults it as its
+own leg, sequenced **after** the health verdict and **before** the reviewer. That placement is the
+whole composition argument: under `HEALTH_SOURCE=ci` (§6.4's sibling, HERD-578) no local suite is
+dispatched at all, so a scorecard requirement bolted onto the local dispatch would silently
+evaporate for every CI-gated project; sequenced in the decide path it composes identically with
+**both** health sources. A `FAIL` takes the ordinary BLOCKED fork (`core_sim_red`, a new lifecycle
+edge REVIEW→BLOCKED, `statemachine.py:CORE_SIM_RED`) on its own `coresim` refix rail — never
+sharing the health rail's budget. A missing scenario script yields `SKIP` **with a loud
+`core_surface_skipped`**, never a silent pass; an unreadable diff is gated AS core (strict, and
+journaled `core_surface_unreadable`), because the scenarios are hermetic and cost ~30s while the
+other error is exactly the merge this gate exists to stop.
+
+**Leg 2 — core diffs serialize.** `LiveTick._core_prepass` resolves this tick's **core front**
+before any candidate is walked, from the core-matching subset of the same `_queue_eligible` set
+§6.3 uses, ordered by the same `_queue_sort_key`. A blessed core candidate that is not the front
+HOLDS (`core_surface_wait`, a new edge BLESSED→HOLD, `statemachine.py:CORE_SURFACE_WAIT`, journaled
+`core_surface_hold`) until the one ahead lands — then it is re-gated, and its scorecard re-proven,
+against a base that CONTAINS it. This is the one failure no per-PR gate can see: two core diffs each
+individually green can still be mutually incompatible, because each sim proved the engine works with
+*its* change and not with both. Non-core candidates are never consulted and never held. Ordered
+BELOW §6.3's queue check so that with both armed the global order wins first and this only narrows
+further. The hold is never silent: `LiveState.set_core_wait` writes the render side channel
+`agent-watch.sh:_gate_phase_row` paints as the calm `core diff · serialized behind PR #N` row (§5.1
+row-truth).
+
+Off (an empty glob, the default): `_core_prepass` returns immediately, `core_surface` returns `SKIP`
+before touching a file, no `.core-surface-*` marker is ever written and no `core_surface_*` event is
+ever journaled — candidate order, dispatches, argv and merge behavior are byte-identical.
+
+Proven by `tests/test_live_runtime.py` (`TestCoreSurfaceConfig`, `TestCoreSurfaceWalk`,
+`TestCoreSurfaceSerialize`) and the hermetic sim-of-sims `tests/test-core-surface.sh` (a stub
+scenario dir, so the gate itself is proven without paying for a real sandbox run: a core diff with
+no green scorecard reds its gate, with a green one merges, two core PRs serialize with the second
+visibly held, a non-core PR is byte-identical, and an absent scenario skips LOUDLY).
 
 ---
 

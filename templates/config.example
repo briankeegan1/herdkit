@@ -307,6 +307,25 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 # HEALTH_SUITE_SCOPE="full"    # full (default) | diff
 # HEALTH_SOURCE="local"        # local (default) | ci
 
+# CORE_SURFACE_GLOB (HERD-577) — the LOAD-BEARING CORE. EMPTY (default) = feature off, byte-identical.
+#   The observation behind it: compound failures cluster in a handful of files while dozens of other
+#   merges flow through the same gate harmlessly, so a uniform gate over-proves the many and
+#   under-proves the few. Set it to an egrep of the paths whose breakage is COMPOUND rather than local
+#   (same egrep semantics as HEALTHCHECK_HEAVY_GLOB / REVIEW_ESCALATE_GLOB) and a matching diff must:
+#     • carry a GREEN sandbox-sim scorecard — a THIRD gate leg in the decide path, sequenced after the
+#       health verdict and before the reviewer, so it composes IDENTICALLY with HEALTH_SOURCE=local
+#       and =ci. scripts/herd/core-surface.sh maps each touched seam to the scenario that proves it
+#       (gate / concurrency / limit / panes, scripts/herd/sim/sandbox-*.sh). A red scorecard bounces on
+#       its own `coresim` refix rail, then escalates needs-you when that budget is spent.
+#     • merge ONE AT A TIME — among core-matching candidates only the lowest-numbered lands per window
+#       (the same total order MERGE_QUEUE derives); the rest hold with a visible calm console row
+#       naming the PR they wait on, and re-gate against a base that contains it.
+#   Non-core diffs are never consulted and never held. An absent scenario SKIPs loudly (never a silent
+#   pass); an unreadable diff is gated AS core (strict). KEEP IT NARROW — every match pays a sim run
+#   and gives up parallel merging, which is the point for six files and pure latency for sixty. Leave
+#   it EMPTY in a project with no sandbox-sim rig: the gate would only ever skip loudly.
+# CORE_SURFACE_GLOB=""         # '' (default, off) | e.g. '^src/(scheduler|dispatch)\.py$'
+
 # native-burst (HERD-107) — the bounded read-only FAN-OUT seam (scripts/herd/burst.sh).
 #   off  default — byte-identical to today: research fan-out is un-hinted; the review is a single reviewer.
 #   on   read-only work may BURST — fan out several CONCURRENT calls bounded by REVIEW_CONCURRENCY (the

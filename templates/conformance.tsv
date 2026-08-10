@@ -224,6 +224,10 @@ HEALTH_TRUST_BUILDER	unit	tests/test-health-trust.sh
 HEALTH_TRUST_BUILDER	unit	tests/test_live_runtime.py
 HEALTH_SOURCE	sim	tests/test-ci-as-gate.sh
 HEALTH_SOURCE	unit	tests/test_live_runtime.py
+core-surface.sh	sim	tests/test-core-surface.sh
+core-surface.sh	unit	tests/test_live_runtime.py
+CORE_SURFACE_GLOB	sim	tests/test-core-surface.sh
+CORE_SURFACE_GLOB	unit	tests/test_live_runtime.py
 HEALTH_TRUST_MAX_AGE_SECS	unit	tests/test-health-trust.sh
 HEALTH_TRUST_MAX_AGE_SECS	unit	tests/test_live_runtime.py
 HEALTH_SUITE_SCOPE	unit	tests/test-suite-scope.sh

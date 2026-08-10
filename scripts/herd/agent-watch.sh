@@ -229,6 +229,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/herd/health-trust.sh
 . "$HERE/health-trust.sh"
 
+# CORE-SURFACE (HERD-577) — THE shared implementation of "is this diff core, which sim proves it, and
+# is that scorecard green" (scripts/herd/core-surface.sh). The console is one of its three enforcement
+# surfaces (docs/multi-seat-doctrine.md Rule 2): the render pass reads the SAME `herd_core_surface_*`
+# functions the Python gate leg executes, so a row can never claim a phase the gate does not agree
+# with. Sourcing DEFINES functions only; byte-inert until CORE_SURFACE_GLOB is armed.
+# shellcheck source=scripts/herd/core-surface.sh
+. "$HERE/core-surface.sh"
+
 # ── The gh availability guard (HERD-237) ──────────────────────────────────────────────────────────
 # EVERY `gh` call on the tick path runs through _gh_timeout. Grounding (audit 2026-07-09, G4): the
 # whole control room rides ONE loop. A single `gh` that never returns — a wedged TLS handshake, a
@@ -15064,6 +15072,10 @@ _gate_health_inflight() {
 #      engine's dispatch both write `.health-inflight-*`), so this fires under either engine. n==0 (a
 #      free slot, about to dispatch — typically gone by the very next tick) is deliberately NOT queued:
 #      that transient reads as the pre-existing bare placeholder below, matching today.
+#   5. a live CORE-SIM worker (HERD-577) → `core-surface sim · in progress (<age>)`, and
+#   6. a CORE-SERIALIZE hold (HERD-577 leg 2) → the calm `core diff · serialized behind PR #N` row.
+#      Both are strictly guarded on CORE_SURFACE_GLOB being armed, so an unarmed project never even
+#      names the marker files and its rows are byte-identical.
 #   4. neither               → <fallback-row> VERBATIM.
 # Both gate branches call this, so "what phase is this PR in" has ONE answer on the console. Reads only
 # marker files the rails already write; side-effect-free; byte-identical to the pre-HERD-453 rows
@@ -15081,6 +15093,30 @@ _gate_phase_row() {
     if [ -f "$_gpr_inf" ] && _review_pid_live "$_gpr_inf"; then
       printf '%s' "    ${C_YELLOW}🔍${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}review · in progress ($(_fmt_age "$(_marker_age_or_mtime "$_gpr_inf")"))${C_RESET}"
       return 0
+    fi
+    # CORE-SURFACE phases (HERD-577), both byte-inert with CORE_SURFACE_GLOB empty — the guard
+    # short-circuits before either file is even named, so an unarmed project's rows are unchanged:
+    #   5. a live CORE-SIM worker → the sandbox scenario(s) proving this core diff are running;
+    #   6. a CORE-SERIALIZE hold  → this core diff is blessed and waiting for the core diff ahead of
+    #      it to land (leg 2). CALM, not a red: nothing is wrong, the engine is deliberately landing
+    #      core changes one at a time — but it names WHAT it waits on, because an unexplained
+    #      blessed-and-not-merging row is exactly the stall that reads as a wedged watcher.
+    if herd_core_surface_enabled; then
+      _gpr_inf="$TREES/.core-surface-inflight-${_gpr_pr}-${_gpr_sha}"
+      # _marker_live (via _review_pid_live), NOT the timeout-bounded health predicate: this must be
+      # the EXACT liveness test the Python dispatcher's own in-flight check uses (live_runtime.py's
+      # `_marker_live` over `.core-surface-inflight-*`), or the row and the rail could disagree about
+      # whether a sim is running. The sim's own hard timeout is what bounds a hung worker.
+      if [ -f "$_gpr_inf" ] && _review_pid_live "$_gpr_inf"; then
+        printf '%s' "    ${C_YELLOW}🧪${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}core-surface sim · in progress ($(_fmt_age "$(_marker_age_or_mtime "$_gpr_inf")"))${C_RESET}"
+        return 0
+      fi
+      _gpr_inf="$TREES/.core-surface-wait-${_gpr_pr}-${_gpr_sha}"
+      if [ -f "$_gpr_inf" ]; then
+        local _gpr_front; _gpr_front="$(sed -n '1p' "$_gpr_inf" 2>/dev/null)"
+        printf '%s' "    ${C_YELLOW}⏳${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}core diff · serialized behind PR #${_gpr_front:-?} · merges when it lands${C_RESET}"
+        return 0
+      fi
     fi
     if ! _health_slot_free; then
       printf '%s' "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}health-check · queued ($(_count_live_healthchecks) ahead)${C_RESET}"

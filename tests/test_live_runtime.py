@@ -3166,6 +3166,217 @@ class TestMergeQueueOrdering(unittest.TestCase):
         self.assertFalse([e for e in evs if e["event"] == "merge_queue_hold" and e["pr"] == 3])
 
 
+class TestCoreSurfaceConfig(unittest.TestCase):
+    """CORE_SURFACE_GLOB (§6.5, HERD-577): a GLOB key, not a boolean — empty/absent is the feature
+    OFF and any non-empty pattern arms it. Unlike the strict-validated on/off levers there is no
+    "typo turns it on" hazard: a pattern is either something the operator wrote or it is nothing."""
+
+    def test_absent_or_empty_is_off(self):
+        for cfg in ({}, None, {"CORE_SURFACE_GLOB": ""}, {"CORE_SURFACE_GLOB": "   "}):
+            self.assertFalse(LR._core_surface_enabled(cfg), cfg)
+            self.assertEqual(LR._core_surface_glob(cfg), "")
+
+    def test_a_pattern_arms_it_and_is_carried_verbatim(self):
+        cfg = {"CORE_SURFACE_GLOB": r"^scripts/herd/agent-watch\.sh$"}
+        self.assertTrue(LR._core_surface_enabled(cfg))
+        self.assertEqual(LR._core_surface_glob(cfg), r"^scripts/herd/agent-watch\.sh$")
+
+    def test_the_key_crosses_into_the_python_child_process(self):
+        # HERD-449's bug class: a knob this module reads from os.environ that herd-config.sh does not
+        # export is silently the built-in default no matter what .herd/config says. env-export-lint.sh
+        # imports this tuple directly, so membership here is what makes the lint cover the key.
+        self.assertIn("CORE_SURFACE_GLOB", LR._CORE_ENV_KEYS)
+
+    def test_off_never_reads_a_diff(self):
+        # The ship-dormant claim at its narrowest: with no glob the gate answers SKIP without ever
+        # resolving a worktree, so an unarmed project pays nothing — not even a subprocess.
+        gates = LiveGates("/no/such/home", LiveState(tempfile.mkdtemp()), LiveJournal(None),
+                          config={})
+        cand = LiveCandidate(pr="1", sha="s1", worktree="/definitely/not/a/worktree")
+        self.assertEqual(gates.core_surface(cand), "SKIP")
+        self.assertEqual(gates.core_surface_paths(cand), ())
+        self.assertFalse(gates.core_surface_is_core(cand))
+
+
+class TestCoreSurfaceWalk(unittest.TestCase):
+    """The decide-path leg (§6.5 leg 1). Driven through FixtureGates' scripted `core_surface`, so the
+    walk's own composition is under test independently of the sim dispatch (that half is proven end
+    to end by tests/test-core-surface.sh)."""
+
+    def _run(self, config, candidates, state=None):
+        tmp = tempfile.mkdtemp()
+        if state is None:
+            sdir = os.path.join(tmp, "state")
+            os.makedirs(sdir)                      # a real dir: the refix ledger + markers are the proof
+            state = LiveState(sdir)
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        scen = {"config": config, "candidates": candidates}
+        tick = LiveTick(config, FixtureDiscovery(scen), FixtureGates(scen),
+                        DryRunActuator(journal), journal, state=state)
+        res = tick.run()
+        return res, events(journal.path), state
+
+    def _cand(self, pr, **kw):
+        kw.setdefault("sha", "s%s" % pr)
+        kw.setdefault("review", "PASS")
+        kw.setdefault("health", "CLEAN")
+        kw.setdefault("worktree", "/wt/%s" % pr)
+        return dict(pr=pr, **kw)
+
+    _ON = {"MERGE_POLICY": "auto", "CORE_SURFACE_GLOB": r"^core/"}
+
+    def test_a_green_scorecard_merges_and_is_journaled_once(self):
+        res, evs, _ = self._run(self._ON, [self._cand(4, core_surface="PASS")])
+        self.assertEqual(res["merged"], ["4"])
+        gate = [e for e in evs if e["event"] == "core_surface_gate"]
+        self.assertEqual([e["result"] for e in gate], ["pass"])
+
+    def test_a_red_scorecard_never_merges_and_bounces_on_its_own_rail(self):
+        res, evs, state = self._run(self._ON, [self._cand(5, core_surface="FAIL")])
+        self.assertEqual(res["merged"], [])
+        self.assertEqual([e["result"] for e in evs if e["event"] == "core_surface_gate"], ["fail"])
+        bounces = [e for e in evs if e["event"] == "refix_bounce"]
+        self.assertEqual([e["rule"] for e in bounces], ["core-surface-sim"])
+        # The ledger row rides the SEPARATE `coresim` kind, so a sim red can never spend the health
+        # rail's budget (and a later health red still gets its own full REFIX_MAX_ROUNDS).
+        rows = LR.D.parse_refix_ledger(LR._read_refix_ledger(state.dir))
+        self.assertEqual(LR.D.refix_rail_count(rows, "5", "coresim"), 1)
+        self.assertEqual(LR.D.refix_rail_count(rows, "5", "health"), 0)
+
+    def test_wait_holds_the_candidate_pending_without_reaching_the_reviewer(self):
+        res, evs, _ = self._run(self._ON, [self._cand(6, core_surface="WAIT", review="BLOCK")])
+        self.assertEqual(res["outcomes"]["6"], "PENDING")
+        # review=BLOCK would have bounced had the walk reached the reviewer — it must not have.
+        self.assertFalse([e for e in evs if e["event"] == "refix_bounce"])
+        self.assertTrue([e for e in evs if e["event"] == "core_surface_pending"])
+
+    def test_skip_is_indistinguishable_from_the_feature_being_off(self):
+        # A NON-CORE diff under an ARMED glob and the SAME candidate with the lever off must produce
+        # identical outcomes and identical (zero) core_surface_* events — leg 1's byte-identical claim.
+        on_res, on_evs, _ = self._run(self._ON, [self._cand(7, core_surface="SKIP")])
+        off_res, off_evs, _ = self._run({"MERGE_POLICY": "auto"}, [self._cand(7)])
+        self.assertEqual(on_res["merged"], off_res["merged"], ["7"])
+        for evs in (on_evs, off_evs):
+            self.assertFalse([e for e in evs if str(e["event"]).startswith("core_surface")])
+
+
+class TestCoreSurfaceSerialize(unittest.TestCase):
+    """Core-diff serialization (§6.5 leg 2): among CORE candidates that would merge, only the
+    deterministic front lands per window — and NON-core candidates are never held by it."""
+
+    def _run(self, config, candidates, state=None):
+        tmp = tempfile.mkdtemp()
+        if state is None:
+            sdir = os.path.join(tmp, "state")
+            os.makedirs(sdir)                      # a real dir: the wait marker IS the render proof
+            state = LiveState(sdir)
+        journal = LiveJournal(os.path.join(tmp, "j.jsonl"))
+        scen = {"config": config, "candidates": candidates}
+        tick = LiveTick(config, FixtureDiscovery(scen), FixtureGates(scen),
+                        DryRunActuator(journal), journal, state=state)
+        return tick.run(), events(journal.path), state, tick
+
+    def _core(self, pr):
+        return dict(pr=pr, sha="s%s" % pr, review="PASS", health="CLEAN",
+                    worktree="/wt/%s" % pr, core_surface="PASS")
+
+    def _plain(self, pr):
+        return dict(pr=pr, sha="s%s" % pr, review="PASS", health="CLEAN",
+                    worktree="/wt/%s" % pr, core=False, core_surface="SKIP")
+
+    _ON = {"MERGE_POLICY": "auto", "CORE_SURFACE_GLOB": r"^core/"}
+
+    def test_only_the_lowest_numbered_core_pr_merges_this_window(self):
+        res, evs, state, _ = self._run(self._ON, [self._core(8), self._core(3)])
+        self.assertEqual(res["merged"], ["3"])
+        self.assertEqual(res["outcomes"]["8"], "HOLD")
+        holds = [e for e in evs if e["event"] == "core_surface_hold"]
+        self.assertEqual(len(holds), 1)
+        self.assertEqual(holds[0]["pr"], 8)
+        self.assertEqual(str(holds[0]["front_pr"]), "3")
+        # The render side channel the console row reads — a hold nobody can see is the stall this
+        # leg must never become.
+        self.assertTrue(os.path.exists(state.core_wait_file("8", "s8")))
+        self.assertFalse(os.path.exists(state.core_wait_file("3", "s3")))
+
+    def test_a_non_core_sibling_is_never_held_by_a_core_front(self):
+        res, evs, _, _ = self._run(self._ON, [self._core(9), self._plain(2)])
+        # pr 2 is NOT core, so the core mutex never applies to it: both land, and only the single
+        # core candidate (which IS the core front) merges through the leg at all.
+        self.assertEqual(sorted(res["merged"]), ["2", "9"])
+        self.assertFalse([e for e in evs if e["event"] == "core_surface_hold"])
+
+    def test_the_held_pr_promotes_once_the_front_lands(self):
+        state = LiveState(tempfile.mkdtemp())
+        res1, _, _, _ = self._run(self._ON, [self._core(8), self._core(3)], state=state)
+        self.assertEqual(res1["merged"], ["3"])
+        # pr 3 merged + reaped; pr 8 is now the only core candidate, hence the front.
+        res2, _, _, _ = self._run(self._ON, [self._core(8)], state=state)
+        self.assertEqual(res2["merged"], ["8"])
+        # …and its stale wait marker is cleared the moment it is no longer held.
+        self.assertFalse(os.path.exists(state.core_wait_file("8", "s8")))
+
+    def test_lever_off_leaves_no_core_front_and_merges_both(self):
+        res, evs, _, tick = self._run({"MERGE_POLICY": "auto"}, [self._core(8), self._core(3)])
+        self.assertFalse(tick._core_surface)
+        self.assertIsNone(tick._core_front)
+        self.assertEqual(sorted(res["merged"]), ["3", "8"])
+        self.assertFalse([e for e in evs if str(e["event"]).startswith("core_surface")])
+
+
+class TestCoreSurfaceSupersession(unittest.TestCase):
+    """_supersede_stale must cancel a stale core-surface sim exactly like the other rails (§6.1). It
+    matters MORE here than anywhere else: a sandbox sim forks whole repos, it is the most expensive
+    worker on the tree, and it holds the single project-wide core-sim slot — a doomed one left
+    running starves every other core candidate while proving a sha the PR has already moved past."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+        os.environ["HERD_JOURNAL_NOW"] = "2026-08-10T00:00:00Z"
+
+    def tearDown(self):
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def test_stale_core_sim_terminated_reaped_and_journaled(self):
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        # A DEAD marker for a superseded sha — _terminate_worker treats a dead/recycled marker as
+        # already-gone, so the cancel is exercised without spawning a real process.
+        old = state.core_surface_inflight_file("77", "aaaaaa1")
+        _marker_write(old, 999999)
+        for p in (state.core_surface_dispatch_file("77", "aaaaaa1"),
+                  state.core_surface_log_file("77", "aaaaaa1"),
+                  state.core_wait_file("77", "aaaaaa1")):
+            open(p, "w").close()
+        t = LiveTick({"MERGE_POLICY": "observe", "CORE_SURFACE_GLOB": r"^core/"},
+                     None, None, DryRunActuator(journal), journal, state=state)
+        t._supersede_stale([LiveCandidate(pr=77, sha="newsha")])
+        self.assertFalse(os.path.exists(old))
+        self.assertFalse(os.path.exists(state.core_surface_dispatch_file("77", "aaaaaa1")))
+        self.assertFalse(os.path.exists(state.core_surface_log_file("77", "aaaaaa1")))
+        self.assertFalse(os.path.exists(state.core_wait_file("77", "aaaaaa1")))
+        sup = [e for e in events(self.jpath)
+               if e["event"] == "gate_superseded" and e.get("rail") == "core_surface"]
+        self.assertEqual(len(sup), 1)
+        self.assertEqual(sup[0]["old_sha"], "aaaaaa1")
+        self.assertEqual(sup[0]["new_sha"], "newsha")
+
+    def test_off_lever_leaves_nothing_to_supersede(self):
+        # With no .core-surface-* marker ever written (the lever-off default) the glob is empty and
+        # this rail journals nothing — byte-inert.
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        t = LiveTick({"MERGE_POLICY": "observe"}, None, None, DryRunActuator(journal), journal,
+                     state=state)
+        t._supersede_stale([LiveCandidate(pr=78, sha="newsha")])
+        # Byte-inert at its strictest: the journal file is not even CREATED, because nothing had
+        # anything to say. (A missing file and an empty one are the same claim here.)
+        evs = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertFalse([e for e in evs
+                          if e["event"] == "gate_superseded" and e.get("rail") == "core_surface"])
+
+
 class TestSupersessionCancel(unittest.TestCase):
     """HERD-341: discovery → supersession-cancel. A candidate whose head sha has moved past an in-flight
     worker's sha TERMs that doomed worker — by a SESSION kill of its whole detached subtree (HERD-283/348:
