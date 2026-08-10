@@ -29,6 +29,7 @@ from unittest import mock
 import subprocess
 import time
 
+from herd import ci_verdict as CVD
 from herd import cost_emit as CE
 from herd import decisions as D
 from herd import live_runtime as LR
@@ -7744,6 +7745,260 @@ class TestLiveTickRateLimitBackoff(LiveCase):
             t.run()
         evs = events(self.jpath) if os.path.exists(self.jpath) else []
         self.assertEqual([e for e in evs if e["event"] == "engine_rate_limited"], [])
+
+
+class TestCiVerdictMapping(unittest.TestCase):
+    """HERD-578: the ONE shared CI-verdict mapping (herd.ci_verdict), read by the watcher's own
+    HEALTH_SOURCE=ci health rail AND — through `python3 -m herd.ci_verdict` — by agent-watch.sh's
+    main-health CI leg and CI_FAST_BOUNCE leg. Pure fixtures: no gh, no network.
+
+    The end-to-end gate proof (all five mappings driven through a real LiveTick walk with a stubbed
+    gh) lives in tests/test-ci-as-gate.sh; this class pins the mapping itself, including PARITY with
+    the two inline programs it replaced — a mapping that quietly changed shape would break the
+    main-health leg's console row and its autofix identity at once.
+    """
+
+    def _run(self, sha, status, conclusion, wf="CI", rid=1):
+        return {"headSha": sha, "status": status, "conclusion": conclusion,
+                "workflowName": wf, "databaseId": rid}
+
+    # ── classify_runs: which run speaks for this sha ───────────────────────────────────────────────
+    def test_green_run_for_the_head_sha_is_pass(self):
+        scan = CVD.classify_runs([self._run("a", "COMPLETED", "SUCCESS")], "a")
+        self.assertEqual(scan["bucket"], "pass")
+        self.assertEqual(scan["run_id"], "1")
+
+    def test_fail_vocabulary_is_exactly_the_branch_ci_leg_s(self):
+        for concl in ("FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"):
+            self.assertEqual(CVD.classify_runs([self._run("a", "COMPLETED", concl)], "a")["bucket"],
+                             "fail", concl)
+        for concl in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            self.assertEqual(CVD.classify_runs([self._run("a", "COMPLETED", concl)], "a")["bucket"],
+                             "pass", concl)
+
+    def test_cancelled_and_unknown_conclusions_are_never_red(self):
+        for concl in ("CANCELLED", "STALE", "SOMETHING_NEW", None):
+            scan = CVD.classify_runs([self._run("a", "COMPLETED", concl)], "a")
+            self.assertEqual(scan["bucket"], "cancelled", concl)
+            self.assertNotEqual(CVD.map_verdict(scan)[0], CVD.CODEERROR)
+
+    def test_in_progress_run_for_this_sha_is_pending(self):
+        scan = CVD.classify_runs([self._run("a", "IN_PROGRESS", None)], "a")
+        self.assertEqual(scan["bucket"], "pending")
+        self.assertEqual(scan["in_progress"], 1)
+
+    def test_runs_exist_but_none_for_this_sha_is_none_not_absent(self):
+        # "CI has not picked this commit up yet" is a WAIT; only a branch with NO runs at all is the
+        # absent-CI fallback, so a fresh push can never be mistaken for "this repo has no CI".
+        scan = CVD.classify_runs([self._run("other", "COMPLETED", "SUCCESS")], "a")
+        self.assertEqual(scan["bucket"], "none")
+        self.assertEqual(CVD.map_verdict(scan)[0], CVD.WAIT)
+
+    def test_empty_window_is_absent_and_maps_to_local(self):
+        self.assertEqual(CVD.classify_runs([], "a")["bucket"], "absent")
+        self.assertEqual(CVD.map_verdict(CVD.classify_runs([], "a"))[0], CVD.LOCAL)
+
+    def test_non_list_input_never_raises(self):
+        for junk in (None, {}, "nope", 7):
+            self.assertEqual(CVD.classify_runs(junk, "a")["bucket"], "absent")
+
+    def test_cancelled_count_qualifies_the_wait(self):
+        runs = [self._run("a", "COMPLETED", "CANCELLED", rid=2),
+                self._run("a", "COMPLETED", "CANCELLED", rid=3)]
+        scan = CVD.classify_runs(runs, "a")
+        verdict, reason, detail = CVD.map_verdict(scan)
+        self.assertEqual((verdict, reason), (CVD.WAIT, "ci-cancelled-chain"))
+        self.assertEqual(detail, "2 newer runs cancelled")
+
+    # ── classify_failure_log: code red vs platform outage ─────────────────────────────────────────
+    def test_real_test_output_is_a_code_red(self):
+        log = "ci-suite\t✗ tests/test-a.sh (rc=1)\nci-suite\t✗ tests/test-b.sh\n"
+        self.assertEqual(CVD.classify_failure_log(log),
+                         ("code", "tests/test-a.sh (rc=1),tests/test-b.sh"))
+
+    def test_duplicate_identities_are_deduped_in_order(self):
+        log = "x ✗ t1\ny ✗ t1\nz ✗ t2\n"
+        self.assertEqual(CVD.classify_failure_log(log), ("code", "t1,t2"))
+
+    def test_identity_is_capped(self):
+        log = "\n".join("job ✗ tests/test-%d.sh" % i for i in range(200))
+        kind, detail = CVD.classify_failure_log(log)
+        self.assertEqual(kind, "code")
+        self.assertLessEqual(len(detail), 200)
+
+    def test_infra_signatures_classify_infra_not_code(self):
+        for sig in ("Error: Failed to resolve action download info",
+                    "The runner has received a shutdown signal",
+                    "remote: Service Unavailable",
+                    "The job was not acquired by runner within the timeout",
+                    "The operation was canceled."):
+            kind, detail = CVD.classify_failure_log(sig)
+            self.assertEqual(kind, "infra", sig)
+            self.assertTrue(detail)
+            self.assertEqual(CVD.map_verdict({"bucket": "fail"}, (kind, detail))[0], CVD.WAIT, sig)
+
+    def test_real_test_output_wins_over_an_incidental_infra_line(self):
+        """A run that got far enough to fail a named test failed on the DIFF — the infra line may be
+        a retried step's noise. Only a red with NO test output is ever infra-transient."""
+        log = "setup\tService Unavailable\nci-suite\t✗ tests/test-a.sh\n"
+        self.assertEqual(CVD.classify_failure_log(log)[0], "code")
+
+    def test_unreadable_log_is_unknown_and_holds(self):
+        for log in ("", None, "nothing interesting here\n"):
+            self.assertEqual(CVD.classify_failure_log(log), ("unknown", ""))
+        verdict, reason, _ = CVD.map_verdict({"bucket": "fail"}, ("unknown", ""))
+        self.assertEqual((verdict, reason), (CVD.WAIT, "ci-log-unreadable"))
+
+    def test_a_fail_with_no_log_at_all_never_guesses_a_red(self):
+        self.assertEqual(CVD.map_verdict({"bucket": "fail"}, None)[0], CVD.WAIT)
+
+    # ── PARITY with the pre-HERD-578 inline programs the bash legs used to carry ───────────────────
+    _PARITY_FIXTURES = (
+        [],
+        [{"headSha": "a", "status": "COMPLETED", "conclusion": "SUCCESS",
+          "workflowName": "CI", "databaseId": 1}],
+        [{"headSha": "a", "status": "COMPLETED", "conclusion": "FAILURE",
+          "workflowName": "CI\twith tab", "databaseId": 2}],
+        [{"headSha": "a", "status": "IN_PROGRESS", "conclusion": None,
+          "workflowName": "CI", "databaseId": 3}],
+        [{"headSha": "b", "status": "COMPLETED", "conclusion": "CANCELLED",
+          "workflowName": "CI", "databaseId": 4},
+         {"headSha": "a", "status": "COMPLETED", "conclusion": "FAILURE",
+          "workflowName": "CI", "databaseId": 5}],
+        [{"headSha": "a", "status": "COMPLETED", "conclusion": "CANCELLED",
+          "workflowName": "CI", "databaseId": 6}],
+        [{"headSha": "c", "status": "QUEUED", "conclusion": None, "workflowName": "", "databaseId": None},
+         {"headSha": "b", "status": "COMPLETED", "conclusion": "STALE", "workflowName": "CI",
+          "databaseId": 7},
+         {"headSha": "a", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI",
+          "databaseId": 8}],
+        ["not-a-dict", {"headSha": "a", "status": "COMPLETED", "conclusion": "FAILURE",
+                        "workflowName": "CI", "databaseId": 9}],
+    )
+
+    @staticmethod
+    def _legacy_classify(runs, expected):
+        """agent-watch.sh's `_main_ci_classify` body, verbatim, as it stood before HERD-578."""
+        PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+        FAIL = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
+
+        def clean(s):
+            return str(s or "").replace("\t", " ").replace("\n", " ").strip()
+        for r in runs:
+            if not isinstance(r, dict):
+                continue
+            if expected and r.get("headSha") != expected:
+                continue
+            if str(r.get("status") or "").upper() != "COMPLETED":
+                continue
+            concl = str(r.get("conclusion") or "").upper()
+            if concl in FAIL:
+                bucket = "fail"
+            elif concl in PASS:
+                bucket = "pass"
+            else:
+                bucket = "pending"
+            run_id = r.get("databaseId")
+            return "%s\t%s\t%s\t%s\n" % (bucket, clean(r.get("workflowName")), concl or "?",
+                                         run_id if run_id else "")
+        return ""
+
+    @staticmethod
+    def _legacy_starve_scan(runs):
+        """agent-watch.sh's `_main_ci_starve_scan` body, verbatim, as it stood before HERD-578."""
+        PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+        FAIL = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
+
+        def clean(s):
+            return str(s or "").replace("\x1f", " ").replace("\t", " ").replace("\n", " ").strip()
+        in_progress = 0
+        cancelled_shas = set()
+        bucket, wf, concl, run_id, run_sha = "none", "", "", "", ""
+        for r in runs:
+            if not isinstance(r, dict):
+                continue
+            sha = clean(r.get("headSha"))
+            if str(r.get("status") or "").upper() != "COMPLETED":
+                in_progress = 1
+                continue
+            c = str(r.get("conclusion") or "").upper()
+            if c in PASS or c in FAIL:
+                bucket = "pass" if c in PASS else "fail"
+                wf, concl, run_sha = clean(r.get("workflowName")), c, sha
+                rid = r.get("databaseId")
+                run_id = str(rid) if rid else ""
+                break
+            if sha:
+                cancelled_shas.add(sha)
+        return "\x1f".join([bucket, wf, concl, run_id, run_sha, str(len(cancelled_shas)),
+                            str(in_progress)]) + "\n"
+
+    def test_classify_emitter_is_byte_identical_to_the_program_it_replaced(self):
+        for fixture in self._PARITY_FIXTURES:
+            for sha in ("a", "", "zzz"):
+                self.assertEqual(CVD._emit_classify(fixture, sha),
+                                 self._legacy_classify(fixture, sha),
+                                 "classify drift: %r sha=%r" % (fixture, sha))
+
+    def test_starve_scan_emitter_is_byte_identical_to_the_program_it_replaced(self):
+        for fixture in self._PARITY_FIXTURES:
+            self.assertEqual(CVD._emit_starve_scan(fixture), self._legacy_starve_scan(fixture),
+                             "starve-scan drift: %r" % (fixture,))
+
+    def test_identity_from_log_matches_the_bash_grep_sed_pipeline(self):
+        """The old identity leg was `grep -F ✗ | sed 's/^.*✗ *//' | tr -d '\\r' | awk NF |
+        awk !seen | paste -sd,` capped at 200 chars — same answers, including the CRLF and
+        blank-name cases."""
+        cases = {
+            "job\t✗ tests/a.sh\r\njob\t✗ tests/a.sh\njob\t✗ tests/b.sh\n": "tests/a.sh,tests/b.sh",
+            "job\t✗   \n": "",
+            "no failures here": "",
+            "": "",
+        }
+        for log, want in cases.items():
+            self.assertEqual(CVD.identity_from_log(log), want, repr(log))
+
+    # ── the lever itself ──────────────────────────────────────────────────────────────────────────
+    def test_health_source_lever_is_ci_only_on_the_exact_value(self):
+        self.assertEqual(LR._health_source({"HEALTH_SOURCE": "ci"}), "ci")
+        self.assertEqual(LR._health_source({"HEALTH_SOURCE": " CI "}), "ci")
+        for cfg in ({}, None, {"HEALTH_SOURCE": ""}, {"HEALTH_SOURCE": "local"},
+                    {"HEALTH_SOURCE": "on"}, {"HEALTH_SOURCE": "cirrus"}):
+            self.assertEqual(LR._health_source(cfg), "local", cfg)
+
+    def test_health_source_is_a_core_env_key(self):
+        """A python-core knob unexported by herd-config.sh is invisible to the `--tick` child (the
+        HERD-449 bug class) — scripts/herd/env-export-lint.sh reads this tuple to catch that."""
+        self.assertIn("HEALTH_SOURCE", LR._CORE_ENV_KEYS)
+
+
+class TestCiInfraRerunBound(unittest.TestCase):
+    """HERD-609: the auto-rerun of an infra-transient CI red is BOUNDED — one per run id, ever, and
+    at most one within the cooldown. A platform outage must cost a handful of reruns, not a storm."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_first_run_id_is_allowed_then_never_again(self):
+        self.assertTrue(LR._ci_rerun_allowed(self.tmp, "77"))
+        open(LR._ci_rerun_marker(self.tmp, "77"), "w").close()
+        self.assertFalse(LR._ci_rerun_allowed(self.tmp, "77"))
+
+    def test_cooldown_blocks_a_different_run_id(self):
+        open(LR._ci_rerun_cooldown_marker(self.tmp), "w").close()
+        self.assertFalse(LR._ci_rerun_allowed(self.tmp, "88"),
+                         "a fresh cooldown stamp must hold off every run id, not just the last one")
+
+    def test_expired_cooldown_allows_a_new_run_id(self):
+        cooldown = LR._ci_rerun_cooldown_marker(self.tmp)
+        open(cooldown, "w").close()
+        old = time.time() - (LR._CI_RERUN_COOLDOWN_SECS + 60)
+        os.utime(cooldown, (old, old))
+        self.assertTrue(LR._ci_rerun_allowed(self.tmp, "88"))
+
+    def test_no_state_dir_never_reruns(self):
+        self.assertFalse(LR._ci_rerun_allowed("", "77"))
+        self.assertFalse(LR._ci_rerun_allowed(self.tmp, ""))
 
 
 if __name__ == "__main__":

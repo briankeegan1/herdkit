@@ -70,6 +70,7 @@ import subprocess
 import sys
 import time
 
+from herd import ci_verdict as CV
 from herd import cost_emit as _cost_emit
 from herd import decisions as D
 from herd import human_verify as _human_verify
@@ -142,16 +143,21 @@ class LiveCandidate:
 
     __slots__ = ("pr", "sha", "slug", "base", "worktree", "stale", "hv_hold", "approved",
                  "hv_body", "author", "assignees", "labels", "review_decision", "merge_status",
-                 "restale_laps", "agent_status", "wake_succeeds", "dirty")
+                 "restale_laps", "agent_status", "wake_succeeds", "dirty", "branch")
 
     def __init__(self, pr, sha, slug="", base="", worktree="", stale=False,
                  hv_hold=False, approved=False, hv_body="", author="", assignees=None,
                  labels=None, review_decision="", merge_status="", restale_laps=0,
-                 agent_status="", wake_succeeds=True, dirty=False):
+                 agent_status="", wake_succeeds=True, dirty=False, branch=""):
         self.pr = str(pr)
         self.sha = str(sha)
         self.slug = slug or ("pr-%s" % pr)
         self.base = str(base)
+        # HERD-578: the HEAD ref, bare — the form `gh run list --branch` knows a run by (a
+        # remote-qualified "origin/x" silently matches zero runs, the HERD-434 bug). Discovery already
+        # fetches it to derive the slug; HEALTH_SOURCE=ci needs it to ask CI about this PR. Absent in
+        # every fixture written before this key → "", which reads as "cannot ask CI" and falls back.
+        self.branch = str(branch or "")
         self.worktree = str(worktree)
         self.stale = bool(stale)
         self.hv_hold = bool(hv_hold)
@@ -196,7 +202,7 @@ class LiveCandidate:
             review_decision=d.get("review_decision", ""), merge_status=d.get("merge_status", ""),
             restale_laps=d.get("restale_laps", 0),
             agent_status=d.get("agent_status", ""), wake_succeeds=d.get("wake_succeeds", True),
-            dirty=d.get("dirty", False),
+            dirty=d.get("dirty", False), branch=d.get("branch", ""),
         )
 
 
@@ -2037,7 +2043,7 @@ def discover_via_graphql(repo=None, limit=50):
         slug = _branch_worktree_slug(branch)
         cands.append(LiveCandidate(
             pr=node.get("number"), sha=node.get("headRefOid", ""),
-            slug=slug, base=node.get("baseRefName", ""),
+            slug=slug, base=node.get("baseRefName", ""), branch=branch,
             worktree=_worktree_for_slug(slug),
             stale=(node.get("mergeStateStatus") == "BEHIND"),
             merge_status=node.get("mergeStateStatus", ""),
@@ -2411,6 +2417,146 @@ def _health_trust_check(trees, sha, worktree):
 
 # ── gate dispatch: shell out to the existing leaf scripts, consume their contract output ───────────
 
+# ── HEALTH_SOURCE=ci — the PR's OWN CI conclusion IS the health verdict (HERD-578) ────────────────
+# SHIP-DORMANT. HEALTH_SOURCE=local (the default, and any unrecognized value) never reaches a single
+# line below: no `gh` call, no journal event, no behavior change — the classic local dispatch rail is
+# byte-identical to before this feature.
+#
+# WHY: under `local` every PR pays for a full local suite on the watcher's own host, serialized behind
+# HEALTH_CONCURRENCY, while GitHub Actions has ALREADY run the same suite on the same sha, in
+# parallel, for free. Under `ci` the watcher stops dispatching local suites entirely and READS the
+# answer instead; builder-local scoped runs stay an opt-in dev tool via healthcheck.sh, unchanged.
+#
+# TWO HARD RULES, both grounded in live incidents:
+#
+#   (A) INFRA-TRANSIENT IS NOT A CODE RED (HERD-609, grounded in the 2026-08-06 GitHub Actions outage
+#       that held main red overnight). A FAILURE conclusion whose failed jobs name no test but carry a
+#       platform signature ("Failed to resolve action download info", "Service Unavailable", a job
+#       never acquired by a runner, a concurrency cancel) classifies WAIT-infra-transient and gets ONE
+#       bounded, journaled `gh run rerun --failed` per run id. Only a completed run whose failures
+#       carry REAL TEST OUTPUT is ever a code red — the classification itself lives in
+#       herd.ci_verdict, shared with the bash legs.
+#
+#   (B) THE VERDICT IS A PER-TICK RECONCILED READ, NEVER A DISPATCHED CHAIN (HERD-612, grounded
+#       2026-08-07/10: a dispatched verdict-collector chain died between suite-pass and verdict-write
+#       and stranded a MAIN RED for three days). So this leg lays NO marker, spawns NO worker and
+#       writes NO sha-cache: every tick re-reads the live conclusion from observed state. A tick that
+#       dies mid-read costs one re-read, never a stranded verdict. The only memo is tick-scoped (a
+#       LiveGates instance lives exactly one tick), so two PRs on one branch cost one `gh` call.
+#
+# FAIL-SOFT, NEVER SILENT: an unreachable/unauthenticated `gh`, unparseable JSON, or a branch with no
+# Actions runs at all FALLS BACK to the local suite and says so LOUDLY (a once-per-(pr,sha)
+# `ci_health_fallback` journal event) — never a silent skip, never an invented verdict.
+
+_CI_GH_TIMEOUT = 30            # seconds per `gh` call — a constant upper bound, not a knob
+_CI_RUN_LIMIT = 20             # runs per `gh run list` window (matches the bash branch-CI leg)
+_CI_RERUN_COOLDOWN_SECS = 900  # min seconds between ANY two infra-transient reruns (bounded, HERD-609)
+
+
+def _health_source(config):
+    """``ci`` iff HEALTH_SOURCE explicitly says so; ``local`` for everything else (absent, empty, a
+    typo). Fails toward the SAFE side by construction: an unreadable lever runs the authoritative
+    local suite rather than trusting a CI read nobody asked for."""
+    val = str((config or {}).get("HEALTH_SOURCE", "") or "").strip().lower()
+    return "ci" if val == "ci" else "local"
+
+
+def _ci_runs(branch):
+    """The recent CI runs for ``branch`` as a parsed list, or ``None`` when CI cannot be read at all
+    (no gh, unauthenticated, timeout, non-zero exit, unparseable JSON). ``None`` and ``[]`` are
+    DIFFERENT answers on purpose: ``None`` means "could not ask", ``[]`` means "asked, this branch has
+    no Actions runs" — both fall back to local, but only the second is a statement about the repo.
+
+    Uses the BARE branch name gh knows the run by; a remote-qualified ref ("origin/main") silently
+    returns zero rows (the HERD-434 bug this leg must not re-make), so the caller passes the head ref
+    from discovery, which is already bare."""
+    if not branch:
+        return None
+    try:
+        out = subprocess.run(
+            ["gh", "run", "list", "--branch", branch, "--limit", str(_CI_RUN_LIMIT),
+             "--json", "headSha,status,conclusion,workflowName,databaseId"],
+            capture_output=True, text=True, timeout=_CI_GH_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0 or not (out.stdout or "").strip():
+        return None
+    try:
+        runs = json.loads(out.stdout)
+    except Exception:
+        return None
+    return runs if isinstance(runs, list) else None
+
+
+def _ci_failed_log(run_id):
+    """``gh run view <id> --log-failed`` — ONLY the failed steps' logs, the same stream the bash
+    honest-identity leg reads. ``""`` on any failure, which classifies as UNKNOWN (a hold), never as
+    a guessed verdict."""
+    if not run_id:
+        return ""
+    try:
+        out = subprocess.run(["gh", "run", "view", str(run_id), "--log-failed"],
+                             capture_output=True, text=True, timeout=_CI_GH_TIMEOUT)
+    except Exception:
+        return ""
+    return out.stdout or ""
+
+
+def _ci_rerun_marker(state_dir, run_id):
+    """The once-per-run-id rerun marker path, in the same shared ``$TREES`` space every other
+    sha/run-keyed marker lives in (so the bound holds across seats and watcher restarts, not just
+    within one process)."""
+    if not state_dir or not run_id:
+        return ""
+    return os.path.join(state_dir, ".ci-rerun-%s" % run_id)
+
+
+def _ci_rerun_cooldown_marker(state_dir):
+    return os.path.join(state_dir, ".ci-rerun-last") if state_dir else ""
+
+
+def _ci_rerun_allowed(state_dir, run_id):
+    """The BOUND on HERD-609's auto-rerun: at most ONE rerun per run id, ever, and at most one rerun
+    of any run within :data:`_CI_RERUN_COOLDOWN_SECS`. A sustained platform outage therefore costs a
+    handful of reruns, not a rerun storm — the row stays WAIT-infra-transient either way, so the
+    bound can only ever cost latency, never correctness. Fail-soft: an unwritable/unreadable marker
+    dir reads as NOT allowed (never a loop nothing can stop)."""
+    marker = _ci_rerun_marker(state_dir, run_id)
+    if not marker or os.path.exists(marker):
+        return False
+    cooldown = _ci_rerun_cooldown_marker(state_dir)
+    try:
+        if cooldown and os.path.exists(cooldown):
+            # _now_epoch() is a STRING (it doubles as a journal field) — coerce before arithmetic.
+            if (int(_now_epoch()) - int(os.path.getmtime(cooldown))) < _CI_RERUN_COOLDOWN_SECS:
+                return False
+    except Exception:
+        return False
+    return True
+
+
+def _ci_rerun_failed(state_dir, run_id):
+    """Ask GitHub to re-run just the FAILED jobs of ``run_id``. Records the bound markers BEFORE the
+    call (so a crash mid-request can never license a second attempt) and returns True iff gh accepted
+    it. Never raises."""
+    marker = _ci_rerun_marker(state_dir, run_id)
+    try:
+        if marker:
+            open(marker, "w", encoding="utf-8").close()
+        cooldown = _ci_rerun_cooldown_marker(state_dir)
+        if cooldown:
+            open(cooldown, "w", encoding="utf-8").close()
+    except Exception:
+        return False
+    try:
+        out = subprocess.run(["gh", "run", "rerun", str(run_id), "--failed"],
+                             capture_output=True, text=True, timeout=_CI_GH_TIMEOUT)
+    except Exception:
+        return False
+    return out.returncode == 0
+
+
 class LiveGates:
     """Dispatch the gate rails by SHELLING OUT to the existing leaf scripts — ASYNC, sha-keyed, and
     marker-aware, EXACTLY as the bash tick does (task HERD-324 leg 1, agent-watch.sh:_review_gate_step /
@@ -2456,6 +2602,16 @@ class LiveGates:
         # HEALTH_TRUST_BUILDER (HERD-531/555): ship-dormant, default off. Resolved ONCE per tick, same
         # rationale as _merge_result_gate above — off means health() never even opens a provenance file.
         self._health_trust_on = _health_trust_on(cfg)
+        # HEALTH_SOURCE (HERD-578): ship-dormant, default `local`. Resolved ONCE per tick, same
+        # rationale as the two levers above — `local` means health() never even looks at CI.
+        self._health_source = _health_source(cfg)
+        # Tick-scoped memo of the `gh run list` read, keyed by BRANCH: two PRs on one branch (or two
+        # walks of one candidate) cost ONE API call, and the memo dies with the tick, so the next
+        # tick always re-reads live state (HERD-612 — the verdict is a reconciled read, never cached).
+        self._ci_runs_cache = {}
+        # The failing-test identity a CI-sourced CODEERROR named this tick ("" for every other
+        # verdict, and always "" under HEALTH_SOURCE=local) — read by LiveTick._refix_prompt.
+        self.ci_health_detail = ""
         # WATCH_CLAUDE_PROBE_TIMEOUT (HERD-108/HERD-580): the exec-hang probe result, memoized on `self`
         # for the same reason as `_main_health_pending_cache` below — a LiveGates instance lives exactly
         # one tick, so at most ONE `claude --version` exec happens per tick no matter how many
@@ -2510,7 +2666,22 @@ class LiveGates:
         # branch as-is, so there is exactly ONE suite run per candidate, never a doubled gate latency
         # (spike §2 cleanup note). OFF (default) never reaches `_merge_result_health` — byte-identical.
         if self._merge_result_gate:
+            # An operator running BOTH levers gets the merge-result rail (the stricter claim), and is
+            # told so once per (pr, sha) rather than silently wondering why no CI read happened.
+            if self._health_source == "ci" and self.state.once(cand.pr, cand.sha, "ci_health_skipped"):
+                self.journal.append("ci_health_skipped", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "reason", "merge-result-gate")
             return self._merge_result_health(cand)
+        # HEALTH_SOURCE=ci (HERD-578): the PR's OWN CI conclusion IS the verdict — read fresh, never
+        # dispatched. `local` (the default) never calls this, and even under `ci` a repo whose CI
+        # cannot answer falls back to the classic rail below with a loud note, so this branch can only
+        # ever ADD a verdict path, never remove one. Deliberately BELOW the merge-result gate: that
+        # gate's whole claim is "the suite ran against head MERGED WITH base", which no branch CI run
+        # can attest, so an operator who armed it keeps the local rail (see _ci_health's own note).
+        if self._health_source == "ci":
+            verdict = self._ci_health(cand)
+            if verdict is not None:
+                return verdict
         st = self.state
         self.reused_health = False
         # 1. REVIEW-ONCE: an unchanged commit cannot yield a different verdict — reuse the sha-cache.
@@ -2620,6 +2791,96 @@ class LiveGates:
         # 5. DISPATCH the async suite worker + lay the marker → wait.
         self._dispatch_health(cand, profile)
         return WAIT
+
+    # ── HEALTH_SOURCE=ci: the CI-sourced health verdict (HERD-578) ─────────────────────────────────
+    def _ci_health(self, cand):
+        """The health verdict READ from the PR's own CI, or ``None`` meaning "CI cannot answer — fall
+        back to the local rail" (the caller then runs the classic dispatch unchanged).
+
+        Returns ``CLEAN`` / ``CODEERROR`` / :data:`WAIT` / ``None``. The five mappings, all decided by
+        the ONE shared implementation in :mod:`herd.ci_verdict` (never re-derived here, so the watcher
+        leg, the main-health CI leg and the fast-bounce leg can never disagree):
+
+          green checks-run for the head sha  → CLEAN      (merges through the ordinary rails)
+          red naming a real test             → CODEERROR  (bounces on the SAME kind=health rail, with
+                                                           the extracted identity as the evidence)
+          red carrying only infra signatures → WAIT       (+ ONE bounded, journaled rerun — HERD-609)
+          pending / cancelled-chain          → WAIT       (qualified in the journal, NEVER a red)
+          CI absent entirely                 → None       (+ a loud `ci_health_fallback` note)
+
+        NO marker, NO worker, NO sha-cache (HERD-612): a stranded verdict is impossible because there
+        is nothing holding one — every tick re-reads. The cost of that is one `gh run list` per branch
+        per tick, memoized tick-scoped in ``self._ci_runs_cache``.
+        """
+        st = self.state
+        self.reused_health = False
+        branch = getattr(cand, "branch", "") or ""
+        if not branch:
+            # A candidate with no head ref (a legacy fixture, or a discovery shape that predates the
+            # field) cannot be asked about — fall back rather than guess at a branch name.
+            self._ci_fallback(cand, "no-branch")
+            return None
+        if branch in self._ci_runs_cache:
+            runs = self._ci_runs_cache[branch]
+        else:
+            runs = _ci_runs(branch)
+            self._ci_runs_cache[branch] = runs
+        if runs is None:
+            self._ci_fallback(cand, "gh-unavailable")
+            return None
+        scan = CV.classify_runs(runs, cand.sha)
+        failure = None
+        if scan["bucket"] == "fail":
+            failure = CV.classify_failure_log(_ci_failed_log(scan["run_id"]))
+        verdict, reason, detail = CV.map_verdict(scan, failure)
+        if verdict == CV.LOCAL:
+            self._ci_fallback(cand, reason)
+            return None
+        # HERD-609: a platform-infra red gets ONE bounded rerun per run id, journaled either way, and
+        # STAYS a WAIT. Never a bounce, never a red row, never a merge.
+        if reason == "ci-infra-transient":
+            self._ci_infra_rerun(cand, scan, detail)
+        # One outcome line per (pr, sha, verdict) — a standing WAIT/red re-read every ~40s must not
+        # re-journal every tick (HERD-459's phase-not-event rule). `reused_health` is exactly the flag
+        # LiveTick._walk consults before journaling `healthcheck_outcome`, so reusing it here keeps
+        # the CI leg's journal shape identical to the local rail's.
+        first = st.once(cand.pr, cand.sha, "ci_health_%s_%s" % (verdict, reason))
+        self.reused_health = not first
+        if first:
+            self.journal.append("ci_health_verdict", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                "verdict", verdict, "reason", reason, "detail", detail,
+                                "workflow", scan["workflow"], "conclusion", scan["conclusion"],
+                                "run_id", scan["run_id"], "cancelled", scan["cancelled"])
+        # The identity CI named IS the evidence the bounce carries: LiveTick._refix_prompt reads this
+        # so a CI-sourced red re-tasks the builder with the failing test, not the local rail's generic
+        # "read the failing suite output". Held on the (tick-scoped) gates object rather than the
+        # sha-cache: nothing about a CI read may become a durable verdict another tick could reuse
+        # after CI itself has moved on (HERD-612).
+        self.ci_health_detail = detail if verdict == CV.CODEERROR else ""
+        return verdict
+
+    def _ci_fallback(self, cand, reason):
+        """LOUD fallback to the local suite: journal once per (pr, sha) and let the classic rail run.
+        Never silent — "CI could not answer" is exactly the state an operator must be able to see
+        before wondering why local suites are still burning slots under HEALTH_SOURCE=ci."""
+        if self.state.once(cand.pr, cand.sha, "ci_health_fallback"):
+            self.journal.append("ci_health_fallback", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug, "reason", reason,
+                                "detail", "HEALTH_SOURCE=ci could not read CI — running the local suite")
+
+    def _ci_infra_rerun(self, cand, scan, signature):
+        """HERD-609's bounded auto-rerun. Journals `ci_infra_transient` with the outcome of the attempt
+        (``rerun`` | ``bounded`` | ``failed``) so the record shows both that the platform failed and
+        what the engine did about it — the 2026-08-06 outage's whole cost was that nobody could see
+        either from the console."""
+        run_id = scan.get("run_id") or ""
+        if not self.state.once(cand.pr, cand.sha, "ci_infra_%s" % (run_id or "norun")):
+            return                     # this run id is already on the record — a phase, not an event
+        result = "bounded"
+        if run_id and _ci_rerun_allowed(self.state.dir, run_id):
+            result = "rerun" if _ci_rerun_failed(self.state.dir, run_id) else "failed"
+        self.journal.append("ci_infra_transient", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                            "run_id", run_id, "signature", signature, "result", result)
 
     def _dispatch_health(self, cand, profile=""):
         st = self.state
@@ -4818,6 +5079,17 @@ class LiveTick:
     def _refix_prompt(self, cand, kind):
         """The re-task prompt text typed into the builder's pane for this rail's bounce."""
         if kind == "health":
+            # HERD-578: under HEALTH_SOURCE=ci the red came from the PR's OWN CI run, which already
+            # NAMED the failing test — say so, instead of sending the builder to read a local suite
+            # output that never ran. Empty under HEALTH_SOURCE=local (and for a CI verdict that is not
+            # a code red), so the local rail's prompt is byte-identical to before.
+            ci_detail = getattr(self.gates, "ci_health_detail", "") or ""
+            if ci_detail:
+                return ("PR #%s's CI concluded FAILURE, naming: %s\n"
+                        "CI is the authoritative health gate for this project (HEALTH_SOURCE=ci) — no "
+                        "local suite verdict is coming.\n"
+                        "Reproduce and fix %s from your worktree, run the healthcheck, and push your "
+                        "fix." % (cand.pr, ci_detail, ci_detail))
             return ("PR #%s failed the healthcheck (CODEERROR).\n"
                     "Read the failing suite output, fix every CODE error, run the healthcheck, and "
                     "push your fix." % cand.pr)
@@ -5874,7 +6146,7 @@ _REVIEW_FASTPATH_KEYS = ("REVIEW_PREGATE", "REVIEW_MECH_FLOOR", "REVIEW_MECH_FLO
 _CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
                     "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
                     "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE",
-                    "HEALTH_TRUST_BUILDER", "STALE_BASE_AUTOFIX")
+                    "HEALTH_TRUST_BUILDER", "STALE_BASE_AUTOFIX", "HEALTH_SOURCE")
                    + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS
                    + _REVIEW_FASTPATH_KEYS)
 

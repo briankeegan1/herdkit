@@ -294,8 +294,18 @@ MERGE_METHOD="merge"    # merge | squash | rebase
 #        '# suite-deps:' header, and an always-run core. Any unmappable or wide-blast path (bin/herd,
 #        herd-config.sh, agent-watch.sh, either healthcheck wrapper, capabilities.tsv, the selection
 #        library, the bats discovery surface) selects the FULL curated set.
+#   HEALTH_SOURCE         ci → the watcher stops dispatching local PR suites ENTIRELY and reads the
+#        PR's own GitHub Actions conclusion for its exact head sha as the verdict (the same suite CI
+#        already ran, in parallel, at zero local slot cost): green → CLEAN, a red naming a real test →
+#        CODEERROR bouncing on the same kind=health rail with that test as the evidence, pending or
+#        cancelled → WAIT (never a red). A red carrying only PLATFORM-INFRA signatures (an Actions
+#        outage) is WAIT-infra-transient with ONE bounded auto-rerun, NEVER a code red; a branch with
+#        no Actions run at all falls back to the local suite and journals ci_health_fallback saying so.
+#        Requires an authenticated gh with Actions read (+ rerun write) access. Leave local (default)
+#        unless CI genuinely runs the same suite on every PR head sha.
 # HEALTH_TRUST_BUILDER="off"   # off (default) | on
 # HEALTH_SUITE_SCOPE="full"    # full (default) | diff
+# HEALTH_SOURCE="local"        # local (default) | ci
 
 # native-burst (HERD-107) — the bounded read-only FAN-OUT seam (scripts/herd/burst.sh).
 #   off  default — byte-identical to today: research fan-out is un-hinted; the review is a single reviewer.

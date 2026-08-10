@@ -215,7 +215,7 @@ MERGE_RESULT_GATE MERGE_QUEUE HEALTH_CONCURRENCY REVIEW_CONCURRENCY WATCHER_SCOP
 WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL WATCHER_VIEW_STATUS \
 WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER GATE_STATUS GATE_STATUS_PENDING MERGE_FAIRNESS \
 MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN HEALTH_TRUST_BUILDER \
-STALE_BASE_AUTOFIX"
+STALE_BASE_AUTOFIX HEALTH_SOURCE"
 
 # ── Engine-core key RESET (HERD-465): the FILE is authoritative, never inherited/stale env ─────────
 # WATCHER_SELF_RESTART (HERD-251) re-execs this very process in place, inheriting every var it had
@@ -928,6 +928,27 @@ export REVIEW_MODEL_CHEAP REVIEW_MODEL_DOCS
 # into the live pipeline. A Python-core knob means this key is now in _HERD_ENGINE_CORE_KEYS below and
 # must stay `export`ed (HERD-449/465) — see env-export-lint.sh.
 : "${HEALTH_TRUST_BUILDER:="off"}"   # HERD-531/555: trust a sha-matched builder-local heavy run — on | off
+# HEALTH_SOURCE (HERD-578) — WHERE the PR health verdict COMES FROM: local | ci (default local,
+# ship-dormant). local → unchanged: the watcher dispatches the local healthcheck suite per (pr, sha),
+# serialized behind HEALTH_CONCURRENCY, and that run is the verdict. ci → the watcher stops dispatching
+# local PR suites entirely and READS the PR's own GitHub Actions conclusion for its exact head sha as
+# the verdict instead (the same suite, already run in parallel by CI, at no local slot cost): a green
+# checks-run maps to CLEAN, a red naming a real test maps to CODEERROR carrying that test as the
+# bounce evidence, and pending or cancelled maps to WAIT — never a red. TWO HARD RULES, both from live
+# incidents: (1) HERD-609 — a failure whose failed jobs carry PLATFORM-INFRA signatures (Failed to
+# resolve action download info / Service Unavailable / job not acquired by runner / concurrency
+# cancel) and name no test classifies WAIT-infra-transient with ONE bounded, journaled
+# `gh run rerun --failed` per run id, NEVER CODEERROR (grounded: the 2026-08-06 Actions outage held
+# main red overnight); (2) HERD-612 — the verdict is a per-tick RECONCILED READ of live CI state, never
+# a dispatched worker chain that can die holding it (grounded 2026-08-07/10: a dead collector chain
+# stranded a MAIN RED for three days). FAIL-SOFT, NEVER SILENT: an unreachable/unauthenticated gh, or a
+# branch with no Actions runs at all, falls back to the local suite and journals `ci_health_fallback`
+# saying so. HEALTHCHECK_AUTOFIX bounces a CI red on the SAME kind=health rail (same once-guard, same
+# REFIX_MAX_ROUNDS budget) a local red uses — one rail, not two. Builder-local scoped runs stay an
+# opt-in dev tool via healthcheck.sh, unchanged. An unrecognized value reads as local (fail toward the
+# authoritative local suite). Consumed by pysrc/herd/live_runtime.py (LiveGates.health) — a Python-core
+# knob, so this key is in _HERD_ENGINE_CORE_KEYS below and must stay `export`ed (HERD-449/465).
+: "${HEALTH_SOURCE:="local"}"        # HERD-578: where the PR health verdict comes from — local | ci
 # HEALTH_SUITE_SCOPE (HERD-532) — DIFF-SCOPED test selection for the heavy suite: diff | full (default
 # full, ship-dormant). full → the healthcheck wrapper runs the whole curated set, byte-identical to
 # before. diff → it maps the worktree's changed paths to the tests that can actually cover them, via
@@ -1095,7 +1116,7 @@ export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
        WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \
        WATCHER_VIEW_STATUS WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER GATE_STATUS GATE_STATUS_PENDING \
        MERGE_FAIRNESS MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN \
-       HEALTH_TRUST_BUILDER STALE_BASE_AUTOFIX
+       HEALTH_TRUST_BUILDER STALE_BASE_AUTOFIX HEALTH_SOURCE
 # Claude exec-hang probe (HERD-108) — some environments WEDGE `claude` on invocation (every exec hangs
 # before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
 # claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang

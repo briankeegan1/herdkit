@@ -8821,6 +8821,29 @@ A ${_pa_label} run just took $(_fmt_age "$_pa_secs"), past its learned p95 basel
   return 0
 }
 
+# ── THE shared CI-verdict mapping seam (HERD-578) ─────────────────────────────────────────────────
+# Every "what did GitHub Actions say?" question this file asks — the main-health branch-CI leg's run
+# classification (_main_ci_classify / _main_ci_starve_scan), its honest-identity log parse
+# (_main_health_ci_log_identity) and the CI_FAST_BOUNCE leg that reuses both — is answered by ONE
+# implementation, pysrc/herd/ci_verdict.py, which the watcher's OWN health rail also reads natively
+# under HEALTH_SOURCE=ci. Before HERD-578 the PASS/FAIL conclusion vocabulary and the "✗ <test>"
+# identity parse each lived in a hand-kept copy here; a new terminal conclusion (or a new
+# platform-infra signature) had to be applied twice to hold, which is exactly the drift
+# docs/multi-seat-doctrine.md's "one shared check at every surface" rule exists to prevent.
+#
+# _ci_verdict_run <subcommand> [args…] — run that module over stdin and print its line(s). Fail-soft
+# by construction: no python3, no resolvable pysrc, or a module error all print NOTHING and return 0,
+# which every caller here already treats as "no signal" (never a red, never a guess) — the same
+# posture the pre-HERD-578 `python3 -c` bodies had when python3 was missing.
+_ci_verdict_run() {
+  local _cvr_pyp
+  _cvr_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_cvr_pyp" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_cvr_pyp" python3 -m herd.ci_verdict "$@" 2>/dev/null || true
+  return 0
+}
+
 # _main_health_ci_log_identity <run-id> — HERD-476: derive an HONEST failing-test identity for a
 # kind=ci red from the failing run's OWN logs, rather than trusting the bare workflow/conclusion pair
 # _main_health_ci_leg renders ("CI <workflow>: <conclusion>", which names no test and so
@@ -8835,6 +8858,11 @@ A ${_pa_label} run just took $(_fmt_age "$_pa_secs"), past its learned p95 basel
 # id, an unavailable/timed-out/old `gh`, or a log with no ✗ line at all (a run that failed for a reason
 # run-suite.sh never got to print, e.g. an earlier setup step) — the caller then skips with
 # reason=ci-log-unreadable rather than ever filing off the generic conclusion string.
+#
+# HERD-578: the PARSE now lives in pysrc/herd/ci_verdict.py (classify_failure_log), shared verbatim
+# with the watcher's own HEALTH_SOURCE=ci health rail — this function keeps owning the FETCH (the
+# `gh run view --log-failed` call and its timeout) and delegates the reading of it. Same contract,
+# same 200-char cap, same emptiness-on-anything-unparseable.
 _main_health_ci_log_identity() {
   local _cl_run="${1:-}" _cl_tmp _cl_names
   [ -n "$_cl_run" ] || return 0
@@ -8844,14 +8872,28 @@ _main_health_ci_log_identity() {
     rm -f "$_cl_tmp" 2>/dev/null || true
     return 0
   fi
-  _cl_names="$(grep -F '✗' "$_cl_tmp" 2>/dev/null \
-    | sed -E 's/^.*✗[[:space:]]*//' \
-    | tr -d '\r' \
-    | awk 'NF' \
-    | awk '!seen[$0]++' \
-    | paste -sd, -)"
+  _cl_names="$(_ci_verdict_run identity < "$_cl_tmp")"
   rm -f "$_cl_tmp" 2>/dev/null || true
-  printf '%s' "${_cl_names:0:200}"
+  printf '%s' "$_cl_names"
+}
+
+# _main_health_ci_log_class <run-id> — HERD-609: the SAME failed-job log, classified rather than just
+# name-scraped. Prints "<kind>\t<detail>" where kind ∈ code|infra|unknown (see ci_verdict.py:
+# classify_failure_log). `infra` is the outage shape — a red whose failing jobs never ran a test and
+# carry a platform signature — which must never be treated as a code red by ANY consumer. Empty (no
+# line) when the log cannot be read at all, which reads as unknown.
+_main_health_ci_log_class() {
+  local _cc_run="${1:-}" _cc_tmp _cc_out
+  [ -n "$_cc_run" ] || return 0
+  _cc_tmp="$(mktemp 2>/dev/null)" || return 0
+  _gh_timeout main_health_ci_class run view "$_cc_run" --log-failed > "$_cc_tmp" 2>/dev/null
+  if [ ! -s "$_cc_tmp" ]; then
+    rm -f "$_cc_tmp" 2>/dev/null || true
+    return 0
+  fi
+  _cc_out="$(_ci_verdict_run failure-class < "$_cc_tmp")"
+  rm -f "$_cc_tmp" 2>/dev/null || true
+  printf '%s' "$_cc_out"
 }
 
 # _main_health_ci_identity_persist <identity> — HERD-476 review fix (PR #600): once the CI honest-
@@ -9397,35 +9439,11 @@ _main_health_file_age_mins() {
 # 476) is databaseId, the numeric id `gh run view --log-failed` wants — empty when the field is absent
 # (an older `gh` or a caller that omitted it from --json), which the honest-identity leg below then
 # treats as unreadable rather than guessing. python3 stdlib only.
+# HERD-578: delegated to pysrc/herd/ci_verdict.py (`classify`) — the SAME mapping the watcher's own
+# HEALTH_SOURCE=ci health rail reads, so the conclusion vocabulary cannot drift between the two.
+# Output shape is unchanged from the inline program this replaced.
 _main_ci_classify() {
-  python3 -c '
-import sys, json
-expected = sys.argv[1] if len(sys.argv) > 1 else ""
-try:
-    runs = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if not isinstance(runs, list):
-    sys.exit(0)
-PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
-FAIL = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
-def clean(s):
-    return str(s or "").replace("\t", " ").replace("\n", " ").strip()
-for r in runs:                       # gh returns newest-first
-    if not isinstance(r, dict):
-        continue
-    if expected and r.get("headSha") != expected:
-        continue
-    if str(r.get("status") or "").upper() != "COMPLETED":
-        continue                     # not terminal for this sha yet → no verdict
-    concl = str(r.get("conclusion") or "").upper()
-    if concl in FAIL:   bucket = "fail"
-    elif concl in PASS: bucket = "pass"
-    else:               bucket = "pending"   # CANCELLED / STALE / unknown → never red
-    run_id = r.get("databaseId")
-    sys.stdout.write("%s\t%s\t%s\t%s\n" % (bucket, clean(r.get("workflowName")), concl or "?", run_id if run_id else ""))
-    break
-' "$1"
+  _ci_verdict_run classify "${1:-}"
 }
 
 # _main_ci_starve_scan — HERD-545: read the SAME `gh run list --json …` array on stdin as
@@ -9448,41 +9466,11 @@ for r in runs:                       # gh returns newest-first
 # preserving the empty field, shifting every later column (the exact hazard $MAIN_HEALTH_STATE's own
 # US-vs-tab comment already warns about). bucket is pass|fail|none (no conclusive run anywhere in the
 # window — deep starvation). NOTHING on bad JSON / not-a-list / empty input. python3 stdlib only.
+#
+# HERD-578: delegated to pysrc/herd/ci_verdict.py (`starve-scan`, the sha-unfiltered read of the SAME
+# classify_runs the sha-scoped classification above uses). Output shape unchanged.
 _main_ci_starve_scan() {
-  python3 -c '
-import sys, json
-try:
-    runs = json.load(sys.stdin)
-except Exception:
-    sys.exit(0)
-if not isinstance(runs, list):
-    sys.exit(0)
-PASS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
-FAIL = {"FAILURE", "TIMED_OUT", "STARTUP_FAILURE", "ACTION_REQUIRED"}
-def clean(s):
-    return str(s or "").replace("\x1f", " ").replace("\t", " ").replace("\n", " ").strip()
-in_progress = 0
-cancelled_shas = set()
-bucket, wf, concl, run_id, run_sha = "none", "", "", "", ""
-for r in runs:                       # gh returns newest-first
-    if not isinstance(r, dict):
-        continue
-    sha = clean(r.get("headSha"))
-    if str(r.get("status") or "").upper() != "COMPLETED":
-        in_progress = 1              # still running somewhere in the window — never redispatch onto it
-        continue
-    c = str(r.get("conclusion") or "").upper()
-    if c in PASS or c in FAIL:
-        bucket = "pass" if c in PASS else "fail"
-        wf, concl, run_sha = clean(r.get("workflowName")), c, sha
-        rid = r.get("databaseId")
-        run_id = str(rid) if rid else ""
-        break                        # newest conclusive run wins — everything above it was no-signal
-    if sha:
-        cancelled_shas.add(sha)      # CANCELLED / STALE / unknown terminal conclusion — no-signal
-US = "\x1f"
-sys.stdout.write(US.join([bucket, wf, concl, run_id, run_sha, str(len(cancelled_shas)), str(in_progress)]) + "\n")
-'
+  _ci_verdict_run starve-scan
 }
 
 # _main_health_ci_redispatch_marker <sha> — run-once-per-sha guard for the HERD-545 fresh-signal
@@ -11662,6 +11650,40 @@ EOF
   _main_health_ci_log_identity "$_cfi_run"
 }
 
+# _ci_fastbounce_class <branch> <sha> — HERD-609/HERD-578: WHY this PR's CI run failed, through the
+# shared mapping (pysrc/herd/ci_verdict.py). Prints "<kind>\t<detail>", kind ∈ code|infra|unknown, or
+# nothing at all when CI cannot be read. Consulted ONLY on the path where no honest identity was
+# derived, to tell the two very different silences apart:
+#   • infra   — the 2026-08-06 Actions-outage shape: every failed job died before a test ran, carrying
+#               a platform signature. The builder has NOTHING to fix, so a bounce would burn a real
+#               refix round on a red that is not theirs. Journaled as its own reason and never bounced.
+#   • unknown — a log we genuinely could not read (the pre-existing ci-log-unreadable path, unchanged).
+# The bounded auto-RERUN of an infra-transient run belongs to the leg where CI is the AUTHORITATIVE
+# gate (HEALTH_SOURCE=ci, pysrc/herd/live_runtime.py:_ci_infra_rerun); here the local suite is still
+# the authority and will verdict this sha on its own, so this leg only classifies and records.
+#
+# Test seam: HERD_CI_FASTBOUNCE_CLASS, when SET (even to ""), is returned verbatim with no gh call.
+_ci_fastbounce_class() {
+  local _cfc_branch="$1" _cfc_sha="$2"
+  if [ -n "${HERD_CI_FASTBOUNCE_CLASS+set}" ]; then
+    printf '%s' "$HERD_CI_FASTBOUNCE_CLASS"
+    return 0
+  fi
+  [ -n "$_cfc_branch" ] && [ -n "$_cfc_sha" ] || return 0
+  local _cfc_json _cfc_res _cfc_bucket _cfc_wf _cfc_concl _cfc_run
+  _cfc_json="$(_gh_timeout ci_fastbounce_class run list --branch "$_cfc_branch" --limit 20 \
+                 --json headSha,status,conclusion,workflowName,databaseId 2>/dev/null)" || return 0
+  [ -n "$_cfc_json" ] || return 0
+  _cfc_res="$(printf '%s' "$_cfc_json" | _main_ci_classify "$_cfc_sha")"
+  [ -n "$_cfc_res" ] || return 0
+  IFS=$'\t' read -r _cfc_bucket _cfc_wf _cfc_concl _cfc_run <<EOF
+$_cfc_res
+EOF
+  [ "$_cfc_bucket" = "fail" ] || return 0
+  [ -n "$_cfc_run" ] || return 0
+  _main_health_ci_log_class "$_cfc_run"
+}
+
 # _handle_ci_fastbounce <pr#> <slug> <headSha> <display-idx> <worktree-dir> <branch> <ci-summary>
 # Called from the same UNSTABLE+fail spot as _handle_ci_repair, only when that handler returned 1 (off,
 # or a genuinely real — not inherited — CI failure). Returns 0 if THIS handler set DISPLAY (bounced,
@@ -11678,10 +11700,20 @@ _handle_ci_fastbounce() {
 
   _cfb_id="$(_ci_fastbounce_identity "$_cfb_branch" "$_cfb_sha")"
   if [ -z "$_cfb_id" ]; then
+    # HERD-609: distinguish "the platform failed" from "we could not read the log". Both decline to
+    # bounce (identical control flow, identical row), but only one of them is evidence of an OUTAGE —
+    # and the outage that grounded this rule stood for a full night precisely because nothing ever
+    # said so out loud. Same once-guard, so neither reason re-journals per tick.
+    local _cfb_class _cfb_kind _cfb_detail _cfb_reason=ci-log-unreadable
+    _cfb_class="$(_ci_fastbounce_class "$_cfb_branch" "$_cfb_sha")"
+    IFS=$'\t' read -r _cfb_kind _cfb_detail <<EOF
+$_cfb_class
+EOF
+    [ "${_cfb_kind:-}" = "infra" ] && _cfb_reason=infra-transient
     if ! _refix_dead_seen "$_cfb_pr" "ci-fastbounce-unreadable-$_cfb_sha"; then
       _record_refix_dead "$_cfb_pr" "ci-fastbounce-unreadable-$_cfb_sha"
       journal_append ci_fastbounce pr "$_cfb_pr" sha "$_cfb_sha" slug "$_cfb_slug" \
-        result skipped reason ci-log-unreadable
+        result skipped reason "$_cfb_reason" detail "${_cfb_detail:-}"
     fi
     return 1
   fi
