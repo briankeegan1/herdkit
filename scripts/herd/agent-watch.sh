@@ -3195,7 +3195,15 @@ render() {
   fi
   frame="${frame}  ${C_DIM}in flight${C_RESET}"$'\n'
   if [ "${#DISPLAY[@]}" -eq 0 ]; then
-    frame="${frame}    ${C_DIM}— idle —${C_RESET}"$'\n'
+    # HERD-615: a first-tick skeletal paint (see _tick_render_reconcile) reaches this render() call
+    # BEFORE the PR roster is even fetched — DISPLAY is empty because nothing has been classified yet,
+    # not because the herd is idle. "— idle —" would be a fabricated claim (the exact lie this file's
+    # other rows are careful never to tell); say what is actually true instead.
+    if [ -n "${_RENDER_GATHERING:-}" ]; then
+      frame="${frame}    ${C_DIM}⏳ gathering — first probes in flight…${C_RESET}"$'\n'
+    else
+      frame="${frame}    ${C_DIM}— idle —${C_RESET}"$'\n'
+    fi
   else
     for line in "${DISPLAY[@]}"; do frame="${frame}${line}"$'\n'; done
   fi
@@ -3203,6 +3211,44 @@ render() {
     clear
     if printf '%b' "$frame"; then last_frame="$frame"; fi
   fi
+}
+
+# _first_frame_paint — HERD-615 COLD-START FIRST FRAME. _tick_render_reconcile calls this ONE line
+# below its last purely-local build_* call and BEFORE _prs_fetch_tick (its first `gh` call): every
+# section var render() reads at that point (HDR_LINE/RULE plus LANDED/BLOCKED/TRACKER_DRIFT/
+# SPAWN_HOLDS/MAIN_HEALTH/… — see docs/engine-debug-topology's "every console row renders from a
+# ledger file" note) is already a ledger/local read, so a render() call THERE costs no network at all.
+# Everything after it in the tick DOES shell out — _prs_fetch_tick's `gh pr list`, the driver's agent
+# roster, and (inside the FEATS loop further down) per-PR mergeability/CI checks — and each of those
+# can individually hold for up to _GH_TIMEOUT_DEFAULT_SECS. Chained on a cold start (a fresh `gh`
+# process with no warm auth/DNS cache) that is where the ~60s "stuck at the banner" cold open came
+# from (operator report 2026-08-10): NOTHING painted until every one of them had returned, because the
+# tick's only `render` call sat at the very bottom.
+#
+# Fires ONCE per process (the guard below) and is otherwise a hard no-op — every tick after the first
+# skips this function entirely, byte-identical to before it existed. DISPLAY is still empty here (the
+# PR roster hasn't been fetched yet), so render() is told to paint an honest "gathering" row via
+# _RENDER_GATHERING instead of the ordinary — and here FALSE — "— idle —" claim (see render()'s
+# in-flight branch). The calling tick then falls straight through to the slow probes exactly as
+# before; render()'s own last_frame diff means its normal end-of-tick call repaints for free the
+# moment the real rows are ready — no extra process, no extra sleep, no second tick.
+_first_frame_paint() {
+  [ -z "${_FIRST_FRAME_PAINTED:-}" ] || return 0
+  _FIRST_FRAME_PAINTED=1
+  local _ff_t0_ms _ff_t1_ms _ff_elapsed_ms
+  # Portable ms clock (`date`'s %N is GNU-only — see sim/sandbox-capacity-ledger-scenario.sh's own
+  # now_ms for the same idiom); fails soft to 0 elapsed on a python3-less box, never a crash.
+  _ff_t0_ms="$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo 0)"
+  _RENDER_GATHERING=1
+  render
+  unset _RENDER_GATHERING
+  _ff_t1_ms="$(python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || echo 0)"
+  _ff_elapsed_ms=$(( _ff_t1_ms - _ff_t0_ms ))
+  [ "$_ff_elapsed_ms" -ge 0 ] || _ff_elapsed_ms=0
+  journal_append first_frame elapsed_ms "$_ff_elapsed_ms"
+  # Feeds the ANOMALY_BASELINES rail (ship-dormant off it; see _phase_anomaly_observe) so a first
+  # frame that regresses back toward the slow-probe hold this fix removes is caught automatically.
+  _phase_anomaly_observe first_frame "first frame" "$(( _ff_elapsed_ms / 1000 ))"
 }
 
 # already_merged — moved to work-units/git-pr.sh (HERD-398, Phase 3 work-unit extraction).
@@ -17100,6 +17146,11 @@ _tick_render_reconcile() {
   build_sweep_note
   build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
   build_gate_scale_note       # HERD-542: derived review/health caps when GATE_SCALE=on has scaled them
+
+  # HERD-615: paint the cold-start skeletal frame — see _first_frame_paint's own header for why this
+  # sits exactly here (every build_* call above this line is a pure ledger/local read; everything
+  # below can shell out to `gh`).
+  _first_frame_paint
 
   # Fetch open PRs (HERD-224: capture success vs failure — never collapse a blip into '[]' and then
   # claim "awaiting task"). On success, apply the configured watcher view (lens + filters). The view
