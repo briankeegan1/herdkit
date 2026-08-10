@@ -304,6 +304,58 @@ grep -q ' escalated #514 515 unknown$' "$HERD_TSWEEP_NOTE_FILE" || fail "a shape
 [ "$(grep -c . "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null)" -eq 1 ] || fail "expected exactly one console note for #514, got $(grep -c . "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null)"
 pass
 
+# ── (10) HERD-613 LEG 3: auto-retire — an escalated row whose ref FAILS the shape guard auto-acks;
+#         a VALID-shaped escalated row is untouched (guardrail: real drift must still escalate loudly).
+cat > "$REPO/.herd/config" <<EOF
+PROJECT_ROOT="$REPO"
+WORKTREES_DIR="$T/trees"
+DEFAULT_BRANCH="main"
+BACKLOG_FILE="BACKLOG.md"
+SCRIBE_BACKEND="linear"
+EOF
+export HERD_TSWEEP_ACK_FILE="$T/trees/.tracker-heals-acked"
+: > "$HERD_TSWEEP_NOTE_FILE"; rm -f "$HERD_TSWEEP_ACK_FILE"
+cat > "$HERD_TSWEEP_NOTE_FILE" <<EOF
+1786040000 escalated test-py-merge-fairness.sh,test-py-live-runtime.sh 712 unknown
+1786040001 escalated HERD-999 727 unknown
+EOF
+: > "$T/prs-empty.tsv"
+out="$(SCRIBE_BACKEND_DIR="$BACKENDS" run_sweep "$T/prs-empty.tsv")" || fail "(10) sweep exited non-zero: $out"
+grep -qF '1786040000 escalated test-py-merge-fairness.sh,test-py-live-runtime.sh 712 unknown' "$HERD_TSWEEP_ACK_FILE" \
+  || fail "(10) the shape-invalid escalated row was not auto-acked: $(cat "$HERD_TSWEEP_ACK_FILE" 2>/dev/null)"
+grep -qF '1786040001 escalated HERD-999 727 unknown' "$HERD_TSWEEP_ACK_FILE" \
+  && fail "(10) a VALID-shaped escalated row was wrongly auto-acked — real drift must still escalate loudly"
+grep -q '^1786040000 escalated' "$HERD_TSWEEP_NOTE_FILE" || fail "(10) auto-retire must never rewrite the ledger — history preserved"
+pass
+# idempotent: a second sweep never appends a duplicate ack line.
+before_acks="$(grep -c . "$HERD_TSWEEP_ACK_FILE" 2>/dev/null || echo 0)"
+out2="$(SCRIBE_BACKEND_DIR="$BACKENDS" run_sweep "$T/prs-empty.tsv")" || fail "(10) second sweep exited non-zero: $out2"
+after_acks="$(grep -c . "$HERD_TSWEEP_ACK_FILE" 2>/dev/null || echo 0)"
+[ "$before_acks" -eq "$after_acks" ] || fail "(10) auto-retire is not idempotent: $before_acks -> $after_acks acks"
+pass
+
+# ── (11) HERD-613 LEG 3: one-time migration — the two known-malformed PR-712/719 rows (named by their
+#         exact historical epoch) are dropped from the ledger outright; anything else is untouched. ──
+cat > "$HERD_TSWEEP_NOTE_FILE" <<EOF
+1785854043 healed HERD-512 629 in-progress
+1785994821 escalated test-py-merge-fairness.sh,test-py-live-runtime.sh,test-config-manifest.sh 712 unknown
+1785998819 escalated test-gh-rate-limit-backoff.sh,test-healthcheck-project-env-manifest.sh 719 unknown
+1786031691 escalated HERD-999 727 unknown
+EOF
+rm -f "$HERD_TSWEEP_ACK_FILE"
+out="$(SCRIBE_BACKEND_DIR="$BACKENDS" run_sweep "$T/prs-empty.tsv")" || fail "(11) sweep exited non-zero: $out"
+grep -q 'HERD-613 one-time migration' <<< "$out" || fail "(11) the sweep did not report the one-time migration: $out"
+grep -q '^1785994821 ' "$HERD_TSWEEP_NOTE_FILE" && fail "(11) the PR-712 malformed row was not dropped: $(cat "$HERD_TSWEEP_NOTE_FILE")"
+grep -q '^1785998819 ' "$HERD_TSWEEP_NOTE_FILE" && fail "(11) the PR-719 malformed row was not dropped: $(cat "$HERD_TSWEEP_NOTE_FILE")"
+grep -q '^1785854043 healed HERD-512' "$HERD_TSWEEP_NOTE_FILE" || fail "(11) an unrelated healed row was wrongly touched by the migration"
+grep -q '^1786031691 escalated HERD-999' "$HERD_TSWEEP_NOTE_FILE" || fail "(11) an unrelated valid-shaped escalated row was wrongly dropped by the migration"
+pass
+# idempotent: a second sweep finds nothing left to migrate.
+out2="$(SCRIBE_BACKEND_DIR="$BACKENDS" run_sweep "$T/prs-empty.tsv")" || fail "(11) second sweep exited non-zero: $out2"
+grep -q 'HERD-613 one-time migration' <<< "$out2" && fail "(11) the migration re-ran on an already-clean ledger: $out2"
+pass
+unset HERD_TSWEEP_ACK_FILE
+
 # ── (6) the file backend (no update-state op) makes the sweep byte-inert ───────
 cat > "$REPO/.herd/config" <<EOF
 PROJECT_ROOT="$REPO"

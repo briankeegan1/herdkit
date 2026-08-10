@@ -513,6 +513,16 @@ CI_CHECKS_STATE="$TREES/.agent-watch-ci-checks"
 # the console, never a silent correction.
 TRACKER_SWEEP_LEDGER="$TREES/.agent-watch-tracker-swept"
 TRACKER_HEAL_FILE="$TREES/.agent-watch-tracker-heals"
+# TRACKER_HEAL_ACK — HERD-613 LEG 3: the ACK ledger for tracker-heal console rows (mirrors
+# BUILDER_NOTES_ACK/HERD-243). A `failed`/`escalated` row is LOUD by design (build_tracker_drift below
+# never ages it out on its own) — before this, the ONLY way a row left the console was a fresh `healed`
+# row for the SAME ref superseding it, which an escalated ref that will NEVER resolve (a shape-invalid
+# `Refs:` value — pr-ref.sh's HERD-613 shape guard) can never produce. One verbatim ledger line per row
+# an operator has handled via `herd tracker-heals ack <n|all>`, OR tracker-state-sweep.sh's own
+# auto-retire leg for an escalated row whose ref fails the shape guard (belt-and-suspenders: a valid-
+# shaped ref that genuinely will not resolve still escalates loudly and is NEVER auto-acked). The
+# ledger (and the journal) are never touched — only the console clears.
+TRACKER_HEAL_ACK="$TREES/.agent-watch-tracker-heals-acked"
 # UNPARSEABLE-REF alarm surface (HERD-522, GH #637). One "<epoch>\t<pr>\t<line>" row per merged PR
 # whose body MENTIONED `refs:` yet yielded no parseable tracker id — the shape that used to reconcile
 # silently to nothing (emberglen-godot PR #125's `## Refs: EMG-111` heading: item left open, no
@@ -1090,7 +1100,7 @@ EOF
 build_tracker_drift() {
   TRACKER_DRIFT=""
   local rows
-  rows="$(herd_console_section_tracker "$TRACKER_HEAL_FILE" 3 _tracker_heal_row)"
+  rows="$(herd_console_section_tracker "$TRACKER_HEAL_FILE" 3 _tracker_heal_row "$TRACKER_HEAL_ACK")"
   [ -n "$rows" ] && TRACKER_DRIFT="${rows}"$'\n'
   return 0
 }
@@ -8468,6 +8478,52 @@ _main_health_honest_identity() {
 # can spy on it without spawning a real drainer. Best-effort by construction: an alarm never fails a tick.
 _main_health_scribe() { bash "$HERE/scribe.sh" "$1" >/dev/null 2>&1 || true; }
 
+# _main_health_scribe_sync <text> — HERD-613: a SYNCHRONOUS create attempt through the ACTIVE tracker
+# backend, so the spawn leg below (_main_health_autofix_spawn) can thread the item's REAL tracker id as
+# HERD_ITEM_REF the moment it exists — never the failing-test identity. PRs 712/719: the pre-existing
+# code threaded the raw failing-test identity as the ref whenever no OPEN item already matched it, and
+# an auto-spawned builder faithfully wrote that string into its own PR's `Refs:` line — a non-empty
+# token that parsed clean (pre-HERD-613 LEG 2) and then sat forever as an unresolvable ESCALATED
+# tracker-heal row with no operator clear path (LEG 3).
+#
+# `_main_health_scribe`'s ordinary path is fully ASYNC — it only enqueues a request file and ensures a
+# live scribe DRAINER (an agent process) is running to apply it later, so THIS tick can never learn
+# that item's id. This function instead sources the backend directly (mirroring _reconcile_via_ref's
+# subshell pattern) and calls its OWN `_backend_add_item` synchronously — the exact op the async
+# drainer eventually calls too, just called here, now, so the create's result is available before this
+# tick's spawn decision. The default `file` backend needs a scribe AGENT to stage the BACKLOG.md edit
+# first (this tick cannot do that), so it — like a backend with no create op, an unreachable backend, or
+# a create call that itself fails — always prints NOTHING: the caller falls back to the ordinary async
+# enqueue and spawns with no ref, never a fabricated one. On a CONFIRMED create (_BACKEND_RESULT=DONE),
+# the created item's ref is pulled out of the backend's own output via herd_pr_ref_find_in_text — LEG
+# 2's SAME per-backend shape guard, so a ref this function would hand to a builder is always one
+# pr-ref.sh would also accept back out of that builder's PR body. Fully fail-soft: never blocks or
+# fails the tick, and the caller still enqueues via _main_health_scribe for the ordinary async
+# record/report trail regardless of whether this synchronous attempt lands.
+_main_health_scribe_sync() {
+  local _ss_text="$1" _ss_backend="${SCRIBE_BACKEND:-file}" _ss_bdir _ss_bfile _ss_out _ss_ref
+  [ "$_ss_backend" != "file" ] || return 0
+  _ss_bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+  _ss_bfile="$_ss_bdir/${_ss_backend}.sh"
+  [ -f "$_ss_bfile" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  _ss_out="$(
+    _secrets="$MAIN/.herd/secrets"
+    # shellcheck source=/dev/null
+    [ -f "$_secrets" ] && . "$_secrets"
+    # shellcheck source=/dev/null
+    . "$_ss_bfile" 2>/dev/null || exit 0
+    command -v _backend_add_item >/dev/null 2>&1 || exit 0
+    cd "$MAIN" 2>/dev/null || true
+    _BACKEND_RESULT=""
+    _backend_add_item "main-health-autofix" "$_ss_text" 2>/dev/null
+    [ "$_BACKEND_RESULT" = "DONE" ] || exit 0
+  )" || return 0
+  [ -n "$_ss_out" ] || return 0
+  _ss_ref="$(printf '%s\n' "$_ss_out" | herd_pr_ref_find_in_text "$_ss_backend")"
+  [ -n "$_ss_ref" ] && printf '%s' "$_ss_ref"
+}
+
 # _main_health_fix_pysrc — locate pysrc/ for the store-accessor shellout below (mirrors
 # herd_engine_live_tick's HERDKIT_HOME resolution in engine-version.sh), or empty when the module cannot
 # be found — every caller then fails soft (dedup treated as "skip filing", never a crash).
@@ -9050,19 +9106,31 @@ _main_health_autofix() {
   # nothing to double-build and would only wedge a claim it can never release). A rc=3 ALREADY means
   # someone else — e.g. the coordinator's own pick-and-spawn flow — already owns this exact repair;
   # back off before filing or enqueueing a duplicate.
-  local _af_ref="$_af_id" _af_dedup_rc=0
+  local _af_ref="" _af_dedup_rc=0
   if _main_health_autofix_spawn_enabled; then
     _af_ref="$(_main_health_dedup_ref "$_af_id")"; _af_dedup_rc=$?
     if [ "$_af_dedup_rc" -eq 3 ]; then
       journal_append main_health_autofix pr "$_af_pr" sha "$_af_sha" failed "$_af_id" result dedup_claimed
       return 0
     fi
-    [ -n "$_af_ref" ] || _af_ref="$_af_id"
   fi
-  # Reuse: an OPEN item already matched and we just claimed it above — file no redundant duplicate.
-  if [ "$_af_ref" = "$_af_id" ]; then
+  # Reuse: an OPEN item already matched and we just claimed it above (_af_ref is its real id) — file no
+  # redundant duplicate. Otherwise file a NEW one. HERD-613: never fall back to the raw failing-test
+  # identity as the ref (PRs 712/719 — a builder faithfully wrote that string into its own PR's
+  # `Refs:` line, producing an unresolvable-forever ESCALATED tracker-heal row). Try a SYNCHRONOUS
+  # create first — _main_health_scribe_sync sources the ACTIVE backend directly and, on a confirmed
+  # create whose own output shape-checks (LEG 2's same per-backend guard), returns the item's REAL id
+  # so this tick's spawn below can cite it immediately. Only when that yields nothing (the default
+  # `file` backend, an unreachable backend, a create that itself failed) does this fall back to the
+  # ordinary ASYNC scribe enqueue — which the async drainer applies later with no id available to this
+  # tick at all, so _af_ref stays empty and the spawn below goes out UNTRACKED rather than mislabeled.
+  if [ -z "$_af_ref" ]; then
     # First line is the tracker TITLE (the backend takes it verbatim) — keep it short; body carries context.
-    _main_health_scribe "MAIN RED: fix ${_af_id}
+    _af_ref="$(_main_health_scribe_sync "MAIN RED: fix ${_af_id}
+The default branch is RED at sha ${_af_sha} (landed as PR #${_af_pr}).
+Failing test: ${_af_detail}
+Add a 🔜 item to fix it. Do not close it until main-health goes green.")"
+    [ -n "$_af_ref" ] || _main_health_scribe "MAIN RED: fix ${_af_id}
 The default branch is RED at sha ${_af_sha} (landed as PR #${_af_pr}).
 Failing test: ${_af_detail}
 Add a 🔜 item to fix it. Do not close it until main-health goes green."
@@ -9082,17 +9150,20 @@ Add a 🔜 item to fix it. Do not close it until main-health goes green."
 # Dispatches through the SAME durable spawn queue the coordinator's own spawn.sh enqueues to (drained by
 # _drain_spawn_queue → herd-quick.sh) — a TRACKED + CLAIMED quick-lane build, not a bespoke launch path:
 # HERD_ITEM_REF carries <ref> (HERD-543: the REAL tracker id _main_health_dedup_ref already resolved
-# and claimed, when the caller found+claimed an OPEN item loosely matching this identity; else the same
-# raw failing identity string as before — <ref> defaults to <identity> so a caller passing only 4 args
-# is byte-identical), so the builder's PR carries a 'Refs:' line and, when CLAIM_REQUIRED is on,
-# herd-claim.sh attempts an atomic (self-)claim on it before any worktree/agent is created — exactly the
-# two guarantees "tracked+claimed" names. (A ref that does not yet resolve to a real tracker item — a
-# freshly scribe-filed item is created ASYNCHRONOUSLY by the drainer — degrades no worse than any other
-# untracked spawn: merge-time reconcile falls back to its existing fuzzy slug/title match, per
-# agent-watch.sh's own _reconcile_via_ref contract.) The slug embeds the SHA, never just the identity,
-# so a LATER regression of the same test — which _main_health_fix_clear re-arms for filing once main
-# goes green — gets its own fresh worktree instead of colliding with one still sitting from a prior
-# cycle.
+# and claimed, when the caller found+claimed an OPEN item loosely matching this identity; else HERD-613:
+# the REAL id a synchronous backend create just returned (_main_health_scribe_sync), or — when neither
+# resolved — EMPTY, on purpose: <ref> defaults to EMPTY, never to <identity>, because the raw
+# failing-test identity is not a tracker id and a builder spawned with it as HERD_ITEM_REF faithfully
+# writes it into its own PR's `Refs:` line (PRs 712/719 — the incident this closes: an unresolvable-
+# forever ESCALATED tracker-heal row with no operator clear path). So the builder's PR carries a real
+# 'Refs:' line whenever one is known, and, when CLAIM_REQUIRED is on, herd-claim.sh attempts an atomic
+# (self-)claim on it before any worktree/agent is created — exactly the two guarantees "tracked+claimed"
+# names. An empty ref degrades no worse than any other untracked spawn: merge-time reconcile falls back
+# to its existing fuzzy slug/title match, per agent-watch.sh's own _reconcile_via_ref contract, and
+# TRACKED_SPAWNS=required (off by default) is the only gate that would ever refuse it outright. The slug
+# embeds the SHA, never just the identity, so a LATER regression of the same test — which
+# _main_health_fix_clear re-arms for filing once main goes green — gets its own fresh worktree instead
+# of colliding with one still sitting from a prior cycle.
 #
 # RISK, spelled out because this is the one path in the whole MAIN_HEALTH_AUTOFIX feature that writes
 # code unattended: the builder still goes through the ordinary pipeline (its own light healthcheck, then
@@ -9100,7 +9171,7 @@ Add a 🔜 item to fix it. Do not close it until main-health goes green."
 # merging. Fully fail-soft: a missing spawn.sh, or a non-zero enqueue, is journaled and never blocks or
 # fails the tick — the scribe file above has already happened by the time this runs.
 _main_health_autofix_spawn() {
-  local _as_pr="$1" _as_sha="$2" _as_id="$3" _as_detail="$4" _as_ref="${5:-$3}" _as_slug _as_out _as_rc=0
+  local _as_pr="$1" _as_sha="$2" _as_id="$3" _as_detail="$4" _as_ref="${5:-}" _as_slug _as_out _as_rc=0
   _main_health_autofix_spawn_enabled || return 0
   if [ ! -f "$HERE/spawn.sh" ]; then
     journal_append main_health_autofix_spawn pr "$_as_pr" sha "$_as_sha" failed "$_as_id" result skipped reason no-spawn-sh

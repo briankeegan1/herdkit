@@ -291,6 +291,65 @@ NOPY_ALL="$(
   || fail "(9c) the no-python3 multi-ref fallback returned: $NOPY_ALL"
 ok; echo "PASS (9c) without python3 the multi-ref extraction still dedups, decorates and skips placeholders"
 
+# ══ (9d) HERD-613 — PER-BACKEND SHAPE GUARD ═══════════════════════════════════════════════════════
+# PRs 712/719: an auto-spawned builder carried a `Refs:` line full of comma-joined TEST FILENAMES
+# instead of a tracker id — a non-empty token that, pre-HERD-613, parsed clean under (4)'s "no shape
+# test" rule and then sat forever as an unresolvable ESCALATED tracker-heal row. Under a backend with
+# a KNOWN tracker-id shape (linear/jira: TEAM-NUMBER; github: optional-hash-digits), a token that does
+# not conform is now treated exactly like an empty/placeholder token: pr_ref_from_body yields nothing
+# and the silent-miss alarm reports it instead. The default `file` backend (and anything else this
+# repo's suite never sets SCRIBE_BACKEND to) stays completely exempt — (4) above already proves that,
+# unconditionally, since none of these tests ever export SCRIBE_BACKEND.
+_ref_be()      { SCRIBE_BACKEND="$1" bash -c ". '$LIB'; printf '%s' \"\$1\" | herd_pr_ref_from_body" _ "$2"; }
+_unparsed_be() { SCRIBE_BACKEND="$1" bash -c ". '$LIB'; printf '%s' \"\$1\" | herd_pr_ref_unparsed_line" _ "$2"; }
+_all_be()      { SCRIBE_BACKEND="$1" bash -c ". '$LIB'; printf '%s' \"\$1\" | herd_pr_ref_all_from_body" _ "$2"; }
+
+got="$(_ref_be linear 'Refs: HERD-613')"
+[ "$got" = "HERD-613" ] || fail "(9d) a shape-valid linear ref stopped parsing under SCRIBE_BACKEND=linear: '$got'"
+got="$(_unparsed_be linear 'Refs: HERD-613')"
+[ -z "$got" ] || fail "(9d) a shape-valid linear ref wrongly alarmed: '$got'"
+
+got="$(_ref_be linear 'Refs: test-py-merge-fairness.sh,test-py-live-runtime.sh')"
+[ -z "$got" ] || fail "(9d) the PR-712/719 comma-joined-filenames shape parsed as a literal ref under linear: '$got'"
+got="$(_unparsed_be linear 'Refs: test-py-merge-fairness.sh,test-py-live-runtime.sh')"
+[ "$got" = "Refs: test-py-merge-fairness.sh,test-py-live-runtime.sh" ] \
+  || fail "(9d) the PR-712/719 shape did not route to the silent-miss alarm: '$got'"
+
+got="$(_ref_be github 'Refs: #45')"
+[ "$got" = "#45" ] || fail "(9d) a shape-valid github ref stopped parsing under SCRIBE_BACKEND=github: '$got'"
+got="$(_ref_be github 'Refs: 45')"
+[ "$got" = "45" ] || fail "(9d) a bare-digits github ref stopped parsing: '$got'"
+got="$(_ref_be github 'Refs: HERD-522')"
+[ -z "$got" ] || fail "(9d) a linear-shaped ref wrongly parsed under SCRIBE_BACKEND=github: '$got'"
+
+# the default (unset) backend, and any backend this map does not name, stay exempt — a title slug
+# still parses under EVERY unnamed backend, never just 'file'.
+got="$(_ref_be changelog 'Refs: healthcheck-sha-cache')"
+[ "$got" = "healthcheck-sha-cache" ] || fail "(9d) a slug ref stopped parsing under an unnamed backend (changelog): '$got'"
+
+# pr_ref_all_from_body: a shape-invalid line is SKIPPED (scan continues), not an abort — mirrors how a
+# placeholder line is skipped in (9b), not treated as a first-line veto.
+got="$(_all_be linear "$(printf 'Refs: test-a.sh,test-b.sh\nRefs: HERD-9\n')")"
+[ "$got" = "HERD-9" ] || fail "(9d) a shape-invalid line wrongly blanked out a later valid multi-ref line: '$got'"
+ok; echo "PASS (9d) a backend-shape-invalid Refs: token never parses as a literal ref, and alarms instead"
+
+# ── herd_pr_ref_shape_ok / herd_pr_ref_find_in_text — the standalone wrappers LEG 1 reuses ────────
+. "$LIB"
+herd_pr_ref_shape_ok "HERD-613" linear || fail "(9d) herd_pr_ref_shape_ok rejected a valid linear shape"
+! herd_pr_ref_shape_ok "not-a-tracker-id.sh" linear \
+  || fail "(9d) herd_pr_ref_shape_ok accepted a shape-invalid token under linear"
+herd_pr_ref_shape_ok "anything-goes" file || fail "(9d) herd_pr_ref_shape_ok rejected a slug under the file backend"
+
+got="$(printf 'https://linear.app/herdkit/issue/HERD-613/guard-ref-shape' | herd_pr_ref_find_in_text linear)"
+[ "$got" = "HERD-613" ] || fail "(9d) herd_pr_ref_find_in_text did not pull HERD-613 out of a linear issue URL: '$got'"
+got="$(printf 'https://github.com/org/repo/issues/45' | herd_pr_ref_find_in_text github)"
+[ "$got" = "45" ] || fail "(9d) herd_pr_ref_find_in_text did not pull 45 out of a github issue URL: '$got'"
+got="$(printf 'no id anywhere in this text' | herd_pr_ref_find_in_text linear)"
+[ -z "$got" ] || fail "(9d) herd_pr_ref_find_in_text fabricated a ref out of text with none: '$got'"
+got="$(printf 'https://linear.app/herdkit/issue/HERD-613/x' | herd_pr_ref_find_in_text file)"
+[ -z "$got" ] || fail "(9d) herd_pr_ref_find_in_text returned a ref for a backend with no fixed shape (file): '$got'"
+ok; echo "PASS (9d) herd_pr_ref_shape_ok / herd_pr_ref_find_in_text — the LEG 1 create-output helpers"
+
 # ══ Fixture for the watcher-side legs (10)–(12) ══════════════════════════════════════════════════
 MAIN="$T/main"; TREES="$T/trees"
 mkdir -p "$MAIN/.herd" "$TREES/.herd"
