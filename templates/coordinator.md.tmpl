@@ -330,6 +330,9 @@ repo/journal, not to the scribe:
    limit-park / pane** seam, name the exact **sandbox sim scenario + the seam** it exercises (see
    *Verify GATE / MERGE …* above) — a green scorecard is the proof. Otherwise name the **test surface**
    (which `tests/*.sh` or unit covers it). An item with no verification plan ships the builder blind.
+   Where `CORE_SURFACE_GLOB` is armed this is not optional for a matching file surface: ask
+   `{{SCRIPTS_DIR}}/core-surface.sh scenarios <worktree>` and write the named scenario + the
+   serialization warning into the spec (see *The CORE SURFACE makes that requirement automatic*).
 6. **CONVENTIONS.** Bake in the engine defaults: **fail-soft** (a missing optional tool skips silently,
    never a red row), **ship-dormant / default-off** (new behavior rides behind a config key, off by
    default), and **byte-identical-when-off** (with the flag off the rendered/observed output is
@@ -562,6 +565,34 @@ scenario's invariants. **Thread this into the builder task spec whenever you spa
 item** (anything under `agent-watch.sh`, the lanes, `herd-review.sh`, or gate / merge / limit logic):
 tell the builder to reproduce the change in the matching sim scenario and confirm a clean scorecard
 before opening the PR, so the engine change is proven against the real gate loop, not just unit tests.
+
+### The CORE SURFACE makes that requirement automatic (HERD-577)
+
+Where `CORE_SURFACE_GLOB` is armed, the paragraph above stops being advice and becomes a **gate**:
+a PR whose diff matches the glob cannot merge without a green sandbox-sim scorecard, and core PRs
+merge **one at a time** (the second holds with a calm `core diff · serialized behind PR #N` row until
+the first lands). Ask the glob rather than guessing:
+
+```
+bash {{SCRIPTS_DIR}}/core-surface.sh paths     <worktree>   # the core paths this diff touches (rc 1 = not core)
+bash {{SCRIPTS_DIR}}/core-surface.sh scenarios <worktree>   # the sim scenario(s) that diff must prove
+```
+
+**Spawn rule — do this at task-spec time, not at gate time.** Before you spawn, run `core-surface.sh
+scenarios` against the item's intended file surface (or read the glob in `.herd/config`). If it comes
+back non-empty, write BOTH of these into the task spec verbatim:
+
+- *"Your diff touches the CORE SURFACE. Run `bash {{SCRIPTS_DIR}}/sim/<scenario>.sh --artifacts
+  /tmp/<slug>-sim` yourself and read back `result: pass` from its `scorecard.json` BEFORE `gh pr
+  create`; paste the scenario name + result into the PR body. The merge gate re-runs it — a red
+  scorecard bounces you on the `coresim` rail exactly like a red healthcheck."*
+- *"Core PRs SERIALIZE. If another core PR is open, yours will hold — blessed but not merged — until
+  that one lands, then re-gate against the new base. That hold is expected, not a stall."*
+
+Two coordinator consequences worth planning around: **do not spawn two core-surface items in
+parallel** expecting both to land in one window (they will queue — sequence them, or accept the
+latency), and when a core PR sits blessed-and-unmerged, check the console row before diagnosing a
+wedged watcher — `core diff · serialized behind PR #N` means the engine is working as designed.
 
 ## Pipeline throughput & scaling
 

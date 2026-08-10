@@ -1213,6 +1213,88 @@ class LiveState:
         except Exception:
             pass
 
+    # core-surface substrate (CORE_SURFACE_GLOB, HERD-577) ────────────────────────────────────────
+    # A SEPARATE namespace from every rail above — never shares a filename with one — so with the
+    # lever off (an empty glob) not one of these files is ever created and every existing glob
+    # (``.health-*``, ``.review-*``, ``.merge-result-*``) sees exactly what it saw before. Same
+    # dispatch/collect/in-flight shape as the health rail: the sha-keyed VERDICT is durable (a sim
+    # proven green for this exact commit is never re-run), the dispatch out-file and the in-flight
+    # marker are scratch. ``core_wait_file`` is the render-side half of the serialize leg: the
+    # console (agent-watch.sh:_gate_phase_row) reads it to paint the calm "waiting on PR #N" row, so
+    # the hold is never a silent stall.
+    def core_surface_result_file(self, pr, sha):
+        return self._p(".core-surface-result-%s-%s" % (pr, sha))
+
+    def core_surface_dispatch_file(self, pr, sha):
+        return self._p(".core-surface-dispatch-%s-%s" % (pr, sha))
+
+    def core_surface_inflight_file(self, pr, sha):
+        return self._p(".core-surface-inflight-%s-%s" % (pr, sha))
+
+    def core_surface_log_file(self, pr, sha):
+        return self._p(".core-surface-log-%s-%s" % (pr, sha))
+
+    def core_surface_art_dir(self, pr, sha):
+        return self._p(".core-surface-art-%s-%s" % (pr, sha))
+
+    def core_wait_file(self, pr, sha):
+        return self._p(".core-surface-wait-%s-%s" % (pr, sha))
+
+    def core_surface_verdict(self, pr, sha):
+        """The TERMINAL scorecard verdict cached for this exact head sha (``PASS``/``FAIL``/``SKIP``),
+        or ``None``. Same one-line ``<verdict>\\t<detail>`` shape as the health sha-cache."""
+        path = self.core_surface_result_file(pr, sha)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                first = fh.readline().rstrip("\n")
+        except Exception:
+            return None
+        verdict = first.split("\t", 1)[0]
+        return verdict if verdict in ("PASS", "FAIL", "SKIP") else None
+
+    def core_surface_detail(self, pr, sha):
+        path = self.core_surface_result_file(pr, sha)
+        if not path or not os.path.exists(path):
+            return ""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                first = fh.readline().rstrip("\n")
+        except Exception:
+            return ""
+        parts = first.split("\t", 1)
+        return parts[1] if len(parts) > 1 else ""
+
+    def record_core_surface_verdict(self, pr, sha, verdict, detail=""):
+        path = self.core_surface_result_file(pr, sha)
+        if not path or not sha:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%s\t%s\n" % (verdict, detail or ""))
+        except Exception:
+            pass
+
+    def set_core_wait(self, pr, sha, front_pr):
+        """Record that this ``(pr, sha)`` is HELD behind ``front_pr`` on the core-diff serialization
+        (HERD-577 leg 2). Purely a RENDER side channel — the hold decision itself is re-derived from
+        the candidate set every tick and never reads this file back, so a stale marker can delay no
+        merge, only paint one extra console row until the next walk clears it."""
+        path = self.core_wait_file(pr, sha)
+        if not path or not sha:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%s\n" % front_pr)
+        except Exception:
+            pass
+
+    def clear_core_wait(self, pr, sha):
+        path = self.core_wait_file(pr, sha)
+        if path:
+            self.rm(path)
+
     # shared helpers ───────────────────────────────────────────────────────────────────────────────
     def once(self, pr, sha, kind):
         """Fire a hold's side effects exactly once per ``(pr, sha, kind)`` (once-guard doctrine, §5.3).
@@ -2124,6 +2206,34 @@ def _queue_sort_key(pr):
     return (0, int(s)) if s.isdigit() else (1, s)
 
 
+# ── CORE_SURFACE_GLOB — the load-bearing core needs a green sandbox-sim scorecard (HERD-577) ──────
+# SHIP-DORMANT. An EMPTY (or unset) glob is the feature OFF: no diff is ever read, no scenario is ever
+# dispatched, no marker is written and no `core_surface_*` event is journaled — the candidate walk,
+# every dispatch and every merge stay BYTE-IDENTICAL to before this feature.
+#
+# The glob itself is NOT re-implemented here (docs/multi-seat-doctrine.md Rule 2): the match, the
+# seam→scenario map and the scorecard read all live in scripts/herd/core-surface.sh, which this
+# module EXECUTES. Two hand-rolled matchers is exactly how the console and the gate come to disagree
+# about what "core" means.
+#
+# COMPOSITION WITH HEALTH_SOURCE (HERD-578): this is its OWN gate leg in the decide path, sequenced
+# AFTER whichever health rail produced the verdict — never a rider on the local suite dispatch. Under
+# HEALTH_SOURCE=ci no local suite is dispatched at all, so a scorecard requirement bolted onto that
+# dispatch would silently vanish for every CI-gated project; sequenced here it composes with BOTH
+# sources identically.
+
+def _core_surface_glob(config):
+    """The effective ``CORE_SURFACE_GLOB`` — ``""`` (feature off) when absent/empty. A COSMETICALLY
+    invalid glob is not validated here: the shared bash implementation feeds it to ``grep -E``, which
+    reports its own error, and an unusable pattern matches nothing → the feature is simply off for
+    that diff (never a false hold on a pattern nobody can parse)."""
+    return str((config or {}).get("CORE_SURFACE_GLOB", "") or "").strip()
+
+
+def _core_surface_enabled(config):
+    return bool(_core_surface_glob(config))
+
+
 def _watcher_scope(config):
     v = str(config.get("WATCHER_SCOPE", "") or "mine")
     return v if v in ("mine", "all") else "mine"                      # unknown → safe default (10764)
@@ -2620,6 +2730,12 @@ class LiveGates:
         # one tick, so at most ONE `claude --version` exec happens per tick no matter how many
         # candidates would otherwise dispatch a reviewer this round.
         self._claude_hang_cache = None
+        # CORE_SURFACE_GLOB (HERD-577): ship-dormant, default empty. Resolved ONCE per tick, same
+        # rationale as the levers above — an empty glob means `core_surface()` never reads a diff.
+        self._core_glob = _core_surface_glob(cfg)
+        # Tick-scoped memo of the (pr, sha) → matched-core-paths read. Two walks of one candidate (the
+        # gate leg and the serialize prepass) cost ONE `git diff`; the memo dies with the tick.
+        self._core_match_cache = {}
 
     def _script(self, name):
         return os.path.join(self.home, "scripts", "herd", name)
@@ -3036,6 +3152,171 @@ class LiveGates:
         self.journal.append("merge_result_gate_dispatched", "pr", cand.pr, "slug", cand.slug,
                             "sha", cand.sha, "base", base_sha, "pid", proc.pid, "log_path", log or "")
         return WAIT
+
+    # ── core-surface rail (CORE_SURFACE_GLOB, HERD-577) ────────────────────────────────────────────
+    # THE THIRD GATE LEG, and deliberately its own: `health` may come from a local suite OR from CI
+    # (HEALTH_SOURCE, HERD-578) and `review` is a model verdict; neither answers "does the engine still
+    # WORK end to end after this diff". For the ~6 load-bearing files that carry every compound
+    # failure, the answer has to be a sandbox-sim scorecard, and it has to be required in the DECIDE
+    # path so it composes with both health sources rather than riding on a dispatch one of them skips.
+    #
+    # Same async dispatch/collect/in-flight discipline as the health rail (reuse, not a new pattern):
+    #   1. NOT CORE / lever off → SKIP, with ZERO file I/O and zero journal lines.
+    #   2. REUSE   — a verdict already proven for this exact head sha is reused, no sim re-runs.
+    #   3. COLLECT — a finished worker's nonce-matched out-file becomes the durable verdict.
+    #   4. IN FLIGHT / slot budget → WAIT, never a second overlapping sim.
+    #   5. DISPATCH scripts/herd/core-surface.sh `run` detached, lay the marker, WAIT.
+
+    _CORE_SIM_MAX_INFLIGHT = 1   # sims fork whole sandbox repos + engine ticks; one at a time, project-wide
+
+    def core_surface_paths(self, cand):
+        """The candidate's changed paths that MATCH ``CORE_SURFACE_GLOB``.
+
+        ``()`` = proven NOT core · a non-empty tuple = core (the matched paths) · ``None`` = the diff
+        could not be read at all. Tick-memoized per ``(pr, sha)``.
+
+        ``None`` is treated as CORE by every caller — the STRICT direction AGENTS.md prescribes for a
+        gate key. The cost of being wrong that way is one hermetic ~30s sandbox run (the scenarios
+        build their own fixture; they never need the candidate's worktree), and the verdict is
+        sha-cached; the cost of being wrong the other way is exactly the class of merge this gate
+        exists to stop. Journaled loudly so "we could not read the diff" is never invisible."""
+        if not self._core_glob:
+            return ()
+        key = (str(cand.pr), str(cand.sha))
+        if key in self._core_match_cache:
+            return self._core_match_cache[key]
+        result = None
+        tree = cand.worktree
+        if tree and _is_worktree(tree):
+            base = str(self.config.get("DEFAULT_BRANCH") or os.environ.get("DEFAULT_BRANCH") or "main")
+            try:
+                proc = subprocess.run(
+                    ["bash", self._script("core-surface.sh"), "paths", tree, base],
+                    capture_output=True, text=True, timeout=60,
+                    env=dict(os.environ, CORE_SURFACE_GLOB=self._core_glob))
+                if proc.returncode == 0:
+                    result = tuple(p for p in (proc.stdout or "").splitlines() if p)
+                elif proc.returncode == 1:
+                    result = ()
+            except Exception:
+                result = None
+        if result is None and self.state.once(cand.pr, cand.sha, "core_surface_unreadable"):
+            self.journal.append("core_surface_unreadable", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug, "worktree", tree or "",
+                                "detail", "diff unreadable — gating as CORE (strict)")
+        self._core_match_cache[key] = result
+        return result
+
+    def core_surface_is_core(self, cand):
+        """True iff this candidate must satisfy the core-surface contract (strict on unknown)."""
+        if not self._core_glob:
+            return False
+        matched = self.core_surface_paths(cand)
+        return matched is None or bool(matched)
+
+    def core_surface(self, cand):
+        """``PASS`` | ``FAIL`` | ``SKIP`` | :data:`WAIT` for this candidate's scorecard requirement."""
+        if not self._core_glob:
+            return "SKIP"
+        matched = self.core_surface_paths(cand)
+        if matched == ():
+            return "SKIP"                       # a non-core diff is BYTE-IDENTICAL to the lever being off
+        st = self.state
+        # 2. REUSE: an unchanged commit cannot yield a different scorecard.
+        cached = st.core_surface_verdict(cand.pr, cand.sha)
+        if cached:
+            return cached
+        disp = st.core_surface_dispatch_file(cand.pr, cand.sha)
+        inflight = st.core_surface_inflight_file(cand.pr, cand.sha)
+        # 3. COLLECT — same HERD-349 freshness guard the health rail uses: only a nonce-matched
+        #    out-file is ever trusted, never an mtime.
+        if disp and os.path.exists(disp):
+            try:
+                with open(disp, encoding="utf-8") as fh:
+                    first = fh.readline().rstrip("\n")
+            except Exception:
+                first = ""
+            nonce, _, rest = first.partition("\t")
+            expected = _marker_nonce(inflight)
+            if not expected or nonce != expected:
+                self.journal.append("stale_result_ignored", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "rail", "core_surface", "nonce", nonce or "",
+                                    "expected", expected or "")
+                st.rm(disp)
+            else:
+                verdict, _, detail = rest.partition("\t")
+                if verdict in ("PASS", "FAIL", "SKIP"):
+                    st.record_core_surface_verdict(cand.pr, cand.sha, verdict, detail)
+                    st.rm(disp, inflight)
+                    self.journal.append("core_surface_scorecard", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "verdict", verdict, "detail", detail,
+                                        "log_path", st.core_surface_log_file(cand.pr, cand.sha) or "")
+                    return verdict
+                st.rm(disp)                     # unparseable payload = infra death, never a verdict
+                return WAIT
+        # 4. IN FLIGHT / slot budget.
+        if inflight and _marker_live(inflight):
+            return WAIT
+        if _count_live_inflight(st.dir, ".core-surface-inflight") >= self._CORE_SIM_MAX_INFLIGHT:
+            if st.once(cand.pr, cand.sha, "core_surface_queued"):
+                self.journal.append("core_surface_queued", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "limit", self._CORE_SIM_MAX_INFLIGHT)
+            return WAIT
+        # 5. DISPATCH.
+        return self._dispatch_core_surface(cand, matched)
+
+    def _dispatch_core_surface(self, cand, matched):
+        st = self.state
+        disp = st.core_surface_dispatch_file(cand.pr, cand.sha)
+        inflight = st.core_surface_inflight_file(cand.pr, cand.sha)
+        log = st.core_surface_log_file(cand.pr, cand.sha)
+        art = st.core_surface_art_dir(cand.pr, cand.sha)
+        if not disp:
+            # No state dir (a sim/dry-run tick): nothing durable to dispatch against. SKIP loudly
+            # rather than pretend a scorecard exists — never a silent pass.
+            self.journal.append("core_surface_skipped", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug, "reason", "no-state-dir")
+            return "SKIP"
+        script = self._script("core-surface.sh")
+        scenarios = self._core_scenarios(matched, script)
+        if not scenarios:
+            self.journal.append("core_surface_skipped", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug, "reason", "no-scenario-resolved")
+            return "SKIP"
+        st.rm(disp)                             # a dispatch OWNS its result slot (HERD-349)
+        nonce = _dispatch_nonce()
+        argv = ["bash", script, "run", art, disp, log, nonce] + list(scenarios)
+        try:
+            proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True,
+                                    env=dict(os.environ, CORE_SURFACE_GLOB=self._core_glob))
+        except Exception as exc:
+            self.journal.append("infra_event", "pr", cand.pr, "sha", cand.sha, "rail", "core_surface",
+                                "detail", "core-surface dispatch failed: %s" % str(exc)[:160])
+            return WAIT
+        _marker_write(inflight, proc.pid, nonce=nonce)
+        self.journal.append("core_surface_dispatched", "pr", cand.pr, "sha", cand.sha,
+                            "slug", cand.slug, "pid", proc.pid,
+                            "scenarios", ",".join(scenarios), "paths", ",".join(matched or ()),
+                            "log_path", log or "")
+        return WAIT
+
+    def _core_scenarios(self, matched, script):
+        """The scenario basenames this diff must prove, resolved by the SHARED seam map in
+        core-surface.sh (never re-derived here). An unreadable/unknown diff (``matched is None``)
+        resolves to the gate scenario — the fail-toward-more-proof default the bash side documents."""
+        if not matched:
+            return ("sandbox-scenario.sh",)
+        try:
+            proc = subprocess.run(["bash", script, "scenarios-for"] + list(matched),
+                                  capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0:
+                names = tuple(n for n in (proc.stdout or "").splitlines() if n)
+                if names:
+                    return names
+        except Exception:
+            pass
+        return ("sandbox-scenario.sh",)
 
     # ── review rail ────────────────────────────────────────────────────────────────────────────────
     def review(self, cand):
@@ -3517,6 +3798,21 @@ class FixtureGates:
     def review(self, cand):
         v = str(self._spec(cand).get("review", "PASS")).upper()
         return v if v in ("PASS", "BLOCK", "INFRA", WAIT) else "PASS"
+
+    def core_surface(self, cand):
+        """CORE_SURFACE_GLOB (HERD-577) scripted per-candidate, exactly like the two rails above:
+        ``core_surface`` ∈ PASS|FAIL|SKIP|WAIT in the fixture, defaulting to ``SKIP`` — so every
+        scenario written before this feature drives a BYTE-IDENTICAL walk (SKIP is the not-core /
+        lever-off answer, which journals nothing and holds nothing)."""
+        v = str(self._spec(cand).get("core_surface", "SKIP")).upper()
+        return v if v in ("PASS", "FAIL", "SKIP", WAIT) else "SKIP"
+
+    def core_surface_is_core(self, cand):
+        """Fixture-side membership for the serialize leg (HERD-577 leg 2): a scenario marks a
+        candidate core with ``"core": true`` (or by scripting any non-SKIP ``core_surface``)."""
+        if self._spec(cand).get("core") is not None:
+            return bool(self._spec(cand).get("core"))
+        return self.core_surface(cand) != "SKIP"
 
 
 # ── apply: actuate the terminal action (merge / reap) or, in dry-run, journal only ────────────────
@@ -4944,6 +5240,11 @@ class LiveTick:
         # _queue_front always None, so the merge path below is byte-identical to before this feature.
         self._queue = _merge_queue_enabled(self.config)
         self._queue_front = None   # this tick's queue-front pr (resolved by _queue_prepass, once)
+        # CORE_SURFACE_GLOB (HERD-577). An empty glob → _core_surface False and _core_front always
+        # None, so both the scorecard leg and the serialize leg below are unreachable and the walk is
+        # byte-identical to before this feature.
+        self._core_surface = _core_surface_enabled(self.config)
+        self._core_front = None    # this tick's CORE-diff front pr (resolved by _core_prepass, once)
 
     # Return sentinel for _refix_check_and_record: sha already bounced, hold silently.
     _REFIX_ALREADY_ATTEMPTED = object()
@@ -5096,6 +5397,26 @@ class LiveTick:
             return ("PR #%s failed the healthcheck (CODEERROR).\n"
                     "Read the failing suite output, fix every CODE error, run the healthcheck, and "
                     "push your fix." % cand.pr)
+        if kind == "coresim":
+            # HERD-577: a core-surface red is NOT a review finding and NOT a suite failure — there is
+            # no reviewer comment to read and no healthcheck output to grep. Name the scenario and the
+            # scorecard, and hand the builder the exact command that reproduces it, so the re-task is
+            # actionable instead of sending it hunting for a review nobody wrote.
+            detail = ""
+            try:
+                detail = self.state.core_surface_detail(cand.pr, cand.sha) or ""
+            except Exception:
+                detail = ""
+            return ("PR #%s touches the CORE SURFACE (CORE_SURFACE_GLOB) and its sandbox-sim "
+                    "SCORECARD is not green%s.\n"
+                    "This is not a review finding and not a healthcheck failure: the engine "
+                    "provably does not work end to end with your diff.\n"
+                    "Reproduce it from your worktree:\n"
+                    "  bash scripts/herd/core-surface.sh scenarios .   # which scenario(s) your diff must prove\n"
+                    "  bash scripts/herd/sim/<scenario>.sh --artifacts /tmp/%s-sim\n"
+                    "then read /tmp/%s-sim/scorecard.json and fix every failed checkpoint until it "
+                    "says result: pass. Run the healthcheck and push your fix." %
+                    (cand.pr, (" — %s" % detail) if detail else "", cand.slug, cand.slug))
         if kind == "stale":
             # HERD-566: the stale-base rail's fresh-bounce call always passes an explicit `prompt`
             # (the live detected overlap reason), so this generic fallback is reached only if a
@@ -5140,8 +5461,8 @@ class LiveTick:
                 "and confirm (git log / gh pr view %s) that the PR head sha moved. If you believe "
                 "the fix already left the worktree, run git status and git log again — something "
                 "did not make it out." % (cand.pr,
-                                          {"health": "healthcheck", "stale": "stale base"}.get(
-                                              kind, "review"),
+                                          {"health": "healthcheck", "stale": "stale base",
+                                           "coresim": "core-surface sim"}.get(kind, "review"),
                                           cand.sha, cand.pr))
 
     def _bounce_and_wake(self, cand, kind, round_num, rule, prompt=None, no_wake_fallback=None):
@@ -5489,6 +5810,47 @@ class LiveTick:
         self.journal.append("merge_queue_window", "front_pr", front.pr, "front_sha", front.sha,
                             "eligible", len(eligible))
 
+    # ── core-diff serialization (CORE_SURFACE_GLOB leg 2, HERD-577) ───────────────────────────────
+    def _cand_is_core(self, cand):
+        """True iff this candidate's diff touches the core surface — asked of the GATE object, which
+        owns the ONE shared match (LiveGates.core_surface_is_core → core-surface.sh). A gate twin that
+        does not model it (a legacy fixture) answers False, keeping older scenarios byte-identical."""
+        probe = getattr(self.gates, "core_surface_is_core", None)
+        if probe is None:
+            return False
+        try:
+            return bool(probe(cand))
+        except Exception:
+            return False
+
+    def _core_prepass(self, candidates):
+        """Resolve THIS tick's CORE front BEFORE any candidate is walked — the same prepass shape as
+        :meth:`_queue_prepass`, scoped to core-glob matches (task HERD-577 leg 2: "the merge decision
+        holds a second core-matching PR until the first lands").
+
+        Why serialize at all: two core diffs that are each individually green can still be mutually
+        incompatible — the exact compound failure the blast-radius insight names, and the one thing no
+        per-PR gate can see, because each PR's sim proved the engine works with ITS change and not
+        with both. Landing them one at a time means the second one's gate (and its scorecard) re-runs
+        against a base that already contains the first.
+
+        The front is the MINIMUM pr (:func:`_queue_sort_key` — reused verbatim, so a seat running
+        MERGE_QUEUE and a seat running only this key derive the SAME order with no shared ledger).
+        A strict NO-OP with the lever off: ``_core_front`` stays ``None`` and the walk's core branch is
+        never taken. NON-CORE candidates are untouched by this leg entirely — they merge in whatever
+        order their own gates clear, byte-identically to today."""
+        if not self._core_surface:
+            return
+        eligible = [c for c in candidates if self._queue_eligible(c) and self._cand_is_core(c)]
+        if not eligible:
+            self._core_front = None
+            return
+        front = min(eligible, key=lambda c: _queue_sort_key(c.pr))
+        self._core_front = front.pr
+        if len(eligible) > 1:
+            self.journal.append("core_surface_window", "front_pr", front.pr, "front_sha", front.sha,
+                                "eligible", len(eligible))
+
     def _supersede_stale(self, candidates):
         """Discovery → cancel: TERM every doomed in-flight worker a candidate has moved PAST (contract
         §2.4/§6.1, HERD-341). For each current candidate, DYNAMICALLY discover the in-flight markers
@@ -5538,6 +5900,19 @@ class LiveTick:
                               st.merge_result_log_file_sha(cand.pr, sha))
                         _remove_merge_tree(cand.worktree, st.merge_result_tree_path_sha(cand.pr, sha))
                         self.journal.append("gate_superseded", "pr", cand.pr, "rail", "merge_result",
+                                            "old_sha", sha, "new_sha", cur, "action", "session_kill")
+                # core-surface rail (§6.5, HERD-577) — a sandbox-sim proving a sha the PR has already
+                # moved past is proving nothing, and it is the most expensive worker on the tree (it
+                # forks whole sandbox repos) AND the one holding the single core-sim slot. Same
+                # session-kill cancel, same scratch reap. BYTE-INERT with the lever off: no
+                # ``.core-surface-inflight-*`` marker is ever written, so this glob is always empty.
+                for path, sha in st.stale_inflight(".core-surface-inflight", cand.pr, cur,
+                                                   journal=self.journal):
+                    if _terminate_worker(path):
+                        st.rm(path, st.core_surface_dispatch_file(cand.pr, sha),
+                              st.core_surface_log_file(cand.pr, sha),
+                              st.core_wait_file(cand.pr, sha))
+                        self.journal.append("gate_superseded", "pr", cand.pr, "rail", "core_surface",
                                             "old_sha", sha, "new_sha", cur, "action", "session_kill")
             except Exception as exc:
                 # A supersession scan fault for one candidate must never sink the tick (parking a doomed
@@ -5716,6 +6091,56 @@ class LiveTick:
             # woke, so a red never sits BLOCKED with no evidence of whether the builder ever heard it.
             return self._bounce_and_wake(cand, "health", round_num, "healthcheck")
 
+        # 2c. CORE-SURFACE SCORECARD GATE (CORE_SURFACE_GLOB, HERD-577 leg 1) — its OWN gate leg, on
+        #     purpose. The health verdict above may have come from the local suite OR, under
+        #     HEALTH_SOURCE=ci (HERD-578), from the PR's own CI conclusion with no local dispatch at
+        #     all; a scorecard requirement attached to that dispatch would silently evaporate for every
+        #     CI-gated project. Sequenced HERE it composes with both sources identically, and it runs
+        #     BEFORE the review rail so a core diff with no green sim never burns a reviewer.
+        #     Byte-inert with the lever off (and for every non-core diff): `core_surface` returns SKIP
+        #     without touching a file, so no branch below is taken and nothing is journaled.
+        core = "SKIP"
+        if self._core_surface and hasattr(self.gates, "core_surface"):
+            core = self.gates.core_surface(cand)
+        if core == WAIT:
+            # A phase, not an event (HERD-459) — the sim is dispatched/in flight; say so once per sha.
+            if self.state.once(cand.pr, cand.sha, "core_surface_pending"):
+                self.journal.append("core_surface_pending", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug)
+            return PENDING
+        if core == "FAIL":
+            # The scorecard is red: this core diff demonstrably breaks the engine end to end. Same
+            # three-way bounce gate the health/review rails use (HERD-358), on its OWN ledger rail
+            # ("coresim") so a sim red never eats the health rail's budget and vice versa.
+            self._advance(cand, "core_sim_red")
+            if self.state.once(cand.pr, cand.sha, "core_surface_red"):
+                self.journal.append("core_surface_gate", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "result", "fail",
+                                    "reason", self.state.core_surface_detail(cand.pr, cand.sha)
+                                    or "sandbox-sim scorecard not green")
+            _cs_round, _cs_reason = self._refix_check_and_record(cand, "coresim")
+            if _cs_round is None and _cs_reason is None:
+                outcome = self._refix_completion_incomplete(cand, "coresim")
+                return outcome if outcome is not None else BLOCK
+            if _cs_reason is not None:
+                if self.state.once(cand.pr, cand.sha, "refix_escalated_coresim"):
+                    rows_after = D.parse_refix_ledger(_read_refix_ledger(self.state.dir))
+                    total = D.refix_total_count(rows_after, str(cand.pr))
+                    self.journal.append("core_surface_refix_escalated", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "rounds", total,
+                                        "reason", _cs_reason + " — sandbox-sim scorecard still red")
+                self._advance(cand, "refix_exhausted")
+                return ESCALATE
+            return self._bounce_and_wake(cand, "coresim", _cs_round, "core-surface-sim")
+        if core == "PASS":
+            if self.state.once(cand.pr, cand.sha, "core_surface_green"):
+                self.journal.append("core_surface_gate", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "result", "pass",
+                                    "reason", self.state.core_surface_detail(cand.pr, cand.sha))
+            self._refix_rail_reset(cand, "coresim")
+        # core == "SKIP": not a core diff, the lever is off, or NOTHING could be proven. The rail
+        # already journaled `core_surface_skipped` in the last case — loud, never a silent pass.
+
         # 3. review rail (LLM) — DISPATCHED async by shelling out to the adversarial reviewer.
         verdict = self.gates.review(cand)
         verdict = verdict if verdict in ("PASS", "BLOCK", "INFRA", WAIT) else "PASS"
@@ -5888,6 +6313,31 @@ class LiveTick:
                 self.journal.append("merge_queue_hold", "pr", cand.pr, "sha", cand.sha,
                                     "slug", cand.slug, "front_pr", self._queue_front or "")
             return HOLD
+
+        # 5d. CORE-DIFF SERIALIZATION (CORE_SURFACE_GLOB leg 2, HERD-577): among the CORE-matching
+        #     candidates that would merge, only this tick's core front may actually land. A second
+        #     core diff HOLDS until the first one has merged — then it is walked again against a base
+        #     that CONTAINS the first, and its own scorecard is re-proven there. NON-core candidates
+        #     are never consulted and never held: 40+ ordinary merges a week keep flowing exactly as
+        #     they do today, which is the whole point of scoping the serialization to the core.
+        #     Deliberately BELOW the MERGE_QUEUE check: with both armed the queue's global order wins
+        #     first and this only ever narrows further — the two can never disagree about who merges,
+        #     only about how many hold. Off / not core / already the front → never taken.
+        if action == "MERGE" and self._core_surface and self._core_front \
+                and str(cand.pr) != str(self._core_front) and self._cand_is_core(cand):
+            self._advance(cand, "core_surface_wait")           # BLESSED --core_surface_wait--> HOLD
+            # The RENDER side channel the console reads to paint the calm "waiting on PR #N" row —
+            # a hold nobody can see is the stall this leg must never become (§5.1 row-truth).
+            self.state.set_core_wait(cand.pr, cand.sha, self._core_front)
+            if self.state.once(cand.pr, cand.sha, "core_surface_hold"):
+                self.journal.append("core_surface_hold", "pr", cand.pr, "sha", cand.sha,
+                                    "slug", cand.slug, "front_pr", self._core_front,
+                                    "reason", "core diff serialized behind PR #%s" % self._core_front)
+            return HOLD
+        # Not held on the core mutex this tick (the front landed, the diff is not core, or the lever
+        # is off) — drop any marker a PRIOR tick left so the console never paints a lapsed hold.
+        if self._core_surface:
+            self.state.clear_core_wait(cand.pr, cand.sha)
 
         self._advance(cand, {"MERGE": "decide_merge", "HOLD": "decide_hold",
                              "OBSERVE": "decide_observe"}[action])
@@ -6103,6 +6553,9 @@ class LiveTick:
         # Resolve this tick's queue front before any candidate is walked (§6.3, HERD-273). A strict
         # no-op under MERGE_QUEUE=off, so the loop below stays byte-identical to before this feature.
         self._queue_prepass(candidates)
+        # Resolve this tick's CORE front before any candidate is walked (HERD-577 leg 2). A strict
+        # no-op with CORE_SURFACE_GLOB empty, so the loop below stays byte-identical to before it.
+        self._core_prepass(candidates)
         for cand in candidates:
             try:
                 self._outcome[cand.pr] = self._walk(cand)
@@ -6149,7 +6602,8 @@ _REVIEW_FASTPATH_KEYS = ("REVIEW_PREGATE", "REVIEW_MECH_FLOOR", "REVIEW_MECH_FLO
 _CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
                     "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
                     "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE",
-                    "HEALTH_TRUST_BUILDER", "STALE_BASE_AUTOFIX", "HEALTH_SOURCE")
+                    "HEALTH_TRUST_BUILDER", "STALE_BASE_AUTOFIX", "HEALTH_SOURCE",
+                    "CORE_SURFACE_GLOB")
                    + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS
                    + _REVIEW_FASTPATH_KEYS)
 

@@ -215,7 +215,7 @@ MERGE_RESULT_GATE MERGE_QUEUE HEALTH_CONCURRENCY REVIEW_CONCURRENCY WATCHER_SCOP
 WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL WATCHER_VIEW_STATUS \
 WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER GATE_STATUS GATE_STATUS_PENDING MERGE_FAIRNESS \
 MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN HEALTH_TRUST_BUILDER \
-STALE_BASE_AUTOFIX HEALTH_SOURCE"
+STALE_BASE_AUTOFIX HEALTH_SOURCE CORE_SURFACE_GLOB"
 
 # ── Engine-core key RESET (HERD-465): the FILE is authoritative, never inherited/stale env ─────────
 # WATCHER_SELF_RESTART (HERD-251) re-execs this very process in place, inheriting every var it had
@@ -949,6 +949,34 @@ export REVIEW_MODEL_CHEAP REVIEW_MODEL_DOCS
 # authoritative local suite). Consumed by pysrc/herd/live_runtime.py (LiveGates.health) — a Python-core
 # knob, so this key is in _HERD_ENGINE_CORE_KEYS below and must stay `export`ed (HERD-449/465).
 : "${HEALTH_SOURCE:="local"}"        # HERD-578: where the PR health verdict comes from — local | ci
+# CORE_SURFACE_GLOB (HERD-577) — the LOAD-BEARING CORE: an egrep of changed diff paths (repo-root
+# relative) whose diffs must carry a GREEN sandbox-sim scorecard before they may merge, and which
+# merge ONE AT A TIME. EMPTY (the default) = feature OFF, byte-identical: no diff is read, no sim is
+# dispatched, no marker is written and no core_surface_* event is journaled. GROUNDING (the
+# blast-radius insight): every compound failure this engine has had lives in ~6 load-bearing files —
+# the gate loop / dispatch / verdict-cache regions of scripts/herd/agent-watch.sh, the decide + health
+# paths of pysrc/herd/live_runtime.py, pysrc/herd/ci_verdict.py, scripts/herd/healthcheck.sh,
+# .herd/healthcheck.project.sh and scripts/herd/herd-review.sh's dispatch — while 40+ other merges
+# flow through the same gate harmlessly, so a uniform gate spends the same proof budget on a TSV row
+# edit and on a rewrite of the merge decision. ARMED (a non-empty egrep) → TWO things, both scoped to
+# matching diffs only: (1) a THIRD gate leg in the decide path requires a green scorecard from the
+# sandbox-sim scenario(s) that cover the touched seam (gate / concurrency / limit / panes —
+# scripts/herd/sim/sandbox-*.sh, mapped by scripts/herd/core-surface.sh). It is its OWN leg, sequenced
+# after the health verdict rather than riding the local suite dispatch, so it composes IDENTICALLY
+# with HEALTH_SOURCE=local and HEALTH_SOURCE=ci (under ci no local suite is dispatched at all, and a
+# requirement bolted onto that dispatch would silently vanish). A red scorecard bounces on its own
+# `coresim` refix rail (same REFIX_MAX_ROUNDS budget shape, never sharing the health rail's). (2) core
+# diffs SERIALIZE: among core-matching candidates that would merge, only the deterministic front
+# (lowest PR number — the same total order MERGE_QUEUE uses, so the two never disagree) lands per
+# window; the rest HOLD with a visible calm console row naming what they wait on. Non-core diffs are
+# never consulted and never held. FAIL-SOFT, NEVER SILENT: an absent scenario script SKIPS with a
+# loud journaled note and a SKIP (never a PASS) verdict; STRICT the other way — a diff whose paths
+# cannot be read at all is gated AS core (the sims are hermetic and cheap, so being wrong that way
+# costs one ~30s run). Same egrep semantics as HEALTHCHECK_HEAVY_GLOB / REVIEW_ESCALATE_GLOB.
+# Consumed by pysrc/herd/live_runtime.py (LiveGates.core_surface / LiveTick._core_prepass) and
+# scripts/herd/core-surface.sh — a Python-core knob, so this key is in _HERD_ENGINE_CORE_KEYS above
+# and must stay `export`ed (HERD-449/465).
+: "${CORE_SURFACE_GLOB:=""}"         # HERD-577: '' (default, feature off) | egrep of the load-bearing core paths
 # HEALTH_SUITE_SCOPE (HERD-532) — DIFF-SCOPED test selection for the heavy suite: diff | full (default
 # full, ship-dormant). full → the healthcheck wrapper runs the whole curated set, byte-identical to
 # before. diff → it maps the worktree's changed paths to the tests that can actually cover them, via
@@ -1116,7 +1144,7 @@ export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
        WATCHER_SCOPE WATCHER_VIEW WATCHER_VIEW_AUTHOR WATCHER_VIEW_ASSIGNEE WATCHER_VIEW_LABEL \
        WATCHER_VIEW_STATUS WATCHER_VIEW_DEPS_LABEL WATCHER_OWNER GATE_STATUS GATE_STATUS_PENDING \
        MERGE_FAIRNESS MERGE_FAIRNESS_STARVE_THRESHOLD INFRA_BREAKER_MAX INFRA_BREAKER_COOLDOWN \
-       HEALTH_TRUST_BUILDER STALE_BASE_AUTOFIX HEALTH_SOURCE
+       HEALTH_TRUST_BUILDER STALE_BASE_AUTOFIX HEALTH_SOURCE CORE_SURFACE_GLOB
 # Claude exec-hang probe (HERD-108) — some environments WEDGE `claude` on invocation (every exec hangs
 # before the process finishes starting, e.g. the macOS com.apple.quarantine _dyld_start hang). A wedged
 # claude makes every review/refix dispatch spawn a corpse, so the poll loop burns cycles against a hang

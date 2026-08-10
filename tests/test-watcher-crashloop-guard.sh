@@ -256,17 +256,23 @@ cat > "$SLOW_STUB" <<EOF
 #!/usr/bin/env bash
 c=0; [ -f "$COUNTER_4" ] && c=\$(cat "$COUNTER_4")
 c=\$((c + 1)); printf '%s' "\$c" > "$COUNTER_4"
-if [ "\$c" -eq 1 ]; then sleep 3; fi
+if [ "\$c" -eq 1 ]; then sleep 5; fi
 echo "attempt \$c" >&2
 exit 9
 EOF
 chmod +x "$SLOW_STUB"
 export HERD_WATCH_CHILD_SCRIPT="$SLOW_STUB"
 export HERD_WATCH_CRASHLOOP_N=2
-# A wide margin (3s sleep vs a 1s threshold) — $SECONDS is whole-second granularity, and a tighter
-# margin (e.g. 1.5s) flaked under load: process-spawn overhead alone can eat several hundred ms, and
-# a slow CI box can round the elapsed time across the threshold either way.
-export HERD_WATCH_CRASHLOOP_FAST_SECS=1
+# The margin has to clear the GRANULARITY, not just the runtime. herd-watch.sh measures
+# `elapsed=$(( SECONDS - t0 ))` — whole seconds — so a threshold of 1 requires every FAST death to
+# land inside the SAME wall-clock second it started in: a child that spawns at x.98 and exits at
+# (x+1).01 measures elapsed=1 and is misread as SLOW, which RESETS the counter and buys two more
+# attempts (the observed 5-instead-of-3, CI 2026-08-10). That is a coin flip on second-boundary
+# alignment, not a load problem, so widening the sleep alone could never fix it.
+# 5s sleep vs a 3s threshold puts BOTH sides a full second clear of any rounding: a fast death
+# measures 0 or 1 (both < 3) and the slow death measures 4 or 5 (both >= 3), whichever way each one
+# rounds. Costs ~2s of runtime for a race that cannot happen rather than one that is merely rare.
+export HERD_WATCH_CRASHLOOP_FAST_SECS=3
 CAPTURE_4="$T/capture-4"; export HERD_WATCH_CRASH_CAPTURE="$CAPTURE_4"
 
 rc=0

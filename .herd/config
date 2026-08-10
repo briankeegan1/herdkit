@@ -223,3 +223,15 @@ RESOLVER_PANE="on"
 # HERD-392: finish-line watchdog default-on for this project.
 FINISH_STALL_MIN="30"
 JOURNAL_AUDIT="on"
+
+# CORE_SURFACE_GLOB (HERD-577) — herdkit's OWN load-bearing core, armed here because this repo is the
+# one that ships the engine: a diff touching any of these files must carry a GREEN sandbox-sim
+# scorecard (dispatched by the gate, scripts/herd/core-surface.sh maps each touched seam to its
+# scenario) and core diffs merge ONE AT A TIME. The list is the blast-radius six — the gate loop /
+# dispatch / verdict-cache in agent-watch.sh, the decide + health paths in live_runtime.py,
+# ci_verdict.py, both healthcheck surfaces, and herd-review.sh's dispatch — plus the shared
+# core-surface implementation itself and the statemachine the decide path transitions through.
+# KEEP IT NARROW: every matching PR pays a sim run (~30s, hermetic) and gives up parallel merging with
+# other core PRs. Ships EMPTY for every other project (scripts/herd/herd-config.sh) — see
+# templates/capabilities.tsv for when arming it is worth it.
+CORE_SURFACE_GLOB='^scripts/herd/(agent-watch|healthcheck|herd-review|core-surface)\.sh$|^pysrc/herd/(live_runtime|ci_verdict|statemachine)\.py$|^\.herd/healthcheck\.project\.sh$'
