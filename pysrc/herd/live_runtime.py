@@ -2448,7 +2448,10 @@ def _health_trust_check(trees, sha, worktree):
 # Actions runs at all FALLS BACK to the local suite and says so LOUDLY (a once-per-(pr,sha)
 # `ci_health_fallback` journal event) — never a silent skip, never an invented verdict.
 
-_CI_GH_TIMEOUT = 30            # seconds per `gh` call — a constant upper bound, not a knob
+# Seconds per `gh` call — a constant upper bound, not a knob, and deliberately the SAME bound bash's
+# own gh call sites use (agent-watch.sh:_GH_TIMEOUT_DEFAULT_SECS=15). These reads happen INSIDE the
+# tick walk, so the bound is also the per-candidate worst case a hung API can add to a tick.
+_CI_GH_TIMEOUT = 15
 _CI_RUN_LIMIT = 20             # runs per `gh run list` window (matches the bash branch-CI leg)
 _CI_RERUN_COOLDOWN_SECS = 900  # min seconds between ANY two infra-transient reruns (bounded, HERD-609)
 
