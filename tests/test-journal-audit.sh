@@ -225,6 +225,102 @@ out="$(run_audit on)" || fail "(2b'') audit exited non-zero: $out"
 pass
 echo "PASS (2b'') heartbeat + real dispatch → only the real dispatch fires, byte-identical"
 
+# ── (2b''') HERD-612 leg 4: a RESULT-shaped dispatch — event=main_health result=dispatched ───────
+# The main-health rail journals a CONSTANT event name and carries its stage in `result`, so the
+# *_dispatched NAME scan above was structurally blind to it (the same guards-blind shape as HERD-607).
+# GROUNDED: pid 47281's chain for sha 0f50601 died between the suite passing and the verdict write, and
+# MAIN RED stood three days with the evidence sitting unread in this very journal.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281,"provenance":"observed-sha"'
+out="$(run_audit on)" || fail "(2b''') audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b''') a died main_health dispatch must surface as dispatch_no_outcome, got $(count_audit dispatch_no_outcome); $(cat "$JOURNAL_FILE")"
+grep -q '"kind":"dispatch_no_outcome"' "$JOURNAL_FILE" || fail "(2b''') finding kind is not dispatch_no_outcome"
+grep -q '0f50601' "$JOURNAL_FILE" || fail "(2b''') the finding does not name the stranded sha"
+pass
+echo "PASS (2b''') main_health result=dispatched with no terminal → dispatch_no_outcome"
+
+# THE CI-RED WINDOW, which is this leg's own target composition (review BLOCK on the first cut): with a
+# CI-scoped red standing, every later local-suite green is collected and journals `partial_clear` with
+# cleared=no — it moved nothing, because the scope it owns was not the red one. That IS a completed
+# chain, and reading it as stranded fabricated one unclearable finding per merged sha for the whole
+# duration of a CI-red window — the exact incident this rail exists to report on.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+jline "2026-07-09T12:05:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"partial_clear","kind":"local","cleared":"no"'
+out="$(run_audit on)" || fail "(2b3a) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b3a) a green collected under a standing CI red was reported STRANDED; $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b3a) a partial_clear that cleared nothing still closes the chain (the CI-red window)"
+
+# COMPLETENESS IS NOT AN ALLOW-LIST. What closes a chain is defined as "not one of the results that
+# START one", so a terminal this scan has never heard of can never be reported as a strand. The reverse
+# rule would put this scan one new result token away from fabricating alarms about completed work.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+jline "2026-07-09T12:05:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"some_future_terminal"'
+out="$(run_audit on)" || fail "(2b3b) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b3b) an unrecognized terminal was reported as a strand; $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b3b) an unrecognized terminal result closes the chain (deny-list, never an allow-list)"
+
+# …but the results that START a run never close one. chain_collected (HERD-612 leg 3) is the sharp
+# case: it means the dead worker's result file was written, NOT that the collector has routed it — the
+# real terminal lands a tick later, and treating the hand-off as an outcome would hide a collector that
+# then died itself.
+for _start in recheck chain_collected; do
+  reset_surfaces
+  jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+  jline "2026-07-09T12:05:00Z" "\"event\":\"main_health\",\"pr\":\"?\",\"sha\":\"0f50601\",\"result\":\"$_start\""
+  out="$(run_audit on)" || fail "(2b3c) audit exited non-zero: $out"
+  [ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b3c) result=$_start closed a chain it only re-started; $(cat "$JOURNAL_FILE")"
+done
+pass
+echo "PASS (2b3c) recheck / chain_collected re-start a chain, they never close one"
+
+# SAME-SECOND TERMINAL. Journal ts is whole-second, so a verdict that lands fast — or simply an unlucky
+# second boundary — shares its dispatch's timestamp. A ts-strict "later" reported that as a strand;
+# found by replaying a REAL engine journal through this scanner instead of trusting a fixture. "Later"
+# is the journal's own order.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"partial_clear","kind":"local","cleared":"no"'
+out="$(run_audit on)" || fail "(2b3d) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b3d) a terminal in the SAME second as its dispatch was not seen; $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b3d) a terminal sharing its dispatch's timestamp still closes the chain (order, not clock)"
+
+# Every terminal result the rail can actually write CLOSES the chain — including the fail-soft ones
+# (checkout-moved, sandbox-unavailable, died-cap all journal result=infra_event), and including a
+# partial_clear (one identity cleared while the other stays red). None of these may be a finding.
+for _term in green red partial_clear infra_event; do
+  reset_surfaces
+  jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+  jline "2026-07-09T12:05:00Z" "\"event\":\"main_health\",\"pr\":\"?\",\"sha\":\"0f50601\",\"result\":\"$_term\""
+  out="$(run_audit on)" || fail "(2b4) audit exited non-zero: $out"
+  [ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b4) result=$_term must close the chain, got a dispatch_no_outcome; $(cat "$JOURNAL_FILE")"
+done
+pass
+echo "PASS (2b4) every terminal main_health result (green/red/partial_clear/infra_event) closes the chain"
+
+# A terminal for a DIFFERENT sha never closes this one: main advancing past a stranded sha is exactly
+# how the live instance hid — the newer sha's own green looked, to a sha-blind scan, like an outcome.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+jline "2026-07-09T12:05:00Z" '"event":"main_health","pr":"?","sha":"a816294","result":"green"'
+out="$(run_audit on)" || fail "(2b5) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b5) another sha's green must not close this chain, got $(count_audit dispatch_no_outcome); $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b5) a terminal for a different sha never closes a stranded main_health dispatch"
+
+# A re-dispatch of the SAME sha is not an outcome either — it STARTS a chain, it never ends one.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47281'
+jline "2026-07-09T12:05:00Z" '"event":"main_health","pr":"?","sha":"0f50601","result":"dispatched","pid":47999'
+out="$(run_audit on)" || fail "(2b6) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b6) two dispatches for one sha dedup to ONE finding, got $(count_audit dispatch_no_outcome); $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b6) a re-dispatch of the same sha is not a terminal (and both dispatches key one finding)"
+
 # ── (2c) refix_bounce without refix_wake_result ──────────────────────────────
 reset_surfaces
 jline "2026-07-09T12:00:00Z" '"event":"refix_bounce","pr":8,"sha":"bbb","slug":"s","round":1'

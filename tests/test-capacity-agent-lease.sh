@@ -67,11 +67,22 @@ for cp in spawn_class_in_comparator spawn_never_leases_reserved_top \
 done
 echo "PASS (a) every named checkpoint passed: comparator's spawn class, mutation-prove of the never-leasable reserved-top slot, herd-spawn-gate.sh deferring on suite-ledger contention (and admitting once it frees), a headless agent's lease admitting/denying-a-rival/liveness-reclaiming on SIGKILL, a never-launched lease self-releasing on its start timeout, CAPACITY_BUDGET-off byte-identical"
 
-# ── (b) SUITE tenant untouched (P1's own proof, unmodified) ─────────────────────────────────────────
-bash "$SUITE_TEST" >"$T/suite.out" 2>&1 \
-  || fail "tests/test-capacity-ledger.sh (unmodified) failed — the SUITE tenant must be unaffected by the AGENT tenant sharing its library"$'\n'"$(cat "$T/suite.out")"
-grep -q "ALL PASS" "$T/suite.out" || fail "tests/test-capacity-ledger.sh did not report ALL PASS: $(cat "$T/suite.out")"
-echo "PASS (b) tests/test-capacity-ledger.sh (HERD-557 P1, unmodified) still passes in full — the SUITE tenant is untouched"
+# ── (b) SUITE tenant untouched (P1's own proof, referenced — never re-run here) ─────────────────────
+# This check used to `bash "$SUITE_TEST"` — a FULL nested run of tests/test-capacity-ledger.sh (~22s
+# local) inside this test. That bought no signal and cost real gate time three ways: the suite runs
+# test-capacity-ledger.sh as its OWN entry anyway (both are tests/test-*.sh, both are bound in
+# templates/conformance.tsv as sim proofs of CAPACITY_BUDGET / capacity-ledger.sh), so P1 breaking
+# already reds CI under its own name; the nested copy hid that failure under THIS test's name instead;
+# and scripts/ci/run-suite.sh caps each test at HERD_CI_TEST_TIMEOUT (120s), so the wrapper was paying
+# for two tests' worth of subprocess spawns against ONE cap — which is exactly how it started timing
+# out on the CI runner while passing in 29s locally (2026-08-10, PR #734).
+#
+# What the check was really asserting is a DEPENDENCY: "P1's proof still exists and still runs". That
+# is what is asserted now — the file guard at the top of this test — while the RUN belongs to the suite
+# entry that owns it. A rename or deletion of P1's proof still fails here loudly; it just no longer
+# costs a second execution of it.
+[ -s "$SUITE_TEST" ] || fail "tests/test-capacity-ledger.sh (the SUITE tenant's own proof, HERD-557 P1) is missing or empty — the AGENT tenant's claim that P1 is untouched has nothing standing behind it"
+echo "PASS (b) the SUITE tenant's proof (tests/test-capacity-ledger.sh, HERD-557 P1) is present and runs as its own suite entry — not re-run here"
 
 # ── (c) HERMETIC ──────────────────────────────────────────────────────────────────────────────────
 NOW_STATUS="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null | sort || true)"

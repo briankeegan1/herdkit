@@ -205,6 +205,64 @@ for d in dispatches:
         summary = "%s with no terminal · pr=%s sha=%s" % (ev, pr if pr is not None else "?", (sha[:8] if sha else "?"))
         findings.append(("dispatch_no_outcome", key, summary, ctx(pr=pr, sha=sha, slug=d.get("slug"), event=ev)))
 
+# ── (b') RESULT-SHAPED dispatches: event=main_health result=dispatched ───────
+# HERD-612 leg 4 — the same guards-blind shape as HERD-607: check (b) above keys off the event NAME
+# ending in "_dispatched", but the main-health rail journals a CONSTANT event name (`main_health`) and
+# carries its lifecycle stage in the `result` FIELD. A died main-health chain was therefore invisible to
+# this auditor by construction. GROUNDED: `main_health result=dispatched pid=47281 sha=0f50601` on
+# 2026-08-07T14:31:16Z never got a terminal — the worker died between the suite passing and the verdict
+# write — and MAIN RED stood for three days with the evidence sitting unread in this very journal.
+#
+# Scanned per SHA (a main-health dispatch's identity is its sha; its `pr` is routinely the placeholder
+# "?" for a sha this seat did not merge, so pr can neither key nor filter it).
+#
+# WHAT CLOSES A CHAIN is defined as a DENY-list of the results that START one, not an allow-list of the
+# ones that end it. That direction is load-bearing (review BLOCK on the first cut of this leg, which
+# allow-listed green/red/partial_clear/infra_event): an allow-list makes this scan's correctness depend
+# on it enumerating the rail's ENTIRE result vocabulary forever, and the day the rail grows a terminal
+# the list does not know about, every healthy chain ending that way is reported STRANDED — a false,
+# permanently unclearable finding that escalates into an operator alarm. The two error directions are
+# not symmetric: a missed terminal fabricates alarms about work that completed, while a missed START
+# token (the deny-list's own failure mode) only means one genuinely-stranded chain goes unreported,
+# which is the pre-HERD-612 status quo for this whole rail. Fail toward believing work finished.
+#
+# The three non-terminals, each of which announces that a run is BEGINNING:
+#   dispatched      — a worker was backgrounded for this sha (this is the event being reconciled);
+#   recheck         — a cadence / one-shot re-verify is starting another run for it;
+#   chain_collected — HERD-612 leg 3 wrote the dead worker's result file; the COLLECTOR still has to
+#                     route it, and that routing is what journals the real terminal a tick later.
+# "LATER" IS JOURNAL ORDER, NOT A TIMESTAMP COMPARISON. Journal ts carries whole-second resolution, so
+# a terminal written in the SAME second as its dispatch — a verdict that lands fast (an infra_event off
+# a worker that could not even start), or simply an unlucky second boundary — is not `> d["_ts"]` and a
+# ts-strict scan reports the chain stranded. Found by replaying a REAL engine journal through this
+# scanner rather than a hand-written fixture: the engine emitted dispatch + terminal in one second and
+# this leg still raised a finding. `events` is built in file order and sorted STABLY, so the index is
+# the journal's own order and is exact where the clock is not.
+MH_NON_TERMINAL = {"dispatched", "recheck", "chain_collected"}
+for _mh_i, d in [(i, e) for i, e in enumerate(events)
+                 if str(e.get("event") or "") == "main_health" and str(e.get("result") or "") == "dispatched"]:
+    if age_secs(now, d["_ts"]) < dispatch_ttl:
+        continue
+    sha = str(d.get("sha") or "")
+    if not sha:
+        continue                      # no sha ⇒ no identity to reconcile against (fail-soft, never a finding)
+    ok = False
+    for e in events[_mh_i + 1:]:
+        if str(e.get("event") or "") != "main_health":
+            continue
+        if str(e.get("sha") or "") != sha:
+            continue
+        res = str(e.get("result") or "")
+        if res and res not in MH_NON_TERMINAL:
+            ok = True
+            break
+    if not ok:
+        pr = d.get("pr")
+        key = "dispatch_no_outcome|main_health|sha=%s" % sha
+        summary = "main_health dispatch with no terminal · sha=%s pr=%s" % (sha[:8], pr if pr is not None else "?")
+        findings.append(("dispatch_no_outcome", key, summary,
+                         ctx(pr=pr, sha=sha, event="main_health")))
+
 # ── (c) refix_bounce without refix_wake_result ──────────────────────────────
 bounces = [e for e in events if e.get("event") == "refix_bounce"]
 wakes = [e for e in events if e.get("event") == "refix_wake_result"]

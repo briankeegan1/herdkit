@@ -8177,6 +8177,16 @@ _main_health_recheck_mins() {
   esac
 }
 
+# _main_health_recheck_oneshot_enabled — true iff MAIN_HEALTH_RECHECK_ONESHOT opts in (HERD-612 leg 5).
+# Default OFF, same truthy vocabulary and same fail-toward-dormant rule as _main_health_enabled: any
+# unrecognized value reads as off, so a typo can never arm an unattended re-suite.
+_main_health_recheck_oneshot_enabled() {
+  case "$(printf '%s' "${MAIN_HEALTH_RECHECK_ONESHOT:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # _main_health_autofix_enabled — true iff MAIN_HEALTH_AUTOFIX opts in, file-only OR spawn. Default OFF
 # (ship-dormant).
 _main_health_autofix_enabled() {
@@ -8323,6 +8333,24 @@ _main_health_sandbox_note() {
   fi
 }
 
+# _main_health_detail_from_log <log> <rc> — the ONE derivation of a main-health run's <detail> string
+# from its suite log, shared by the worker that just finished the suite and by the chain reconciler that
+# collects a DEAD worker's completed log (HERD-612 leg 3) — doctrine Rule 2. Two seams deriving this
+# independently is exactly how a collected-from-log verdict would come to disagree with the identical
+# run's live verdict: the leak-guard exemption (a tab-leak-guard trip is infra, never MAIN RED) lives in
+# this ordering, and a copy that forgot it would turn a control-room hiccup into a tracker item.
+# rc 3 (checkout-moved) is deliberately NOT handled here — only the worker process ever saw both HEADs.
+_main_health_detail_from_log() {
+  local _dl_log="$1" _dl_rc="${2:-0}" _dl_detail=""
+  if [ "$_dl_rc" = "1" ]; then
+    _dl_detail="$(_health_leak_guard_line "$_dl_log")"
+    [ -n "$_dl_detail" ] || _dl_detail="$(_health_fail_detail "$_dl_log")"
+  else
+    _dl_detail="$(sed -n '1p' "$_dl_log" 2>/dev/null)"
+  fi
+  printf '%s' "$_dl_detail"
+}
+
 # _main_health_worker <sha> <dispatch-file> <log-file> — the ASYNC main-health suite, run in the
 # BACKGROUND by main_health_tick so a post-merge heavy suite (the LONGEST the watcher runs) never blocks
 # the tick. Runs the FULL (heavy) suite STREAMING to the tailable log, with the same retry-before-red
@@ -8390,13 +8418,10 @@ _main_health_worker() {
       _mw_rc=3
     fi
   fi
-  if [ "$_mw_rc" -eq 1 ]; then
-    _mw_detail="$(_health_leak_guard_line "$_mw_log")"
-    [ -n "$_mw_detail" ] || _mw_detail="$(_health_fail_detail "$_mw_log")"
-  elif [ "$_mw_rc" -eq 3 ]; then
-    _mw_detail="checkout moved during run: ${_mw_head0:-?} -> ${_mw_head1:-?}"
+  if [ "$_mw_rc" -eq 3 ]; then
+    _mw_detail="checkout moved during run: ${_mw_head0:-?} -> ${_mw_head1:-?}"     # worker-local: only this process saw both HEADs
   else
-    _mw_detail="$(sed -n '1p' "$_mw_log" 2>/dev/null)"
+    _mw_detail="$(_main_health_detail_from_log "$_mw_log" "$_mw_rc")"
   fi
   _mw_detail="$(printf '%s' "$_mw_detail" | tr '\t\n' '  ')"; _mw_detail="${_mw_detail:0:200}"
   printf '%s\t%s\n' "$_mw_rc" "$_mw_detail" > "$_mw_wtmp" 2>/dev/null && mv "$_mw_wtmp" "$_mw_out" 2>/dev/null || true
@@ -8422,9 +8447,30 @@ _main_health_worker() {
 # live branch-CI red, and a CI recovery must never mask a live local red. Only when BOTH identities are
 # now clear does the state file drop, the green result journal, and (on a RED→green TRANSITION) recovery
 # notify once. Byte-identical to the pre-HERD-372 behavior whenever only one identity ever existed.
+#
+# HERD-612 leg 1 — THE OUTCOME IS LOAD-BEARING, so it is now REPORTED. This function has a legitimate
+# REFUSAL path (the ancestor-clear below), and a caller that DELETES its own anchor state BEFORE
+# calling can never learn that the clear did not happen. That is not hypothetical: _main_health_ci_leg's
+# pass bucket rm'ed $MAIN_HEALTH_CI_STATE first, the stale-green refusal fired for real at
+# 2026-08-07T00:33:41Z (green 72812f1 was a strict ancestor of pinned 3bdd006), and from that moment the
+# display ledger's CI identity had NO reachable clear left: every later pass read an EMPTY anchor, took
+# the byte-quiet no-standing-red return, and never called here again — a deadlock with unlimited green
+# evidence and zero clear calls, which held MAIN RED on this box for four days.
+#
+# $_MAIN_HEALTH_CLEAR_RESULT is set on EVERY path, ahead of every return, to exactly one of:
+#   stale-green — REFUSED (the green is a strict ancestor of the pinned red). The caller's anchor MUST
+#                 survive, so a later DESCENDANT green still finds a standing red to clear.
+#   partial     — this kind's identity was cleared; the OTHER identity is still standing red.
+#   cleared     — nothing stands red for this kind any more (the ordinary full clear, and the vacuous
+#                 "there was no state at all" call, which leaves nothing for an anchor to hold).
+# Reported through a GLOBAL, never the return code: no caller propagates this function's rc today (an
+# alarm may never fail a tick), and making the rc three-valued would turn every unchecked call under
+# `set -e` into a tick-ender. A caller that ignores the global behaves exactly as it did before.
+_MAIN_HEALTH_CLEAR_RESULT=""
 _main_health_clear() {
   local _mc_pr="$1" _mc_sha="$2" _mc_kind="${3:-local}"
   local _mc_pv_sha="" _mc_pv_since="" _mc_pv_local="" _mc_pv_ci="" _mc_own="" _mc_other=""
+  _MAIN_HEALTH_CLEAR_RESULT="cleared"
   if [ -s "$MAIN_HEALTH_STATE" ]; then
     IFS=$'\x1f' read -r _mc_pv_sha _mc_pv_since _mc_pv_local _mc_pv_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
   fi
@@ -8434,6 +8480,7 @@ _main_health_clear() {
   # or any DESCENDANT of it still clears (strictly stronger evidence), so the ordinary collect is
   # untouched; so does an UNORDERED pair, which is what a rewritten default branch leaves behind.
   if [ -n "$_mc_pv_sha" ] && ! _main_health_green_supersedes "$_mc_sha" "$_mc_pv_sha"; then
+    _MAIN_HEALTH_CLEAR_RESULT="stale-green"
     journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result infra_event reason stale-green \
       pinned "$_mc_pv_sha" kind "$_mc_kind"
     return 0
@@ -8444,11 +8491,25 @@ _main_health_clear() {
   esac
   [ -n "$_mc_own" ] && _main_health_fix_clear "$_mc_own"
   if [ -n "$_mc_other" ]; then
+    _MAIN_HEALTH_CLEAR_RESULT="partial"
     case "$_mc_kind" in
       ci) printf '%s\x1f%s\x1f%s\x1f%s\n' "$_mc_pv_sha" "$_mc_pv_since" "$_mc_other" ""           > "$MAIN_HEALTH_STATE" 2>/dev/null || true ;;
       *)  printf '%s\x1f%s\x1f%s\x1f%s\n' "$_mc_pv_sha" "$_mc_pv_since" ""           "$_mc_other" > "$MAIN_HEALTH_STATE" 2>/dev/null || true ;;
     esac
-    [ -n "$_mc_own" ] && journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result partial_clear kind "$_mc_kind"
+    # HERD-612 leg 4 (review BLOCK): journal UNCONDITIONALLY. The old `[ -n "$_mc_own" ]` guard meant
+    # that a green collected in a scope which was NOT itself standing red ended its dispatch chain with
+    # NO terminal main_health event AT ALL — and that is the ROUTINE case in this feature's own target
+    # composition: with MAIN_HEALTH_CI_GATE on and a CI-scoped red standing (field4 set, field3 empty),
+    # every later local-suite green lands here with an empty _mc_own. The ENGINE was right both times
+    # (nothing to clear, nothing to re-fire, the row stays up for the live CI red); the JOURNAL was
+    # incomplete, and a reconciler reading it — journal-audit's dispatch_no_outcome scan, which THIS PR
+    # extends to this rail — can only read "no terminal" as "stranded", raising a false, unclearable
+    # finding per merged sha for the whole duration of a CI-red window. A verdict that was collected
+    # must SAY so. `cleared` keeps the distinction the guard was carrying: yes = this scope really was
+    # red and is now clear; no = it was already clear, so this green moved nothing.
+    local _mc_didclear=no; [ -n "$_mc_own" ] && _mc_didclear=yes
+    journal_append main_health pr "$_mc_pr" sha "$_mc_sha" result partial_clear kind "$_mc_kind" \
+      cleared "$_mc_didclear"
     return 0
   fi
   rm -f "$MAIN_HEALTH_STATE" 2>/dev/null || true
@@ -9634,9 +9695,61 @@ _main_health_ci_redispatch() {
   [ -e "$(_main_health_marker "$_rd_sha")" ] || return 0    # local suite has not verified THIS sha yet
   IFS=$'\x1f' read -r _rd_local_sha _rd_local_since _rd_local_local _rd_local_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
   [ -z "$_rd_local_local" ] || return 0    # a standing LOCAL red — never manufacture a green off it
-  rm -f "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true
+  # HERD-612 leg 1, the SAME ordering rule as the pass bucket below: the local-fallback green can be a
+  # strict ancestor of the pinned red just as a CI green can, so the anchor may only be dropped once the
+  # clear actually cleared. Journaling `cleared` unconditionally was the second half of the same lie.
   _main_health_clear "?" "$_rd_sha" ci
+  if [ "$_MAIN_HEALTH_CLEAR_RESULT" = "stale-green" ]; then
+    journal_append main_health_ci_redispatch sha "$_rd_sha" result held reason stale-green provenance local-fallback
+    return 0
+  fi
+  rm -f "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true
   journal_append main_health_ci_redispatch sha "$_rd_sha" result cleared provenance local-fallback
+  return 0
+}
+
+# _main_health_ci_anchor_reconcile — HERD-612 leg 2: the ORPHAN-RECONCILE invariant for the CI anchor.
+#
+# THE INVARIANT: a CI-scoped identity standing in the DISPLAY LEDGER ($MAIN_HEALTH_STATE, field 4) must
+# always have an ANCHOR ($MAIN_HEALTH_CI_STATE) behind it, because the anchor's non-emptiness is the ONLY
+# thing that lets _main_health_ci_leg's pass bucket reach the clear at all. Leg 1 above stops this seat
+# from CREATING a new orphan; this leg HEALS one that already exists — including the live instance on
+# this box, whose anchor was deleted by the pre-leg-1 code on 2026-08-07 and can never come back on its
+# own (nothing else in the engine writes that file except the fail bucket, which only fires on a CHANGED
+# conclusion — and the conclusion has not changed since).
+#
+# Reconciled, not event-driven (doctrine Rule 1): it re-derives the anchor from the ledger row on every
+# pass rather than depending on whoever deleted it to have noticed. The anchor is a pure MEMO — nothing
+# renders it, and its only readers are "is it non-empty" and "did the (sha, conclusion, cancelled-count)
+# line change" — so a best-effort reconstruction is sound: worst case the next FAIL bucket sees a
+# different line and re-renders the SAME identity (one extra journal line, no second notify, since
+# _main_health_set_red's notify is gated on the state file being empty).
+#
+# Gated on BOTH main-health levers: with MAIN_HEALTH_CI_GATE off nothing ever reads the anchor, so
+# writing one would be a behavior change in a composition that must stay byte-inert. Fail-soft: an
+# unwritable $TREES simply leaves the orphan for the next pass.
+_main_health_ci_anchor_reconcile() {
+  _main_health_enabled || return 0
+  _main_health_ci_gate_enabled || return 0
+  [ -n "${DRYRUN:-}" ] && return 0
+  [ -s "$MAIN_HEALTH_STATE" ] || return 0                  # no standing red at all → nothing to anchor
+  [ -s "$MAIN_HEALTH_CI_STATE" ] && return 0               # anchor stands → the ordinary, healthy case
+  local _ar_sha="" _ar_since="" _ar_local="" _ar_ci="" _ar_concl="" _ar_cxl=""
+  IFS=$'\x1f' read -r _ar_sha _ar_since _ar_local _ar_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  [ -n "$_ar_ci" ] || return 0                             # LOCAL-only red — the CI leg owns no clear here
+  [ -n "$_ar_sha" ] || return 0                            # a row with no sha can anchor nothing
+  # Reconstruct the two qualifying fields from the identity text the fail bucket itself wrote:
+  #   "CI <workflow>: <conclusion>"                                        → conclusion after the ": "
+  #   "CI red at <sha7> · <n> newer runs cancelled · awaiting a …"         → the cancelled count
+  # Neither is guaranteed (an identity may have been normalized by _health_fail_identity), so both fall
+  # back rather than failing: `failure` is the only conclusion class that can raise a CI red at all.
+  _ar_concl="$(printf '%s' "$_ar_ci" | sed -n 's/^CI .*: \([A-Za-z_][A-Za-z_]*\)$/\1/p' 2>/dev/null)"
+  [ -n "$_ar_concl" ] || _ar_concl="failure"
+  _ar_cxl="$(printf '%s' "$_ar_ci" | sed -n 's/.*· \([0-9][0-9]*\) newer runs cancelled.*/\1/p' 2>/dev/null)"
+  case "${_ar_cxl:-}" in ''|*[!0-9]*) _ar_cxl=0 ;; esac
+  printf '%s %s %s\n' "$_ar_sha" "$_ar_concl" "$_ar_cxl" > "$MAIN_HEALTH_CI_STATE" 2>/dev/null || return 0
+  journal_append main_health_ci_anchor sha "$_ar_sha" result reconciled reason orphaned-ledger-row \
+    conclusion "$_ar_concl" cancelled "$_ar_cxl"
   return 0
 }
 
@@ -9705,8 +9818,18 @@ EOF
   if [ "$_bucket" = "pass" ]; then
     _prev="$(cat "$MAIN_HEALTH_CI_STATE" 2>/dev/null || true)"
     [ -n "$_prev" ] || return 0                            # no standing CI red to clear — byte-quiet
-    rm -f "$MAIN_HEALTH_CI_STATE" "$(_main_health_ci_redispatch_marker "$_sha")" 2>/dev/null || true
+    # HERD-612 leg 1 — CLEAR FIRST, DELETE THE ANCHOR ONLY IF IT ACTUALLY CLEARED. The anchor is this
+    # leg's ONLY memory that a CI red is standing; deleting it ahead of a call that can REFUSE (the
+    # HERD-453 stale-green ancestor path) orphans the display ledger's CI identity, because every later
+    # pass then reads an empty anchor and returns byte-quiet above without ever calling the clear again.
+    # A stale-green refusal is not "nothing to do" — it is "this green is too old to be evidence", and
+    # the anchor must stand so the NEXT, descendant green still reaches the clear.
     _main_health_clear "?" "$_run_sha" ci                  # HERD-545 (3): the PASS's own sha, not $_sha
+    if [ "$_MAIN_HEALTH_CLEAR_RESULT" = "stale-green" ]; then
+      journal_append main_health_ci_anchor sha "$_run_sha" result held reason refused-stale-green pinned "$_prev"
+      return 0
+    fi
+    rm -f "$MAIN_HEALTH_CI_STATE" "$(_main_health_ci_redispatch_marker "$_sha")" 2>/dev/null || true
     return 0
   fi
 
@@ -9740,6 +9863,165 @@ EOF
   return 0
 }
 
+# _main_health_log_terminal_rc <log> — the run's OWN exit class, read back from a suite log that already
+# RAN TO COMPLETION: prints 0 (clean, or a tolerated data/env / inherited-base result — healthcheck.sh
+# exits 0 for all three) or 1 (a reproduced CODE ERROR), and returns 1 printing NOTHING when this log
+# carries no terminal banner at all (absent, empty, or truncated mid-suite).
+#
+# The banner IS the completeness proof, which is what makes this safe: healthcheck.sh writes its
+# classifier line at the very END of a run (see its exit-classify case), so a banner on line 1 means the
+# suite finished and this rc is the verdict it would have written — not a guess reconstructed from
+# partial output. Both the full and --oneline banner spellings are accepted: the live worker runs
+# without --oneline, but a project healthcheck (and every test stub) may emit either.
+_main_health_log_terminal_rc() {
+  local _lt_first
+  [ -s "${1:-}" ] || return 1
+  _lt_first="$(sed -n '1p' "$1" 2>/dev/null)"
+  case "$_lt_first" in
+    '✅ HEALTHCHECK CLEAN'*|'✅ clean'*) printf '0' ;;   # green
+    '⚠️'*)                              printf '0' ;;   # DATA/ENV or INHERITED BASE FAILURE → exit 0, tolerated
+    '❌ CODE ERROR'*|'❌ code error'*)   printf '1' ;;   # reproduced red
+    *) return 1 ;;                                       # no terminal banner → this log proves nothing
+  esac
+  return 0
+}
+
+# _reconcile_main_health_chains — HERD-612 leg 3: RECONCILE THE CHAIN, not just the dispatch.
+#
+# GROUNDED 2026-08-07/10: `main_health result=dispatched pid=47281 sha=0f50601` was journaled with NO
+# terminal verdict ever written. The suite itself COMPLETED — its log read `HEALTHCHECK CLEAN` on disk —
+# but the worker died between the suite's exit and the atomic result write, so no .health-dispatch-main-
+# file was ever laid down, the collector had nothing to route, and the display ledger kept a red pinned
+# to an ANCESTOR sha for three days. reconcile_main_health's died branch could not help: it only ever
+# looks at the CURRENT HEAD, and main had long since moved past 0f50601.
+#
+# The invariant this restores: EVERY DISPATCHED CHAIN ENDS IN A TERMINAL OUTCOME — a collected verdict,
+# a re-dispatch, or an honest infra_event — for every sha, not only the one main happens to be on. The
+# pr# sidecar (written at dispatch, removed at collect) is the durable record of "a chain was started
+# for this sha", so it is the set this walks; _main_health_died is the SAME predicate the HEAD path uses
+# to decide a chain is dead (no marker, no pending result, no live worker), reused verbatim so the two
+# can never disagree about what "died" means.
+#
+#   • dead pid + a COMPLETE suite log → SYNTHESIZE the result file the dead worker never wrote and let
+#     the ordinary collector route it next tick. Deliberately NOT a direct clear/set_red call: routing
+#     through _collect_main_health is what keeps the leak-guard exemption, the run-once marker, the slot
+#     release, the anomaly observation and the lifecycle retire identical to a live collection.
+#   • dead pid + NO usable log → nothing to collect. The CURRENT HEAD is left to reconcile_main_health's
+#     own died branch (unchanged, provenance=died, bounded by _MAIN_HEALTH_DIED_MAX); the PINNED red's
+#     sha re-dispatches here on the same budget, because its own green is the one verdict that can
+#     retire the standing row; any OTHER stale sha is retired with an infra_event instead of re-running
+#     a ~9-minute heavy suite for a tree nothing is pinned to and main has already moved past.
+#
+# A RETRY IN FLIGHT IS NOT A VERDICT. The worker re-runs a red ONCE into "<log>.retry" and moves it over
+# the log only on completion, so a bare "<log>.retry" on disk means the worker died DURING the retry and
+# "<log>" still holds run 1's red — collecting that would paint MAIN RED for a failure the retry-before-
+# red path might well have absorbed. So when a .retry companion exists it is the only log consulted:
+# terminal ⇒ that is the verdict, non-terminal ⇒ no verdict, re-dispatch. A false red is the exact class
+# of lie this item exists to remove; spending one suite is the cheaper mistake.
+#
+# Rides MAIN_HEALTH_TICK (byte-inert when off, like every other leg here) and is fail-soft throughout:
+# an unwritable result file, an unreadable log or a refused dispatch all simply leave the chain for the
+# next tick. Always returns 0 — an alarm may never fail a tick.
+_reconcile_main_health_chains() {
+  _main_health_enabled || return 0
+  [ -n "${DRYRUN:-}" ] && return 0
+  local _mhc_f _mhc_base _mhc_sha _mhc_pr _mhc_log _mhc_rc _mhc_detail _mhc_disp _mhc_tmp _mhc_n
+  local _mhc_head _mhc_pin="" _mhc_pin_since="" _mhc_pin_local="" _mhc_pin_ci=""
+  _mhc_head="$(_main_health_observed_sha)"
+  if [ -s "$MAIN_HEALTH_STATE" ]; then
+    IFS=$'\x1f' read -r _mhc_pin _mhc_pin_since _mhc_pin_local _mhc_pin_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  fi
+  for _mhc_f in "$TREES"/.main-health-pr-*; do
+    [ -e "$_mhc_f" ] || continue                              # unmatched glob — no chains at all
+    _mhc_base="${_mhc_f##*/}"; _mhc_sha="${_mhc_base#.main-health-pr-}"
+    [ -n "$_mhc_sha" ] || continue
+    _main_health_died "$_mhc_sha" || continue                 # live worker / pending result / already verdicted
+    _mhc_pr="$(cat "$_mhc_f" 2>/dev/null || true)"; [ -n "$_mhc_pr" ] || _mhc_pr="?"
+    _mhc_log="$(_health_log_file "main-$_mhc_sha")"
+    _mhc_rc=""
+    if [ -e "${_mhc_log}.retry" ]; then
+      _mhc_log="${_mhc_log}.retry"                            # died mid-retry: run 1's red is not the verdict
+    fi
+    _mhc_rc="$(_main_health_log_terminal_rc "$_mhc_log")" || _mhc_rc=""
+
+    if [ -n "$_mhc_rc" ]; then
+      _mhc_disp="$(_health_dispatch_file "main-$_mhc_sha")"
+      # Staging name deliberately outside the ".health-dispatch-main-*" glob the collector walks (the
+      # same trap _main_health_worker's own _mw_wtmp comment documents): a collector poll landing between
+      # the write and the rename must not parse the temp name as a sha.
+      _mhc_tmp="$TREES/.health-write-chain-$$"
+      _mhc_detail="$(_main_health_detail_from_log "$_mhc_log" "$_mhc_rc")"
+      _mhc_detail="$(printf '%s' "$_mhc_detail" | tr '\t\n' '  ')"; _mhc_detail="${_mhc_detail:0:200}"
+      if printf '%s\t%s\n' "$_mhc_rc" "$_mhc_detail" > "$_mhc_tmp" 2>/dev/null && mv "$_mhc_tmp" "$_mhc_disp" 2>/dev/null; then
+        journal_append main_health pr "$_mhc_pr" sha "$_mhc_sha" result chain_collected \
+          reason dead-pid-complete-log rc "$_mhc_rc" log_path "$_mhc_log"
+      else
+        rm -f "$_mhc_tmp" 2>/dev/null || true                 # unwritable $TREES → retry next tick
+      fi
+      continue
+    fi
+
+    [ "$_mhc_sha" = "$_mhc_head" ] && continue                # HEAD is the died branch's own, unchanged
+    _mhc_n="$(cat "$(_main_health_retry_file "$_mhc_sha")" 2>/dev/null || printf 0)"
+    case "$_mhc_n" in ''|*[!0-9]*) _mhc_n=0 ;; esac
+    if [ "$_mhc_sha" != "$_mhc_pin" ] || [ "$_mhc_n" -ge "$_MAIN_HEALTH_DIED_MAX" ]; then
+      : > "$(_main_health_marker "$_mhc_sha")" 2>/dev/null || true   # run-once: this sha gets no verdict
+      journal_append main_health pr "$_mhc_pr" sha "$_mhc_sha" result infra_event reason chain-death-no-log \
+        deaths "$_mhc_n"
+      rm -f "$_mhc_f" "$(_main_health_retry_file "$_mhc_sha")" \
+            "$(_health_inflight_file "main-$_mhc_sha")" 2>/dev/null || true
+      continue
+    fi
+    # The PINNED sha, still inside its death budget: its own green is the one verdict that retires the
+    # standing row, so re-dispatch immediately rather than waiting for a cadence that may not be armed.
+    if _main_health_dispatch "$_mhc_pr" "$_mhc_sha" chain-death; then
+      printf '%s\n' "$(( _mhc_n + 1 ))" > "$(_main_health_retry_file "$_mhc_sha")" 2>/dev/null || true
+    fi
+  done
+  return 0
+}
+
+# _main_health_red_oneshot <sha> — HERD-612 leg 5: a standing red must always have at least ONE armed
+# clearing trigger. Ship-dormant behind MAIN_HEALTH_RECHECK_ONESHOT (default off → byte-identical).
+#
+# GROUNDED 2026-08-10, right after this project flipped HEALTH_SOURCE=ci: the local-suite identity of a
+# red pinned during the Aug-6 CI outage had, at that moment, ZERO reachable clearing triggers. Its sha
+# already carried a run-once marker (so the observed-sha branch never re-dispatches it),
+# MAIN_HEALTH_RECHECK_MINS was 0 (the default — no cadence), and main was quiescent (no newer sha whose
+# green could supersede it). The row was not stale by accident: nothing in the engine could ever ask
+# again. "Every observed sha ends with a verdict" has to include "and that verdict can still change".
+#
+# So when a LOCAL identity stands with no cadence armed, fire exactly ONE re-verify of the CURRENT main
+# sha — the very sha MAIN_HEALTH_RECHECK_MINS would re-verify, so the two paths differ in CADENCE only,
+# never in what they verify (and a green on a current sha that DESCENDS the pinned one supersedes it
+# through _main_health_clear's own ancestor rule, exactly as the cadence path relies on).
+# Scoped to the LOCAL identity on purpose: the CI identity always has the CI leg itself as
+# a trigger (a PASS bucket clears it — leg 1/2 above are what keep that path reachable), and a local
+# suite green cannot clear a CI-scoped red anyway (HERD-372 scope rules).
+#
+# The once-guard is keyed on the SHA, not on a boot event, which is the reconciled form of "fire at
+# watcher boot": the first tick after ANY restart observes the red and fires if this sha never has, and
+# a restart loop can never re-spend it. The marker is written only on a REAL dispatch (mirroring the
+# died-budget rule) so a busy HEALTH_CONCURRENCY slot defers the one-shot instead of consuming it.
+_main_health_red_oneshot() {
+  _main_health_recheck_oneshot_enabled || return 0
+  local _os_sha="${1:-}" _os_marker _os_pr
+  local _os_pv_sha="" _os_pv_since="" _os_pv_local="" _os_pv_ci=""
+  [ -n "$_os_sha" ] || return 0
+  IFS=$'\x1f' read -r _os_pv_sha _os_pv_since _os_pv_local _os_pv_ci < "$MAIN_HEALTH_STATE" 2>/dev/null || true
+  [ -n "$_os_pv_local" ] || return 0                        # CI-only red — the CI leg owns its clear
+  _os_marker="$TREES/.main-health-oneshot-$_os_sha"
+  [ -e "$_os_marker" ] && return 0
+  _os_pr="$(_main_health_observed_pr "$_os_sha")"; [ -n "$_os_pr" ] || _os_pr="?"
+  if _main_health_dispatch "$_os_pr" "$_os_sha" red-oneshot; then
+    : > "$_os_marker" 2>/dev/null || true
+    rm -f "$(_main_health_marker "$_os_sha")" 2>/dev/null || true   # same ordering rule as the cadence recheck
+    journal_append main_health pr "$_os_pr" sha "$_os_sha" result recheck reason no-trigger-armed \
+      provenance red-oneshot
+  fi
+  return 0
+}
+
 # reconcile_main_health — the HERD-222 tick-level invariant: EVERY observed main sha ends with a
 # collected health verdict, no matter who merged it. Call once per tick, AFTER reconcile_main_freshness
 # (so $MAIN's HEAD is the real default-branch HEAD, not a stale checkout). Safe to call repeatedly.
@@ -9758,6 +10040,13 @@ EOF
 reconcile_main_health() {
   _main_health_enabled || return 0
   [ -n "${DRYRUN:-}" ] && return 0
+  # HERD-612 legs 2 + 3, both run BEFORE the HEAD rules below and both scoped to state those rules
+  # cannot see: an orphaned CI anchor (a ledger row whose only clearing path was deleted out from under
+  # it), and a DEAD dispatch chain for ANY sha (the HEAD rules only ever reason about the current HEAD).
+  # The chain pass runs first so a verdict it recovers is already pending collection when the HEAD rules
+  # read this sha — which makes them the no-ops they should be, rather than dispatching a second suite.
+  _main_health_ci_anchor_reconcile
+  _reconcile_main_health_chains
   local _rm_sha _rm_marker _rm_pr _rm_mins _rm_age _rm_n
   _rm_sha="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
   [ -n "$_rm_sha" ] || return 0                             # no HEAD to observe — silent, retried next tick
@@ -9792,7 +10081,14 @@ reconcile_main_health() {
   # re-verify on a cadence — everything else is a no-op (and, with the lever off, byte-identical).
   [ -s "$MAIN_HEALTH_STATE" ] || return 0
   _rm_mins="$(_main_health_recheck_mins)"
-  [ "$_rm_mins" -gt 0 ] 2>/dev/null || return 0
+  if ! [ "$_rm_mins" -gt 0 ] 2>/dev/null; then
+    # HERD-612 leg 5: a red standing with NO cadence armed has no clearing trigger left at all — fire
+    # the one-shot re-verify instead of simply returning. Byte-identical to the pre-HERD-612 return
+    # whenever MAIN_HEALTH_RECHECK_ONESHOT is off (its default), which is what keeps
+    # "MAIN_HEALTH_RECHECK_MINS=0 never re-runs a sha that has a verdict" true for every consumer.
+    _main_health_red_oneshot "$_rm_sha"
+    return 0
+  fi
   _rm_age="$(_main_health_file_age_mins "$_rm_marker")"     # marker mtime = when this sha was last collected
   case "$_rm_age" in ''|-*|*[!0-9]*) return 0 ;; esac
   [ "$_rm_age" -ge "$_rm_mins" ] || return 0

@@ -404,6 +404,7 @@ MAIN_HEALTH_TICK	sim	tests/test-sandbox-sim.sh
 MAIN_HEALTH_TICK	unit	tests/test-main-health-invariant.sh
 MAIN_HEALTH_TICK	sim	tests/test-sandbox-concurrency.sh
 MAIN_HEALTH_RECHECK_MINS	unit	tests/test-main-health-invariant.sh
+MAIN_HEALTH_RECHECK_ONESHOT	unit	tests/test-main-health-chain-reconcile.sh
 red-ledger.sh	unit	tests/test-red-ledger.sh
 red-ledger.sh	unit	tests/test-main-health-invariant.sh
 red-ledger.sh	unit	tests/test-ref-unparsed-reverify.sh

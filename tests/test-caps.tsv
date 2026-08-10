@@ -24,3 +24,4 @@
 #     no longer near the cap.
 test	cap-secs	reason	measured-baseline
 test-cli-reload.sh	180	~24 real bin/herd reload subprocess spawns (each pays a fresh bash-startup+source cost); already flagged macOS-XFAIL in tests/known-env-sensitive.tsv (HERD-440) for periodically TIMING OUT against the shared 120s cap — this row gives it real headroom instead of masking the timeout as env-sensitive	93
+test-cli-update.sh	240	12 checks, each driving a REAL `bash bin/herd update` subprocess (11 invocations) on top of 4 local git clones — every one pays a fresh bash-startup + herd-config source + skill render, the same cost shape as test-cli-reload.sh's row above; measured 39s idle but 65s under local CPU oversubscription and OBSERVED >120s on the CI runner (PR #734, 2026-08-10), where a 2-core box runs the suite's tests in parallel	65
