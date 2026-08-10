@@ -226,7 +226,20 @@ MAIN_HEAD_BEFORE="$(git -C "$BMAIN" rev-parse HEAD)"
 [ -z "$MAIN_STATUS_BEFORE" ] || fail "(B) fixture: shared checkout must start clean"
 
 # Run the REAL healthcheck heavy gate with the watcher's baseline seam pointed at the shared checkout.
-OUT="$(env \
+# `env -i` (never a bare `env`): PART A sourced agent-watch.sh (lib mode) directly into THIS shell, whose
+# herd-config.sh pass EXPORTS PROJECT_ROOT/WORKTREES_DIR (resolved from the real dogfood checkout, since
+# HERD_CONFIG_FILE pointed at a nonexistent file there too) — those exports persist in this process for
+# the rest of the script. A bare `env KEY=val ... bash "$HC"` only ADDS/overrides the listed keys and lets
+# every other already-exported var (PROJECT_ROOT chief among them) ride along into the child; HERD-558's
+# cross-worktree config.local overlay then resolves that leaked PROJECT_ROOT and picks up THIS MACHINE'S
+# real .herd/config.local (HEALTHCHECK_CMD=true, CAPACITY_BUDGET=on), silently overriding the stub below
+# — a false green that skips the whole point of this leg, reproducing as a false RED once the stub's
+# `not ok` never even runs. `env -i` starts the child from a BLANK environment, re-supplying only what it
+# genuinely needs (PATH for git/gh/herdr — including this test's own stubs — plus HOME for git), so no
+# residue from Part A (or the operator's own machine) can reach this leg.
+OUT="$(env -i \
+  PATH="$PATH" \
+  HOME="$HOME" \
   HERD_CONFIG_FILE="$T/no-such-config" \
   HEALTHCHECK_CMD="bash $STUB" \
   DEFAULT_BRANCH="main" \
