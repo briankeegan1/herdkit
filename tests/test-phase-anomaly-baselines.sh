@@ -37,6 +37,10 @@ export PATH="$BIN:$PATH"
 export AGENT_WATCH_LIB=1
 export WORKTREES_DIR="$T/trees"; mkdir -p "$T/trees/.herd"
 export HERD_CONFIG_FILE="$T/no-such-config"
+# HERD-618: pin loadavg QUIET so this prove is deterministic regardless of the real box's load —
+# _anomaly_load_high (the under-load filing-margin guard) has its own dedicated fixture in
+# tests/test-phase-anomaly-load-qualified.sh; this file exercises the pre-HERD-618 filing rail alone.
+export HERD_FAKE_LOADAVG=0
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 
