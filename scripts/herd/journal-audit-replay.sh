@@ -205,6 +205,46 @@ for d in dispatches:
         summary = "%s with no terminal · pr=%s sha=%s" % (ev, pr if pr is not None else "?", (sha[:8] if sha else "?"))
         findings.append(("dispatch_no_outcome", key, summary, ctx(pr=pr, sha=sha, slug=d.get("slug"), event=ev)))
 
+# ── (b') RESULT-SHAPED dispatches: event=main_health result=dispatched ───────
+# HERD-612 leg 4 — the same guards-blind shape as HERD-607: check (b) above keys off the event NAME
+# ending in "_dispatched", but the main-health rail journals a CONSTANT event name (`main_health`) and
+# carries its lifecycle stage in the `result` FIELD. A died main-health chain was therefore invisible to
+# this auditor by construction. GROUNDED: `main_health result=dispatched pid=47281 sha=0f50601` on
+# 2026-08-07T14:31:16Z never got a terminal — the worker died between the suite passing and the verdict
+# write — and MAIN RED stood for three days with the evidence sitting unread in this very journal.
+#
+# Scanned per SHA (a main-health dispatch's identity is its sha; its `pr` is routinely the placeholder
+# "?" for a sha this seat did not merge, so pr can neither key nor filter it). TERMINALS are the results
+# _collect_main_health / _main_health_clear / _main_health_set_red actually write: green, red,
+# partial_clear, infra_event — every path by which a dispatched chain ends, including the fail-soft ones
+# (checkout-moved, sandbox-unavailable, died-cap). `dispatched` and `recheck` are NOT terminal: they are
+# what STARTS a chain, so a re-dispatch of the same sha can never close the earlier one.
+MH_TERMINALS = {"green", "red", "partial_clear", "infra_event"}
+for d in [e for e in events
+          if str(e.get("event") or "") == "main_health" and str(e.get("result") or "") == "dispatched"]:
+    if age_secs(now, d["_ts"]) < dispatch_ttl:
+        continue
+    sha = str(d.get("sha") or "")
+    if not sha:
+        continue                      # no sha ⇒ no identity to reconcile against (fail-soft, never a finding)
+    ok = False
+    for e in events:
+        if e["_ts"] <= d["_ts"]:
+            continue
+        if str(e.get("event") or "") != "main_health":
+            continue
+        if str(e.get("sha") or "") != sha:
+            continue
+        if str(e.get("result") or "") in MH_TERMINALS:
+            ok = True
+            break
+    if not ok:
+        pr = d.get("pr")
+        key = "dispatch_no_outcome|main_health|sha=%s" % sha
+        summary = "main_health dispatch with no terminal · sha=%s pr=%s" % (sha[:8], pr if pr is not None else "?")
+        findings.append(("dispatch_no_outcome", key, summary,
+                         ctx(pr=pr, sha=sha, event="main_health")))
+
 # ── (c) refix_bounce without refix_wake_result ──────────────────────────────
 bounces = [e for e in events if e.get("event") == "refix_bounce"]
 wakes = [e for e in events if e.get("event") == "refix_wake_result"]
