@@ -78,6 +78,23 @@ STUB
 chmod +x "$BIN/herdr"
 export PATH="$BIN:$PATH"
 
+# HERD-616: context-guard.sh's test-safety pane/tab guard (HERD-310, herd_context_pane_guard) refuses a
+# pane/tab mutation whenever (1) `herdr workspace list` answers successfully, (2) cwd is a git LINKED
+# worktree, and (3) WORKSPACE_NAME isn't a disposable sandbox-* sim. Case (7) below exercises a REAL
+# corpse reap (pane close + tab close) against the `herdr` STUB above — which unconditionally answers
+# `workspace list` with exit 0 — so (1) is always true here, purely from the stub, REGARDLESS of whether
+# an actual herdr control room happens to be running (reproduces identically with every real HERDR_*
+# env var unset). (2) is then decided by WHERE this file is invoked from: every builder task runs out of
+# its own `git worktree add`-created checkout (this very repo included), so locally (2) is always true
+# too and the guard refuses every time — while CI's `actions/checkout` is a plain, non-worktree clone
+# where (2) is false and the guard never fires, the false-red/CI-green divergence HERD-616 names.
+# The fix is the guard's OWN sanctioned escape valve for exactly this shape (context-guard.sh's
+# _herd_context_workspace_disposable): declare this run a disposable sim workspace, same as the
+# sandbox-* sim scenarios — true here for the same reason (every herdr call this test makes is a stub,
+# so there is no real control room for the guard to protect). This is a hermetic FIX, not a skip: the
+# corpse-reap ordering assertions in case (7) still run for real, in every environment.
+export HERD_DISPOSABLE_WORKSPACE=1
+
 # Source the watcher's helpers WITHOUT its live loop, fully hermetic (no repo/.herd walk-up).
 export AGENT_WATCH_LIB=1
 export HERD_CONFIG_FILE="$T/no-such-config"
