@@ -356,6 +356,74 @@ grep -q 'HERD-613 one-time migration' <<< "$out2" && fail "(11) the migration re
 pass
 unset HERD_TSWEEP_ACK_FILE
 
+# ── (12) HERD-624 LEG 3: a NON-NUMERIC old-backend-shaped ref (a file-backend title slug — pr-ref.sh
+#         PASS test (4): "the default file backend's item ref IS a title slug") classifies unresolvable
+#         IMMEDIATELY under a backend with a fixed shape (github), via the SHARED herd_pr_ref_shape_ok
+#         check — not just the pre-existing bare-numeric case. The backend is never even probed. ──
+cat > "$REPO/.herd/config" <<EOF
+PROJECT_ROOT="$REPO"
+WORKTREES_DIR="$T/trees"
+DEFAULT_BRANCH="main"
+BACKLOG_FILE="BACKLOG.md"
+SCRIBE_BACKEND="github"
+EOF
+cp "$BACKENDS/stub.sh" "$BACKENDS/github.sh"
+: > "$HERD_TSWEEP_LEDGER"; : > "$HERD_TSWEEP_UNRESOLVED_FILE"; : > "$STUB_UPDATES"; : > "$STUB_READS"
+: > "$JOURNAL_FILE"; : > "$HERD_TSWEEP_NOTE_FILE"
+: > "$STUB_STATES"      # the backend has NOTHING for this ref — proves it's never even asked
+printf '516\tadd-dark-mode-toggle\n' > "$T/prs6.tsv"
+out="$(SCRIBE_BACKEND_DIR="$BACKENDS" run_sweep "$T/prs6.tsv")" || fail "(12) sweep (slug shape-mismatch) exited non-zero: $out"
+[ "$(journal_events tracker_state_unresolvable)" -eq 1 ] || fail "(12) a file-backend-shaped slug under github did not journal exactly 1 tracker_state_unresolvable event ($out)"
+grep -q '"ref":"add-dark-mode-toggle"' "$JOURNAL_FILE" || fail "(12) unresolvable event does not name the slug ref"
+awk '$2=="add-dark-mode-toggle"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null \
+  || fail "(12) the slug ref was not ledgered as unresolvable"
+[ -s "$STUB_READS" ] && fail "(12) a shape mismatch must never probe the backend at all ($(cat "$STUB_READS"))"
+pass
+
+# ── (13) HERD-624 LEG 2: age-to-retired — an `unresolvable` ref that stays ledgered for
+#         _TSWEEP_RETIRE_AFTER (5) further sweeps graduates to a terminal `retired` row: ONE
+#         tracker_reconcile_retired journal event, a 4-column `retired` ledger row, and ONE calm
+#         `retired` console note — while a DIFFERENT, resolvable ref in the same sweeps still heals
+#         normally (the mechanism never interferes with genuine drift). Backend is `linear` here (not
+#         (12)'s `github`) so the resolvable ref's own HERD-nnn shape stays VALID under it — only the
+#         non-numeric slug is old-backend-shaped. ──
+cat > "$REPO/.herd/config" <<EOF
+PROJECT_ROOT="$REPO"
+WORKTREES_DIR="$T/trees"
+DEFAULT_BRANCH="main"
+BACKLOG_FILE="BACKLOG.md"
+SCRIBE_BACKEND="linear"
+EOF
+cp "$BACKENDS/stub.sh" "$BACKENDS/linear.sh"
+: > "$HERD_TSWEEP_LEDGER"; : > "$HERD_TSWEEP_UNRESOLVED_FILE"; export HERD_TSWEEP_RETIRE_FILE="$T/trees/.tracker-retire-counts"
+: > "$HERD_TSWEEP_RETIRE_FILE"; : > "$STUB_UPDATES"; : > "$STUB_READS"; : > "$JOURNAL_FILE"; : > "$HERD_TSWEEP_NOTE_FILE"
+cat > "$STUB_STATES" <<'S'
+HERD-410 in-progress
+S
+printf '517\told-backend-slug\n410\tHERD-410\n' > "$T/prs7.tsv"
+i=0
+while [ "$i" -lt 6 ]; do
+  out="$(SCRIBE_BACKEND_DIR="$BACKENDS" run_sweep "$T/prs7.tsv")" || fail "(13) sweep $i exited non-zero: $out"
+  i=$((i + 1))
+done
+[ "$(journal_events tracker_reconcile_retired)" -eq 1 ] || fail "(13) expected exactly 1 tracker_reconcile_retired event after 6 sweeps, got $(journal_events tracker_reconcile_retired)"
+grep -q '"ref":"old-backend-slug"' "$JOURNAL_FILE" || fail "(13) retired event does not name old-backend-slug"
+grep -q '"reason":"retired: pre-switch ref"' "$JOURNAL_FILE" || fail "(13) retired event missing its reason"
+awk '$2=="old-backend-slug" && NF==4 && $4=="retired"{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null \
+  || fail "(13) old-backend-slug was not ledgered as retired ($(cat "$HERD_TSWEEP_LEDGER"))"
+grep -q ' retired old-backend-slug 517 unknown$' "$HERD_TSWEEP_NOTE_FILE" || fail "(13) no calm 'retired' console note for old-backend-slug"
+# the sibling resolvable ref (HERD-410) still healed normally across the same 6 sweeps.
+grep -q '^HERD-410 done sweep 410$' "$STUB_UPDATES" || fail "(13) sibling resolvable ref HERD-410 did not heal ($(cat "$STUB_UPDATES"))"
+awk '$2=="HERD-410" && NF==3{f=1} END{exit !f}' "$HERD_TSWEEP_LEDGER" 2>/dev/null || fail "(13) HERD-410 must be ledgered Done (3 columns)"
+pass
+# idempotent: a 7th sweep never re-journals or re-notes the already-retired ref.
+out="$(SCRIBE_BACKEND_DIR="$BACKENDS" run_sweep "$T/prs7.tsv")" || fail "(13) sweep 7 exited non-zero: $out"
+[ "$(journal_events tracker_reconcile_retired)" -eq 1 ] || fail "(13) sweep 7 must not re-journal tracker_reconcile_retired"
+[ "$(awk '$2=="retired" && $3=="old-backend-slug"' "$HERD_TSWEEP_NOTE_FILE" 2>/dev/null | grep -c .)" -eq 1 ] \
+  || fail "(13) sweep 7 must not write a second 'retired' console note ($(cat "$HERD_TSWEEP_NOTE_FILE"))"
+pass
+unset HERD_TSWEEP_RETIRE_FILE
+
 # ── (6) the file backend (no update-state op) makes the sweep byte-inert ───────
 cat > "$REPO/.herd/config" <<EOF
 PROJECT_ROOT="$REPO"
