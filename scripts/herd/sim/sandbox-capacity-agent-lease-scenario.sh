@@ -33,6 +33,12 @@
 #   lever_off_byte_identical           — CAPACITY_BUDGET unset -> capacity_agent_lease_reserve returns
 #                                         0 with ZERO .capacity-* files, and capacity_suite_queue_saturated
 #                                         is false — byte-identical to before this feature existed.
+#   agent_lease_holder_isolates_caller_fds — the detached, session-long holder inherits NONE of its
+#                                         caller's descriptors: a caller holding a flocked fd 9 (the
+#                                         watcher singleton's shape) sees that lock re-acquirable the
+#                                         moment it exits, so a holder can never pin it for hours
+#                                         (HERD-339's lock-pin class, load-bearing from HERD-641 on
+#                                         because the watcher TICK is now a caller).
 #
 # HERD-641 (Phase 4 of HERD-625, docs/spikes/coordinator-work-queue.md §5.5) adds the DRAIN's own
 # admission to this tenant's proofs — the watcher's spawn-queue drain now leases a machine-wide unit
@@ -283,6 +289,64 @@ else
 fi
 unset WORKTREES_DIR
 
+# ── agent_lease_holder_isolates_caller_fds ───────────────────────────────────────────────────────
+# HERD-339's lock-pin regression class, made load-bearing by HERD-641: the detached holder outlives its
+# caller by the agent SESSION's whole duration, and from Phase 4 one of its callers is the WATCHER TICK
+# process — which holds the singleton watcher lock on fd 9. A holder that inherits that descriptor pins
+# the lock for hours and a HERD-266 self-restart can never re-acquire it.
+#
+# Proven on the REAL mechanism rather than on a descriptor listing (`lsof` is absent or
+# permission-limited on some runners): the caller opens fd 9 on a lock file and flocks it, exactly as
+# agent-watch.sh's singleton does, then reserves a lease and exits. A flock lives on the open file
+# DESCRIPTION, so it survives the caller's exit for as long as ANY process still holds an inherited
+# copy of that fd. Re-acquirability after the caller is gone is therefore a direct, portable read of
+# whether the detached holder inherited it: free (rc 0) = isolated, busy (rc 75) = pinned for the
+# agent's whole session.
+step fdiso "the detached lease holder inherits NONE of its caller's descriptors (fd 9 lock-pin)"
+POOL_F="$ART/pool-fdiso"; mkdir -p "$POOL_F/.herd/agents/fd-slug"
+LOCK_F="$ART/fdiso-watcher.lock"
+# Restore the scenario-wide settle window: the start-timeout leg above narrowed it to 0.2s for its own
+# race, and reserve's admitted-vs-busy detection needs a window comfortably wider than a python start.
+export WORKTREES_DIR="$POOL_F" CAPACITY_BUDGET=on HERD_DRIVER=headless \
+       HERD_CONFIG_FILE="$ART/no-such-config" HERD_CAPACITY_AGENT_HOLD_POLL_SECS=1 \
+       HERD_CAPACITY_AGENT_START_TIMEOUT_SECS=60 \
+       HERD_CAPACITY_AGENT_RESERVE_POLL_TRIES=20 HERD_CAPACITY_AGENT_RESERVE_POLL_SECS=0.05
+sleep 300 & FD_AGENT=$!
+disown "$FD_AGENT" 2>/dev/null || true
+printf '%s\n' "$FD_AGENT" > "$POOL_F/.herd/agents/fd-slug/pid"
+# The caller: a shell holding a flocked fd 9 (the watcher-tick shape). The `python3 -c fcntl.flock`
+# locks the fd it INHERITED from this shell, so the lock rides the shell's own open file description
+# and outlives that one-liner — which is why the self-probe immediately below must read BUSY.
+# The caller's self-probe rc goes to a FILE, never to a command substitution: `$( )` would leave the
+# subshell's stdout a PIPE that the session-long detached holder is under no obligation to release, so
+# the capture itself would block for the agent's whole lifetime — an artifact of the harness, not of
+# the code under test.
+_FD_SELF_F="$ART/fdiso-selfprobe"
+( exec 9>>"$LOCK_F"
+  python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)' >/dev/null 2>&1 || { printf 'setup-failed' > "$_FD_SELF_F"; exit 9; }
+  python3 "$ENGINE/capacity_flock_run.py" "$LOCK_F" -- true >/dev/null 2>&1; printf '%s' "$?" > "$_FD_SELF_F"
+  capacity_agent_lease_reserve 1 fd-slug >/dev/null 2>&1 ) >/dev/null 2>&1
+_fd_self="$(cat "$_FD_SELF_F" 2>/dev/null || true)"
+# The marker is written by capacity_flock_run.py a beat after the flock is taken, so poll for it rather
+# than a single racy read (the same discipline the reclaim legs above use).
+_fd_holder=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  _fd_holder="$(sed -n 1p "$(capacity_markerfile "$POOL_F" agent 1)" 2>/dev/null || true)"
+  case "$_fd_holder" in ''|*[!0-9]*) _fd_holder="" ;; *) break ;; esac
+  sleep 0.25
+done
+python3 "$ENGINE/capacity_flock_run.py" "$LOCK_F" -- true >/dev/null 2>&1
+_fd_reacquire=$?
+[ -n "$_fd_holder" ] && { pkill -9 -P "$_fd_holder" 2>/dev/null || true; kill -9 "$_fd_holder" 2>/dev/null || true; }
+kill -9 "$FD_AGENT" 2>/dev/null || true
+if [ "$_fd_self" = "75" ] && [ -n "$_fd_holder" ] && [ "$_fd_reacquire" -eq 0 ]; then
+  checkpoint agent_lease_holder_isolates_caller_fds pass "the caller genuinely held the fd-9 flock (its own probe read BUSY/75) and admitted a lease whose holder (pid $_fd_holder) is still running — yet the lock was re-acquirable (rc 0) the moment the caller exited, so the session-long holder inherited none of the caller's descriptors and can never pin a watcher's singleton lock"
+else
+  checkpoint agent_lease_holder_isolates_caller_fds fail "caller self-probe=$_fd_self (want 75 — else the setup never held the lock and proves nothing) holder pid='$_fd_holder' (want a live pid) re-acquire rc=$_fd_reacquire (want 0; 75 means the detached holder still holds the caller's fd 9 — the HERD-339 lock pin)"
+fi
+unset WORKTREES_DIR CAPACITY_BUDGET HERD_DRIVER HERD_CAPACITY_AGENT_HOLD_POLL_SECS \
+      HERD_CAPACITY_AGENT_START_TIMEOUT_SECS
+
 # ══ HERD-641 (Phase 4 of HERD-625) — the spawn-queue DRAIN admits through this same tenant ═════════
 # docs/spikes/coordinator-work-queue.md §5.5 measured the gap these three checkpoints close: each
 # watcher sized its spawn budget from its OWN `FEATS` roster, so two seats draining ONE pool queue each
@@ -430,8 +494,13 @@ else
   if [ -z "$_c_holder" ]; then
     checkpoint drain_crashed_holder_lease_frees fail "no live agent-slot-1 holder to crash (marker $_c_marker unreadable) — the two-seat leg did not actually lease"
   else
-    pkill -9 -P "$_c_holder" 2>/dev/null || true      # the wait-script child, orphaned by the 'crash'
+    # SIGKILL the HOLDER ITSELF FIRST — that is what a crashed seat does, and it is what makes the
+    # marker stale (the holder's own cleanup never runs). Reaping the wait-script child first instead
+    # would let the holder EXIT NORMALLY and tidy its marker away, so the stale-record half of this
+    # checkpoint would race. Children are captured before the kill, since they reparent once it lands.
+    _c_kids="$(pgrep -P "$_c_holder" 2>/dev/null | tr '\n' ' ')"
     kill -9 "$_c_holder" 2>/dev/null || true
+    for _k in $_c_kids; do kill -9 "$_k" 2>/dev/null || true; done
     _c_gone=0
     for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$_c_holder" 2>/dev/null || { _c_gone=1; break; }; sleep 0.2; done
     _c_marker_stale=0; [ -f "$_c_marker" ] && _c_marker_stale=1   # SIGKILL skipped its own cleanup

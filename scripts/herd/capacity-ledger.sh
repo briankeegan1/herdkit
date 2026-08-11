@@ -461,7 +461,17 @@ capacity_agent_lease_reserve() {
     local lk marker bgpid t died
     lk="$(capacity_lockfile "$pool" agent "$idx")"
     marker="$(capacity_markerfile "$pool" agent "$idx")"
-    capacity_agent_lease_hold "$pool" "$py" "$lk" "$marker" "$slug" >/dev/null 2>&1 &
+    # FD ISOLATION (HERD-339's discipline, made load-bearing here by HERD-641). The holder outlives
+    # this shell by the AGENT SESSION's whole duration — hours — so it must inherit NONE of the
+    # caller's own descriptors. Until Phase 4 every caller was a short-lived LANE process, where this
+    # cost nothing; the watcher's spawn-queue drain now calls it from the TICK process, which holds the
+    # singleton watcher lock on fd 9. A holder inheriting that shared open-file description pins the
+    # lock for the agent's entire life, and a HERD-266 self-restart could never re-`flock -n 9` — the
+    # exact lock-pin regression agent-watch.sh's _bg_new_session / _bg_health_worker close fd 9 for.
+    # `9>&-` is a hard no-op when fd 9 was never opened (every lane caller, and every test), so this is
+    # always safe and byte-inert for the pre-existing callers; `</dev/null` gives stdin the same
+    # treatment those helpers give it (the holder never reads it).
+    capacity_agent_lease_hold "$pool" "$py" "$lk" "$marker" "$slug" </dev/null >/dev/null 2>&1 9>&- &
     bgpid=$!
     disown "$bgpid" 2>/dev/null || true
     t=0; died=0

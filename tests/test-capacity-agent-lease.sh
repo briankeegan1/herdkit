@@ -66,11 +66,12 @@ for cp in spawn_class_in_comparator spawn_never_leases_reserved_top \
           gate_defers_while_suite_saturated_admits_when_freed \
           agent_lease_admitted_then_reclaimed_on_kill \
           agent_lease_start_timeout_self_releases lever_off_byte_identical \
+          agent_lease_holder_isolates_caller_fds \
           drain_two_seats_one_admission drain_crashed_holder_lease_frees \
           drain_ledger_absent_legacy_identical; do
   assert_cp "$SCARD" "$cp"
 done
-echo "PASS (a) every named checkpoint passed: comparator's spawn class, mutation-prove of the never-leasable reserved-top slot, herd-spawn-gate.sh deferring on suite-ledger contention (and admitting once it frees), a headless agent's lease admitting/denying-a-rival/liveness-reclaiming on SIGKILL, a never-launched lease self-releasing on its start timeout, CAPACITY_BUDGET-off byte-identical, and (HERD-641) the watcher drain admitting once across two seats, freeing a crashed holder's lease by reconciliation, and falling back to the legacy FEATS budget when the ledger is absent"
+echo "PASS (a) every named checkpoint passed: comparator's spawn class, mutation-prove of the never-leasable reserved-top slot, herd-spawn-gate.sh deferring on suite-ledger contention (and admitting once it frees), a headless agent's lease admitting/denying-a-rival/liveness-reclaiming on SIGKILL, a never-launched lease self-releasing on its start timeout, CAPACITY_BUDGET-off byte-identical, the detached holder inheriting none of its caller's descriptors (no fd-9 lock pin), and (HERD-641) the watcher drain admitting once across two seats, freeing a crashed holder's lease by reconciliation, and falling back to the legacy FEATS budget when the ledger is absent"
 
 # ── (b) SUITE tenant untouched (P1's own proof, referenced — never re-run here) ─────────────────────
 # This check used to `bash "$SUITE_TEST"` — a FULL nested run of tests/test-capacity-ledger.sh (~22s
