@@ -27,6 +27,25 @@ file. Keep it short, factual, and current.
 - **Never read or commit `.herd/secrets`.** Credentials never land in a committed or generated file.
   `DENY_PATHS` stays honored.
 
+## Scratch A/B checkouts
+
+- **To compare your change against a clean base, use a throwaway detached worktree, never `git
+  stash`.** A `stash push <pathspec>` + `pop` can strand edits staged-but-reverted; a detached
+  checkout is disposable and never touches your live worktree.
+- **Name it `scratch-<anything>`** so the sweep's detached-scratch reaper recognizes it on sight
+  instead of leaving it to age out:
+  ```
+  wt="$(mktemp -d)/scratch-ab"
+  git worktree add -q --detach "$wt" HEAD
+  trap 'git worktree remove --force "$wt" 2>/dev/null || true' EXIT
+  ```
+- **Pair every `git worktree add --detach` with a `trap … EXIT` remove**, so a crashed or
+  interrupted session never strands it. If the trap doesn't fire, it still isn't lost debris: `herd
+  sweep` reaps any detached, clean, zero-unique-commit worktree with nothing live inside it — not
+  only ones matching a `scratch-*`/`tmp-*` name — right away outside `$WORKTREES_DIR`, or after a
+  short age floor inside it. A worktree carrying commits that exist nowhere else is never reaped;
+  it's flagged for a human instead.
+
 ## Design invariants for new behavior
 
 - **Ship-dormant / default-off.** New behavior is gated behind a config key (or an explicit opt-in)
