@@ -24,6 +24,29 @@
 #  (11)  FAIL-SOFT: a tree with no engine surface → skip (exit 2), never a red.
 #  (12)  BYTE-IDENTICAL when clean: a clean fixture emits zero GIT-SCOPE lines, only the ADVISORY.
 #
+# (13)-(18): CWD-RELIANT class (HERD-637 leg 2), grounded in the 2026-08-11 CHECKOUT UNCLEAN incident
+# (.checkout-contamination-2026-08-11.patch) — a `git stash` / `git restore` / `git checkout -- <p>` /
+# `git reset` with neither `-C <dir>` nor an enclosing `cd` operates on whatever the CALLING process's
+# cwd happens to be, which is exactly the shape that staged six files into the shared $MAIN checkout
+# between two unrelated PR merges. Unlike the two classes above, this one is NOT fixture-exempt in
+# tests/ — a rogue mutating verb in a test is the "test-side actor" the incident named — but sim/ and
+# experiment/ (pure throwaway-repo builders) stay exempt.
+#  (13)  Bare `git stash` / `git restore` / `git checkout -- <p>` / `git reset` (no -C, no cd) REDS —
+#        in a PRODUCTION path AND in tests/ alike (tests/ is no longer blanket-exempt for this class).
+#  (14)  The SAME verbs are clean when scoped via `-C <dir>` OR an enclosing `cd "<dir>"` — same-line
+#        (`cd "$d" && git reset --hard`) and multi-line (`( cd "$d"\n  git reset --hard\n )`) alike.
+#  (15)  A `cd` sealed inside an already-CLOSED sibling subshell does not falsely scope a later,
+#        unrelated command at the outer level — proving the paren-depth tracking, not a blind
+#        "a cd appeared somewhere earlier in the file" pass.
+#  (16)  A `cd` in the OUTER scope still scopes a target AFTER a self-contained NESTED `( … )` that
+#        opens and closes entirely in between (the depth counter returns to 0, not stuck positive).
+#  (17)  PROSE is not mistaken for an invocation even when it reads exactly like a real one — a
+#        backtick-quoted doc example and a quoted echo/assert message naming `git reset --hard` or
+#        `git checkout -- <path>` verbatim are clean (the flag/terminator guard alone cannot tell
+#        these apart from a real call, unlike ADD_RE/COMMIT_RE's prose case in (9)).
+#  (18)  A plain `git checkout <branch>` (no `--`) is a branch switch, not the path-restore shape this
+#        class targets, and is never flagged even bare.
+#
 # Network-free: temp dirs + fixtures only. Run:  bash tests/test-git-scope-lint.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -234,5 +257,113 @@ grep -qE '^ADVISORY: 0 unscoped git op' <<< "$out" || fail "(12) clean advisory 
 pass
 echo "PASS (12) clean fixture → only the ADVISORY summary, zero GIT-SCOPE lines"
 
+# ── 13. CWD-RELIANT: bare stash/restore/checkout--/reset reds, in production AND in tests/ ─────────
+for rel in scripts/herd/probe.sh tests/test-probe.sh; do
+  T13="$T/cwdreliant$$-${rel//\//x}"; rm -rf "$T13"
+  # An engine-tree marker so the scan doesn't skip (exit 2) — required even when the candidate itself
+  # lives under tests/, since `herd_git_scope_lint`'s marker check looks for scripts/herd, pysrc/herd
+  # or bin/herd, never tests/ alone.
+  make_file "$T13" scripts/herd/marker.sh 'true'
+  make_file "$T13" "$rel" \
+    'git stash' \
+    'git restore -- "$f"' \
+    'git checkout -- "$f"' \
+    'git reset --hard'
+  out="$(herd_git_scope_lint "$T13")"; rc=$?
+  [ "$rc" -eq 1 ] || fail "(13) '$rel': unscoped stash/restore/checkout--/reset must red (exit 1, got $rc): $out"
+  for verb in stash restore 'checkout --' reset; do
+    grep -qF "CWD-RELIANT $verb" <<< "$out" \
+      || fail "(13) '$rel': expected a CWD-RELIANT $verb finding (got: $out)"
+  done
+done
+pass
+echo "PASS (13) bare stash/restore/checkout--/reset → CWD-RELIANT red, in production paths AND tests/"
+
+# ── 14. Scoped via -C or an enclosing cd (same-line and multi-line) → clean ────────────────────────
+T14A="$T/scoped-c"; make_file "$T14A" scripts/herd/probe.sh \
+  'git -C "$d" stash' 'git -C "$d" restore -- "$f"' 'git -C "$d" checkout -- "$f"' 'git -C "$d" reset --hard'
+out="$(herd_git_scope_lint "$T14A")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(14) '-C \"\$d\"'-scoped verbs must be clean (exit 0, got $rc): $out"
+
+T14B="$T/scoped-sameline"; make_file "$T14B" scripts/herd/probe.sh \
+  'cd "$d" && git stash' '( cd "$d" && git reset --hard )'
+out="$(herd_git_scope_lint "$T14B")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(14) same-line 'cd \"\$d\" && git …' must be clean (exit 0, got $rc): $out"
+
+T14C="$T/scoped-multiline"; mkdir -p "$T14C/scripts/herd"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'foo() {\n'
+  printf '  ( cd "$d"\n'
+  printf '    git checkout -q -b main\n'
+  printf '    git restore -- "$f"\n'
+  printf '  )\n'
+  printf '}\n'
+} > "$T14C/scripts/herd/probe.sh"
+out="$(herd_git_scope_lint "$T14C")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(14) a multi-line '( cd \"\$d\" \\n git … )' block must be clean (exit 0, got $rc): $out"
+pass
+echo "PASS (14) '-C' and an enclosing 'cd' (same-line or multi-line) scope stash/restore/checkout--/reset"
+
+# ── 15. A cd sealed inside an already-closed SIBLING subshell does not scope a later command ───────
+T15="$T/sibling-closed"; mkdir -p "$T15/scripts/herd"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'foo() {\n'
+  printf '  ( cd "$other_dir"\n'
+  printf '    git add other.txt\n'
+  printf '  )\n'
+  printf '  git reset --hard\n'
+  printf '}\n'
+} > "$T15/scripts/herd/probe.sh"
+out="$(herd_git_scope_lint "$T15")"; rc=$?
+[ "$rc" -eq 1 ] || fail "(15) a cd sealed in a CLOSED sibling subshell must not scope a later command (exit 1, got $rc): $out"
+grep -qF 'CWD-RELIANT reset' <<< "$out" || fail "(15) expected the reset line itself to be flagged (got: $out)"
+pass
+echo "PASS (15) a cd inside an already-closed sibling subshell never falsely scopes a later, unrelated command"
+
+# ── 16. An outer cd still scopes a target AFTER a self-contained nested subshell in between ────────
+T16="$T/nested-then-outer"; mkdir -p "$T16/scripts/herd"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'foo() {\n'
+  printf '  cd "$d"\n'
+  printf '  (\n'
+  printf '    something_unrelated\n'
+  printf '  )\n'
+  printf '  git reset --hard\n'
+  printf '}\n'
+} > "$T16/scripts/herd/probe.sh"
+out="$(herd_git_scope_lint "$T16")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(16) an outer cd must still scope a target after a self-contained nested subshell (exit 0, got $rc): $out"
+pass
+echo "PASS (16) an outer 'cd' scopes a target across a self-contained nested '( … )' in between"
+
+# ── 17. Prose naming the exact CWD-RELIANT shape is not mistaken for a call ────────────────────────
+T17="$T/prose-cwd"; make_file "$T17" scripts/herd/probe.sh \
+  'assert_untouched "after git reset --hard"' \
+  'echo "PASS (6) '"'"'git reset --hard'"'"' (the shape): the untracked nested repo survives intact"'
+out="$(herd_git_scope_lint "$T17")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(17) prose naming 'git reset --hard' must not red (exit 0, got $rc): $out"
+
+TPYDOC="$T/prose-py-doc"; mkdir -p "$TPYDOC/pysrc/herd"
+{
+  printf '"""module doc.\n'
+  printf '\n'
+  printf 'A scoped ``git checkout <rev> -- <path>`` can only add/update.\n'
+  printf '"""\n'
+} > "$TPYDOC/pysrc/herd/probe.py"
+out="$(herd_git_scope_lint "$TPYDOC")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(17) a backtick-quoted docstring example must not red (exit 0, got $rc): $out"
+pass
+echo "PASS (17) prose (quoted messages, backtick-quoted docstring examples) naming the shape is not a call"
+
+# ── 18. A plain 'git checkout <branch>' (no --) is a branch switch, never flagged bare ─────────────
+T18="$T/checkout-branch"; make_file "$T18" scripts/herd/probe.sh 'git checkout -q -b main'
+out="$(herd_git_scope_lint "$T18")"; rc=$?
+[ "$rc" -eq 0 ] || fail "(18) a bare branch-switching 'git checkout -q -b main' must not red (exit 0, got $rc): $out"
+pass
+echo "PASS (18) 'git checkout <branch>' (no '--') is a branch switch, not flagged even unscoped"
+
 echo
-echo "ALL PASS ($PASS checks) — engine/project isolation is ENFORCED: repo-wide staging reds in production paths, sim fixtures stay clean."
+echo "ALL PASS ($PASS checks) — engine/project isolation is ENFORCED: repo-wide staging reds in production paths, sim fixtures stay clean; CWD-RELIANT mutating verbs (HERD-637) red everywhere, including tests/."

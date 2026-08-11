@@ -13,22 +13,40 @@
 # each call site was written carefully, and nothing stopped the next one from breaking it. This lint
 # turns it into an ENFORCED property: repo-wide staging in a production path is a CODE error.
 #
-# TWO VIOLATION CLASSES
-#   REPO-WIDE   `git add -A` / `--all` / `-u` / `.` / `:/` / `*`, and `git commit -a|-am|--all`.
-#               These stage by SCAN, not by name — the shape that can reach a path the engine does
-#               not own. Always a red in a production path.
-#   UNSCOPED    a `git commit` with no `-- <pathspec>`. It commits whatever the INDEX holds, so a
-#               path staged by someone else (an operator mid-edit in the shared checkout) rides along
-#               under a message that never mentions it. Already documented as a live hazard in
-#               pysrc/herd/work_unit.py's `_restore_pre_apply` docstring. Opt-out-able (below), since
-#               the file/changelog scribe backends deliberately commit index-wide after a NAMED add.
+# THREE VIOLATION CLASSES
+#   REPO-WIDE    `git add -A` / `--all` / `-u` / `.` / `:/` / `*`, and `git commit -a|-am|--all`.
+#                These stage by SCAN, not by name — the shape that can reach a path the engine does
+#                not own. Always a red in a production path.
+#   UNSCOPED     a `git commit` with no `-- <pathspec>`. It commits whatever the INDEX holds, so a
+#                path staged by someone else (an operator mid-edit in the shared checkout) rides along
+#                under a message that never mentions it. Already documented as a live hazard in
+#                pysrc/herd/work_unit.py's `_restore_pre_apply` docstring. Opt-out-able (below), since
+#                the file/changelog scribe backends deliberately commit index-wide after a NAMED add.
+#   CWD-RELIANT  (HERD-637) a `git stash` / `git restore` / `git checkout -- <path>` / `git reset`
+#                with NEITHER an explicit `-C <dir>` NOR a `cd` earlier in the same enclosing block —
+#                it operates on WHATEVER the calling process's cwd happens to be. GROUNDED: the
+#                2026-08-11 CHECKOUT UNCLEAN incident (docs at
+#                .checkout-contamination-2026-08-11.patch) found six files staged in the shared $MAIN
+#                checkout with stale content between two PR merges — the fingerprint of exactly this
+#                shape run with cwd resolving to $MAIN instead of its own worktree/sandbox. Two prior
+#                incidents (HERD-361's baseline suite, HERD-452's main-health worker) hit the same
+#                failure mode and were fixed by sandboxing the CALLER; this class catches the shape
+#                itself so a THIRD occurrence reds before it can land, wherever it turns up. Unlike
+#                REPO-WIDE, this class runs in tests/ too (leg 2 below) — a rogue mutating verb in a
+#                test fixture is exactly the "test-side actor" this incident named. Deliberately NOT
+#                extended to `git add <named-path>`: a named add can only ever touch the ONE path it
+#                names, and the existing scribe-backend precedent (`scripts/herd/backends/file.sh`)
+#                already runs one legitimately uncounted-for cwd, documented via `# herd-scope-ok`.
 #
-# SIM FIXTURES ARE EXEMPT, BY CLASSIFICATION NOT BY ACCIDENT
-# ----------------------------------------------------------
+# FIXTURES ARE EXEMPT, BY CLASSIFICATION NOT BY ACCIDENT
+# --------------------------------------------------------
 # scripts/herd/sim/, scripts/herd/experiment/ and tests/ build throwaway repos in temp dirs and
 # legitimately `git add -A` them. Those paths are SCANNED and then classified FIXTURE, so the
 # advisory reports how many were skipped and the distinction is itself testable — rather than falling
-# out of a glob that happens not to recurse.
+# out of a glob that happens not to recurse. CWD-RELIANT (above) is the one exception: sim/ and
+# experiment/ stay fully exempt (pure throwaway-repo builders), but tests/ is scanned for it — a test
+# that runs a mutating verb outside its own `cd`-scoped fixture dir is the exact bug class HERD-637
+# grounds, and blanket fixture exemption is precisely what let it hide.
 #
 # OPT-OUT:  # herd-scope-ok: <why>
 # It suppresses the offending line when it appears ON that line, anywhere in the same CONTINUED
@@ -83,15 +101,88 @@ HERD_GIT_SCOPE_COMMITALL_RE='git[[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+[[:sp
 # subcommand must be followed by an option, end-of-line, or a command terminator, so English prose
 # that merely names the command (`die "git commit failed at $path"`) is not mistaken for a call.
 HERD_GIT_SCOPE_COMMIT_RE='git[[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+[[:space:]]+)*commit([[:space:]]+-|[[:space:]]*([;&|)]|$))'
+# CWD-RELIANT candidates (HERD-637, leg 2): stash/restore in ANY form, `reset` in any form, and
+# `checkout` ONLY when followed by a standalone `--` (the path-restore shape named by the incident —
+# a plain `git checkout <branch>` is a branch switch, not a mutation of $PWD's tracked content, and
+# this codebase's tests routinely do that unscoped after their own `cd`).
+HERD_GIT_SCOPE_STASH_RE='git[[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+[[:space:]]+)*stash([[:space:]]|$)'
+HERD_GIT_SCOPE_RESTORE_RE='git[[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+[[:space:]]+)*restore([[:space:]]|$)'
+HERD_GIT_SCOPE_RESET_RE='git[[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+[[:space:]]+)*reset([[:space:]]|$)'
+HERD_GIT_SCOPE_CHECKOUTDASH_RE='git[[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+[[:space:]]+)*checkout[[:space:]]+([^;&|]*[[:space:]])?--([[:space:]]|$)'
+# Has this invocation named `-C <dir>` anywhere in its (possibly continuation-joined) block? Checked
+# against the WHOLE block, not just the candidate's own line, so the python argv form's `"-C", main,`
+# on an earlier wrapped line still counts.
+HERD_GIT_SCOPE_HASC_RE='git[[:space:]]+-[Cc][[:space:]]'
+
+# _gs_is_pure_fixture <path> — true for a sim/experiment file ONLY: a throwaway repo in a temp dir
+# where EVERY mutating verb, scoped or not, is the correct, cheapest thing to do. Unlike
+# `_gs_is_fixture` below, tests/ is deliberately NOT included here — CWD-RELIANT (leg 2) scans tests/.
+_gs_is_pure_fixture() {
+  case "$1" in
+    */scripts/herd/sim/*|scripts/herd/sim/*) return 0 ;;
+    */scripts/herd/experiment/*|scripts/herd/experiment/*) return 0 ;;
+  esac
+  return 1
+}
 
 # _gs_is_fixture <path> — true for a sim/experiment/test file: a throwaway repo in a temp dir, where
-# repo-wide staging is the correct, cheapest thing to do and must stay clean.
+# repo-wide staging is the correct, cheapest thing to do and must stay clean. Gates the REPO-WIDE /
+# REPO-WIDE-commit / UNSCOPED-commit classes only — CWD-RELIANT (leg 2) uses `_gs_is_pure_fixture`.
 _gs_is_fixture() {
   case "$1" in
     */scripts/herd/sim/*|scripts/herd/sim/*) return 0 ;;
     */scripts/herd/experiment/*|scripts/herd/experiment/*) return 0 ;;
     */tests/*|tests/*) return 0 ;;
   esac
+  return 1
+}
+
+# _gs_is_prose <raw-line> — true iff the FIRST `git` on <raw-line> reads as PROSE naming the command
+# (a doc string, an echo/die/assert message) rather than an actual invocation — the CWD-RELIANT class
+# (leg 2) has no flag/terminator guard narrow enough to rule this out on its own the way ADD_RE/
+# COMMIT_RE do (`git reset --hard` and `git checkout -- <path>` read exactly like real invocations
+# even quoted in an English sentence, e.g. `echo "... 'git reset --hard' ..."` or a python docstring's
+# RST double-backtick example). Two independent tells, either is sufficient:
+#   * a backtick anywhere on the line — this codebase's markdown/RST doc convention for inline code
+#     (`` `git checkout <rev> -- <path>` ``), never used in an actual shell/python git invocation;
+#   * an ODD number of `"` characters before that first `git` — the token sits inside an OPEN double-
+#     quoted string (a bash message or python docstring line), so it is being NAMED, not run.
+_gs_is_prose() {
+  case "$1" in
+    *'`'*) return 0 ;;
+  esac
+  local _ip_before _ip_n
+  _ip_before="${1%%git*}"
+  [ "$_ip_before" != "$1" ] || return 1
+  _ip_n=$(printf '%s' "$_ip_before" | tr -cd '"' | wc -c)
+  [ $(( _ip_n % 2 )) -eq 1 ]
+}
+
+# _gs_cd_scoped <from-line> — true iff a `cd` command scopes line <from-line> of the file currently
+# slurped into `_gs_arr` (dynamic-scope read from the caller, `herd_git_scope_check` — bash 3.2 has no
+# way to pass an array by reference, and every call site here is nested inside that function). Walks
+# BACKWARD from <from-line> (inclusive, so a same-line `cd "$dir" && git add f` is caught on the first
+# iteration) tracking PAREN DEPTH so a `cd` sealed inside an already-closed SIBLING subshell never
+# falsely scopes a later, unrelated command — only a `cd` reachable at the SAME nesting level as
+# <from-line> counts. Stops (unscoped) at a function-definition line: a `cd` in an enclosing function
+# is a separate scope, never inherited by intent.
+_gs_cd_scoped() {
+  local _cs_i="$1" _cs_ln _cs_depth=0 _cs_open _cs_close _cs_net
+  while [ "$_cs_i" -ge 1 ]; do
+    _cs_ln="${_gs_arr[_cs_i]}"
+    if printf '%s' "$_cs_ln" | grep -qE '^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*\(\)[[:space:]]*\{'; then  # pipe-ok: one file line, far under a pipe buffer
+      return 1
+    fi
+    if [ "$_cs_depth" -eq 0 ] \
+       && printf '%s' "$_cs_ln" | grep -qE '(^|[;&|(]|[[:space:]])cd([[:space:]]|$)'; then  # pipe-ok: one file line, far under a pipe buffer
+      return 0
+    fi
+    _cs_open="${_cs_ln//[^(]/}"; _cs_close="${_cs_ln//[^)]/}"
+    _cs_net=$(( ${#_cs_close} - ${#_cs_open} ))
+    _cs_depth=$((_cs_depth + _cs_net))
+    [ "$_cs_depth" -lt 0 ] && _cs_depth=0
+    _cs_i=$((_cs_i - 1))
+  done
   return 1
 }
 
@@ -110,18 +201,22 @@ herd_git_scope_check() {
   local _gs_hits="" _gs_total=0 _gs_annot=0 _gs_fixture=0 _gs_f _gs_cands _gs_num _gs_code _gs_trim
   local _gs_n _gs_ln _gs_start _gs_end _gs_prev _gs_j _gs_ok _gs_norm _gs_class _gs_block _gs_ctrim
   local -a _gs_arr
+  local _gs_is_fx _gs_verb
   for _gs_f in "$@"; do
     [ -f "$_gs_f" ] || continue
-    if _gs_is_fixture "$_gs_f"; then _gs_fixture=$((_gs_fixture + 1)); continue; fi
+    if _gs_is_pure_fixture "$_gs_f"; then _gs_fixture=$((_gs_fixture + 1)); continue; fi
+    _gs_is_fx=0
+    if _gs_is_fixture "$_gs_f"; then _gs_is_fx=1; _gs_fixture=$((_gs_fixture + 1)); fi
 
-    # Candidate lines: any `git … add` or `git … commit`. The file is normalized THROUGH `tr` first —
-    # the same quote/comma → space mapping applied per line below — so the python argv form
-    # (`["git", "-C", main, "add", …]`) is a candidate exactly as the shell form is. `grep -n` reads
-    # its whole input (no early exit, so no EPIPE — HERD-297) and the line numbers are unchanged by a
-    # 1:1 character map. `|| true`: grep exits 1 on no-match. Skip the (usual) clean file before
-    # paying to slurp it into an array.
+    # Candidate lines: any `git … add`/`commit` (the OLD classes, non-fixture only) OR `git …
+    # stash`/`restore`/`reset`/`checkout` (CWD-RELIANT, HERD-637 leg 2 — scanned everywhere, tests/
+    # included). The file is normalized THROUGH `tr` first — the same quote/comma → space mapping
+    # applied per line below — so the python argv form (`["git", "-C", main, "add", …]`) is a
+    # candidate exactly as the shell form is. `grep -n` reads its whole input (no early exit, so no
+    # EPIPE — HERD-297) and the line numbers are unchanged by a 1:1 character map. `|| true`: grep
+    # exits 1 on no-match. Skip the (usual) clean file before paying to slurp it into an array.
     _gs_cands="$(tr '\042\047,' '   ' < "$_gs_f" 2>/dev/null \
-      | grep -nE 'git[[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+[[:space:]]+)*(add[[:space:]]|commit([[:space:]]+-|[[:space:]]*([;&|)]|$)))' || true)"
+      | grep -nE 'git[[:space:]]+(-[Cc][[:space:]]+[^[:space:]]+[[:space:]]+)*(add[[:space:]]|commit([[:space:]]+-|[[:space:]]*([;&|)]|$))|stash([[:space:]]|$)|restore([[:space:]]|$)|reset([[:space:]]|$)|checkout([[:space:]]|$))' || true)"
     [ -n "$_gs_cands" ] || continue
 
     # Slurp into a 1-indexed array (bash 3.2 has no mapfile) so a continued command can be inspected
@@ -175,19 +270,41 @@ herd_git_scope_check() {
       if [ "$_gs_ok" -eq 1 ]; then _gs_annot=$((_gs_annot + 1)); continue; fi
 
       _gs_class=""
-      if printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_ADD_RE"; then          # pipe-ok: one normalized line, far under a pipe buffer
-        # Class strings deliberately omit the leading `git ` so this file never matches its own
-        # grammar — the guard must be clean on the tree it guards, without needing an opt-out.
-        _gs_class="REPO-WIDE staging (add -A/./-u) — name the paths instead"
-      elif printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_COMMITALL_RE"; then  # pipe-ok: one normalized line, far under a pipe buffer
-        _gs_class="REPO-WIDE commit (commit -a) — stages every tracked change"
-      elif printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_COMMIT_RE"; then     # pipe-ok: one normalized line, far under a pipe buffer
-        # Scoped when a ` -- ` pathspec appears anywhere in the same logical command (it is routinely
-        # on a wrapped continuation line in the python argv form).
-        case " $_gs_block " in
-          *' -- '*) : ;;
-          *) _gs_class="UNSCOPED commit (no -- pathspec) — commits the whole INDEX" ;;
-        esac
+      if [ "$_gs_is_fx" -eq 0 ]; then
+        if printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_ADD_RE"; then          # pipe-ok: one normalized line, far under a pipe buffer
+          # Class strings deliberately omit the leading `git ` so this file never matches its own
+          # grammar — the guard must be clean on the tree it guards, without needing an opt-out.
+          _gs_class="REPO-WIDE staging (add -A/./-u) — name the paths instead"
+        elif printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_COMMITALL_RE"; then  # pipe-ok: one normalized line, far under a pipe buffer
+          _gs_class="REPO-WIDE commit (commit -a) — stages every tracked change"
+        elif printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_COMMIT_RE"; then     # pipe-ok: one normalized line, far under a pipe buffer
+          # Scoped when a ` -- ` pathspec appears anywhere in the same logical command (it is routinely
+          # on a wrapped continuation line in the python argv form).
+          case " $_gs_block " in
+            *' -- '*) : ;;
+            *) _gs_class="UNSCOPED commit (no -- pathspec) — commits the whole INDEX" ;;
+          esac
+        fi
+      fi
+
+      # CWD-RELIANT (HERD-637 leg 2): stash / restore / reset (any form) / checkout -- (the path-
+      # restore shape). Runs REGARDLESS of fixture status — a rogue mutating verb in a test fixture is
+      # exactly the shape the grounding incident named. Skipped when the line already carries an OLD
+      # class above (no double-reporting the same line) or already has `-C` named anywhere in the
+      # block, or is reachable from an enclosing `cd` (_gs_cd_scoped).
+      if [ -z "$_gs_class" ]; then
+        _gs_verb=""
+        if printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_STASH_RE"; then _gs_verb="stash"          # pipe-ok: one normalized line, far under a pipe buffer
+        elif printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_RESTORE_RE"; then _gs_verb="restore"    # pipe-ok: one normalized line, far under a pipe buffer
+        elif printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_CHECKOUTDASH_RE"; then _gs_verb="checkout --"  # pipe-ok: one normalized line, far under a pipe buffer
+        elif printf '%s' "$_gs_norm" | grep -qE "$HERD_GIT_SCOPE_RESET_RE"; then _gs_verb="reset"        # pipe-ok: one normalized line, far under a pipe buffer
+        fi
+        if [ -n "$_gs_verb" ] \
+           && ! _gs_is_prose "$_gs_code" \
+           && ! printf '%s' "$_gs_block" | grep -qE "$HERD_GIT_SCOPE_HASC_RE" \
+           && ! _gs_cd_scoped "$_gs_start"; then  # pipe-ok: whole-command block text, far under a pipe buffer
+          _gs_class="CWD-RELIANT ${_gs_verb} (no -C, no enclosing cd) — name the directory explicitly"
+        fi
       fi
       [ -n "$_gs_class" ] || continue
 

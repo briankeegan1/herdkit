@@ -504,6 +504,9 @@ PY
             git fetch -q "$HERD_REMOTE" "$HERD_BRANCH_NAME" 2>/dev/null || true
             if ! git rebase -q "$HERD_REMOTE/$HERD_BRANCH_NAME" 2>/dev/null; then
                 git rebase --abort >/dev/null 2>&1 || true
+                # herd-scope-ok: every caller of this backend `cd`s to $PROJECT_ROOT (the shared $MAIN
+                # checkout) FIRST — scribe-step.sh's `cd "$REPO" || exit 1` before sourcing this file —
+                # that invariant is cross-file and invisible to this per-file scan (HERD-637 leg 2).
                 git reset --hard "$HERD_REMOTE/$HERD_BRANCH_NAME" >/dev/null 2>&1 || true
             fi
             # Still ahead (rebase succeeded, no conflict) → retry the push; a lost claim was reset away
@@ -550,8 +553,12 @@ _file_remote_configured() { git remote get-url "$HERD_REMOTE" >/dev/null 2>&1; }
 _file_release_abort() {
     git rebase --abort >/dev/null 2>&1 || true
     if git rev-parse --verify -q "$HERD_REMOTE/$HERD_BRANCH_NAME" >/dev/null 2>&1; then
+        # herd-scope-ok: every caller of this backend `cd`s to $PROJECT_ROOT (the shared $MAIN checkout)
+        # FIRST — scribe-step.sh's `cd "$REPO" || exit 1` before sourcing this file — that invariant is
+        # cross-file and invisible to this per-file scan (HERD-637 leg 2).
         git reset --hard "$HERD_REMOTE/$HERD_BRANCH_NAME" >/dev/null 2>&1 || true
     else
+        # herd-scope-ok: same cross-file cd invariant as above (HERD-637 leg 2).
         git reset --hard "${1:-HEAD}" >/dev/null 2>&1 || true
     fi
 }
@@ -626,8 +633,14 @@ PY
     fi
     # herd-scope-ok: index-scoped — the named `git add "$BACKLOG_FILE"` above is all that is staged.
     if ! git commit -q -m "Release: $slug → unclaimed ($who)" 2>/dev/null; then
-        # Never leave the operator's main checkout dirty with a half-applied release.
+        # Never leave the operator's main checkout dirty with a half-applied release. Every caller of
+        # this backend `cd`s to $PROJECT_ROOT (the shared $MAIN checkout) FIRST — scribe-step.sh's
+        # `cd "$REPO" || exit 1` before sourcing this file — that invariant is cross-file and invisible
+        # to this per-file scan (HERD-637 leg 2); both lines below are also named `-- $BACKLOG_FILE`
+        # pathspecs, never a repo-wide reset/checkout.
+        # herd-scope-ok: cross-file cd invariant, see above
         git reset -q HEAD -- "$BACKLOG_FILE" >/dev/null 2>&1 || true
+        # herd-scope-ok: cross-file cd invariant, see above
         git checkout -q -- "$BACKLOG_FILE" >/dev/null 2>&1 || true
         _RELEASE_RESULT="UNREACHABLE"; return 0
     fi
