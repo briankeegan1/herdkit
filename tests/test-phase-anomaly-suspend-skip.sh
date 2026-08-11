@@ -80,12 +80,13 @@ _ledger_lines(){ _count_matches '' "${ANOMALY_LEDGER:-/nonexistent}"; }
 NOW=1000000
 export HERD_FAKE_NOW="$NOW"
 
-# _learn <phase> — 5 calm readings (10 11 9 10 12), enough for _ANOMALY_MIN_SAMPLES; prior p95 is then
-# 12, so a later reading past 24 is anomalous. Runs with the wake probe UNAVAILABLE.
+# _learn <phase> — 5 calm readings (100 110 90 100 120), enough for _ANOMALY_MIN_SAMPLES; prior p95 is
+# then 120, so a later reading past the HERD-645-floored threshold (max(180,150)=180) is anomalous.
+# Runs with the wake probe UNAVAILABLE.
 _learn() {
   local v
   _wake_probe_epoch() { return 1; }
-  for v in 10 11 9 10 12; do _phase_anomaly_observe "$1" "$1" "$v"; done
+  for v in 100 110 90 100 120; do _phase_anomaly_observe "$1" "$1" "$v"; done
 }
 
 # ── (a1) _sysctl_timeval_epoch parses the shapes the darwin probe actually sees ─────────────────────
@@ -113,7 +114,7 @@ export ANOMALY_FILE_COOLDOWN_SECS=0     # leg (a) isolates the wake guard; leg (
 _learn noprobe_phase
 [ ! -s "$JLOG" ] || fail "the learning samples themselves fired: $(cat "$JLOG")"
 _wake_probe_epoch() { return 1; }
-_phase_anomaly_observe noprobe_phase "noprobe phase" 40
+_phase_anomaly_observe noprobe_phase "noprobe phase" 400
 grep -q '^phase_anomaly ' "$JLOG" || fail "no-probe host lost the anomaly: $(cat "$JLOG")"
 grep -q 'phase_anomaly_filed.*result enqueued' "$JLOG" || fail "no-probe host did not file: $(cat "$JLOG")"
 ok
@@ -121,8 +122,8 @@ ok
 # ── (a3) wake OUTSIDE the measured interval → observe + file, unchanged ─────────────────────────────
 : > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
 _learn outside_phase
-_wake_probe_epoch() { printf '%s' "$(( NOW - 500 ))"; }   # interval is [NOW-40, NOW] — well clear
-_phase_anomaly_observe outside_phase "outside phase" 40
+_wake_probe_epoch() { printf '%s' "$(( NOW - 500 ))"; }   # interval is [NOW-400, NOW] — well clear
+_phase_anomaly_observe outside_phase "outside phase" 400
 grep -q '^phase_anomaly ' "$JLOG" || fail "a wake outside the interval suppressed a REAL anomaly: $(cat "$JLOG")"
 [ "$(_ledger_lines)" -eq 1 ] || fail "expected one ledger row: $(cat "$ANOMALY_LEDGER" 2>/dev/null)"
 [ "$(_scribed)" -eq 1 ] || fail "expected one filed item: $(cat "$SCRIBELOG")"
@@ -132,8 +133,8 @@ ok
 : > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
 _learn asleep_phase
 BASE_BEFORE="$T/asleep-before.txt"; cp "$(_baseline_file asleep_phase)" "$BASE_BEFORE"
-_wake_probe_epoch() { printf '%s' "$(( NOW - 20 ))"; }     # inside [NOW-40, NOW]
-_phase_anomaly_observe asleep_phase "asleep phase" 40
+_wake_probe_epoch() { printf '%s' "$(( NOW - 20 ))"; }     # inside [NOW-400, NOW]
+_phase_anomaly_observe asleep_phase "asleep phase" 400
 [ ! -s "$JLOG" ]      || fail "a sleep-spanning interval journaled anyway: $(cat "$JLOG")"
 [ "$(_ledger_lines)" -eq 0 ] || fail "a sleep-spanning interval painted a row: $(cat "$ANOMALY_LEDGER")"
 [ "$(_scribed)" -eq 0 ] || fail "a sleep-spanning interval filed an item: $(cat "$SCRIBELOG")"
@@ -144,7 +145,7 @@ ok
 # The same phase, same duration, with the boundary moved out of the interval, still fires — proving
 # (a4) suppressed the reading for the WAKE reason and not because the phase went quiet.
 _wake_probe_epoch() { printf '%s' "$(( NOW - 500 ))"; }
-_phase_anomaly_observe asleep_phase "asleep phase" 40
+_phase_anomaly_observe asleep_phase "asleep phase" 400
 grep -q '^phase_anomaly ' "$JLOG" || fail "the skip was not wake-scoped — the phase never fires: $(cat "$JLOG")"
 ok
 
@@ -156,9 +157,9 @@ export ANOMALY_FILE_COOLDOWN_SECS=1800
 : > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
 rm -f "$(_anomaly_file_stamp_path burst_phase)"
 _learn burst_phase
-_phase_anomaly_observe burst_phase "burst phase" 40     # prior p95 12 → threshold 24 → fires, files
+_phase_anomaly_observe burst_phase "burst phase" 400     # prior p95 120 → threshold max(180,150)=180 → fires, files
 grep -q 'phase_anomaly_filed.*result enqueued' "$JLOG" || fail "first reading did not file: $(cat "$JLOG")"
-_phase_anomaly_observe burst_phase "burst phase" 200    # prior p95 40 → threshold 80 → fires again
+_phase_anomaly_observe burst_phase "burst phase" 2000    # prior p95 400 → threshold max(600,430)=600 → fires again
 grep -q 'phase_anomaly_filed.*result cooldown' "$JLOG" || fail "second reading was not withheld: $(cat "$JLOG")"
 [ "$(_scribed)" -eq 1 ] || fail "the cooldown did not collapse the burst: $(cat "$SCRIBELOG")"
 # visibility is NOT what the cooldown withholds — both readings still journal and still paint a row
@@ -170,14 +171,14 @@ ok
 : > "$JLOG"; : > "$SCRIBELOG"
 rm -f "$(_anomaly_file_stamp_path other_phase)"
 _learn other_phase
-_phase_anomaly_observe other_phase "other phase" 40
+_phase_anomaly_observe other_phase "other phase" 400
 grep -q 'phase_anomaly_filed.*result enqueued' "$JLOG" || fail "one phase's cooldown gagged another: $(cat "$JLOG")"
 ok
 
 # (b3) once the window elapses, the same phase files again
 : > "$JLOG"; : > "$SCRIBELOG"
 export HERD_FAKE_NOW="$(( NOW + 1801 ))"
-_phase_anomaly_observe burst_phase "burst phase" 900    # a fresh identity, past the elapsed window
+_phase_anomaly_observe burst_phase "burst phase" 9000    # a fresh identity, past the elapsed window
 grep -q 'phase_anomaly_filed.*result enqueued' "$JLOG" || fail "the cooldown never expired: $(cat "$JLOG")"
 [ "$(_scribed)" -eq 1 ] || fail "expected exactly one filing after the window elapsed: $(cat "$SCRIBELOG")"
 export HERD_FAKE_NOW="$NOW"
@@ -189,8 +190,8 @@ export ANOMALY_FILE_COOLDOWN_SECS=0
 rm -f "$(_anomaly_file_stamp_path off_cooldown_phase)"
 _wake_probe_epoch() { return 1; }
 _learn off_cooldown_phase
-_phase_anomaly_observe off_cooldown_phase "off cooldown phase" 40
-_phase_anomaly_observe off_cooldown_phase "off cooldown phase" 200
+_phase_anomaly_observe off_cooldown_phase "off cooldown phase" 400
+_phase_anomaly_observe off_cooldown_phase "off cooldown phase" 2000
 [ "$(_scribed)" -eq 2 ] || fail "cooldown=0 withheld a filing anyway: $(cat "$SCRIBELOG")"
 grep -q 'result cooldown' "$JLOG" && fail "cooldown=0 journaled a cooldown result: $(cat "$JLOG")"
 ok

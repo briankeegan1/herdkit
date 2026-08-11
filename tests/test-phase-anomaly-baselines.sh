@@ -80,13 +80,16 @@ for v in 9999 8888 7777 6666; do _phase_anomaly_observe learning_phase "learning
 [ ! -s "${ANOMALY_LEDGER:-/nonexistent}" ] || fail "an under-learned baseline painted a row"
 ok
 
-# ── (2) LEARN a baseline (5 calm readings), then one instance past 2x p95 fires ONCE ────────────────
+# ── (2) LEARN a baseline (5 calm readings), then one instance past the filing threshold fires ONCE ──
+# HERD-645: readings are scaled to the hundreds so the p95+30s absolute floor stays well below the
+# 1.5x-p95 pct threshold, exercising the SAME pct-dominant math this rail used pre-HERD-645 — the
+# floor's own edge behavior has its dedicated fixture in tests/test-phase-anomaly-floor-margin.sh.
 : > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
-for v in 10 11 9 10 12; do _phase_anomaly_observe slow_phase "slow phase" "$v"; done
+for v in 100 110 90 100 120; do _phase_anomaly_observe slow_phase "slow phase" "$v"; done
 [ ! -s "$JLOG" ] || fail "the 5 learning samples themselves must never file: $(cat "$JLOG")"
 # snapshot the baseline BEFORE the anomalous reading, to replay the identical instant in step (3)
 SNAP="$T/snap-slow.txt"; cp "$(_baseline_file slow_phase)" "$SNAP"
-_phase_anomaly_observe slow_phase "slow phase" 40    # prior p95=12 (max of 9..12) -> threshold 24 -> fires
+_phase_anomaly_observe slow_phase "slow phase" 400    # prior p95=120 (max of 90..120) -> threshold max(180,150)=180 -> fires
 grep -q '^phase_anomaly ' "$JLOG"                       || fail "no phase_anomaly journal line: $(cat "$JLOG")"
 grep -q 'phase_anomaly_filed.*result enqueued' "$JLOG"  || fail "no enqueued filing: $(cat "$JLOG")"
 [ "$(grep -c "^===$" "$SCRIBELOG")" -eq 1 ] || fail "expected exactly one scribe item: $(cat "$SCRIBELOG")"
@@ -101,7 +104,7 @@ ok
 # observation has already folded in (which would shift p95 and change the identity entirely).
 : > "$JLOG"
 cp "$SNAP" "$(_baseline_file slow_phase)"
-_phase_anomaly_observe slow_phase "slow phase" 40
+_phase_anomaly_observe slow_phase "slow phase" 400
 grep -q 'phase_anomaly_filed.*result dedup' "$JLOG" || fail "no dedup result journaled on repeat: $(cat "$JLOG")"
 [ "$(grep -c "^===$" "$SCRIBELOG")" -eq 1 ] || fail "a repeat reading re-filed a SECOND scribe item: $(cat "$SCRIBELOG")"
 ok
@@ -112,8 +115,8 @@ ok
 # must add NOTHING to it, so the invariant is "line count unchanged", not "the file is now empty".
 : > "$JLOG"; : > "$SCRIBELOG"
 _ledger_lines_before="$( [ -f "${ANOMALY_LEDGER:-/nonexistent}" ] && wc -l < "$ANOMALY_LEDGER" || echo 0)"
-for v in 10 11 9 10 12; do _phase_anomaly_observe calm_phase "calm phase" "$v"; done
-_phase_anomaly_observe calm_phase "calm phase" 20    # prior p95=12 -> threshold 24 -> 20 is UNDER it
+for v in 100 110 90 100 120; do _phase_anomaly_observe calm_phase "calm phase" "$v"; done
+_phase_anomaly_observe calm_phase "calm phase" 150    # prior p95=120 -> threshold max(180,150)=180 -> 150 is UNDER it
 [ ! -s "$JLOG" ]      || fail "an under-threshold reading fired anyway: $(cat "$JLOG")"
 _ledger_lines_after="$(wc -l < "$ANOMALY_LEDGER")"
 [ "$_ledger_lines_before" -eq "$_ledger_lines_after" ] || fail "an under-threshold reading painted a NEW row"

@@ -70,11 +70,14 @@ _wake_probe_epoch() { return 1; }
 NOW=2000000
 export HERD_FAKE_NOW="$NOW"
 
-# _learn <phase> — 5 calm readings (10 11 9 10 12); prior p95 is then 12 → normal threshold 24 (2x)
-# → widened under-load threshold 48 (4x, HERD-618's default 2x-of-threshold margin).
+# _learn <phase> — 5 calm readings (100 110 90 100 120); prior p95 is then 120 → HERD-645-floored
+# normal threshold max(120*1.5=180, 120+30=150)=180 (pct-dominant at this scale, so the readings below
+# exercise the SAME load-margin math PR 737 originally proved — the floor's own edge behavior has its
+# dedicated fixture in tests/test-phase-anomaly-floor-margin.sh) → widened under-load threshold 360
+# (2x, HERD-618's default margin).
 _learn() {
   local v
-  for v in 10 11 9 10 12; do _phase_anomaly_observe "$1" "$1" "$v"; done
+  for v in 100 110 90 100 120; do _phase_anomaly_observe "$1" "$1" "$v"; done
 }
 
 export ANOMALY_BASELINES=on
@@ -107,7 +110,7 @@ ok
 export HERD_FAKE_LOADAVG=11    # mirrors the grounding incident's contended box
 _learn loaded_phase
 [ ! -s "$JLOG" ] || fail "the learning samples themselves fired under load: $(cat "$JLOG")"
-_phase_anomaly_observe loaded_phase "loaded phase" 30    # 30 > 24 (fires), 30 <= 48 (within widened margin)
+_phase_anomaly_observe loaded_phase "loaded phase" 300    # 300 > 180 (fires), 300 <= 360 (within widened margin)
 grep -q '^phase_anomaly ' "$JLOG" || fail "a load-qualified reading lost its journal line: $(cat "$JLOG")"
 grep -q 'phase_anomaly_filed.*result load_qualified' "$JLOG" || fail "no load_qualified filing result: $(cat "$JLOG")"
 grep -q 'phase_anomaly_filed.*result enqueued' "$JLOG" && fail "a load-qualified reading filed anyway: $(cat "$JLOG")"
@@ -123,7 +126,7 @@ case "$ANOMALY_ROWS" in *"load-qualified"*) ok ;; *) fail "the rendered row does
 : > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
 export HERD_FAKE_LOADAVG=2      # under the 8 threshold
 _learn quiet_phase
-_phase_anomaly_observe quiet_phase "quiet phase" 30
+_phase_anomaly_observe quiet_phase "quiet phase" 300
 grep -q 'phase_anomaly_filed.*result enqueued' "$JLOG" || fail "the same exceedance on a quiet box did not file: $(cat "$JLOG")"
 grep -q 'result load_qualified' "$JLOG" && fail "a quiet box journaled a load_qualified result: $(cat "$JLOG")"
 [ "$(_scribed)" -eq 1 ] || fail "expected exactly one filed item on a quiet box: $(cat "$SCRIBELOG")"
@@ -135,7 +138,7 @@ ok
 : > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
 export HERD_FAKE_LOADAVG=11
 _learn beyond_phase
-_phase_anomaly_observe beyond_phase "beyond phase" 50    # 50 > 48 (widened) — files despite load
+_phase_anomaly_observe beyond_phase "beyond phase" 400    # 400 > 360 (widened) — files despite load
 grep -q 'phase_anomaly_filed.*result enqueued' "$JLOG" || fail "an exceedance beyond the widened margin did not file under load: $(cat "$JLOG")"
 [ "$(_scribed)" -eq 1 ] || fail "expected exactly one filed item beyond the widened margin: $(cat "$SCRIBELOG")"
 ok
