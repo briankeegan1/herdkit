@@ -18927,7 +18927,7 @@ _drain_spawn_queue() {
     case "${_dsq_line1:-}" in
       EMPTY|'') break ;;
       CLAIMED*)
-        local _dsq_claimed="${_dsq_line1#CLAIMED }"
+        local _dsq_claimed="${_dsq_line1#CLAIMED }" _dsq_leased=0
         # Fail-soft: validate slug and lane before launching.
         if [ -z "$_dsq_slug" ] || [ -z "$_dsq_lane" ]; then
           bash "$HERE/spawn-step.sh" skip "$_dsq_claimed" "empty slug or lane" >/dev/null 2>&1 || true
@@ -19016,12 +19016,19 @@ _drain_spawn_queue() {
         # own start timeout if the lane never launched one. A seat that CRASHES holding leases frees
         # them by the same contract from below: the flock is the holder process's, so the kernel drops
         # it the instant that process dies and the next seat's reserve admits.
-        if [ "$_dsq_lease" = "1" ] \
-           && ! capacity_agent_lease_reserve "$(capacity_agent_lease_cap)" "$_dsq_slug"; then
-          journal_append spawn_deferred slug "$_dsq_slug" lane "$_dsq_lane" reason "agent capacity lease unavailable"
-          _dsq_held+=("$_dsq_claimed")
-          _dsq_can_launch=0
-          _dsq_n=$(( _dsq_n + 1 )); continue
+        # HERD_FORCE_SPAWN=1 skips the acquire entirely — the SAME override the lanes' own lease check
+        # and this drain's budget pause already honor, so an urgent item is never blocked by lease
+        # pressure. It leaves _dsq_leased at 0, so the lane is dispatched WITHOUT the held-handoff and
+        # applies its own (equally forced) lease path: forced or not, exactly one place decides.
+        if [ "$_dsq_lease" = "1" ] && [ "${HERD_FORCE_SPAWN:-}" != "1" ]; then
+          if capacity_agent_lease_reserve "$(capacity_agent_lease_cap)" "$_dsq_slug"; then
+            _dsq_leased=1
+          else
+            journal_append spawn_deferred slug "$_dsq_slug" lane "$_dsq_lane" reason "agent capacity lease unavailable"
+            _dsq_held+=("$_dsq_claimed")
+            _dsq_can_launch=0
+            _dsq_n=$(( _dsq_n + 1 )); continue
+          fi
         fi
         # Dependency met (or none). If this intent had been held on a prior tick, announce the release
         # (spawn_released, dependency named) and clear its hold row before it spawns below.
@@ -19035,7 +19042,7 @@ _drain_spawn_queue() {
         # `_list_project_watchers` and holds the launch slot shut until the lane lands.
         _SPAWN_DISPATCH_SEQ=$(( ${_SPAWN_DISPATCH_SEQ-0} + 1 ))
         _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug" "${_dsq_id}-${_SPAWN_DISPATCH_SEQ}")" \
-          _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task" "$_dsq_lease"
+          _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task" "$_dsq_leased"
         # BIND THE CLAIM TO THE WORKER (HERD-237), synchronously, before this tick continues.
         # `spawn-step.sh next` reclaims any claim older than five minutes, on the premise that only a
         # dead watcher leaves one behind — true while the lane ran in this loop's foreground, false now
