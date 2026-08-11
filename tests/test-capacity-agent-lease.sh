@@ -7,7 +7,10 @@
 #       checkpoint passes (comparator's spawn class, mutation-prove of the never-leasable reserved-top
 #       slot, herd-spawn-gate.sh deferring on suite-ledger contention, a real headless agent's lease
 #       admitting/denying/liveness-reclaiming on SIGKILL, a never-launched lease self-releasing on its
-#       start timeout, and CAPACITY_BUDGET-off byte-identical).
+#       start timeout, and CAPACITY_BUDGET-off byte-identical) — plus, since HERD-641 (Phase 4 of
+#       HERD-625), the WATCHER DRAIN's own admission through this same tenant: two lib-mode drains over
+#       one pool queue admitting exactly once, a crashed holder's lease freeing by reconciliation, and
+#       the ledger-absent fallback to the legacy per-seat FEATS budget.
 #   (b) SUITE TENANT UNTOUCHED — tests/test-capacity-ledger.sh (HERD-557 P1's own proof, run here
 #       UNMODIFIED) still passes in full — the strongest available proof that adding the AGENT tenant
 #       never regressed the SUITE tenant it shares a library with.
@@ -62,10 +65,13 @@ echo "PASS (a) end-to-end scenario + scorecard shape"
 for cp in spawn_class_in_comparator spawn_never_leases_reserved_top \
           gate_defers_while_suite_saturated_admits_when_freed \
           agent_lease_admitted_then_reclaimed_on_kill \
-          agent_lease_start_timeout_self_releases lever_off_byte_identical; do
+          agent_lease_start_timeout_self_releases lever_off_byte_identical \
+          agent_lease_holder_isolates_caller_fds \
+          drain_two_seats_one_admission drain_crashed_holder_lease_frees \
+          drain_ledger_absent_legacy_identical; do
   assert_cp "$SCARD" "$cp"
 done
-echo "PASS (a) every named checkpoint passed: comparator's spawn class, mutation-prove of the never-leasable reserved-top slot, herd-spawn-gate.sh deferring on suite-ledger contention (and admitting once it frees), a headless agent's lease admitting/denying-a-rival/liveness-reclaiming on SIGKILL, a never-launched lease self-releasing on its start timeout, CAPACITY_BUDGET-off byte-identical"
+echo "PASS (a) every named checkpoint passed: comparator's spawn class, mutation-prove of the never-leasable reserved-top slot, herd-spawn-gate.sh deferring on suite-ledger contention (and admitting once it frees), a headless agent's lease admitting/denying-a-rival/liveness-reclaiming on SIGKILL, a never-launched lease self-releasing on its start timeout, CAPACITY_BUDGET-off byte-identical, the detached holder inheriting none of its caller's descriptors (no fd-9 lock pin), and (HERD-641) the watcher drain admitting once across two seats, freeing a crashed holder's lease by reconciliation, and falling back to the legacy FEATS budget when the ledger is absent"
 
 # ── (b) SUITE tenant untouched (P1's own proof, referenced — never re-run here) ─────────────────────
 # This check used to `bash "$SUITE_TEST"` — a FULL nested run of tests/test-capacity-ledger.sh (~22s
@@ -90,4 +96,4 @@ NEW_ENTRIES="$(comm -13 <(printf '%s\n' "$BASELINE_STATUS") <(printf '%s\n' "$NO
 [ -z "$NEW_ENTRIES" ] || fail "scenario leaked into the real repo tree:"$'\n'"$NEW_ENTRIES"
 echo "PASS (c) hermetic — no leak into the real repo"
 
-echo "ALL PASS — HERD-581 (HERD-557 P2): builder spawns lease 'agent' tenant capacity through the same ledger/comparator P1 built for suites, released liveness-based on agent exit, with herd-spawn-gate.sh closing the spawning-into-idleness pathology and the SUITE tenant left byte-identical."
+echo "ALL PASS — HERD-581 (HERD-557 P2): builder spawns lease 'agent' tenant capacity through the same ledger/comparator P1 built for suites, released liveness-based on agent exit, with herd-spawn-gate.sh closing the spawning-into-idleness pathology and the SUITE tenant left byte-identical. HERD-641 (HERD-625 Phase 4): the watcher's spawn-queue drain admits through that SAME tenant instead of its own FEATS roster, so two seats draining one queue can no longer jointly exceed the machine's budget."

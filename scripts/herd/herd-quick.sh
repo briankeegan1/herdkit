@@ -114,7 +114,15 @@ fi
 # capacity_agent_lease_reserve's own fail-soft return-0 — proceeds unslotted, byte-identical to before
 # this feature existed. --force / HERD_FORCE_SPAWN=1 bypasses, same override surface as the review-gate
 # check, so an urgent item is never blocked by lease pressure.
-if [ "$FORCE_SPAWN" != "1" ] && command -v capacity_agent_lease_reserve >/dev/null 2>&1 \
+# HERD_AGENT_LEASE_HELD=1 (HERD-641, Phase 4 of HERD-625) means the watcher's spawn-queue drain ALREADY
+# acquired this slug's 'agent' unit as its machine-wide admission decision, then handed the lane off.
+# Leasing again here would spend a SECOND unit on ONE agent session and halve the fleet's real budget,
+# so the lane skips its own acquire and inherits the drain's — same ledger, same slug, one unit. An
+# env seam set by exactly one dispatch path (agent-watch.sh:_drain_lane_worker), never by an operator;
+# unset (every hand-run spawn, and every watcher with CAPACITY_BUDGET off) keeps the acquire below
+# byte-identical.
+if [ "${HERD_AGENT_LEASE_HELD:-}" != "1" ] \
+   && [ "$FORCE_SPAWN" != "1" ] && command -v capacity_agent_lease_reserve >/dev/null 2>&1 \
    && ! capacity_agent_lease_reserve "$(capacity_agent_lease_cap)" "$SLUG"; then
   herd_capacity_lease_emit_defer "$SLUG"
   exit 0

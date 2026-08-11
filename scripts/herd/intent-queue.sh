@@ -22,10 +22,13 @@
 #     non-spawn intent (doc §2.2 / §6): it exists to prove a non-spawn intent rides these rails end to
 #     end before anything load-bearing does.
 #
-# NOT MULTI-SEAT SAFE, and never claimed to be. Two seats draining one pool each compute their own
-# budget from their own roster; the doc's §5.5 open question is Phase 4's job (the HERD-581 `agent`
-# capacity tenant), not this slice's. The at-most-one-CLAIM guarantee below IS cross-seat safe (it is
-# one atomic rename); the at-most-one-ADMISSION guarantee is not.
+# MULTI-SEAT SAFETY, and where it lives. The at-most-one-CLAIM guarantee below IS cross-seat safe on
+# its own (it is one atomic rename). The at-most-one-ADMISSION guarantee is NOT this library's — it was
+# the doc's §5.5 open question, and Phase 4 (HERD-641) closed it one level up, in the spawn drain's own
+# admission: agent-watch.sh:_drain_spawn_queue leases a MACHINE-WIDE unit of the HERD-581 `agent`
+# capacity tenant before dispatching a lane, instead of sizing a budget from its own roster. Deliberately
+# NOT pushed down here: only the spawn tenant consumes a builder slot, so only it has an admission to
+# bound — a marker intent leases nothing and needs nothing.
 #
 # NO NEW CONFIG KEY. Phase 1's single operator lever (INTENT_QUEUE, herd-config.sh) governs every
 # behavior here that is not plain FIFO, exactly as it did before the extraction.

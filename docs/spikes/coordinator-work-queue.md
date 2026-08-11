@@ -358,14 +358,34 @@ already surfaces the mismatch loudly. This is not hypothetical bookkeeping — a
 level N+1 that an N-level watcher drains as "unknown kind → terminal escalate" would convert a
 routine engine skew into a needs-you row per intent.
 
-### 5.5 Open question, deferred to Phase 4
+### 5.5 Cross-seat drain budget — CLOSED by Phase 4 (HERD-641)
 
-Each watcher computes its spawn budget from **its own** `FEATS` roster. Two seats draining one queue
-therefore each admit up to their own cap, and the fleet can exceed the machine's real budget. The
-mechanism to fix it already exists and is not the queue's to reinvent: the HERD-581 `agent` capacity
-tenant is a genuine machine-wide count (`capacity_agent_lease_hold`), and the drain should lease
-through it rather than counting worktrees. Phase 1 does not make this worse — a single-seat drain
-behaves exactly as today — but it must not be shipped as *multi-seat safe* until Phase 4 lands.
+*The open question, as Phase 0 stated it:* each watcher computed its spawn budget from **its own**
+`FEATS` roster. Two seats draining one queue therefore each admitted up to their own cap, and the
+fleet could exceed the machine's real budget. The mechanism to fix it already existed and was not the
+queue's to reinvent: the HERD-581 `agent` capacity tenant is a genuine machine-wide count
+(`capacity_agent_lease_hold`), and the drain should lease through it rather than counting worktrees.
+
+*As shipped (Phase 4):* `_drain_spawn_queue` acquires that tenant's unit for the candidate's slug
+immediately before the lane is dispatched — below the launch-slot and re-ground checks, so a tick that
+cannot launch never touches the ledger and an already-Done candidate never leases one. Denied → the
+intent is held and handed back for a later tick, exactly like a gate-deferred spawn. The per-seat
+`${#FEATS[@]}` subtraction is gone from the armed path; what remains of `_dsq_budget` there is a pure
+per-tick WALK BOUND. `capacity_agent_lease_armed` (capacity-ledger.sh) is the single arming rule both
+the drain and the reserve read, so the two can never disagree, and the lane inherits the drain's unit
+via `HERD_AGENT_LEASE_HELD` rather than leasing a second one for the same session.
+
+Release stays a **reconciled invariant**, never an event side-effect of the drain: the detached holder
+`capacity_agent_lease_hold` polls `herd_driver_agent_liveness` for the slug and releases when the
+session is confirmed gone (or on its own start timeout if the lane never launched one). A seat that
+crashes holding leases frees them by the same contract from below — the flock belongs to the holder
+process, so the kernel drops it the instant that process dies and the next seat's reserve admits.
+
+Fail-soft is byte-identical: no ledger in the tree, `CAPACITY_BUDGET` unset, no worktree pool or no
+python3 → the legacy `cap - ${#FEATS[@]}` budget runs untouched. Proven in
+[`sandbox-capacity-agent-lease-scenario.sh`](../../scripts/herd/sim/sandbox-capacity-agent-lease-scenario.sh)
+by `drain_two_seats_one_admission`, `drain_crashed_holder_lease_frees` and
+`drain_ledger_absent_legacy_identical`. **With this landed the epic may be described multi-seat safe.**
 
 ## 6. Phase cutlist
 
@@ -380,8 +400,10 @@ behaves exactly as today — but it must not be shipped as *multi-seat safe* unt
 - **Phase 3 — non-merge terminal evidence + note-ack.** Close-on-evidence for PRs closed unmerged and
   items superseded by a shipped sibling (§1.2's residue); `note-ack` for notes whose routed artifact
   is observable (§1.4).
-- **Phase 4 — cross-seat drain budget.** Lease the spawn slot through the HERD-581 `agent` capacity
-  tenant instead of counting this seat's `FEATS`; closes §5.5.
+- **Phase 4 — cross-seat drain budget. SHIPPED (HERD-641).** The drain leases the spawn slot through
+  the HERD-581 `agent` capacity tenant instead of counting this seat's `FEATS`, releasing by the
+  tenant's own retirement invariant and falling back byte-identically when the ledger is absent;
+  closes §5.5, and with it the last reason not to call this epic multi-seat safe.
 - **Phase 5 — the candidate list as a first-class surface.** Generation publish/supersede as a
   coordinator command plus a console section showing the pending plan, so a second seat reads the
   queue instead of re-deriving it.
@@ -418,7 +440,10 @@ asserts alone are not sufficient.
 - **Escalation-row sprawl.** Every new intent kind is a new way to produce a needs-you row. The
   age-to-retired path (§4.3) plus one shared row-rendering surface keeps this bounded; a kind that
   cannot age out does not ship.
-- **Two seats over-admitting.** Real until Phase 4 (§5.5). Do not describe Phase 1 as multi-seat safe.
+- ~~**Two seats over-admitting.** Real until Phase 4 (§5.5). Do not describe Phase 1 as multi-seat
+  safe.~~ **RETIRED — Phase 4 shipped (HERD-641).** The drain admits through the machine-wide HERD-581
+  `agent` capacity lease instead of this seat's `FEATS` roster, so two seats draining one queue admit
+  exactly one; see §5.5 for the shipped mechanism and its three proofs.
 - **The abstraction arriving before its second consumer.** Mitigated by sequencing (§3.3), at the cost
   of a Phase 1 that must be written extraction-shaped by discipline rather than by structure. Worth
   naming explicitly in the Phase 2 item so a later builder does not have to rediscover it.
