@@ -19,6 +19,7 @@ Coverage:
 
 Run:  PYTHONPATH=pysrc python3 tests/test_live_runtime.py
 """
+import hashlib
 import json
 import os
 import shlex
@@ -1568,9 +1569,12 @@ class TestLiveMergeVerify(LiveCase):
 
 
 class _RosterPaneSub(_RecordingSub):
-    """HERD-648: stubs `herdr agent list` (a constant agent_status/pane_id row) and `herdr pane read`
-    (a scripted sequence of pane-text frames, consumed in call order, empty once exhausted) — the two
-    real reads LiveActuator._status_resolved / _agent_lookup make."""
+    """HERD-648: stubs `herdr agent list` (a constant agent_status/pane_id row), `herdr pane read` (a
+    scripted sequence of pane-text frames, consumed in call order, empty once exhausted), and `cksum`
+    (a deterministic content-keyed stand-in for the real binary — sufficient for these unit tests,
+    which only ever compare a python-stubbed read against an earlier python-stubbed write, never a
+    bash-written line; TestPaneContentDeltaCksumInterop below is what proves REAL cksum-format
+    compatibility with the bash twin) — the reads LiveActuator._status_resolved / _agent_lookup make."""
 
     def __init__(self, agent_status, pane_texts, pane_id="pane-1", name="slug1"):
         super().__init__()
@@ -1588,6 +1592,11 @@ class _RosterPaneSub(_RecordingSub):
             self.calls.append(list(argv))
             text = self.pane_texts.pop(0) if self.pane_texts else ""
             return _FakeCompleted(text)
+        if argv[:1] == ["cksum"]:
+            self.calls.append(list(argv))
+            text = k.get("input") or ""
+            digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+            return _FakeCompleted("%s %d\n" % (digest, len(text)))
         return super().run(argv, *a, **k)
 
 
@@ -1810,6 +1819,71 @@ class TestStatusCorroborateBashPythonParity(unittest.TestCase):
             if bash_got != expected or python_got != expected or bash_got != python_got:
                 mismatches.append((name, bash_got, python_got, expected))
         self.assertFalse(mismatches, "bash/python status-resolve disagreement: %r" % (mismatches,))
+
+
+class TestPaneContentDeltaCksumInterop(unittest.TestCase):
+    """HERD-648 adversarial review finding: in production the content-delta snapshot store is SHARED
+    on disk between the bash and python engines — agent-watch.sh:391 sets `TREES=$WORKTREES_DIR` and
+    the python engine is launched with `WORKTREES_DIR=${TREES:-}`, so driver.sh's
+    `${WORKTREES_DIR:-${TREES:-.}}/.herd/status-resolve/<slug>` and this module's `_pool_dir()`-rooted
+    store resolve to the IDENTICAL file. The original port hashed with python's sha256 while the bash
+    twin pipes text through `cksum` — the two encodings can never compare equal, so a snapshot written
+    by one side always reads as "changed" to the other, permanently defeating the frozen-pane/dead-
+    builder guardrail the instant both engines touch the same slug. This test proves the fix (python
+    now shells to the SAME `cksum` binary) by sharing one real on-disk store between a genuine bash
+    `_herd_pane_content_delta` call and a genuine python `_pane_content_delta` call — no subprocess
+    stubbing on either side, so a re-introduced encoding mismatch would be caught here even though
+    TestStatusCorroborateBashPythonParity (separate tmpdirs per language) could not catch it."""
+
+    def setUp(self):
+        if shutil.which("bash") is None or shutil.which("cksum") is None:
+            self.skipTest("bash/cksum not on PATH")
+        self.driver_sh = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "herd", "driver.sh"))
+        if not os.path.exists(self.driver_sh):
+            self.skipTest("driver.sh not found at %s" % self.driver_sh)
+        self.pool = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.pool, True)
+        self._orig_trees = os.environ.get("WORKTREES_DIR")
+        self._orig_TREES = os.environ.get("TREES")
+        os.environ["WORKTREES_DIR"] = self.pool
+        os.environ.pop("TREES", None)
+
+    def tearDown(self):
+        if self._orig_trees is None:
+            os.environ.pop("WORKTREES_DIR", None)
+        else:
+            os.environ["WORKTREES_DIR"] = self._orig_trees
+        if self._orig_TREES is not None:
+            os.environ["TREES"] = self._orig_TREES
+
+    def _bash_delta(self, slug, text):
+        # Calls driver.sh's _herd_pane_content_delta DIRECTLY (slug + text args) — no herdr stub
+        # needed, since this function never reads a pane itself.
+        script = (
+            "set -uo pipefail\n"
+            ". %s\n"
+            "_herd_pane_content_delta %s %s && echo DELTA || echo NODELTA\n"
+        ) % (shlex.quote(self.driver_sh), shlex.quote(slug), shlex.quote(text))
+        out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=15)
+        return out.stdout.strip() == "DELTA"
+
+    def _python_delta(self, slug, text):
+        return LR._pane_content_delta(slug, text)
+
+    def test_bash_writes_first_python_reads_the_same_store(self):
+        slug = "interop-a"
+        frame1, frame2 = "✳ frame one", "✳ frame two — different"
+        self.assertFalse(self._bash_delta(slug, frame1))     # bash: no prior snapshot yet
+        self.assertFalse(self._python_delta(slug, frame1))   # python reads bash's frame-1 snapshot: SAME text
+        self.assertTrue(self._python_delta(slug, frame2))    # snapshot (frame 1) vs frame 2: a REAL delta
+
+    def test_python_writes_first_bash_reads_the_same_store(self):
+        slug = "interop-b"
+        frame1, frame2 = "✳ frame one", "✳ frame two — different"
+        self.assertFalse(self._python_delta(slug, frame1))   # python: no prior snapshot yet
+        self.assertFalse(self._bash_delta(slug, frame1))     # bash reads python's frame-1 snapshot: SAME text
+        self.assertTrue(self._bash_delta(slug, frame2))      # snapshot (frame 1) vs frame 2: a REAL delta
 
 
 class _RecordingResolverSub:

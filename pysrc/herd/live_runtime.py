@@ -4041,7 +4041,16 @@ def _pane_content_delta(slug, text):
     recorded for <slug> — a real repaint, not a stale frame — always refreshing the snapshot to <text>
     first. Best-effort store under the worktree pool's .herd/status-resolve/<slug>; an unwritable or
     unconfigured store degrades to "no delta" (never corroborates, never blocks a caller), the same
-    fail-soft shape as the bash twin."""
+    fail-soft shape as the bash twin.
+
+    In production this store is SHARED with the bash twin: agent-watch.sh:391 sets
+    ``TREES=$WORKTREES_DIR`` and the python engine is launched with ``WORKTREES_DIR=${TREES:-}``, so
+    ``_pool_dir()`` here and driver.sh's own ``${WORKTREES_DIR:-${TREES:-.}}`` resolve to the identical
+    file. The snapshot is therefore hashed with the SAME ``cksum`` binary the bash twin pipes text
+    through (HERD-648 review finding) rather than a python-only digest — sha256 hex can never equal a
+    bash-written cksum line, which would make ``prev != cur`` spuriously True on every cross-process
+    read and defeat the frozen-pane/dead-builder guardrail the instant both engines touch one slug.
+    A failed/unavailable ``cksum`` degrades to "no delta" (``cur`` stays empty), never a false one."""
     pool = _pool_dir()
     if not pool or not slug:
         return False
@@ -4056,13 +4065,17 @@ def _pane_content_delta(slug, text):
             prev = fh.read()
     except Exception:
         prev = ""
-    cur = hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()
+    try:
+        out = subprocess.run(["cksum"], input=(text or ""), capture_output=True, text=True, timeout=10)
+        cur = (out.stdout or "").strip()
+    except Exception:
+        cur = ""
     try:
         with open(f, "w", encoding="utf-8") as fh:
             fh.write(cur)
     except Exception:
         pass
-    return bool(prev) and prev != cur
+    return bool(prev) and bool(cur) and prev != cur
 
 
 class DryRunActuator:
