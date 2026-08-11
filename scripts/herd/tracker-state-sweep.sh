@@ -523,6 +523,153 @@ EOF
   herd_console_trim "$ACK_FILE"
 }
 
+# ── HERD-640 · M2 RESIDUE: close-item-on-NON-MERGE terminal evidence ──────────────────────────────
+# This file IS the merge-evidence half of docs/spikes/coordinator-work-queue.md's M2 duty, and §1.2
+# measured that half as already-working (2026-08-10: twelve merged items reached Done with no
+# coordinator turn — 5 via the merge-time fast path, 7 via the loop above). The residue it names is
+# the NON-merge evidence: a PR carrying `Refs:` that CLOSED UNMERGED. Nothing reads that today, so its
+# item sits in whatever state the abandoned build left it in until a human notices.
+#
+# The scan below is the PRODUCER for that residue. It does not write the tracker itself — every write
+# rides the Phase-2 intent queue (agent-watch.sh's _drain_intent_queue → _intent_evidence_apply), for
+# three reasons that are the design, not plumbing taste: the drain RE-GROUNDS the decision against the
+# item's current state before writing (§4.2), it owns the transient/terminal failure split and the
+# attempt counter (§4.3), and it keeps every tracker write behind ONE dispatch table (§4.1) instead of
+# growing a second write surface in a sweep.
+#
+# WHAT IT MAY CONCLUDE, and nothing else (§2.1's four-part test, applied in this item as §8 requires):
+#   • superseded   — a DIFFERENT, MERGED PR carries the same ref ⇒ the work shipped elsewhere.
+#   • work-remains — no merged sibling AND no OPEN sibling ⇒ nothing shipped, nobody is on it.
+#   • in-flight    — an open sibling carries the ref ⇒ the work is live; do nothing, do not ledger,
+#                    re-read next sweep (the cheapest correct answer is to wait).
+#   • ambiguous    — a merged sibling AND an open one ⇒ "shipped" and "still coming" both have
+#                    evidence. Journal ONE coordinator-facing event and stop. §2.3 keeps curation on
+#                    the seat, and the doc's own line is the test: act only when the decision is
+#                    already made and merely unexecuted.
+# Ship-dormant behind Phase 1's lever with no second key: INTENT_QUEUE off ⇒ the scan never runs, so
+# the sweep issues exactly the gh calls and writes exactly the rows it did before this existed.
+#
+# Seams (mirroring the merged-PR ones above, so a test drives the real code path):
+#   HERD_TSWEEP_CLOSED_FILE / _JSON_FILE   closed-unmerged PRs ("<pr>\t<ref>" lines / raw gh JSON)
+#   HERD_TSWEEP_OPEN_FILE   / _JSON_FILE   open PRs, same two shapes
+#   HERD_TSWEEP_CLOSED_LEDGER              the enqueue-once ledger ("<epoch> <ref> <pr> <verdict>")
+CLOSED_LEDGER="${HERD_TSWEEP_CLOSED_LEDGER:-$WORKTREES_DIR/.agent-watch-closed-unmerged-scanned}"
+
+# _tsweep_prs_by_state <state> <file-seam> <json-seam> [--unmerged] — "<pr#>\t<ref>" rows for the PRs
+# in <state>, through the SAME shared multi-ref parser _merged_refs uses (pr-ref.sh, HERD-522/587): a
+# second extractor here is precisely the drift that would make this scan disagree with the backstop it
+# lives beside. --unmerged additionally drops any PR that carries a mergedAt (a merged PR is the OTHER
+# half of M2 and is handled by the loop above). Fail-soft: no gh / offline yields zero rows.
+_tsweep_prs_by_state() {
+  local state="$1" file_seam="$2" json_seam="$3" unmerged="${4:-}" json
+  if [ -n "$file_seam" ]; then cat "$file_seam"; return 0; fi
+  if [ -n "$json_seam" ]; then
+    json="$(cat "$json_seam")"
+  else
+    command -v gh >/dev/null 2>&1 || return 0
+    json="$(cd "$REPO" && gh pr list --state "$state" --limit "$LIMIT" --json number,body,mergedAt 2>/dev/null)" || return 0
+  fi
+  [ -n "$json" ] || return 0
+  printf '%s' "$json" | UNMERGED_ONLY="$unmerged" python3 -c "$HERD_PR_REF_PY"'
+import sys, json, os
+only_unmerged = bool(os.environ.get("UNMERGED_ONLY"))
+try:
+    prs = json.load(sys.stdin)
+except Exception:
+    prs = []
+for pr in prs if isinstance(prs, list) else []:
+    num = pr.get("number")
+    if num is None:
+        continue
+    if only_unmerged and pr.get("mergedAt"):
+        continue
+    for ref in pr_ref_all_from_body(pr.get("body") or ""):
+        print("%s\t%s" % (num, ref))
+' 2>/dev/null || true
+}
+
+# _tsweep_closed_ledgered <ref> <pr> — has this exact (ref, closed-PR) pair already been classified?
+# Keyed on BOTH columns, not the ref alone: two PRs may legitimately close unmerged against one item
+# (two abandoned attempts), and each is its own piece of evidence.
+_tsweep_closed_ledgered() {
+  [ -s "$CLOSED_LEDGER" ] || return 1
+  awk -v r="$1" -v p="$2" '$2==r && $3==p{f=1} END{exit !f}' "$CLOSED_LEDGER" 2>/dev/null
+}
+_tsweep_closed_record() {
+  local dir="${CLOSED_LEDGER%/*}"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s %s %s %s\n' "$(date +%s 2>/dev/null || echo 0)" "$1" "$2" "$3" >> "$CLOSED_LEDGER" 2>/dev/null || true
+}
+
+# _tsweep_enqueue_evidence <ref> <disposition> <closed-pr> [<via-pr>] — publish ONE close-on-evidence
+# intent through the SHARED library (scripts/herd/intent-queue.sh), never a hand-rolled write: the
+# claim mechanics, the id minting and the atomic publish are the ones every other tenant uses. The
+# `[ -f ]` guard is LOAD-BEARING (HERD-632) — `.` is a special builtin, so sourcing a missing path
+# kills the shell outright, which neither `2>/dev/null` nor `|| true` catches.
+_tsweep_enqueue_evidence() {
+  local ref="$1" disp="$2" pr="$3" via="${4:-}"
+  command -v iq_enqueue >/dev/null 2>&1 || {
+    IQ_LOG_PREFIX="tracker-state-sweep"
+    IQ_ENGINE_DIR="$HERE"
+    # shellcheck source=/dev/null
+    [ -f "$HERE/intent-queue.sh" ] && . "$HERE/intent-queue.sh"
+  }
+  command -v iq_enqueue >/dev/null 2>&1 || return 1
+  iq_enqueue "$WORKTREES_DIR/intent-queue" "close-on-evidence
+$ref
+${WATCHER_OWNER:-}
+$disp pr=$pr${via:+ via=$via}" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+# _tsweep_scan_closed_unmerged — the pass. One row per (closed-unmerged PR, ref) not yet classified.
+_tsweep_scan_closed_unmerged() {
+  command -v herd_intent_queue_on >/dev/null 2>&1 || return 0
+  herd_intent_queue_on || return 0
+  local closed merged_set open_set pr ref via disp
+  closed="$(_tsweep_prs_by_state closed "${HERD_TSWEEP_CLOSED_FILE:-}" "${HERD_TSWEEP_CLOSED_JSON_FILE:-}" unmerged)"
+  [ -n "$closed" ] || return 0
+  # The sibling evidence, read ONCE for the whole pass (never per row).
+  merged_set="$(_merged_refs)"
+  open_set="$(_tsweep_prs_by_state open "${HERD_TSWEEP_OPEN_FILE:-}" "${HERD_TSWEEP_OPEN_JSON_FILE:-}")"
+  while IFS=$'\t' read -r pr ref; do
+    [ -n "${ref:-}" ] && [ -n "${pr:-}" ] || continue
+    _tsweep_closed_ledgered "$ref" "$pr" && continue
+    # A ref the ACTIVE backend can never resolve is not evidence of anything (HERD-411/HERD-624's
+    # shape guard, shared with the merged loop) — record it and never probe it again.
+    if _tsweep_ref_backend_mismatch "$ref"; then
+      _tsweep_closed_record "$ref" "$pr" unresolvable
+      continue
+    fi
+    # A merged sibling: any OTHER pr number carrying this same ref in the merged set.
+    via="$(printf '%s\n' "$merged_set" | awk -F'\t' -v r="$ref" -v p="$pr" '$2==r && $1!=p{print $1; exit}')"
+    if printf '%s\n' "$open_set" | awk -F'\t' -v r="$ref" -v p="$pr" '$2==r && $1!=p{f=1} END{exit !f}'; then
+      if [ -n "$via" ]; then
+        # AMBIGUOUS: shipped (a merged sibling) AND still coming (an open one). The queue does not get
+        # to pick; §2.3 says a human does. Journal once, ledger once, write nothing.
+        journal_append intent_evidence_ambiguous ref "$ref" pr "$pr" component sweep \
+          detail "merged sibling #$via and an open sibling both carry this ref" \
+          reason "evidence does not decide — coordinator call"
+        _tsweep_closed_record "$ref" "$pr" ambiguous
+        echo "tracker-state-sweep: $ref has BOTH a merged sibling (#$via) and an open PR after PR #$pr closed unmerged — ambiguous, left for the coordinator."
+      fi
+      # in-flight (no merged sibling, an open one): the work is live. Nothing to do, and deliberately
+      # NOT ledgered — the reading changes the moment that PR merges or closes.
+      continue
+    fi
+    if [ -n "$via" ]; then disp="superseded"; else disp="work-remains"; fi
+    if _tsweep_enqueue_evidence "$ref" "$disp" "$pr" "$via"; then
+      journal_append intent_evidence_queued ref "$ref" pr "$pr" component sweep \
+        disposition "$disp" via "${via:-}"
+      _tsweep_closed_record "$ref" "$pr" "$disp"
+      echo "tracker-state-sweep: queued a close-on-evidence intent for $ref ($disp; PR #$pr closed unmerged${via:+, shipped in #$via})."
+    fi
+  done <<EOF
+$closed
+EOF
+  return 0
+}
+
 _tsweep_migrate_drop_epochs
 _tsweep_auto_retire_shape_invalid
 
@@ -586,6 +733,11 @@ done < <(_merged_refs)
 # `retired` state. Independent of the scan above (it reads $LEDGER's own rows, not a fresh PR list),
 # so it still runs on a sweep that finds nothing new to heal.
 _tsweep_age_unresolvable_to_retired
+
+# HERD-640 M2 RESIDUE: the NON-merge terminal evidence pass. Ship-dormant behind INTENT_QUEUE (it
+# returns on its first line with the lever off), and it never writes the tracker itself — it publishes
+# close-on-evidence intents the watcher's drain re-grounds and executes.
+_tsweep_scan_closed_unmerged
 
 if [ "$healed" -eq 0 ] && [ "$failed" -eq 0 ] && [ "$unresolvable" -eq 0 ]; then
   echo "tracker-state-sweep: no tracker drift — $scanned merged ref(s) scanned, $checked re-checked, all Done. Nothing to heal."

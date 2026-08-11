@@ -450,6 +450,16 @@ note frequently explains the row you are about to act on.
    herd notes ack all     # everything currently on the console
    ```
    The ack is display-only: `herd log` keeps every note forever, so acking never destroys evidence.
+   **When your routing named an artifact you are still waiting on** — the item the scribe is filing,
+   the PR a re-task will land — hand the *waiting* to the engine instead of holding it in your head
+   (HERD-640, and this needs `INTENT_QUEUE=on`):
+   ```
+   herd notes route <n> item:HERD-123   # ack it once that item resolves in the tracker
+   herd notes route <n> pr:812          # ack it once that PR lands
+   ```
+   This acks **nothing** now: it records the artifact, and the watcher clears the note the moment the
+   artifact demonstrably exists. Routing stays your call — a **Dismiss** has no artifact, so it takes
+   no `route`; ack it yourself.
    **If `herd notes ack` is not available in this engine build** (it ships with HERD-243), the loop
    still works — read and route exactly as above, and handled notes simply **age out of the display**
    on their own rather than clearing on command. Never skip the routing step just because you cannot

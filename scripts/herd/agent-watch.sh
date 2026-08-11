@@ -603,14 +603,19 @@ INTENT_TTL="${INTENT_TTL:-86400}"
 # which is every watcher with INTENT_QUEUE off (the ship default).
 INTENT_ESCALATION_LEDGER="$TREES/.agent-watch-intent-escalations"
 INTENT_ESCALATION_ACK="$TREES/.agent-watch-intent-escalations-acked"
-# ── The M3 intent queue (HERD-639 · Phase 2 of HERD-625) ─────────────────────────────────────────
+# ── The general intent queue (HERD-639 Phase 2 · HERD-640 Phase 3 of HERD-625) ───────────────────
 # The general intents ledger the design doc's §3.2 Option B calls for: a SIBLING of spawn-queue/ under
 # the same pool, sharing the same claim primitives through scripts/herd/intent-queue.sh but NOT the
-# spawn queue's budget — a marker intent consumes no builder slot, so it must neither spend one nor
-# queue behind one. Its only tenant today is M3 (queue-marker publish/supersede, §1.3), deliberately
-# the smallest real tracker-write intent: it exists to prove a non-spawn intent rides these rails end
-# to end before anything load-bearing does. Drained only while INTENT_QUEUE=on (no second lever), and
-# the directory is not even created on a watcher where nothing ever enqueued one.
+# spawn queue's budget — none of its intents consumes a builder slot, so none must spend one or queue
+# behind one. Its tenants, in the order the phase cutlist (§6) landed them:
+#   • M3 marker-publish / marker-supersede (Phase 2, §1.3) — the smallest real tracker-write intent,
+#     which exists to prove a non-spawn intent rides these rails end to end.
+#   • M2 close-on-evidence (Phase 3, §1.2's residue) — a PR carrying `Refs:` CLOSED UNMERGED drives its
+#     item to the right terminal. Produced by tracker-state-sweep.sh's closed-unmerged evidence scan.
+#   • M4 note-ack (Phase 3, §1.4) — clear a routed builder note once its artifact demonstrably exists.
+#     Produced by _scan_note_routes below.
+# Drained only while INTENT_QUEUE=on (no second lever), and the directory is not even created on a
+# watcher where nothing ever enqueued one.
 INTENT_QUEUE_DIR="$TREES/intent-queue"
 # How many marker intents one tick may drain. Small on purpose: each is one backend round-trip, the
 # queue is expected to be near-empty, and an unbounded walk would put a slow tracker on the 4 s tick.
@@ -646,9 +651,18 @@ INBOX_SEEN_MAX=1000    # most-recent seen comment ids kept (dedup memory, bounde
 #   • BUILDER_NOTES_ACK — the ACK ledger (HERD-243): one verbatim ledger line per note the operator
 #     has handled via `herd notes ack <all|n>`. An acked note leaves the console IMMEDIATELY; the
 #     journal (the history) is never touched. Notes also age out of display after CONSOLE_ROW_RETENTION.
+#   • BUILDER_NOTES_ROUTES — M4 (HERD-640, Phase 3 of HERD-625): the PENDING-ROUTE surface. Routing a
+#     note is a coordinator JUDGMENT (act now / file it / dismiss — doc §1.4) and stays one; what
+#     Phase 3 externalizes is only the BOOKKEEPING TAIL of a routing that named an observable
+#     artifact. `herd notes route <n> <artifact>` records one TAB row here
+#     ("<epoch>\t<kind>\t<artifact>\t<the note's verbatim ledger line>", kind ∈ item|pr), and
+#     _scan_note_routes enqueues a `note-ack` intent the moment that artifact demonstrably EXISTS.
+#     A note routed as "dismiss" has NO artifact, so it gets no row and is never auto-acked — the
+#     doc's own limit on M4, kept structural rather than documented.
 BUILDER_NOTES_LEDGER="$TREES/.agent-watch-builder-notes"
 BUILDER_NOTES_CURSOR="$TREES/.agent-watch-builder-notes-cursor"
 BUILDER_NOTES_ACK="$TREES/.agent-watch-builder-notes-acked"
+BUILDER_NOTES_ROUTES="$TREES/.agent-watch-builder-notes-routes"
 BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # Phase-anomaly console surface (HERD-496). ANOMALY_BASELINES compares a just-completed phase
 # instance's wall-clock duration against a rolling median/p95 baseline (pysrc/herd/store.py); a
@@ -18325,6 +18339,10 @@ EOF
   _INTENT_DRAIN_TICK=$((_INTENT_DRAIN_TICK + 1))
   if [ "$_INTENT_DRAIN_TICK" -ge "$_INTENT_DRAIN_INTERVAL" ]; then
     _INTENT_DRAIN_TICK=0
+    # M4 producer BEFORE the drain (HERD-640): a route whose artifact has just landed becomes an
+    # intent that this very pass then executes, so the ack costs one cadence, not two. Same lever,
+    # same fast exit — with INTENT_QUEUE off (and with no route ever recorded) both are no-ops.
+    _scan_note_routes
     _drain_intent_queue
   fi
 
@@ -19080,12 +19098,25 @@ _drain_intent_queue() {
         reason "empty kind or ref"
       continue
     fi
-    _diq_result="$(_intent_marker_apply "$_diq_kind" "$_diq_ref" "$_diq_who" "$_diq_detail")"
+    # KIND DISPATCH (HERD-640). One executor per intent CLASS, each resolving to the existing engine
+    # path a coordinator would have used (§4.1) — the queue still adds no new mutation surface. The
+    # marker tenant keeps the fall-through so its own kinds reach _intent_marker_apply unchanged (which
+    # is also what keeps tests/test-intent-queue-marker-tenant.sh's extraction set valid).
+    case "$_diq_kind" in
+      close-on-evidence) _diq_result="$(_intent_evidence_apply "$_diq_ref" "$_diq_who" "$_diq_detail")" ;;
+      note-ack)          _diq_result="$(_intent_note_ack_apply "$_diq_ref" "$_diq_who" "$_diq_detail")" ;;
+      *)                 _diq_result="$(_intent_marker_apply "$_diq_kind" "$_diq_ref" "$_diq_who" "$_diq_detail")" ;;
+    esac
     case "${_diq_kind}/${_diq_result}" in
       */UNKNOWN-KIND)
         iq_skip "$_diq_claimed" "unknown intent kind '$_diq_kind'" 2>/dev/null
         journal_append intent_skipped intent "$_diq_id" kind "$_diq_kind" ref "$_diq_ref" \
           reason "unknown kind"
+        ;;
+      */CONVERGED)
+        # The world already IS what the intent asked for (the item is closed, the note is acked). Not a
+        # failure and not a write — consume it, journaled honestly (§5.3).
+        _intent_consume "$_diq_claimed" "$_diq_id" "$_diq_kind" "$_diq_ref" converged
         ;;
       */NO-OP)
         # §4.1: a backend with no planned-marker op. Advisory feature — consume quietly-but-journaled
@@ -19139,9 +19170,11 @@ _drain_intent_queue() {
 _intent_consume() {
   local _ic_claimed="$1" _ic_id="$2" _ic_kind="$3" _ic_ref="$4" _ic_result="$5" _ic_event
   case "$_ic_kind" in
-    marker-publish)   _ic_event=intent_marker_published ;;
-    marker-supersede) _ic_event=intent_marker_superseded ;;
-    *)                _ic_event=intent_executed ;;
+    marker-publish)    _ic_event=intent_marker_published ;;
+    marker-supersede)  _ic_event=intent_marker_superseded ;;
+    close-on-evidence) _ic_event=intent_evidence_closed ;;   # HERD-640 · M2 residue
+    note-ack)          _ic_event=intent_note_acked ;;        # HERD-640 · M4
+    *)                 _ic_event=intent_executed ;;
   esac
   if iq_require_claim "$_ic_claimed" done 2>/dev/null; then
     iq_done "$_ic_claimed"
@@ -19167,6 +19200,235 @@ _intent_marker_enqueue() {
 $_ime_ref
 $_ime_who
 $_ime_detail" >/dev/null 2>&1 || true
+  return 0
+}
+
+# ── M2 residue · close-item-on-NON-MERGE terminal evidence (HERD-640 · Phase 3 of HERD-625) ──────
+# §1.2 measured that M2 is MOSTLY ALREADY BUILT: on 2026-08-10 all twelve merged items reached Done
+# with no coordinator turn (5 via _reconcile_via_ref, 7 via tracker-state-sweep.sh). What is left
+# un-externalized is closure on NON-MERGE terminal evidence — a PR carrying `Refs:` that CLOSED
+# UNMERGED — and that residue is what this tenant closes.
+#
+# THE EVIDENCE RULE IS THE DOC'S OWN MECHANICAL TEST, restated here because §2.3 puts the neighbouring
+# duty (curation — "this item is no longer worth doing") permanently on the seat: act ONLY when the
+# decision is ALREADY MADE AND MERELY UNEXECUTED. Two readings qualify, and the PRODUCER
+# (tracker-state-sweep.sh's closed-unmerged scan) is what classifies them, because it is the surface
+# that already reads every PR's `Refs:` through the shared parser:
+#   • superseded — a DIFFERENT, MERGED PR carries the same ref. The work shipped; the abandoned PR's
+#     item is driven to a CLOSED-NOT-DONE terminal (`canceled`) with a POINTER COMMENT naming the PR
+#     that shipped it, so the tracker records why it closed without the reader having to reconstruct it.
+#   • work-remains — no merged sibling and no live open sibling. Nothing shipped and nobody is on it,
+#     so the item must stay pickable: release OUR OWN claim (_backend_release_item, which refuses to
+#     steal another operator's) and leave the workflow state alone — moving a started item BACK is a
+#     re-queue, which that backend op's own contract already calls a coordinator act, not a watcher's.
+# ANY OTHER reading — a merged sibling AND an open one — is AMBIGUOUS, and is resolved where the
+# evidence lives: the PRODUCER journals a coordinator-facing `intent_evidence_ambiguous` event and
+# enqueues nothing at all, so no intent for an undecided reading ever reaches this executor (§2.3).
+# Deliberately NOT mirrored as a drain-side branch: a consumer arm nothing produces is the exact shape
+# journal-emission-lint.sh exists to catch, in code instead of in the journal.
+#
+# _intent_evidence_apply <ref> <who> <detail> — execute ONE close-on-evidence intent and print its
+# verdict: DONE | CONVERGED (already terminal / nothing of ours to release) | AMBIGUOUS | NOCHANGE
+# (transient — released with its attempt counter bumped) | NO-OP (this backend has no state ops) |
+# UNKNOWN-KIND (a disposition this engine level does not implement — §5.4). <detail> carries the
+# producer's classification in the intent's FROZEN 4-line payload rather than a 5th line, so an intent
+# written by this engine still parses on a Phase-2 drain: "<disposition> pr=<closed-pr> [via=<pr>]".
+_intent_evidence_apply() {
+  local _iea_ref="$1" _iea_who="${2:-}" _iea_detail="${3:-}" _iea_disp _iea_pr="" _iea_via="" _iea_tok
+  _iea_disp="${_iea_detail%% *}"
+  for _iea_tok in $_iea_detail; do
+    case "$_iea_tok" in
+      pr=*)  _iea_pr="${_iea_tok#pr=}"  ;;
+      via=*) _iea_via="${_iea_tok#via=}" ;;
+    esac
+  done
+  case "$_iea_disp" in superseded|work-remains) ;; *) printf 'UNKNOWN-KIND'; return 0 ;; esac
+  local _iea_bfile="${SCRIBE_BACKEND_DIR:-$HERE/backends}/${SCRIBE_BACKEND:-file}.sh"
+  [ -f "$_iea_bfile" ] || { printf 'NO-OP'; return 0; }
+  (
+    _secrets="$MAIN/.herd/secrets"
+    # shellcheck source=/dev/null
+    [ -f "$_secrets" ] && . "$_secrets"
+    # shellcheck source=/dev/null
+    . "$_iea_bfile" 2>/dev/null || { printf 'NO-OP'; exit 0; }
+    command -v _backend_item_state >/dev/null 2>&1 || { printf 'NO-OP'; exit 0; }
+    cd "$MAIN" 2>/dev/null || true
+    # RE-GROUND (§4.2): the intent was authored against a reading of the tracker that may be hours old.
+    # Re-read the item's CURRENT state through the same op the merge-evidence backstop uses before
+    # writing anything — a decision replayed is not a decision re-checked.
+    ITEM_STATE=""
+    local _iea_state
+    if _backend_item_state "$_iea_ref" >/dev/null 2>&1; then _iea_state="${ITEM_STATE:-unknown}"; else _iea_state="unknown"; fi
+    case "$_iea_state" in
+      unknown) printf 'NOCHANGE'; exit 0 ;;   # TRANSIENT: the backend did not answer — retry, bounded
+    esac
+    # HERD-85 attribution, matching tracker-state-sweep.sh's own heal writes: this IS that sweep's
+    # non-merge sibling, so a reader of `tracker_write` sees one consistent component for the family.
+    export HERD_COMPONENT="sweep" HERD_TW_PR="${_iea_pr:-}"
+    if [ "$_iea_disp" = "superseded" ]; then
+      local _iea_msg="closed not-done by the herd intent queue: PR #${_iea_pr:-?} carrying this ref was CLOSED UNMERGED, and the work shipped in merged PR #${_iea_via:-?}. Non-merge terminal evidence (HERD-640; docs/spikes/coordinator-work-queue.md §1.2). Re-open it if this reading is wrong."
+      # WHO OWNS "DONE" — the ordering that keeps these two halves of M2 from fighting. The
+      # MERGE-evidence half (_reconcile_via_ref, then tracker-state-sweep.sh's own loop) is
+      # AUTHORITATIVE for a ref a merged PR carries, and it runs FIRST: its loop is the one immediately
+      # above this scan in the same sweep process. So by the time an intent exists, that half has
+      # already had its turn, and the two cases split cleanly:
+      #   • item already CLOSED — the authoritative half did its job. The terminal is reached and the
+      #     only thing missing is WHY this PR closed unmerged, so post the pointer comment and stop.
+      #   • item still OPEN — nothing marked it Done, and a CLOSED-UNMERGED PR is not evidence of
+      #     completion. Drive the doc's own verdict for this branch: closed, NOT done (`canceled`),
+      #     with the pointer comment naming where the work went. The residual race with a heal that is
+      #     still retrying is benign — both writers converge on a CLOSED terminal, and
+      #     _backend_update_state reports only CONFIRMED transitions either way.
+      if [ "$_iea_state" = "closed" ]; then
+        command -v _backend_amend >/dev/null 2>&1 || { printf 'CONVERGED'; exit 0; }
+        _BACKEND_RESULT=""
+        _backend_amend "$_iea_ref" "$_iea_msg" >/dev/null 2>&1 || true
+        [ "${_BACKEND_RESULT:-}" = "DONE" ] && printf 'DONE' || printf 'CONVERGED'
+        exit 0
+      fi
+      command -v _backend_update_state >/dev/null 2>&1 || { printf 'NO-OP'; exit 0; }
+      _BACKEND_RESULT=""
+      _backend_update_state "$_iea_ref" canceled >/dev/null 2>&1 || true
+      if [ "${_BACKEND_RESULT:-}" = "DONE" ]; then
+        # The pointer comment rides AFTER the CONFIRMED transition, deliberately: a transient failure
+        # releases the intent for a later tick, and a comment posted before the write would be
+        # re-posted on every one of those retries. Fail-soft — the state is the terminal, the comment
+        # is its explanation, and losing the explanation must never re-open the item.
+        command -v _backend_amend >/dev/null 2>&1 && _backend_amend "$_iea_ref" "$_iea_msg" \
+          >/dev/null 2>&1 || true
+        printf 'DONE'
+      else
+        printf 'NOCHANGE'
+      fi
+      exit 0
+    fi
+    # work-remains on an item that is ALREADY closed: somebody closed it deliberately, which is
+    # curation (§2.3) and never ours to undo.
+    [ "$_iea_state" = "closed" ] && { printf 'CONVERGED'; exit 0; }
+    # work-remains: the item stays OPEN. All that is mechanical here is un-wedging the claim the
+    # abandoned build left on it, through the op whose contract is exactly "release OUR OWN claim".
+    command -v _backend_release_item >/dev/null 2>&1 || { printf 'NO-OP'; exit 0; }
+    _RELEASE_RESULT=""
+    _backend_release_item "$_iea_ref" "${_iea_who:-}" >/dev/null 2>&1 || true
+    case "${_RELEASE_RESULT:-}" in
+      RELEASED) printf 'DONE' ;;
+      NOTOURS)  printf 'CONVERGED' ;;   # unassigned, or someone else's claim — already "left open"
+      *)        printf 'NOCHANGE' ;;    # UNREACHABLE / no answer — TRANSIENT, retry bounded
+    esac
+  )
+}
+
+# ── M4 · note-ack-after-route (HERD-640 · Phase 3 of HERD-625) ───────────────────────────────────
+# §1.4's split, and the whole of what this tenant may touch: ROUTING IS JUDGMENT, ACKING IS
+# BOOKKEEPING. The coordinator still decides what a note MEANS (act now / file it / dismiss) and still
+# names the artifact its routing promised, via `herd notes route <n> <artifact>`. What leaves the seat
+# is only "clear the note once that artifact exists" — the keystroke that, on 2026-08-10, was skipped
+# for one note in five (it aged out unacked instead).
+#
+# _intent_note_ack_apply <artifact> <who> <note-line> — execute ONE note-ack intent: record the note's
+# VERBATIM ledger line in the ack ledger (the identical mechanism `herd notes ack` uses, so the two
+# clearing surfaces can never disagree) and print DONE | CONVERGED | UNKNOWN-KIND | NOCHANGE.
+# Display-only by construction (§4.1): the journal keeps every note, so the blast radius of a wrong
+# ack is one console row an operator can still read back with `herd log`.
+_intent_note_ack_apply() {
+  local _ina_artifact="$1" _ina_note="${3:-}"
+  [ -n "$_ina_note" ] || { printf 'UNKNOWN-KIND'; return 0; }
+  # Already acked (by a racing seat, by the operator, or by this intent on an earlier tick) — the
+  # requested state, reached by someone else. Idempotent by observation, not by hope (§5.3).
+  herd_console_acked "$BUILDER_NOTES_ACK" "$_ina_note" && { printf 'CONVERGED'; return 0; }
+  # An ack for a line the ledger no longer carries is dead weight: the note already left the console
+  # (aged out, or trimmed past the bound). Nothing to clear.
+  [ -s "$BUILDER_NOTES_LEDGER" ] && grep -Fxq -- "$_ina_note" "$BUILDER_NOTES_LEDGER" 2>/dev/null \
+    || { printf 'CONVERGED'; return 0; }
+  local _ina_dir="${BUILDER_NOTES_ACK%/*}"
+  [ -d "$_ina_dir" ] || mkdir -p "$_ina_dir" 2>/dev/null || { printf 'NOCHANGE'; return 0; }
+  printf '%s\n' "$_ina_note" >> "$BUILDER_NOTES_ACK" 2>/dev/null || { printf 'NOCHANGE'; return 0; }
+  herd_console_trim "$BUILDER_NOTES_ACK" "$BUILDER_NOTES_LEDGER_MAX"
+  printf 'DONE'
+  return 0
+}
+
+# _note_artifact_exists <kind> <artifact> — does the artifact a routing named DEMONSTRABLY exist?
+# The ONLY question M4 is allowed to ask, and both answers come from rails that already exist:
+#   pr   → _spawn_dep_merged, the same "has this landed?" predicate the HERD-94 dependency hold uses
+#          (the reap ledger first, one gh read as the fallback).
+#   item → the active backend resolves the ref at all. Deliberately EXISTENCE, not closure: the
+#          artifact a "file it" routing promised is the ITEM, and the scribe's create is the async
+#          step that can silently fail (HERD-267's whole subject). Whether that item then ships is a
+#          different question with its own rails.
+# Fail-soft and CONSERVATIVE: anything unreadable answers "not yet", so the route row simply waits.
+_note_artifact_exists() {
+  local _nae_kind="$1" _nae_artifact="${2:-}"
+  [ -n "$_nae_artifact" ] || return 1
+  case "$_nae_kind" in
+    pr)   _spawn_dep_merged "$_nae_artifact" ;;
+    item)
+      local _nae_bfile="${SCRIBE_BACKEND_DIR:-$HERE/backends}/${SCRIBE_BACKEND:-file}.sh"
+      [ -f "$_nae_bfile" ] || return 1
+      (
+        _secrets="$MAIN/.herd/secrets"
+        # shellcheck source=/dev/null
+        [ -f "$_secrets" ] && . "$_secrets"
+        # shellcheck source=/dev/null
+        . "$_nae_bfile" 2>/dev/null || exit 1
+        command -v _backend_item_state >/dev/null 2>&1 || exit 1
+        cd "$MAIN" 2>/dev/null || true
+        ITEM_STATE=""
+        _backend_item_state "$_nae_artifact" >/dev/null 2>&1 || exit 1
+        [ -n "${ITEM_STATE:-}" ] || exit 1
+      )
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# _scan_note_routes — the M4 producer: one pass over the pending-route ledger. A row whose artifact
+# now exists becomes a `note-ack` intent (and the row is dropped — the intent is the durable record
+# from here); a row whose note has already left the console is GC'd; everything else waits.
+#
+# Why the artifact check lives HERE and not in the drain: an intent released for "the artifact is not
+# there yet" would burn its INTENT_MAX_ATTEMPTS in three minutes and then be dropped loudly, while the
+# artifact it is waiting for (a scribe create, a re-tasked build) routinely lands hours later. So the
+# WAIT is a plain reconciled scan over durable rows, and only a satisfied wait ever becomes an intent —
+# which then drains on the same tick, exactly as §5.2's invariant reads.
+_scan_note_routes() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  command -v iq_enqueue >/dev/null 2>&1 || return 0
+  type herd_intent_queue_on >/dev/null 2>&1 || return 0
+  herd_intent_queue_on || return 0
+  [ -s "$BUILDER_NOTES_ROUTES" ] || return 0
+  local _snr_line _snr_kind _snr_artifact _snr_note _snr_keep="" _snr_changed=0
+  while IFS= read -r _snr_line; do
+    [ -n "$_snr_line" ] || continue
+    _snr_kind="$(printf '%s' "$_snr_line" | cut -f2)"
+    _snr_artifact="$(printf '%s' "$_snr_line" | cut -f3)"
+    _snr_note="$(printf '%s' "$_snr_line" | cut -f4-)"
+    # GC: the note is gone from the console (acked by hand, trimmed, or its ledger row evicted). The
+    # route has nothing left to clear, so the row retires quietly — no state warns forever (§4.3).
+    if [ -z "$_snr_note" ] \
+      || ! { [ -s "$BUILDER_NOTES_LEDGER" ] && grep -Fxq -- "$_snr_note" "$BUILDER_NOTES_LEDGER" 2>/dev/null; } \
+      || herd_console_acked "$BUILDER_NOTES_ACK" "$_snr_note"; then
+      _snr_changed=1
+      continue
+    fi
+    if _note_artifact_exists "$_snr_kind" "$_snr_artifact"; then
+      iq_enqueue "$INTENT_QUEUE_DIR" "note-ack
+${_snr_kind}:${_snr_artifact}
+${WATCHER_OWNER:-}
+$_snr_note" >/dev/null 2>&1 || true
+      journal_append intent_note_ack_queued artifact "${_snr_kind}:${_snr_artifact}"
+      _snr_changed=1
+      continue
+    fi
+    _snr_keep="${_snr_keep}${_snr_line}"$'\n'
+  done < "$BUILDER_NOTES_ROUTES"
+  [ "$_snr_changed" -eq 1 ] || return 0
+  if [ -n "$_snr_keep" ]; then
+    printf '%s' "$_snr_keep" > "$BUILDER_NOTES_ROUTES" 2>/dev/null || true
+    herd_console_trim "$BUILDER_NOTES_ROUTES" "$BUILDER_NOTES_LEDGER_MAX"
+  else
+    rm -f "$BUILDER_NOTES_ROUTES" 2>/dev/null || true
+  fi
   return 0
 }
 
