@@ -1424,6 +1424,46 @@ class LiveState:
         except Exception:
             pass
 
+    # CI-poll conclusive memo substrate (HERD-649b) ───────────────────────────────────────────────
+    # A branch whose newest CI run was already CONCLUSIVE (CLEAN/CODEERROR) at its current head sha
+    # cannot un-complete — so the NEXT tick's HEALTH_SOURCE=ci read for that exact sha needs no gh
+    # call at all, one flat file per branch, keyed the SAME way a worktree slug is (a `/`-bearing
+    # branch never nests a stray subdirectory under $TREES). Deliberately NEVER written for WAIT
+    # (pending/infra-transient/cancelled) — see record_ci_conclusive_memo — so the HERD-612
+    # no-stranded-verdict invariant holds: only a truly terminal word is ever memoized.
+
+    def ci_conclusive_memo_file(self, branch):
+        return self._p(".ci-conclusive-%s" % _branch_worktree_slug(branch)) if branch else None
+
+    def ci_conclusive_memo(self, branch):
+        """The memoized ``(sha, verdict, detail)`` for ``branch``, or ``None`` — no memo, an
+        unreadable file, or a malformed/non-conclusive row (never trusted; the caller re-polls)."""
+        path = self.ci_conclusive_memo_file(branch)
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                first = fh.readline().rstrip("\n")
+        except Exception:
+            return None
+        parts = first.split("\t", 2)
+        if len(parts) < 2 or not parts[0] or parts[1] not in ("CLEAN", "CODEERROR"):
+            return None
+        return {"sha": parts[0], "verdict": parts[1], "detail": parts[2] if len(parts) > 2 else ""}
+
+    def record_ci_conclusive_memo(self, branch, sha, verdict, detail=""):
+        """Persist the CONCLUSIVE verdict for ``branch`` at ``sha``. ONLY ever called with
+        ``verdict`` in (``CLEAN``, ``CODEERROR``) — the refusal below is belt-and-suspenders, not the
+        primary guard, so a future caller mistake can never strand a WAIT as if it were terminal."""
+        path = self.ci_conclusive_memo_file(branch)
+        if not path or not sha or verdict not in ("CLEAN", "CODEERROR"):
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("%s\t%s\t%s\n" % (sha, verdict, " ".join(str(detail or "").split())))
+        except Exception:
+            pass
+
     # approvals substrate ──────────────────────────────────────────────────────────────────────────
     # THE SAME flat ledger `herd-approve.sh` reads and writes (approvals.sh: one seam, one answer):
     # rows are `<epoch> <state> <pr#> <sha>` with state ∈ awaiting | approved | hv-informed, at
@@ -2063,6 +2103,26 @@ def _gh_rate_limit_reset():
     return None
 
 
+def _gh_rate_limit_remaining():
+    """One cheap REST call (``gh api rate_limit``) for the CURRENT remaining core-budget count, or
+    ``None`` on any failure — the SAME fail-soft contract as :func:`_gh_rate_limit_reset` (a probe
+    failure must never itself fault the tick, and must never be read as "refilled").
+
+    HERD-649c: this is the stale-deadline re-probe's read. A budget that genuinely refilled early
+    (GitHub resets on a rolling hourly window, not exactly when a prior tick's exhausted-at snapshot
+    said it would) shows up here as ``remaining > 0`` well before ``gh_rate_limited_until``'s recorded
+    epoch — the 2026-08-11 22:08-22:13 incident this leg is grounded in, where an operator had to
+    hand-clear the marker ~20 minutes early because nothing re-checked."""
+    try:
+        out = subprocess.run(["gh", "api", "rate_limit", "-q", ".rate.remaining"],
+                             capture_output=True, text=True, timeout=10)
+        if out.returncode == 0 and out.stdout.strip():
+            return int(out.stdout.strip())
+    except Exception:
+        pass
+    return None
+
+
 def _reraise_gh_failure(exc):
     """Given a failed gh ``CalledProcessError``, raise :class:`GhRateLimited` when its output matches a
     known rate-limit shape, else re-raise ``exc`` unchanged — genuine failures keep the fault path.
@@ -2551,8 +2611,17 @@ def _health_trust_check(trees, sha, worktree):
 #       2026-08-07/10: a dispatched verdict-collector chain died between suite-pass and verdict-write
 #       and stranded a MAIN RED for three days). So this leg lays NO marker, spawns NO worker and
 #       writes NO sha-cache: every tick re-reads the live conclusion from observed state. A tick that
-#       dies mid-read costs one re-read, never a stranded verdict. The only memo is tick-scoped (a
-#       LiveGates instance lives exactly one tick), so two PRs on one branch cost one `gh` call.
+#       dies mid-read costs one re-read, never a stranded verdict. A CONCLUSIVE (CLEAN/CODEERROR) read
+#       is memoized ACROSS ticks, keyed by branch+sha (HERD-649b — a completed conclusion cannot
+#       un-complete); a WAIT (pending/infra-transient/cancelled) is NEVER memoized and re-polls every
+#       tick, so HERD-612 holds for every non-terminal read exactly as before.
+#
+#   (C) ONE POOLED `gh run list` PER TICK, NOT ONE PER BRANCH (HERD-649a, grounded in the 2026-08-11
+#       backoff: a 30-PR day of one-call-per-branch-per-tick exhausted the 5000/hr REST budget with
+#       completed verdicts sitting unread for ~40 minutes). `LiveTick.run()` primes the pool once,
+#       before any candidate is walked, with every branch NOT already conclusive-memoized; the single
+#       response is grouped locally by `headBranch` (see `_group_ci_runs_by_branch`) instead of asking
+#       gh to filter server-side per branch.
 #
 # FAIL-SOFT, NEVER SILENT: an unreachable/unauthenticated `gh`, unparseable JSON, or a branch with no
 # Actions runs at all FALLS BACK to the local suite and says so LOUDLY (a once-per-(pr,sha)
@@ -2562,7 +2631,12 @@ def _health_trust_check(trees, sha, worktree):
 # own gh call sites use (agent-watch.sh:_GH_TIMEOUT_DEFAULT_SECS=15). These reads happen INSIDE the
 # tick walk, so the bound is also the per-candidate worst case a hung API can add to a tick.
 _CI_GH_TIMEOUT = 15
-_CI_RUN_LIMIT = 20             # runs per `gh run list` window (matches the bash branch-CI leg)
+_CI_RUN_LIMIT = 20             # runs per branch worth of window the pool tries to cover (HERD-649a)
+# The pooled poll's `--limit` is sized to the branches it actually needs to cover (`_CI_RUN_LIMIT`
+# each), capped at gh/GitHub's own single-page size — past this the CLI would paginate into MORE than
+# one HTTP request, quietly turning "one pooled poll" back into several, which is exactly the spend
+# this leg exists to cut.
+_CI_POOL_LIMIT_CAP = 100
 _CI_RERUN_COOLDOWN_SECS = 900  # min seconds between ANY two infra-transient reruns (bounded, HERD-609)
 
 
@@ -2574,6 +2648,9 @@ def _health_source(config):
     return "ci" if val == "ci" else "local"
 
 
+_CI_RUN_JSON_FIELDS = "headSha,status,conclusion,workflowName,databaseId"
+
+
 def _ci_runs(branch):
     """The recent CI runs for ``branch`` as a parsed list, or ``None`` when CI cannot be read at all
     (no gh, unauthenticated, timeout, non-zero exit, unparseable JSON). ``None`` and ``[]`` are
@@ -2582,13 +2659,18 @@ def _ci_runs(branch):
 
     Uses the BARE branch name gh knows the run by; a remote-qualified ref ("origin/main") silently
     returns zero rows (the HERD-434 bug this leg must not re-make), so the caller passes the head ref
-    from discovery, which is already bare."""
+    from discovery, which is already bare.
+
+    SOLO fallback only (HERD-649a): the tick-wide path is :func:`_ci_runs_pooled`, which asks about
+    every branch at once. This single-branch form still exists for a branch the pool never covered —
+    one newly discovered mid-tick, or a caller (a unit test, a future one-off script) that never primes
+    a pool at all — so `_ci_health` always has a correct, if not maximally cheap, answer."""
     if not branch:
         return None
     try:
         out = subprocess.run(
             ["gh", "run", "list", "--branch", branch, "--limit", str(_CI_RUN_LIMIT),
-             "--json", "headSha,status,conclusion,workflowName,databaseId"],
+             "--json", _CI_RUN_JSON_FIELDS],
             capture_output=True, text=True, timeout=_CI_GH_TIMEOUT,
         )
     except Exception:
@@ -2600,6 +2682,46 @@ def _ci_runs(branch):
     except Exception:
         return None
     return runs if isinstance(runs, list) else None
+
+
+def _ci_runs_pooled(limit):
+    """ONE `gh run list` call covering EVERY branch at once (HERD-649a) — no ``--branch`` filter, so
+    the caller groups the single response locally (:func:`_group_ci_runs_by_branch`) instead of gh
+    filtering server-side per branch. Same ``None``-vs-``list`` contract as :func:`_ci_runs`: ``None``
+    means "could not ask at all"; a parsed list (possibly empty) means "asked, here is the window".
+
+    Requests ``headBranch`` in addition to :data:`_CI_RUN_JSON_FIELDS` — without a ``--branch`` filter
+    that field is the ONLY way to attribute a row back to a candidate."""
+    try:
+        out = subprocess.run(
+            ["gh", "run", "list", "--limit", str(limit),
+             "--json", _CI_RUN_JSON_FIELDS + ",headBranch"],
+            capture_output=True, text=True, timeout=_CI_GH_TIMEOUT,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0 or not (out.stdout or "").strip():
+        return None
+    try:
+        runs = json.loads(out.stdout)
+    except Exception:
+        return None
+    return runs if isinstance(runs, list) else None
+
+
+def _group_ci_runs_by_branch(runs):
+    """Group a :func:`_ci_runs_pooled` response by ``headBranch`` — the LOCAL filter that replaces
+    gh's own server-side ``--branch`` filter. A row with no/blank ``headBranch`` (an older gh, or a run
+    gh could not attribute) is dropped rather than mis-bucketed under an empty-string key."""
+    by_branch = {}
+    for row in runs or []:
+        if not isinstance(row, dict):
+            continue
+        branch = str(row.get("headBranch") or "")
+        if not branch:
+            continue
+        by_branch.setdefault(branch, []).append(row)
+    return by_branch
 
 
 def _ci_failed_log(run_id):
@@ -2720,8 +2842,17 @@ class LiveGates:
         self._health_source = _health_source(cfg)
         # Tick-scoped memo of the `gh run list` read, keyed by BRANCH: two PRs on one branch (or two
         # walks of one candidate) cost ONE API call, and the memo dies with the tick, so the next
-        # tick always re-reads live state (HERD-612 — the verdict is a reconciled read, never cached).
+        # tick always re-reads live state for anything non-conclusive (HERD-612 — a WAIT/pending
+        # verdict is a reconciled read, never cached). Normally populated ONCE per tick, in bulk, by
+        # `prime_ci_pool` (HERD-649a); `_ci_health` still fills it lazily per-branch as a fallback for
+        # any branch the pool didn't cover (a mid-tick discovery, or a caller that never primes).
         self._ci_runs_cache = {}
+        # HERD-649c: how many real `gh` calls (pooled list + failed-log fetches + reruns) and how many
+        # branches were polled-live vs. served from the conclusive memo this tick — journaled once as
+        # `ci_poll_budget` (LiveTick.run) so an anomaly baseline can watch this leg's API spend.
+        self._ci_poll_calls = 0
+        self._ci_branches_polled = 0
+        self._ci_branches_memoized = 0
         # The failing-test identity a CI-sourced CODEERROR named this tick ("" for every other
         # verdict, and always "" under HEALTH_SOURCE=local) — read by LiveTick._refix_prompt.
         self.ci_health_detail = ""
@@ -2912,6 +3043,58 @@ class LiveGates:
         return WAIT
 
     # ── HEALTH_SOURCE=ci: the CI-sourced health verdict (HERD-578) ─────────────────────────────────
+    def prime_ci_pool(self, candidates):
+        """ONE pooled `gh run list` for this WHOLE tick (HERD-649a) — called from `LiveTick.run()`
+        right after discovery, before any candidate is walked, so every `_ci_health` call this tick
+        reads its branch out of ONE shared response instead of paying its own `gh run list`.
+
+        Skips a branch entirely (never counted, never in the pooled request) when its conclusive memo
+        (HERD-649b) already answers for the candidate's EXACT head sha — that branch costs no gh call
+        at all this tick. Every other distinct branch goes into a single `_ci_runs_pooled` call sized
+        to the number of branches actually being asked about, then the response is grouped locally and
+        dropped into `self._ci_runs_cache` exactly where `_ci_health` already looks for a tick-scoped
+        answer — so this is purely a cheaper way to FILL that cache, not a second code path.
+
+        A strict no-op under `local` (the default) and when `candidates` is empty: no branches are
+        collected, no gh call is made, `self._ci_runs_cache` stays exactly as `__init__` left it."""
+        if self._health_source != "ci" or not candidates:
+            return
+        branches = []
+        seen = set()
+        for cand in candidates:
+            branch = getattr(cand, "branch", "") or ""
+            if not branch or branch in seen:
+                continue
+            seen.add(branch)
+            memo = self.state.ci_conclusive_memo(branch)
+            if memo and memo["sha"] == cand.sha:
+                self._ci_branches_memoized += 1
+                continue
+            branches.append(branch)
+        if not branches:
+            return
+        limit = min(_CI_POOL_LIMIT_CAP, _CI_RUN_LIMIT * len(branches))
+        runs = _ci_runs_pooled(limit)
+        self._ci_poll_calls += 1
+        self._ci_branches_polled += len(branches)
+        grouped = {} if runs is None else _group_ci_runs_by_branch(runs)
+        for branch in branches:
+            # `None` when the pooled call itself failed (gh missing/unauthenticated/timeout/unparseable)
+            # so `_ci_health` falls back exactly like a failed solo `_ci_runs` would; `[]` when the call
+            # succeeded but this branch had no rows in the window (a real "no runs" answer, or the pool
+            # simply wasn't large enough to reach this branch — either way, fail-soft to local).
+            self._ci_runs_cache[branch] = None if runs is None else grouped.get(branch, [])
+
+    def ci_poll_budget(self):
+        """This tick's CI-poll API spend (HERD-649c), or ``None`` under `local` — LiveTick.run() then
+        journals nothing, keeping the lever byte-inert. ``calls`` counts every real `gh` subprocess the
+        CI leg ran this tick (the pooled/solo list call(s), failed-log fetches, bounded reruns);
+        ``branches_polled``/``branches_memoized`` show how much of that was avoided by HERD-649b."""
+        if self._health_source != "ci":
+            return None
+        return {"calls": self._ci_poll_calls, "branches_polled": self._ci_branches_polled,
+                "branches_memoized": self._ci_branches_memoized}
+
     def _ci_health(self, cand):
         """The health verdict READ from the PR's own CI, or ``None`` meaning "CI cannot answer — fall
         back to the local rail" (the caller then runs the classic dispatch unchanged).
@@ -2927,9 +3110,12 @@ class LiveGates:
           pending / cancelled-chain          → WAIT       (qualified in the journal, NEVER a red)
           CI absent entirely                 → None       (+ a loud `ci_health_fallback` note)
 
-        NO marker, NO worker, NO sha-cache (HERD-612): a stranded verdict is impossible because there
-        is nothing holding one — every tick re-reads. The cost of that is one `gh run list` per branch
-        per tick, memoized tick-scoped in ``self._ci_runs_cache``.
+        NO marker, NO worker, NO sha-cache for a non-terminal verdict (HERD-612): a WAIT is never
+        stranded because nothing holds one — every tick re-reads. A CONCLUSIVE verdict (CLEAN/
+        CODEERROR) IS memoized across ticks, by branch+sha (HERD-649b), so a merged/blocked PR whose
+        sha never changes costs no further gh call at all. Either way the read this tick is served
+        from `self._ci_runs_cache`, normally filled in BULK by `prime_ci_pool` (HERD-649a) before the
+        walk starts; a branch the pool never saw is fetched solo here as a fallback.
         """
         st = self.state
         self.reused_health = False
@@ -2939,10 +3125,23 @@ class LiveGates:
             # field) cannot be asked about — fall back rather than guess at a branch name.
             self._ci_fallback(cand, "no-branch")
             return None
+        memo = st.ci_conclusive_memo(branch)
+        if memo and memo["sha"] == cand.sha:
+            # HERD-649b: this exact commit's CI word was already terminal — no gh call needed to say
+            # it again. `reused_health` mirrors the local rail's sha-cache reuse (health(), step 1):
+            # no re-journal, no re-dispatch, just the same durable answer.
+            verdict = memo["verdict"]
+            self.reused_health = True
+            self.ci_health_detail = memo["detail"] if verdict == CV.CODEERROR else ""
+            return verdict
         if branch in self._ci_runs_cache:
             runs = self._ci_runs_cache[branch]
         else:
+            # Not covered by this tick's pool (mid-tick discovery, or a caller that never primes one) —
+            # a solo per-branch fallback, still correct, just not the cheap pooled path.
             runs = _ci_runs(branch)
+            self._ci_poll_calls += 1
+            self._ci_branches_polled += 1
             self._ci_runs_cache[branch] = runs
         if runs is None:
             self._ci_fallback(cand, "gh-unavailable")
@@ -2951,6 +3150,7 @@ class LiveGates:
         failure = None
         if scan["bucket"] == "fail":
             failure = CV.classify_failure_log(_ci_failed_log(scan["run_id"]))
+            self._ci_poll_calls += 1
         verdict, reason, detail = CV.map_verdict(scan, failure)
         if verdict == CV.LOCAL:
             self._ci_fallback(cand, reason)
@@ -2976,6 +3176,11 @@ class LiveGates:
         # sha-cache: nothing about a CI read may become a durable verdict another tick could reuse
         # after CI itself has moved on (HERD-612).
         self.ci_health_detail = detail if verdict == CV.CODEERROR else ""
+        if verdict in (CV.CLEAN, CV.CODEERROR):
+            # HERD-649b: a TERMINAL word for this exact sha cannot un-complete — memoize it so the next
+            # tick (same branch, same sha) needs no gh call at all. Never reached for WAIT, by
+            # construction (the LOCAL/infra/pending paths above all return before this line).
+            st.record_ci_conclusive_memo(branch, cand.sha, verdict, self.ci_health_detail)
         return verdict
 
     def _ci_fallback(self, cand, reason):
@@ -2997,6 +3202,7 @@ class LiveGates:
             return                     # this run id is already on the record — a phase, not an event
         result = "bounded"
         if run_id and _ci_rerun_allowed(self.state.dir, run_id):
+            self._ci_poll_calls += 1
             result = "rerun" if _ci_rerun_failed(self.state.dir, run_id) else "failed"
         self.journal.append("ci_infra_transient", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
                             "run_id", run_id, "signature", signature, "result", result)
@@ -6623,7 +6829,22 @@ class LiveTick:
         until = self.state.gh_rate_limited_until()
         now = int(_now_epoch())
         if until and now < until:
-            return self._rate_limited_summary(until)
+            # HERD-649c stale-deadline re-probe: the recorded deadline is a SNAPSHOT taken when the
+            # budget was last observed exhausted, not a promise GitHub keeps to the second — the
+            # 2026-08-11 22:08-22:13 incident had the budget refilled ~20 minutes before this marker's
+            # own timestamp, and nothing re-checked, so gates sat unread with completed verdicts until
+            # an operator hand-cleared it. ONE cheap `gh api rate_limit` probe, ONLY here (a marker
+            # must already exist — never spent on a tick with no backoff in force), decides whether to
+            # keep sleeping to the recorded epoch or clear it now and run this tick for real. A
+            # genuinely-exhausted budget (remaining 0, or the probe itself fails) keeps the backoff
+            # exactly as before this leg existed.
+            remaining = _gh_rate_limit_remaining()
+            if remaining is not None and remaining > 0:
+                self.journal.append("gh_rate_limit_refilled_early", "was_until", until,
+                                    "remaining", remaining, "now", now)
+                self.state.clear_gh_rate_limited()
+            else:
+                return self._rate_limited_summary(until)
         try:
             candidates = self.discovery.discover()
         except GhRateLimited as exc:
@@ -6649,6 +6870,11 @@ class LiveTick:
         # Resolve this tick's CORE front before any candidate is walked (HERD-577 leg 2). A strict
         # no-op with CORE_SURFACE_GLOB empty, so the loop below stays byte-identical to before it.
         self._core_prepass(candidates)
+        # HERD-649a: prime the WHOLE tick's CI-poll cache with one pooled `gh run list` before any
+        # candidate is walked, instead of each candidate's health() paying its own call. `hasattr`
+        # guarded — FixtureGates (sim/dry-run) carries no CI leg at all, so a fixture tick is untouched.
+        if hasattr(self.gates, "prime_ci_pool"):
+            self.gates.prime_ci_pool(candidates)
         for cand in candidates:
             try:
                 self._outcome[cand.pr] = self._walk(cand)
@@ -6663,6 +6889,13 @@ class LiveTick:
         pending = [pr for pr, a in self._outcome.items() if a == PENDING]
         self.journal.append("live_tick_end", "merged", len(merged), "held", len(held),
                             "pending", len(pending))
+        # HERD-649c: this tick's CI-poll API spend, so an anomaly baseline can watch it — `None` under
+        # `local` (the default), so this stays a no-op journal line for every tick that never reaches it.
+        budget = self.gates.ci_poll_budget() if hasattr(self.gates, "ci_poll_budget") else None
+        if budget is not None:
+            self.journal.append("ci_poll_budget", "candidates", len(candidates),
+                                "calls", budget["calls"], "branches_polled", budget["branches_polled"],
+                                "branches_memoized", budget["branches_memoized"])
         return {"outcomes": dict(self._outcome), "merged": merged, "held": held, "pending": pending,
                 "journal": self.journal.path}
 
