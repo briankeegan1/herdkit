@@ -34,6 +34,26 @@
 #                                         0 with ZERO .capacity-* files, and capacity_suite_queue_saturated
 #                                         is false — byte-identical to before this feature existed.
 #
+# HERD-641 (Phase 4 of HERD-625, docs/spikes/coordinator-work-queue.md §5.5) adds the DRAIN's own
+# admission to this tenant's proofs — the watcher's spawn-queue drain now leases a machine-wide unit
+# instead of sizing its budget from its own FEATS roster. Driven in LIB MODE (the drain functions
+# extracted from agent-watch.sh, as tests/test-spawn-queue-drain.sh drives them) over the REAL
+# spawn-step.sh queue and the REAL ledger:
+#   drain_two_seats_one_admission      — two independent drains, ONE pool queue, a 1-unit ledger, both
+#                                         seeing an empty FEATS roster: exactly ONE lane launches, the
+#                                         rival journals spawn_deferred and hands its intent back as a
+#                                         live .req, and the admitted lane carries the
+#                                         HERD_AGENT_LEASE_HELD handoff (one unit per agent session).
+#   drain_crashed_holder_lease_frees   — SIGKILL the holder (a crashed seat): the kernel drops the
+#                                         flock, the next drain reconciles the stale marker away and
+#                                         admits the intent that was queued behind it. Reconciled
+#                                         against observed state — never an event side-effect.
+#   drain_ledger_absent_legacy_identical — CAPACITY_BUDGET unset: the drain keeps the legacy
+#                                         cap-minus-FEATS budget (a full roster drains nothing, claims
+#                                         nothing, writes zero .capacity-* files), MUTATION-PROVED by a
+#                                         control run where flipping only that key makes the identical
+#                                         roster admit.
+#
 # Usage: bash scripts/herd/sim/sandbox-capacity-agent-lease-scenario.sh [--artifacts DIR] [--keep]
 # Exit: 0 = every checkpoint passed · 1 = at least one checkpoint failed (or a hard error).
 set -uo pipefail
@@ -262,6 +282,208 @@ else
   checkpoint lever_off_byte_identical fail "rc=$_o_rc (want 0), .capacity-* count=$_o_capfiles (want 0), suite-saturated=$_o_suitesat (want 1/false)"
 fi
 unset WORKTREES_DIR
+
+# ══ HERD-641 (Phase 4 of HERD-625) — the spawn-queue DRAIN admits through this same tenant ═════════
+# docs/spikes/coordinator-work-queue.md §5.5 measured the gap these three checkpoints close: each
+# watcher sized its spawn budget from its OWN `FEATS` roster, so two seats draining ONE pool queue each
+# admitted up to their own cap and the fleet jointly exceeded the machine's real budget. The drain now
+# leases through the AGENT tenant above instead — same ledger, same comparator, same flock backbone, no
+# second counter and no new config key.
+#
+# The drain is driven in LIB MODE (the functions extracted from agent-watch.sh, exactly as
+# tests/test-spawn-queue-drain.sh drives them) against the REAL spawn-step.sh queue mechanics and the
+# REAL capacity-ledger.sh — the admission accounting under test is production code's, not a re-model.
+step drain "HERD-641: two lib-mode drains over ONE pool queue, admitting through a 1-unit agent ledger"
+
+WATCHSH="$ENGINE/agent-watch.sh"
+STEPSH="$ENGINE/spawn-step.sh"
+SPAWNSH="$ENGINE/spawn.sh"
+_drain_prereq=""
+for _f in "$WATCHSH" "$STEPSH" "$SPAWNSH"; do [ -f "$_f" ] || _drain_prereq="${_drain_prereq}missing $_f; "; done
+
+# Extract the drain + the helpers it calls (the SAME set tests/test-spawn-queue-drain.sh extracts).
+DRAIN_SRC="$ART/drain-lib.sh"; : > "$DRAIN_SRC"
+if [ -z "$_drain_prereq" ]; then
+  for _fn in _spawn_slug_key _spawn_inflight_file _lane_lifecycle_key _lane_lifecycle_spawn \
+             _lane_lifecycle_retire _spawn_inflight_bg _spawn_inflight_sweep _lane_spawn_inflight \
+             _drain_lane_worker _drain_spawn_queue; do
+    sed -n "/^$_fn()/,/^}/p" "$WATCHSH" >> "$DRAIN_SRC"
+    grep -q "^$_fn()" "$DRAIN_SRC" || _drain_prereq="${_drain_prereq}could not extract $_fn; "
+  done
+fi
+
+# _drain_env <name> — a fresh, isolated drain world: a pool (which is ALSO the capacity ledger's pool
+# and the headless agent registry root), a fake engine dir holding the REAL spawn-step.sh plus scriptable
+# fake lanes, and a pinned project config so an enqueue can never reach a real project's queue.
+D_POOL=""; D_ENG=""; D_LANELOG=""; D_PROJ=""
+_drain_env() {
+  local root="$ART/drain-$1"
+  D_POOL="$root/trees"; D_ENG="$root/eng"; D_LANELOG="$root/lane.log"; D_PROJ="$root/proj"
+  mkdir -p "$D_POOL/spawn-queue" "$D_POOL/.herd/agents" "$D_ENG" "$D_PROJ/.herd"
+  : > "$D_LANELOG"
+  cp "$STEPSH" "$D_ENG/spawn-step.sh"
+  printf 'WORKTREES_DIR="%s"\nexport WORKTREES_DIR\n' "$D_POOL" > "$D_ENG/herd-config.sh"
+  cat > "$D_PROJ/.herd/config" <<EOF
+PROJECT_ROOT="$D_PROJ"
+WORKSPACE_NAME="capleasesim"
+SCRIBE_BACKEND="file"
+BACKLOG_FILE="BACKLOG.md"
+WORKTREES_DIR="$D_POOL"
+EOF
+  # Fake lanes: record the launch AND the HERD_AGENT_LEASE_HELD handoff the drain passes when it
+  # already holds this slug's unit (an unrecorded '1' here would mean the lane leases a SECOND unit for
+  # one agent session — the double-spend this phase must not introduce).
+  local lane
+  for lane in herd-feature.sh herd-quick.sh; do
+    cat > "$D_ENG/$lane" <<'FAKELANE'
+#!/usr/bin/env bash
+printf '%s %s lease_held=%s\n' "$(basename "$0")" "$1" "${HERD_AGENT_LEASE_HELD:-}" >> "$LANELOG"
+exit 0
+FAKELANE
+    chmod +x "$D_ENG/$lane"
+  done
+}
+
+# _drain_agent_alive <slug> — register a LIVE headless agent session for <slug> in this pool, so the
+# lease holder capacity_agent_lease_reserve detaches observes it going alive and then HOLDS the unit
+# (herd_driver_agent_liveness under HERD_DRIVER=headless is `kill -0` on this pid).
+D_AGENT_PIDS=""
+_drain_agent_alive() {
+  mkdir -p "$D_POOL/.herd/agents/$1"
+  sleep 300 & local p=$!
+  disown "$p" 2>/dev/null || true   # keep the end-of-scenario reaping out of the job-control chatter
+  printf '%s\n' "$p" > "$D_POOL/.herd/agents/$1/pid"
+  D_AGENT_PIDS="$D_AGENT_PIDS $p"
+}
+
+_drain_enqueue() { ( cd "$D_PROJ" && HERD_CONFIG_FILE="$D_PROJ/.herd/config" bash "$SPAWNSH" "$@" >/dev/null 2>&1 ); }
+_drain_reqs()    { local n; n="$(ls "$D_POOL/spawn-queue"/*.req 2>/dev/null | wc -l | tr -d ' ')"; printf '%s' "${n:-0}"; }  # pipe-ok: one short scalar
+# _drain_count <pattern> <file> — `grep -c` prints 0 AND exits 1 on no-match, so a `|| echo 0` fallback
+# would emit TWO lines and break every numeric compare below. Normalize once, here.
+_drain_count() {
+  local n; n="$(grep -c "$1" "$2" 2>/dev/null || true)"
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+# _drain_tick <jlog> <feats-count> — ONE watcher tick's drain, in a subshell carrying the tick globals
+# the drain reads. REVIEW_CONCURRENCY+SPAWN_AHEAD = 1 makes both the legacy budget AND the agent ledger
+# exactly ONE unit, so "over-admission" is a single observable event rather than a statistical one.
+_drain_tick() {
+  local jlog="$1" feats="${2:-0}"
+  ( export LANELOG="$D_LANELOG" JLOG="$jlog" WORKTREES_DIR="$D_POOL"
+    HERE="$D_ENG"; TREES="$D_POOL"
+    FEATS=(); local _i=0; while [ "$_i" -lt "$feats" ]; do FEATS+=("busy-$_i"); _i=$((_i + 1)); done
+    SPAWN_INFLIGHT_PREFIX="$D_POOL/.spawn-inflight-"
+    _marker_write(){ printf '%s\n' "$2" > "$1" 2>/dev/null || true; }
+    _marker_live(){ local p; p="$(sed -n 1p "$1" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+    REVIEW_CONCURRENCY=1; SPAWN_AHEAD=0; DRYRUN=""
+    _BUDGET_DRAIN_PAUSED=""
+    budget_daily_exceeded(){ return 1; }
+    journal_append(){ printf '%s\n' "$*" >> "$JLOG"; }
+    # shellcheck source=/dev/null
+    . "$DRAIN_SRC"
+    _drain_spawn_queue
+    wait )
+}
+
+export HERD_DRIVER=headless HERD_CONFIG_FILE="$ART/no-such-config" \
+       HERD_CAPACITY_AGENT_HOLD_POLL_SECS=1 HERD_CAPACITY_AGENT_DEATH_CONFIRM_TRIES=2 \
+       HERD_CAPACITY_AGENT_START_TIMEOUT_SECS=60
+
+# ── drain_two_seats_one_admission ────────────────────────────────────────────────────────────────
+if [ -n "$_drain_prereq" ]; then
+  checkpoint drain_two_seats_one_admission fail "$_drain_prereq"
+else
+  _drain_env twoseat
+  _drain_agent_alive seat-a-slug; _drain_agent_alive seat-b-slug
+  _drain_enqueue seat-a-slug quick "first intent in the shared pool queue"
+  _drain_enqueue seat-b-slug quick "second intent, behind it"   # FIFO by the INTENT_ID sequence field, not by wall clock
+  J_A="$ART/drain-twoseat-a.log"; J_B="$ART/drain-twoseat-b.log"; : > "$J_A"; : > "$J_B"
+  export CAPACITY_BUDGET=on
+  _drain_tick "$J_A" 0          # SEAT A: an empty FEATS roster, as a second seat always sees
+  _drain_tick "$J_B" 0          # SEAT B: same — this is exactly the §5.5 over-admission setup
+  _t_launches="$(_drain_count 'lease_held=' "$D_LANELOG")"
+  _t_handoff="$(_drain_count 'lease_held=1' "$D_LANELOG")"
+  _t_left="$(_drain_reqs)"
+  _t_deferred=0; grep -q 'spawn_deferred .*agent capacity lease unavailable' "$J_B" 2>/dev/null && _t_deferred=1
+  if [ "$_t_launches" -eq 1 ] && [ "$_t_handoff" -eq 1 ] && [ "$_t_left" -eq 1 ] && [ "$_t_deferred" -eq 1 ]; then
+    checkpoint drain_two_seats_one_admission pass "two independent drains over one queue, each seeing an EMPTY FEATS roster: exactly 1 lane launched, the rival was denied the machine-wide unit and journaled spawn_deferred (agent capacity lease unavailable) with its intent handed back as a live .req — and the admitted lane carried HERD_AGENT_LEASE_HELD=1, so ONE unit covered ONE session"
+  else
+    checkpoint drain_two_seats_one_admission fail "launches=$_t_launches (want 1) handoff=$_t_handoff (want 1) queued-behind .req=$_t_left (want 1) lease-deferred-journal=$_t_deferred (want 1)"
+  fi
+fi
+
+# ── drain_crashed_holder_lease_frees ─────────────────────────────────────────────────────────────
+# The RETIREMENT-INVARIANT half: a seat that dies holding leases must not wedge the machine's budget.
+# Nothing releases the unit as an EVENT — the flock belongs to the holder PROCESS, so the kernel drops
+# it the instant that process is killed, and the next drain's own reconciliation (capacity_reclaim_dead
+# sweeps the dead-pid marker, the flock attempt decides) admits. Reuses the twoseat world above: its
+# queued-behind intent is still a live .req and slot 1 is still held by seat A's holder.
+step crashed "a crashed seat's lease frees by reconciliation, and the queued-behind intent then admits"
+if [ -n "$_drain_prereq" ]; then
+  checkpoint drain_crashed_holder_lease_frees fail "$_drain_prereq"
+else
+  _c_marker="$(capacity_markerfile "$D_POOL" agent 1)"
+  _c_holder="$(sed -n 1p "$_c_marker" 2>/dev/null || true)"
+  case "$_c_holder" in ''|*[!0-9]*) _c_holder="" ;; esac
+  if [ -z "$_c_holder" ]; then
+    checkpoint drain_crashed_holder_lease_frees fail "no live agent-slot-1 holder to crash (marker $_c_marker unreadable) — the two-seat leg did not actually lease"
+  else
+    pkill -9 -P "$_c_holder" 2>/dev/null || true      # the wait-script child, orphaned by the 'crash'
+    kill -9 "$_c_holder" 2>/dev/null || true
+    _c_gone=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do kill -0 "$_c_holder" 2>/dev/null || { _c_gone=1; break; }; sleep 0.2; done
+    _c_marker_stale=0; [ -f "$_c_marker" ] && _c_marker_stale=1   # SIGKILL skipped its own cleanup
+    J_C="$ART/drain-twoseat-c.log"; : > "$J_C"; : > "$D_LANELOG"
+    _drain_tick "$J_C" 0
+    _c_launches="$(_drain_count 'lease_held=1' "$D_LANELOG")"
+    _c_left="$(_drain_reqs)"
+    if [ "$_c_gone" -eq 1 ] && [ "$_c_marker_stale" -eq 1 ] && [ "$_c_launches" -eq 1 ] && [ "$_c_left" -eq 0 ]; then
+      checkpoint drain_crashed_holder_lease_frees pass "SIGKILLing the holder (a crashed seat) left its marker behind as a stale record, yet the very next drain reconciled — swept the dead-pid marker, re-attempted the flock, admitted — and launched the intent that had been queued behind it; the queue is now empty"
+    else
+      checkpoint drain_crashed_holder_lease_frees fail "holder-killed=$_c_gone (want 1) stale-marker-observed=$_c_marker_stale (want 1) launches-after=$_c_launches (want 1) .req left=$_c_left (want 0)"
+    fi
+  fi
+fi
+unset CAPACITY_BUDGET
+
+# ── drain_ledger_absent_legacy_identical ─────────────────────────────────────────────────────────
+# The fail-soft fallback, proven BOTH ways so it cannot be vacuous: with the ledger unavailable the
+# drain must behave byte-identically to before this phase — budget = cap - ${#FEATS[@]}, so a seat whose
+# own roster already fills the cap drains NOTHING and touches no ledger file. The control run flips ONLY
+# CAPACITY_BUDGET and the SAME full roster now admits, which is the whole point of the phase: the
+# per-seat count stopped being the admission rule.
+step fallback "ledger absent -> legacy FEATS budget, byte-identical (and mutation-proved)"
+if [ -n "$_drain_prereq" ]; then
+  checkpoint drain_ledger_absent_legacy_identical fail "$_drain_prereq"
+else
+  _drain_env fallback
+  _drain_agent_alive fallback-slug
+  _drain_enqueue fallback-slug quick "one intent, one seat whose FEATS roster already fills the cap"
+  J_OFF="$ART/drain-fallback-off.log"; : > "$J_OFF"
+  unset CAPACITY_BUDGET
+  _drain_tick "$J_OFF" 1        # cap=1, FEATS=1 -> legacy budget 0 -> return before claiming anything
+  _f_launches_off="$(_drain_count 'lease_held=' "$D_LANELOG")"
+  _f_left_off="$(_drain_reqs)"
+  _f_journal_off="$(_drain_count . "$J_OFF")"
+  _f_capfiles="$(find "$D_POOL" -maxdepth 1 -name '.capacity-*' 2>/dev/null | wc -l | tr -d ' ')"
+  J_ON="$ART/drain-fallback-on.log"; : > "$J_ON"
+  export CAPACITY_BUDGET=on
+  _drain_tick "$J_ON" 1         # SAME full roster, ledger armed -> the machine has room -> admits
+  _f_launches_on="$(_drain_count 'lease_held=1' "$D_LANELOG")"
+  unset CAPACITY_BUDGET
+  if [ "$_f_launches_off" -eq 0 ] && [ "$_f_left_off" -eq 1 ] && [ "$_f_journal_off" -eq 0 ] \
+     && [ "$_f_capfiles" -eq 0 ] && [ "$_f_launches_on" -eq 1 ]; then
+    checkpoint drain_ledger_absent_legacy_identical pass "CAPACITY_BUDGET unset: the drain kept the legacy cap-minus-FEATS budget — a full roster drained nothing, claimed nothing, journaled nothing and created ZERO .capacity-* files; flipping ONLY that key made the identical roster admit, so the fallback is a real branch and the lease is what now decides"
+  else
+    checkpoint drain_ledger_absent_legacy_identical fail "off: launches=$_f_launches_off (want 0) .req left=$_f_left_off (want 1) journal lines=$_f_journal_off (want 0) .capacity-* files=$_f_capfiles (want 0); on: launches=$_f_launches_on (want 1)"
+  fi
+fi
+
+for _p in $D_AGENT_PIDS; do kill -9 "$_p" 2>/dev/null || true; done
+unset WORKTREES_DIR HERD_DRIVER HERD_CONFIG_FILE \
+      HERD_CAPACITY_AGENT_HOLD_POLL_SECS HERD_CAPACITY_AGENT_DEATH_CONFIRM_TRIES HERD_CAPACITY_AGENT_START_TIMEOUT_SECS
 
 # ── scorecard ─────────────────────────────────────────────────────────────────────────────────────
 write_scorecard() {

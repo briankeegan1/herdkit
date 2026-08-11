@@ -246,6 +246,20 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/herd/core-surface.sh
 . "$HERE/core-surface.sh"
 
+# AGENT CAPACITY LEDGER (HERD-641, Phase 4 of HERD-625) — sourced for the MACHINE-WIDE spawn admission
+# _drain_spawn_queue now leases through instead of counting THIS seat's FEATS roster
+# (docs/spikes/coordinator-work-queue.md §5.5). Sourcing DEFINES functions only — capacity-ledger.sh
+# has no source-time side effects (its own header says so, and healthcheck.sh / herd-feature.sh /
+# herd-quick.sh already source it exactly this way) — so it is byte-inert until CAPACITY_BUDGET is
+# armed. The `[ -f ]` guard is the same fail-soft shape those lanes use: a consuming project's tree
+# without the ledger simply leaves every capacity_* function undefined, the drain's `type` guard reads
+# that as OFF, and the legacy FEATS budget runs unchanged. It also DELIBERATELY sits below the
+# herd-spawn-gate.sh source above: that file's own entry point (herd_spawn_gate_saturated) is never
+# called from this file, so making capacity_suite_queue_saturated resolvable here changes nothing the
+# watcher executes.
+# shellcheck source=scripts/herd/capacity-ledger.sh
+[ -f "$HERE/capacity-ledger.sh" ] && . "$HERE/capacity-ledger.sh"
+
 # ── The gh availability guard (HERD-237) ──────────────────────────────────────────────────────────
 # EVERY `gh` call on the tick path runs through _gh_timeout. Grounding (audit 2026-07-09, G4): the
 # whole control room rides ONE loop. A single `gh` that never returns — a wedged TLS handshake, a
@@ -18758,7 +18772,7 @@ _intent_reground_closed() {
 }
 
 _drain_lane_worker() {
-  local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5"
+  local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5" _dlw_leased="${6:-}"
   local _dlw_out="" _dlw_rc=0 _dlw_bin="$HERE/herd-quick.sh"
   [ "$_dlw_lane" = "feature" ] && _dlw_bin="$HERE/herd-feature.sh"
   # (The claim is bound to this worker's pid by the drain, synchronously, before the tick continues —
@@ -18768,7 +18782,18 @@ _drain_lane_worker() {
   # PR's 'Refs:' line, the atomic claim (CLAIM_REQUIRED), and its own TRACKED_SPAWNS gate — an
   # intent that spawn.sh accepted as tracked is never re-refused at drain time. Empty ref =
   # unset-equivalent (every consumer tests for non-empty), so untracked intents are unaffected.
-  _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+  # HERD-641: when the DRAIN already leased this slug's machine-wide 'agent' unit (Phase 4 admission),
+  # the lane must NOT lease a second one for the same session — that would spend two units on one agent
+  # and halve the fleet's real budget. HERD_AGENT_LEASE_HELD is the handoff, and it is an ENV SEAM (the
+  # HERD_ITEM_REF / HERD_FORCE_SPAWN shape), not a config key: nothing outside this dispatch sets it.
+  # The two branches are spelled out rather than composed into one argv so the UNLEASED path — every
+  # path a watcher takes with CAPACITY_BUDGET off — keeps byte-identically the argv AND environment it
+  # had before this change.
+  if [ "$_dlw_leased" = "1" ]; then
+    _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" HERD_AGENT_LEASE_HELD=1 bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+  else
+    _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+  fi
   # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
   # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
   # spawn_claim_lost rather than report a spawn_launched for an intent still sitting in the queue.
@@ -18857,8 +18882,31 @@ _drain_spawn_queue() {
     _dsq_sa="${SPAWN_AHEAD:-1}";       case "$_dsq_sa" in ''|*[!0-9]*) _dsq_sa=1 ;; esac
   fi
   _dsq_cap=$(( _dsq_rc + _dsq_sa ))
-  _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
-  [ "$_dsq_budget" -le 0 ] && return 0
+  # HERD-641 (Phase 4 of HERD-625, docs/spikes/coordinator-work-queue.md §5.5) — MACHINE-WIDE ADMISSION.
+  # `${#FEATS[@]}` is THIS SEAT'S roster. Two watchers draining one pool queue therefore each admit up
+  # to their own cap and the fleet jointly exceeds the machine's real budget — the open risk §5.5
+  # deferred to this phase, and the one reason the epic could not be called multi-seat safe.
+  #
+  # The fix composes rather than invents: the HERD-581 'agent' capacity tenant is ALREADY a genuine
+  # machine-wide count (capacity-ledger.sh + capacity_flock_run.py's flock(2), cap =
+  # REVIEW_CONCURRENCY + SPAWN_AHEAD — the SAME budget computed above, no new key and no second
+  # counter). So when that ledger is armed, the drain STOPS deriving a per-seat headroom number at all:
+  # `_dsq_budget` degrades to a pure WALK BOUND (how deep into the queue one tick may look, which every
+  # skip/hold leg spends exactly as before), and the real admission decision moves to the
+  # capacity_agent_lease_reserve at the launch site below, where every seat on the box is counted.
+  #
+  # FAIL-SOFT FALLBACK, byte-identical: ledger absent from the tree (`type` fails — a consuming project,
+  # or a hermetic harness that extracted this function alone), CAPACITY_BUDGET unset/off, no worktree
+  # pool, or no python3 → capacity_agent_lease_armed is false/undefined and the legacy
+  # `cap - ${#FEATS[@]}` budget (including its `<= 0` early return) runs untouched.
+  local _dsq_lease=0
+  if type capacity_agent_lease_armed >/dev/null 2>&1 && capacity_agent_lease_armed; then _dsq_lease=1; fi
+  if [ "$_dsq_lease" = "1" ]; then
+    _dsq_budget="$_dsq_cap"
+  else
+    _dsq_budget=$(( _dsq_cap - ${#FEATS[@]} ))
+    [ "$_dsq_budget" -le 0 ] && return 0
+  fi
 
   local _dsq_n=0 _dsq_held=()
   while [ "$_dsq_n" -lt "$_dsq_budget" ]; do
@@ -18948,6 +18996,33 @@ _drain_spawn_queue() {
           _spawn_clear_held "$_dsq_id"
           _dsq_n=$(( _dsq_n + 1 )); continue
         fi
+        # HERD-641 §5.5 — MACHINE-WIDE ADMISSION, the last gate before anything is created. Acquire the
+        # 'agent' tenant unit for THIS slug now, so the count that admits is the box's and not this
+        # seat's roster. Placement is the design, and mirrors the two legs above it:
+        #   • BELOW the launch-slot check, so a tick with no slot free never touches the ledger;
+        #   • BELOW the re-ground read, so a candidate that is already Done is dropped WITHOUT ever
+        #     leasing a unit it would then hold for nothing;
+        #   • ABOVE the spawn_released announce, so a lease-deferred intent never announces a release it
+        #     is about to hand back.
+        # Denied → HOLD exactly like the launch-slot leg: keep the intent (released at end of tick),
+        # spend budget so the walk stays bounded, and shut the launch slot so the remaining candidates
+        # this tick do not each re-attempt an acquire against a ledger just observed full. Nothing was
+        # created, so the intent is re-drained cleanly on a later tick — the same durability contract a
+        # gate-deferred lane already gets.
+        # RELEASE is NOT wired here on purpose. The lease is freed by the RETIREMENT INVARIANT the
+        # tenant already owns: capacity_agent_lease_hold's detached holder polls
+        # herd_driver_agent_liveness for this slug (observed builder state, reconciled — never an event
+        # side-effect of this drain), releases when the session is confirmed gone, and gives up on its
+        # own start timeout if the lane never launched one. A seat that CRASHES holding leases frees
+        # them by the same contract from below: the flock is the holder process's, so the kernel drops
+        # it the instant that process dies and the next seat's reserve admits.
+        if [ "$_dsq_lease" = "1" ] \
+           && ! capacity_agent_lease_reserve "$(capacity_agent_lease_cap)" "$_dsq_slug"; then
+          journal_append spawn_deferred slug "$_dsq_slug" lane "$_dsq_lane" reason "agent capacity lease unavailable"
+          _dsq_held+=("$_dsq_claimed")
+          _dsq_can_launch=0
+          _dsq_n=$(( _dsq_n + 1 )); continue
+        fi
         # Dependency met (or none). If this intent had been held on a prior tick, announce the release
         # (spawn_released, dependency named) and clear its hold row before it spawns below.
         if [ -n "$_dsq_after" ] && [ -n "$(_spawn_held_epoch "$_dsq_id")" ]; then
@@ -18960,7 +19035,7 @@ _drain_spawn_queue() {
         # `_list_project_watchers` and holds the launch slot shut until the lane lands.
         _SPAWN_DISPATCH_SEQ=$(( ${_SPAWN_DISPATCH_SEQ-0} + 1 ))
         _spawn_inflight_bg "$(_spawn_inflight_file lane "$_dsq_slug" "${_dsq_id}-${_SPAWN_DISPATCH_SEQ}")" \
-          _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task"
+          _drain_lane_worker "$_dsq_claimed" "$_dsq_slug" "$_dsq_lane" "$_dsq_ref" "$_dsq_task" "$_dsq_lease"
         # BIND THE CLAIM TO THE WORKER (HERD-237), synchronously, before this tick continues.
         # `spawn-step.sh next` reclaims any claim older than five minutes, on the premise that only a
         # dead watcher leaves one behind — true while the lane ran in this loop's foreground, false now
@@ -19005,10 +19080,11 @@ _drain_spawn_queue() {
 # surface (§4.1) — it only removes the requirement that a coordinator be present to type the command.
 #
 # Ship-dormant behind Phase 1's lever, with no second key: INTENT_QUEUE=off means nothing enqueues and
-# this drain returns on its first line, so the tick is byte-identical to before. NOT multi-seat safe
-# (§5.5) — but unlike a spawn, a duplicate marker write is CONVERGENT (§5.3): publish refreshes one
-# marker in place and supersede on an already-clear item is a NOCHANGE, so two seats draining one pool
-# converge on the same tracker state rather than double-spending anything.
+# this drain returns on its first line, so the tick is byte-identical to before. It never needed the
+# machine-wide admission Phase 4 (HERD-641) gave the SPAWN drain: unlike a spawn, a duplicate marker
+# write is CONVERGENT (§5.3) — publish refreshes one marker in place and supersede on an already-clear
+# item is a NOCHANGE, so two seats draining one pool converge on the same tracker state rather than
+# double-spending anything. A marker intent consumes no builder slot, so it leases none.
 
 # _intent_marker_apply <kind> <ref> <who> <detail> — execute ONE marker intent through the active
 # backend and print its verdict: DONE (a real transition), NOCHANGE (the backend saw nothing to do),

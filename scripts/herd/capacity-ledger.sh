@@ -352,6 +352,28 @@ capacity_agent_lease_admit_ceiling() {
   printf '%s' "$ceil"
 }
 
+# capacity_agent_lease_armed — HERD-641 (Phase 4 of HERD-625, docs/spikes/coordinator-work-queue.md
+# §5.5): true iff the AGENT tenant is usable RIGHT NOW as a MACHINE-WIDE admission control — the lever
+# is on, the shared pool resolves, and python3 (the flock(2) backbone) exists.
+#
+# Why a predicate and not just "call reserve and see": the watcher's spawn-queue drain
+# (agent-watch.sh:_drain_spawn_queue) has to choose its BUDGET SHAPE before it walks the queue — the
+# machine-wide lease, or the legacy per-seat `${#FEATS[@]}` count that §5.5 measured as the
+# over-admission bug (two seats draining one queue each admit up to their OWN cap). This answers that
+# one question without paying for, or side-effecting, a reserve attempt.
+#
+# The three guards are DELIBERATELY the same three capacity_agent_lease_reserve's own fail-soft
+# early-returns apply, and they live HERE rather than in the drain because a per-surface duplicate of a
+# rule is a correctness defect (docs/multi-seat-doctrine.md Rule 2): one ledger, one arming rule, one
+# implementation — a caller can never disagree with the reserve it is about to make. FAIL-SOFT: any of
+# the three missing → false → the caller keeps its pre-ledger behavior, byte-identically.
+capacity_agent_lease_armed() {
+  capacity_budget_enabled || return 1
+  [ -n "$(capacity_pool_dir)" ] || return 1
+  [ -n "$(capacity_python_bin)" ] || return 1
+  return 0
+}
+
 # capacity_suite_queue_saturated — true iff the SUITE tenant's ledger is fully occupied RIGHT NOW
 # (live count >= LOCAL_SUITE_CONCURRENCY): a suite trying to acquire this instant would have to queue.
 # Consumed by herd-spawn-gate.sh (HERD-581 P2) as an ADDITIONAL saturation signal, closing the
