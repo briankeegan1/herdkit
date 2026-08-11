@@ -111,11 +111,22 @@ fi
 # modified, which is exactly how they appear in a worktree cut before the untracking migration.
 SWEEP_REGENERABLE_GLOBS='.DS_Store:*.log:*.pyc:*.pyo:*.tmp:__pycache__:.pytest_cache:.mypy_cache:.ruff_cache:.coverage:coverage:node_modules:.venv:venv:dist:build:target'
 
-# Basenames that mark a DETACHED worktree as engine/agent scratch, wherever it lives. A detached
-# worktree UNDER $TREES also qualifies. Anything else detached is left alone: `git worktree add
-# --detach` is the documented way to A/B a change against base, and that tree is precious. Even a
-# MATCHING scratch tree is only reaped when it carries zero unique commits (see sweep_leg_worktrees).
+# Basenames that mark a DETACHED worktree as engine/agent scratch, wherever it lives — a fast-path
+# name check, belt-and-suspenders with the PROOF-based test below. Even a MATCHING scratch tree is
+# only reaped when it carries zero unique commits (see sweep_leg_worktrees).
 SWEEP_SCRATCH_GLOBS='tmp-*:*-tmp:tmp:scratch-*:herd-tmp-*:.tmp*'
+
+# HERD-638: a name/location check alone under-recognizes scratch (basewt/base/h313-style A/B
+# checkouts, named by convenience, not convention, and often cut OUTSIDE $TREES entirely — a session
+# scratchpad, /tmp, wherever the operator happened to be) — the recurring "unreapable dead-builder
+# row" incident. _sweep_is_scratch now trusts PROOF over naming: a detached tree living OUTSIDE
+# $TREES can never collide with a live/future builder slug, so it is scratch-eligible on sight,
+# leaving the REAL safety work (zero unique commits, not dirty, nothing holding it open) to decide
+# whether it is actually reaped. A detached tree INSIDE $TREES *could* someday be reused for a
+# same-named builder slot, so — unless its name already matches SWEEP_SCRATCH_GLOBS above — it
+# additionally waits out this age floor before the same proof authorizes a reap. Hours, not a
+# datestamp, so a test can override with HERD_SWEEP_SCRATCH_MAX_AGE_HOURS without faking the clock.
+SWEEP_SCRATCH_MAX_AGE_HOURS="${HERD_SWEEP_SCRATCH_MAX_AGE_HOURS:-24}"
 
 # Command patterns for leg 4's orphan hunt: a bats runner or a healthcheck/test script.
 SWEEP_ORPHAN_CMD_RE='(^|/| )(bats|healthcheck\.sh)( |$)|/tests/test-[A-Za-z0-9._-]*\.sh'
@@ -227,18 +238,58 @@ else:
 ' 2>/dev/null || printf 'dirty\tunreadable status (assumed dirty)'
 }
 
-# _sweep_is_scratch <dir> <slug> — success iff a DETACHED worktree is engine/agent scratch: it lives
-# under $TREES, or its basename matches a scratch glob. Deliberately narrow — an operator's detached
-# A/B checkout elsewhere is never swept.
+# _sweep_is_scratch <dir> <slug> — success iff a DETACHED worktree is engine/agent scratch (HERD-638):
+#   • outside $TREES entirely           → always (it cannot collide with a live/future builder slug —
+#                                          see sweep_leg_worktrees for the accompanying zero-commits /
+#                                          not-dirty / not-in-use proof that actually gates the reap)
+#   • basename matches a scratch glob   → always (the fast, name-based path, wherever it lives)
+#   • inside $TREES, name doesn't match → only once older than SWEEP_SCRATCH_MAX_AGE_HOURS
+# No $TREES configured degrades to the pre-HERD-638 behavior (always scratch-eligible by location);
+# the detached filter downstream still gates on the same proof. Both sides of the containment check
+# are realpath-resolved first (mirrors _discover_feature_worktrees's own reasoning): `git worktree
+# list` reports its own canonicalized path, and on macOS $TMPDIR (so a hermetic test's $TREES) is
+# itself a symlink (/var → /private/var) — a plain string-prefix compare would read every worktree as
+# "outside $TREES" and skip the age floor entirely.
 _sweep_is_scratch() {
-  local dir="$1" slug="$2" g
-  case "$dir/" in "$TREES"/*) return 0 ;; esac
+  local dir="$1" slug="$2" g rdir rtrees
+  [ -n "${TREES:-}" ] || return 0
+  rdir="$(_sweep_realpath "$dir")"; rtrees="$(_sweep_realpath "$TREES")"
+  case "$rdir/" in "$rtrees"/*) ;; *) return 0 ;; esac
   local IFS=':'
   for g in $SWEEP_SCRATCH_GLOBS; do
     # shellcheck disable=SC2254
     case "$slug" in $g) return 0 ;; esac
   done
-  return 1
+  _sweep_scratch_aged_out "$dir"
+}
+
+# _sweep_realpath <path> — realpath via python3 (already a hard dependency of this file — see
+# _sweep_classify_dirt), falling back to the path UNCHANGED when it cannot resolve (missing path, no
+# python3). Fail-soft and conservative: an unresolved symlink pair only reverts to a plain string
+# compare, the same one this file always did — never a NEW false containment match.
+_sweep_realpath() {
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null || printf '%s' "$1"
+}
+
+# _sweep_worktree_age_hours <dir> — hours since this worktree's checkout was created. Prefers the
+# directory's inode BIRTH time (_stat_birth, unaffected by files coming and going inside it), falling
+# back to its mtime when birth is unavailable (some Linux filesystems report 0). Prints "?" on an
+# unreadable clock — fail-soft AND CONSERVATIVE: the age gate below then reads "not old enough",
+# never the reverse.
+_sweep_worktree_age_hours() {
+  local dir="$1" created now
+  created="$(_stat_birth "$dir" 2>/dev/null || echo 0)"
+  case "$created" in ''|0|*[!0-9]*) created="$(file_mtime "$dir" 2>/dev/null || echo 0)" ;; esac
+  case "$created" in ''|0|*[!0-9]*) printf '?'; return 0 ;; esac
+  now="$(_now_epoch)"
+  printf '%s' $(( (now - created) / 3600 ))
+}
+
+# _sweep_scratch_aged_out <dir> — success iff _sweep_worktree_age_hours clears SWEEP_SCRATCH_MAX_AGE_HOURS.
+_sweep_scratch_aged_out() {
+  local age; age="$(_sweep_worktree_age_hours "$1")"
+  case "$age" in ''|'?'|*[!0-9]*) return 1 ;; esac
+  [ "$age" -ge "$SWEEP_SCRATCH_MAX_AGE_HOURS" ]
 }
 
 # _sweep_dir_in_use <dir> — success iff some live process has <dir> (or anything under it) open,

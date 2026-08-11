@@ -46,6 +46,10 @@
 #       never reaped (removing the worktree destroys them irrecoverably); a clean one still reaps.
 #  (12) COUNTERS RESET PER RUN — the watcher's auto path reuses one process, so SWEEP_N_* must not
 #       accumulate across cadence ticks (a `sweep_auto` line would otherwise report a lifetime total).
+#  (21) HERD-638: a detached scratch tree OUTSIDE $TREES, named the way the recurring incident named
+#       it (basewt/h313 — no glob, no $TREES), is reaped by PROOF alone; one carrying a unique commit
+#       is still FLAGGED. A same-shaped tree INSIDE $TREES with a non-glob name waits out an age floor.
+#  (22) HERD-638: once that age floor is cleared, the in-pool tree from (21) is reaped too.
 #
 # Fully hermetic: a temp git repo + real worktrees, stubbed gh/herdr, headless driver, seams for the
 # process table and cwd probe. NO network, NO model, NO panes, NO real processes killed but our own.
@@ -99,6 +103,25 @@ PRECIOUS_SHA="$(git -C "$TREESDIR/tmp-precious" rev-parse HEAD)"
 # tmp-inuse: a DETACHED scratch tree, clean, zero unique commits — but a live process holds it open.
 # Reaping it loses no data, yet pulls the checkout out from under its user. Must be FLAGGED.
 git -C "$MAINDIR" worktree add -q --detach "$TREESDIR/tmp-inuse" main >/dev/null 2>&1
+
+# HERD-638: outside-$TREES detached scratch trees, named the way a real incident named them (basewt,
+# h313 — no glob, no $TREES) — the recurring "unreapable dead-builder row". Reaped by PROOF alone.
+mkdir -p "$T/outside"
+# basewt: clean, zero unique commits, OUTSIDE $TREES entirely → must be reaped on sight.
+git -C "$MAINDIR" worktree add -q --detach "$T/outside/basewt" main >/dev/null 2>&1
+# h313: same, but carrying a commit reachable from no branch → must still be FLAGGED, never reaped —
+# the safety guarantee is unchanged by widening WHERE a scratch tree can be recognized.
+git -C "$MAINDIR" worktree add -q --detach "$T/outside/h313" main >/dev/null 2>&1
+echo precious2 > "$T/outside/h313/only-here.txt"
+git -C "$T/outside/h313" add -A
+git -C "$T/outside/h313" -c user.email=t@t.local -c user.name=t commit -qm "unique A/B work 2"
+OUTSIDE_PRECIOUS_SHA="$(git -C "$T/outside/h313" rev-parse HEAD)"
+
+# freshpick: a DETACHED tree INSIDE $TREES whose name matches no scratch glob and no builder branch —
+# a plain A/B checkout an operator parked in the pool. Left alone until it ages out (the pool namespace
+# still gets a courtesy buffer, unlike an outside-$TREES tree, which can never collide with a live or
+# future builder slug).
+git -C "$MAINDIR" worktree add -q --detach "$TREESDIR/freshpick" main >/dev/null 2>&1
 
 # stale-sha: HEAD moves past the sha the (merged) PR recorded → no anchor → must be untouched
 echo drift > "$TREESDIR/stale-sha/d.txt"
@@ -335,6 +358,25 @@ git -C "$MAINDIR" cat-file -e "$PRECIOUS_SHA^{commit}" 2>/dev/null \
 ok; echo "PASS (13) detached scratch: unique commits FLAGGED (unrecoverable); clean scratch still reaped"
 ok; echo "PASS (10) a worktree whose HEAD != the merged PR's headRefOid is never reaped"
 
+# ── (21) HERD-638: outside-$TREES detached scratch is reaped by PROOF, not by name/location ──────
+[ ! -d "$T/outside/basewt" ] \
+  || fail "(21) a clean, zero-unique-commit detached tree OUTSIDE \$TREES was not reaped (basewt incident)"
+[ -d "$T/outside/h313" ] \
+  || fail "(21) AUTO DELETED an outside-\$TREES detached tree carrying a commit reachable from no branch"
+git -C "$MAINDIR" cat-file -e "$OUTSIDE_PRECIOUS_SHA^{commit}" 2>/dev/null \
+  || fail "(21) the outside-\$TREES tree's unique commit is gone from the object store"
+grep -q '"reason":"scratch-unique-commits"' "$JOURNAL_FILE" \
+  || fail "(21) no sweep_flag for the outside-\$TREES detached tree carrying unique commits"
+[ -d "$TREESDIR/freshpick" ] \
+  || fail "(21) a fresh, non-glob-named detached tree INSIDE \$TREES was reaped before its age floor"
+ok; echo "PASS (21) HERD-638: outside-\$TREES scratch reaped by proof; inside-\$TREES non-glob scratch waits out the age floor"
+
+# ── (22) HERD-638: once the age floor clears, the same in-pool tree is authorized ──────────────────
+SWEEP_SCRATCH_MAX_AGE_HOURS=0 sweep_leg_worktrees "" >/dev/null 2>&1
+[ ! -d "$TREESDIR/freshpick" ] \
+  || fail "(22) SWEEP_SCRATCH_MAX_AGE_HOURS=0 did not authorize the in-pool scratch reap"
+ok; echo "PASS (22) HERD-638: an aged-out in-pool detached scratch tree is reaped once its floor clears"
+
 # ── (4) safe legs acted + journaled ──────────────────────────────────────────
 [ ! -d "$TREESDIR/merged-clean" ] || fail "(4) the clean merged worktree was not reaped"
 [ ! -d "$TREESDIR/merged-regen" ] || fail "(4) the merged worktree with only regenerable dirt was not reaped"
@@ -525,14 +567,15 @@ ok; echo "PASS (9) SWEEP_AUTO off|advise|auto normalize; off is byte-inert; unkn
 # process. Without a per-run reset the SWEEP_N_* globals accumulate and each `sweep_auto` journal line
 # reports a lifetime total rather than what that tick actually swept. Everything is already clean here,
 # so a second pass must journal all-zero counts.
-# The four judgment worktrees (merged-dirty, closed-unique, tmp-precious, tmp-inuse) survive every pass
-# and are re-flagged each time, so `flagged` exposes accumulation: it must read 4 EVERY pass, not 4,8…
+# The five judgment worktrees (merged-dirty, closed-unique, tmp-precious, tmp-inuse, outside-$TREES
+# h313) survive every pass and are re-flagged each time, so `flagged` exposes accumulation: it must
+# read 5 EVERY pass, not 5,10…
 : > "$JOURNAL_FILE"
 sweep_run_safe_legs >/dev/null 2>&1 || true
 sweep_run_safe_legs >/dev/null 2>&1 || true
 LAST="$(grep '"event":"sweep_auto"' "$JOURNAL_FILE" | tail -1)"
-grep -q '"flagged":4' <<< "$LAST" \
-  || fail "(12) counters accumulated across runs (expected flagged=4 on every pass): $LAST"
+grep -q '"flagged":5' <<< "$LAST" \
+  || fail "(12) counters accumulated across runs (expected flagged=5 on every pass): $LAST"
 grep -q '"reaped":0' <<< "$LAST" || fail "(12) reaped counter accumulated across runs: $LAST"
 ok; echo "PASS (12) SWEEP_N_* counters reset per run (auto ticks never report a lifetime total)"
 
