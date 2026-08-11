@@ -392,7 +392,7 @@ if _red_stale:
     summary = "MAIN RED older than TTL · sha=%s failed=%s" % ((_r_sha[:8] if _r_sha else "?"), _r_failed)
     findings.append(("red_state_stale", key, summary, ctx(pr=_r_pr, sha=_r_sha)))
 
-# ── (k) gates passed but no merge older than TTL (HERD-334) ──────────────────
+# ── (k) gates passed but no merge older than TTL (HERD-334; HELD-VS-UNOWNED split HERD-634) ──
 # A `gate_status` (state=success, context=herd/gates) event is the engine's marker for "all gates
 # passed / herd/gates=success" — journaled by bash post_gate_status and the python actuator on the
 # successful commit-status API write. The python engine core additionally journals event=blessing,
@@ -404,13 +404,30 @@ if _red_stale:
 # When branch protection then keeps blocking the merge on a required CI check, the PR sits
 # engine-approved-but-unmerged with nothing progressing — the exact silent state PRs #440/#441 sat in
 # for 7h. A later `merge` for the same pr clears it (any sha — a merge merges the PR). Past AGING_PR_TTL
-# with no such merge → a gates_passed_no_merge finding. Shares the render pass's AGING_PR_TTL threshold
-# (aging-pr.sh); 0 disables this leg. Advisory only — the auditor never merges or clears anything.
+# with no such merge → a finding. Shares the render pass's AGING_PR_TTL threshold (aging-pr.sh); 0
+# disables this leg. Advisory only — the auditor never merges or clears anything.
+#
+# HELD vs UNOWNED (HERD-634, root instance: PR 742 sat blessed-but-unmerged 3.5h, but it was HELD —
+# serialized behind PR 741's core-diff mutex, not stuck). Not every unmerged-past-TTL blessing is a
+# gap: the live engine's OWN merge-ordering rails (core-diff serialization HERD-577, MERGE_QUEUE
+# HERD-273, MERGE_POLICY=approve / a declared HUMAN-VERIFY hold) each journal a hold event the SAME
+# tick they hold a candidate that just got blessed — same pr, same sha (live_runtime.py's hold
+# decision runs on the same cand right after the blessing it followed, before any push could change
+# the sha). A hold event sharing the blessing's (pr, sha) is therefore proof this PR is a KNOWN,
+# deliberately-serialized wait, not an unowned stall — label it held-not-stuck (no action, no filing;
+# see _ja_act_no_action_reason's gates_passed_held case in journal-audit.sh). No hold evidence at all
+# past the TTL is the genuinely unowned case and keeps the gates_passed_no_merge kind, now MAPPED to a
+# bounded re-verify nudge (see journal-act.sh).
 if aging_pr_ttl > 0:
     blessings = [e for e in events
                  if e.get("event") in ("gate_status", "blessing")
                  and str(e.get("state") or "") == "success"
                  and str(e.get("context") or "herd/gates") == "herd/gates"]
+    # Evidence a candidate was HELD, not dropped: core-diff serialization, MERGE_QUEUE ordering, and
+    # the approve/human-verify hold — the three rails that can legitimately sit a blessed PR without
+    # merging it. Each fires once per (pr, sha) the same tick it holds that candidate.
+    hold_events = [e for e in events
+                   if e.get("event") in ("core_surface_hold", "merge_queue_hold", "hold_applied")]
     for b in blessings:
         if age_secs(now, b["_ts"]) < aging_pr_ttl:
             continue
@@ -421,8 +438,18 @@ if aging_pr_ttl > 0:
                                   and m["_ts"] >= b["_ts"] for m in merges):
             continue
         sha = str(b.get("sha") or "")
+        held = pr is not None and any(
+            h.get("pr") is not None and str(h.get("pr")) == str(pr)
+            and str(h.get("sha") or "") == sha and h["_ts"] >= b["_ts"]
+            for h in hold_events)
+        if held:
+            key = "gates_passed_held|pr=%s|sha=%s" % (pr if pr is not None else "", sha)
+            summary = "engine-approved and HELD (serialized/awaiting-approval), not stuck · pr=%s sha=%s" % (
+                pr if pr is not None else "?", (sha[:8] if sha else "?"))
+            findings.append(("gates_passed_held", key, summary, ctx(pr=pr, sha=sha, slug=b.get("slug"))))
+            continue
         key = "gates_passed_no_merge|pr=%s|sha=%s" % (pr if pr is not None else "", sha)
-        summary = "engine-approved but unmerged past TTL · pr=%s sha=%s — blocked on a required check?" % (
+        summary = "engine-approved but unmerged past TTL, no hold evidence · pr=%s sha=%s — unowned?" % (
             pr if pr is not None else "?", (sha[:8] if sha else "?"))
         findings.append(("gates_passed_no_merge", key, summary, ctx(pr=pr, sha=sha, slug=b.get("slug"))))
 

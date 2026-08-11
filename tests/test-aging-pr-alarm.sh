@@ -20,6 +20,12 @@
 #       journal_append gets from bash post_gate_status / the python actuator on the successful
 #       herd/gates=success API write) and `blessing` state=success (the python engine core's
 #       once-per-(pr,sha) BLESSED marker, live_runtime.py).
+#   (c2) HELD vs UNOWNED (HERD-634) — a blessing past the TTL with no merge yet is not automatically a
+#       gap: a core_surface_hold / merge_queue_hold / hold_applied event for the SAME pr+sha (the
+#       engine's own merge-ordering rails journaling why they held this exact candidate) reclassifies
+#       the finding as `gates_passed_held` instead — the root instance being PR 742, held 3.5h behind
+#       PR 741's core-diff mutex, then merged on its own once 741 landed. A hold event for a DIFFERENT
+#       pr, or a stale hold that predates this blessing, must never suppress a real unowned finding.
 #
 # Run:  bash tests/test-aging-pr-alarm.sh
 # No `set -e`: several predicates deliberately return non-zero; every assertion is explicit.
@@ -326,5 +332,82 @@ JA6="$T/ja6.jsonl"
 AGING_PR_TTL=3600 run_audit "$JA6"
 [ "$(jf_finding "$JA6")" -eq 0 ] || fail "(c) a gate_status with a non-herd/gates context must NOT be treated as gates-passed"
 ok "(c) a foreign-context gate_status is excluded"
+
+# ── (c2) HELD vs UNOWNED split (HERD-634) ─────────────────────────────────────────────────────────
+jf_held() { local n; n="$(grep -c '"kind":"gates_passed_held"' "$1" 2>/dev/null)" || n=0; printf '%s' "${n:-0}"; }
+
+# PR 742's exact root-instance sequence: blessed at 10:00, held behind PR 741's core-diff mutex at
+# 10:00 (same tick), "now" pinned to 13:00 — 3h into the 3.5h gap, well past the 1h TTL, merge has NOT
+# landed yet. This is the live sweep that misfired in production: it must see gates_passed_held, never
+# gates_passed_no_merge.
+JAH1="$T/jah1.jsonl"
+{
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"blessing","pr":742,"sha":"aaaa7420","context":"herd/gates","state":"success"}'
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"core_surface_hold","pr":742,"sha":"aaaa7420","slug":"held-lane","front_pr":741,"reason":"core diff serialized behind PR #741"}'
+} > "$JAH1"
+AUDIT_NOW="2026-08-10T13:00:00Z" AGING_PR_TTL=3600 run_audit "$JAH1"
+[ "$(jf_finding "$JAH1")" -eq 0 ] || fail "(c2) PR 742's held sequence must NOT surface gates_passed_no_merge"
+[ "$(jf_held "$JAH1")" -ge 1 ] || fail "(c2) PR 742's held sequence must surface gates_passed_held"
+ok "(c2) PR 742's exact core_surface_hold sequence classifies as held-not-stuck, never unowned"
+
+# The SAME sequence replayed with "now" AFTER the eventual merge → fully cleared, no finding at all
+# (mirrors the existing merge-clears-blessing behavior; the hold event does not change that). A FRESH
+# fixture file, never the mutated $JAH1 above (run_audit appends its own findings in place, same as
+# the AGING_PR_TTL=0 leg below relies on).
+JAH1B="$T/jah1b.jsonl"
+{
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"blessing","pr":742,"sha":"aaaa7420","context":"herd/gates","state":"success"}'
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"core_surface_hold","pr":742,"sha":"aaaa7420","slug":"held-lane","front_pr":741,"reason":"core diff serialized behind PR #741"}'
+  printf '%s\n' '{"ts":"2026-08-10T23:43:00Z","event":"merge","pr":742,"slug":"held-lane","sha":"aaaa7420","reason":"gates_passed"}'
+} > "$JAH1B"
+AUDIT_NOW="2026-08-11T00:00:00Z" AGING_PR_TTL=3600 run_audit "$JAH1B"
+[ "$(jf_finding "$JAH1B")" -eq 0 ] || fail "(c2) a merged held PR must not surface gates_passed_no_merge"
+[ "$(jf_held "$JAH1B")" -eq 0 ] || fail "(c2) a merged held PR must not surface gates_passed_held either — it is simply done"
+ok "(c2) once PR 742 actually merges, neither finding fires"
+
+# merge_queue_hold is the same shape of evidence for the queue-ordering rail.
+JAH2="$T/jah2.jsonl"
+{
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"blessing","pr":750,"sha":"bbbb7500","context":"herd/gates","state":"success"}'
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"merge_queue_hold","pr":750,"sha":"bbbb7500","slug":"queued-lane","front_pr":749}'
+} > "$JAH2"
+AUDIT_NOW="2026-08-10T13:00:00Z" AGING_PR_TTL=3600 run_audit "$JAH2"
+[ "$(jf_finding "$JAH2")" -eq 0 ] || fail "(c2) merge_queue_hold evidence must NOT surface gates_passed_no_merge"
+[ "$(jf_held "$JAH2")" -ge 1 ] || fail "(c2) merge_queue_hold evidence must surface gates_passed_held"
+ok "(c2) merge_queue_hold evidence for the same pr+sha is also recognized as held"
+
+# hold_applied (MERGE_POLICY=approve / a declared HUMAN-VERIFY block, the "awaiting approval" hold).
+JAH3="$T/jah3.jsonl"
+{
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"blessing","pr":760,"sha":"cccc7600","context":"herd/gates","state":"success"}'
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"hold_applied","pr":760,"sha":"cccc7600","slug":"approve-lane","kind":"approve"}'
+} > "$JAH3"
+AUDIT_NOW="2026-08-10T13:00:00Z" AGING_PR_TTL=3600 run_audit "$JAH3"
+[ "$(jf_finding "$JAH3")" -eq 0 ] || fail "(c2) hold_applied (awaiting-approval) evidence must NOT surface gates_passed_no_merge"
+[ "$(jf_held "$JAH3")" -ge 1 ] || fail "(c2) hold_applied (awaiting-approval) evidence must surface gates_passed_held"
+ok "(c2) hold_applied (approve-policy awaiting-approval) evidence is also recognized as held"
+
+# A hold event for a DIFFERENT pr must never suppress THIS pr's genuinely unowned finding.
+JAH4="$T/jah4.jsonl"
+{
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"blessing","pr":770,"sha":"dddd7700","context":"herd/gates","state":"success"}'
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"core_surface_hold","pr":771,"sha":"eeee7710","slug":"other-lane","front_pr":700,"reason":"core diff serialized behind PR #700"}'
+} > "$JAH4"
+AUDIT_NOW="2026-08-10T13:00:00Z" AGING_PR_TTL=3600 run_audit "$JAH4"
+[ "$(jf_finding "$JAH4")" -ge 1 ] || fail "(c2) a sibling PR's hold event must NOT suppress this pr's unowned finding"
+[ "$(jf_held "$JAH4")" -eq 0 ] || fail "(c2) a sibling PR's hold event must not falsely mark this pr held"
+ok "(c2) a hold event for a different pr never suppresses this pr's unowned finding"
+
+# A STALE hold for an OLDER sha of the same pr (a superseded push) must not suppress the current
+# blessing's unowned finding — the hold evidence must match the blessing's OWN sha.
+JAH5="$T/jah5.jsonl"
+{
+  printf '%s\n' '{"ts":"2026-08-10T09:00:00Z","event":"core_surface_hold","pr":780,"sha":"oldsha01","slug":"resurfaced","front_pr":700,"reason":"core diff serialized behind PR #700"}'
+  printf '%s\n' '{"ts":"2026-08-10T10:00:00Z","event":"blessing","pr":780,"sha":"newsha02","context":"herd/gates","state":"success"}'
+} > "$JAH5"
+AUDIT_NOW="2026-08-10T13:00:00Z" AGING_PR_TTL=3600 run_audit "$JAH5"
+[ "$(jf_finding "$JAH5")" -ge 1 ] || fail "(c2) a stale hold event on a superseded sha must NOT suppress the current blessing's unowned finding"
+[ "$(jf_held "$JAH5")" -eq 0 ] || fail "(c2) a stale hold event on a superseded sha must not falsely mark this pr held"
+ok "(c2) a hold event on a superseded sha never suppresses the current blessing's unowned finding"
 
 printf '\nAll %d aging-PR alarm assertions passed.\n' "$pass"

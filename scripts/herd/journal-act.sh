@@ -32,6 +32,16 @@
 #   merge_without_reap     → retirement_tick (HERD-164's reconciled invariant) RIGHT NOW instead of
 #                            waiting for a tick that may never come: a slug whose PR is merged has no
 #                            right to hold an agent, a tab, a worktree or a branch.
+#   gates_passed_no_merge  → HERD-634: a re-verify NUDGE for a blessed PR sitting unmerged past its TTL
+#                            with NO hold evidence (journal-audit.sh already routed the HELD case — a
+#                            core_surface_hold/merge_queue_hold/hold_applied event for the same pr+sha
+#                            — to the gates_passed_held no-action reason, so this rail only ever sees
+#                            the genuinely unowned kind). Frees any concurrency slot the candidate's
+#                            own worker might still be holding (the same HERD-185 hygiene sweep
+#                            dispatch_no_outcome uses) and journals a `gates_recheck_requested` re-check
+#                            intent so the next tick — and any human reading the log — sees this
+#                            candidate was explicitly nudged. NEVER forces a merge: the live engine's
+#                            own gate/hold logic is the only thing allowed to decide that.
 #   anything else          → `unmapped` on stdout; journal-audit.sh then files a dedup-keyed tracker
 #                            item so the gap becomes WORK instead of another report.
 #
@@ -46,8 +56,9 @@
 #     because a heal could not be attempted, and a heal must never be reported as one that happened.
 #   • HONEST RESULT TOKENS — stdout is a SINGLE lowercase token naming what actually happened; it is
 #     journaled verbatim as `audit_acted result=<token>`. `retired`/`slot_freed`/`rebounced`/
-#     `reverify_armed` mean the rail ran; `rail_off`/`no_pane`/`no_wake`/`pr_lookup_failed`/
-#     `unavailable`/`no_head`/`no_slug`/`unmapped` mean it did not, and say why.
+#     `reverify_armed`/`recheck_armed` mean the rail ran; `rail_off`/`no_pane`/`no_wake`/
+#     `pr_lookup_failed`/`unavailable`/`no_head`/`no_slug`/`no_pr`/`unmapped` mean it did not, and say
+#     why.
 #
 # Usage:
 #   journal-act.sh <class> <finding-key> [k=v ...]
@@ -85,7 +96,7 @@ done
 # whole watcher library to say so would be pure cost — and it keeps the unmapped path (the one the
 # auditor turns into a filed tracker item) provable with zero control-room fixture.
 case "$CLASS" in
-  merge_without_reap|dispatch_no_outcome|refix_bounce_no_wake|red_state_stale) : ;;
+  merge_without_reap|dispatch_no_outcome|refix_bounce_no_wake|red_state_stale|gates_passed_no_merge) : ;;
   *) printf 'unmapped\n'; exit 0 ;;
 esac
 
@@ -216,6 +227,26 @@ Fix every issue the reviewer raised, run the healthcheck, push your fix, and rep
     [ -e "$_jact_marker" ] || { printf 'reverify_pending\n'; exit 0; }
     rm -f "$_jact_marker" 2>/dev/null || true
     printf 'reverify_armed\n'
+    ;;
+
+  # ── (e) gates passed, no merge, no hold evidence → re-verify nudge (HERD-634) ──────────────────
+  # journal-audit.sh only ever routes the genuinely UNOWNED flavor here — a blessed PR with a
+  # core_surface_hold/merge_queue_hold/hold_applied event for the same pr+sha is the gates_passed_held
+  # no-action class instead (see journal-audit.sh's _ja_act_no_action_reason). NEVER a forced merge:
+  # the live engine's own gate/hold decision owns whether this PR is allowed to land.
+  gates_passed_no_merge)
+    [ -n "$_ja_pr" ] || { printf 'no_pr\n'; exit 0; }
+    # Free any concurrency slot a dead/stuck worker for this candidate might still be holding — the
+    # SAME bounded, idempotent, mutex-guarded sweep dispatch_no_outcome uses above.
+    if _jact_have _sweep_gate_corpses; then
+      _sweep_gate_corpses >/dev/null 2>&1 || true
+    fi
+    # The re-check intent itself: a record that the next tick (and any human reading the log) should
+    # treat this candidate as due for re-evaluation, never a mutation of the merge decision.
+    journal_append gates_recheck_requested pr "$_ja_pr" sha "${_ja_sha:-}" slug "${_ja_slug:-}" \
+      reason "journal-audit re-verify (HERD-634): gates passed, no hold evidence, TTL exceeded" \
+      2>/dev/null || true
+    printf 'recheck_armed\n'
     ;;
 esac
 

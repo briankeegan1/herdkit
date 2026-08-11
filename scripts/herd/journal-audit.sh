@@ -54,10 +54,15 @@
 #                 steps carry no approval record — real signal, but the PR is already merged, so no
 #                 rail can retroactively verify or undo it), `watcher_restart_blocked` (an orphaned
 #                 lock holder is a signal for a human to look at — auto-killing an unidentified pid
-#                 risks killing a live builder, so no rail may act on it), and `checkout_unclean`
+#                 risks killing a live builder, so no rail may act on it), `checkout_unclean`
 #                 (reconcile_checkout_cleanliness deliberately LEAVES the contamination in place as
 #                 evidence for a human; a rail that auto-discarded it would destroy the very evidence
-#                 the check exists to preserve).
+#                 the check exists to preserve), and `gates_passed_held` (HERD-634: a blessed PR sitting
+#                 past AGING_PR_TTL with no merge yet, but a core_surface_hold / merge_queue_hold /
+#                 hold_applied event for the SAME pr+sha proves it is a KNOWN, deliberately-serialized
+#                 wait — core-diff serialization, MERGE_QUEUE ordering, or an approve/human-verify hold
+#                 — not an unowned stall; see the gates_passed_no_merge case below for the sibling
+#                 finding that DOES lack that evidence).
 #                 Journals `audit_acted result=no_action reason=…` exactly once and NEVER files,
 #                 escalates, or re-fires for that FINDING KEY. RECURRENCE ESCALATION (HERD-597):
 #                 a class that keeps being found under distinct keys (a new slug, a new pr) is itself a
@@ -212,7 +217,7 @@ AGING_PR_TTL_SECS="$(_aging_pr_ttl_secs)"
 # Each stdout line:  kind\tkey\tsummary\tctx
 # kind ∈ merge_without_reap | dispatch_no_outcome | refix_bounce_no_wake |
 #        red_state_stale | pushed_no_unresolved | main_detached | fixture_slug | watcher_restart_blocked |
-#        checkout_unclean | gates_passed_no_merge
+#        checkout_unclean | gates_passed_no_merge | gates_passed_held
 # key is a stable dedup token; summary is a short human phrase for the inbox row; ctx is the finding's
 # ACTION CONTEXT (HERD-544) — a space-separated `k=v` list (pr=, sha=, slug=, round=) taken from the
 # very event that violated the invariant, so the action pass can drive the matching rail without
@@ -365,6 +370,8 @@ _inbox_append() {
 #   refix_bounce_no_wake → re-deliver the bounce ONCE; a wake that lands closes the finding itself
 #   red_state_stale      → arm the main-health re-verify rail for the current $MAIN HEAD
 #   merge_without_reap   → run the retirement invariant (HERD-164) now
+#   gates_passed_no_merge → re-verify nudge (HERD-634): journal a re-check intent and free any gate
+#                          slot the candidate's own worker still holds — NEVER a forced merge
 #   ANY OTHER CLASS      → no mapped action, so the GAP becomes WORK: file one dedup-keyed tracker
 #                          item via the scribe. A class nothing can heal must never be a class
 #                          nothing knows about.
@@ -500,7 +507,7 @@ _ja_ctx_field() {
 # that gains a rail must gain it in both places or the test reds.
 _ja_act_mapped() {
   case "$1" in
-    merge_without_reap|dispatch_no_outcome|refix_bounce_no_wake|red_state_stale) return 0 ;;
+    merge_without_reap|dispatch_no_outcome|refix_bounce_no_wake|red_state_stale|gates_passed_no_merge) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -534,6 +541,13 @@ _ja_act_mapped() {
 #                               as evidence for a human to inspect; see the (j) check above. A rail that
 #                               auto-reset/auto-discarded it would destroy the very evidence the check
 #                               exists to preserve, so no automated action may touch it.
+#   gates_passed_held        — HERD-634: a blessed PR sitting past AGING_PR_TTL with no merge yet, but
+#                               the replay found a core_surface_hold / merge_queue_hold / hold_applied
+#                               event for the SAME pr+sha (see the (k) check in journal-audit-replay.sh).
+#                               That is proof the PR is a KNOWN, deliberately-serialized wait — a
+#                               live-engine merge-ordering rail already owns it — not a gap for THIS
+#                               auditor to route anywhere. Root instance: PR 742 sat blessed 3.5h behind
+#                               PR 741's core-diff mutex, then merged on its own once 741 landed.
 # Each class still recurrence-escalates via _ja_noaction_recur (HERD-597) below: a class that keeps
 # firing under distinct keys (a new holder_pid, a new head sha) is itself a signal nothing has looked at
 # the root cause, and files ONE class-scoped item once that keeps recurring — gated by the per-class
@@ -556,6 +570,9 @@ _ja_act_no_action_reason() {
       ;;
     checkout_unclean)
       printf 'shared checkout left deliberately dirty as evidence for a human to inspect — an automated rail must never discard/reset the contamination itself'
+      ;;
+    gates_passed_held)
+      printf 'a core_surface_hold/merge_queue_hold/hold_applied event for the same pr+sha proves this is a KNOWN serialized wait, not an unowned stall — a merge-ordering rail already owns it'
       ;;
     *) return 1 ;;
   esac

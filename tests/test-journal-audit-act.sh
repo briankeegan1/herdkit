@@ -327,6 +327,45 @@ out="$(run_audit on)" || fail "(2f) sweep 3 exited non-zero: $out"
 pass
 echo "PASS (2f) HERD-631: a red on a different sha refreshes the one tracked red_state_stale finding instead of filing duplicates"
 
+# ── (2g) gates_passed_no_merge (HERD-634) is MAPPED: a genuinely UNOWNED blessed PR (no hold evidence)
+#         gets a re-verify nudge, never a forced merge — and clears once the PR actually merges ───────
+reset_surfaces
+jline "2026-08-05T13:00:00Z" '"event":"blessing","pr":900,"sha":"beef9000","context":"herd/gates","state":"success","slug":"unowned-lane"'
+out="$(run_audit on)" || fail "(2g) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2g) sweep 1 must drive the re-verify rail once, got $(rail_calls)"
+grep -q '^gates_passed_no_merge|' "$RAILLOG" || fail "(2g) the rail must be handed the gates_passed_no_merge class: $(cat "$RAILLOG")"
+grep -q 'pr=900' "$RAILLOG"  || fail "(2g) the rail's ctx must carry the pr: $(cat "$RAILLOG")"
+grep -q 'sha=beef9000' "$RAILLOG" || fail "(2g) the rail's ctx must carry the sha: $(cat "$RAILLOG")"
+grep -q 'slug=unowned-lane' "$RAILLOG" || fail "(2g) the rail's ctx must carry the slug: $(cat "$RAILLOG")"
+[ -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(2g) an acted mapped finding must be tracked as pending"
+[ "$(scribe_calls)" = "0" ] || fail "(2g) a MAPPED class must not file an item on its first action"
+# The PR actually merges — the world proved the candidate was fine all along, never stuck. A reap
+# right behind it (mirrors reality — do_merge reaps on merge) so this sweep does not ALSO trip the
+# unrelated merge_without_reap rail and inflate the rail-call count this test is checking.
+jline "2026-08-05T15:30:00Z" '"event":"merge","pr":900,"slug":"unowned-lane","sha":"beef9000"'
+jline "2026-08-05T15:30:05Z" '"event":"reap","pr":900,"slug":"unowned-lane","sha":"beef9000","reason":"merged"'
+out="$(run_audit on)" || fail "(2g) sweep 2 exited non-zero: $out"
+[ "$(rail_calls)" = "1" ] || fail "(2g) a cleared finding must never re-drive the rail, got $(rail_calls)"
+grep -q '"event":"audit_finding_cleared".*"class":"gates_passed_no_merge"' "$JOURNAL_FILE" \
+  || fail "(2g) a resolved finding must journal audit_finding_cleared for gates_passed_no_merge"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(2g) a cleared finding must stop being tracked"
+pass
+echo "PASS (2g) gates_passed_no_merge is mapped to a re-verify nudge and clears once the PR actually merges"
+
+# ── (2h) dedup-key composition (HERD-634, per the HERD-631 sha-agnostic-dedup precedent): unlike
+#         red_state_stale's sha-agnostic collapse to ONE tracked finding, gates_passed_no_merge stays
+#         keyed PER (pr,sha) — two blessings of the SAME pr at DIFFERENT shas (a resurfaced/superseded
+#         push) are two DISTINCT findings, each acted on separately, never collapsed into one ─────────
+reset_surfaces
+jline "2026-08-05T13:00:00Z" '"event":"blessing","pr":920,"sha":"aaaa9200","context":"herd/gates","state":"success","slug":"resurfaced"'
+jline "2026-08-05T13:30:00Z" '"event":"blessing","pr":920,"sha":"bbbb9201","context":"herd/gates","state":"success","slug":"resurfaced"'
+out="$(run_audit on)" || fail "(2h) sweep exited non-zero: $out"
+[ "$(rail_calls)" = "2" ] || fail "(2h) two distinct (pr,sha) blessings must drive the rail twice, got $(rail_calls): $(cat "$RAILLOG")"
+grep -q 'sha=aaaa9200' "$RAILLOG" || fail "(2h) the first sha's finding must be acted on: $(cat "$RAILLOG")"
+grep -q 'sha=bbbb9201' "$RAILLOG" || fail "(2h) the second sha's finding must be acted on separately: $(cat "$RAILLOG")"
+pass
+echo "PASS (2h) gates_passed_no_merge's dedup key composes per (pr,sha), never collapsed across a resurfaced pr"
+
 # ── (3) an UNMAPPED finding class files EXACTLY ONE deduped item, ever ──────────────────────────
 reset_surfaces
 jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'      # pushed_no_unresolved: no rail
@@ -504,6 +543,28 @@ grep -q '^checkout_unclean	1$' "$HERD_JOURNAL_AUDIT_NOACTION_COUNT" \
   || fail "(3i) a historical replay must never file a false recurrence item (HERD-604/605), got $(scribe_calls)"
 pass
 echo "PASS (3i) HERD-606: the per-class high-water mark stops a historical journal replay from inflating the recurrence tally, even when the once-guard's own protection is lost"
+
+# ── (3j) gates_passed_held (HERD-634) is a DELIBERATE no-action class: a core_surface_hold event for
+#         the SAME pr+sha as the blessing proves the engine's OWN merge-ordering rail already owns this
+#         candidate — never a rail call, never a filed item, root instance PR 742 ─────────────────────
+reset_surfaces
+jline "2026-08-05T13:00:00Z" '"event":"blessing","pr":910,"sha":"cafe9100","context":"herd/gates","state":"success","slug":"held-lane"'
+jline "2026-08-05T13:00:00Z" '"event":"core_surface_hold","pr":910,"sha":"cafe9100","slug":"held-lane","front_pr":909,"reason":"core diff serialized behind PR #909"'
+out="$(run_audit on)" || fail "(3j) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3j) gates_passed_held must never reach a rail, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3j) gates_passed_held must never file a tracker item, got $(scribe_calls)"
+grep -q '"class":"gates_passed_held".*"result":"no_action"' "$JOURNAL_FILE" \
+  || fail "(3j) gates_passed_held must journal result=no_action: $(grep audit_acted "$JOURNAL_FILE")"
+grep -q 'audit-noaction:gates_passed_held' "$HERD_JOURNAL_AUDIT_INBOX" || fail "(3j) the no-action must still get an advisory inbox row"
+grep -q '"event":"journal_audit".*"kind":"gates_passed_held"' "$JOURNAL_FILE" || fail "(3j) gates_passed_held must still be REPORTED (advisory)"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(3j) a no-action class must never be tracked as pending"
+out="$(run_audit on)" || fail "(3j) sweep 2 exited non-zero: $out"
+out="$(run_audit on)" || fail "(3j) sweep 3 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3j) gates_passed_held must never reach a rail across sweeps, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3j) gates_passed_held must never file across sweeps, got $(scribe_calls)"
+[ "$(grep -c '"result":"no_action"' "$JOURNAL_FILE")" = "1" ] || fail "(3j) the no-action must journal exactly once, ever"
+pass
+echo "PASS (3j) gates_passed_held is a deliberate no-action class — journals a reason once, never acts on the live journal"
 
 # ── (3g) HERD-602: an unmapped class that keeps recurring under DISTINCT finding keys (a new pr, a
 #         new ts) must still file EXACTLY ONE tracker item, ever — dedup keyed on the CLASS, not the
