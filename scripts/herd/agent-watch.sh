@@ -857,21 +857,9 @@ if [ "${AGENT_WATCH_LIB:-}" != "1" ]; then
   esac
 fi
 
-# _effective_human_verify_policy — resolve HUMAN_VERIFY_POLICY (HERD-59) to hold | coordinator | auto.
-# It shapes ONLY how a PR that declares a HUMAN-VERIFY: block is handled under MERGE_POLICY=auto:
-#   hold        default; today's EXACT behavior — a sha-keyed approve-style hold released by
-#               herd-approve.sh approve. Byte-identical when the key is unset.
-#   coordinator keep the hold but notify loudly and flag it coordinator-actionable, so a coordinator/
-#               agent runs the declared steps then approves via herd-approve.sh approve.
-#   auto        treat the declared steps as INFORMATIONAL only — journal + PR-comment them and merge
-#               on green gates (the standing human-verify authorization codified as an engine switch).
-# Unknown/empty → hold (fail safe). Pure; the launch-time resolution below surfaces a bad value once.
-_effective_human_verify_policy() {
-  case "${HUMAN_VERIFY_POLICY:-}" in
-    hold|coordinator|auto) printf '%s' "${HUMAN_VERIFY_POLICY}" ;;
-    *)                     printf 'hold' ;;
-  esac
-}
+# _effective_human_verify_policy (HUMAN_VERIFY_POLICY resolution, HERD-59) now lives in
+# human-verify.sh — sourced above — so journal-audit.sh's HERD-644 policy-aware audit reuses this
+# exact function instead of a second copy. The launch-time resolution below surfaces a bad value once.
 HV_POLICY="$(_effective_human_verify_policy)"
 # An explicitly-set but UNRECOGNIZED value fails safe to hold — journal it once at launch so a typo
 # (HUMAN_VERIFY_POLICY=cordinator) never silently rides the default. Skipped in lib mode so sourcing

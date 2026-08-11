@@ -17,14 +17,28 @@
 #   (i) a DETACHED shared checkout (HERD-336): a main_detached result=detected not cleared by a later
 #       result=reattached — the coordinator checkout sat on a detached HEAD (the refresh-race corpse)
 #   (f) known-fixture slugs (retiree / conv / stuck / hd — the HERD-223 pollution set)
-#   (g) a MERGED PR whose body declares a HUMAN-VERIFY block but which carries NO sha-keyed approval
-#       record. Such a PR merged with its declared manual steps never run. This is not hypothetical:
-#       agent-watch.sh's `_pr_body` used to swallow gh's exit status, so any 5xx blip made an
-#       unreadable body indistinguishable from "declares no block" — and an absent block means MERGE
-#       (fixed in 65fe660 by making the rc three-valued). Every merge that predates that fix is
-#       therefore unproven. Because the audit replays a journal WINDOW, one check serves both readings:
-#       ONGOING, it re-examines each tick's fresh merges; RETROACTIVELY, a one-shot run with a widened
-#       JOURNAL_AUDIT_WINDOW_SECS sweeps as far back as the journal reaches.
+#   (g) a MERGED PR whose body declares a HUMAN-VERIFY block, merged under a policy where that steps
+#       block IS an approval-bypass signal — i.e. HUMAN_VERIFY_POLICY=hold|coordinator with NO
+#       sha-keyed approval record. This is not hypothetical: agent-watch.sh's `_pr_body` used to
+#       swallow gh's exit status, so any 5xx blip made an unreadable body indistinguishable from
+#       "declares no block" — and an absent block means MERGE (fixed in 65fe660 by making the rc
+#       three-valued). Every merge that predates that fix is therefore unproven. Because the audit
+#       replays a journal WINDOW, one check serves both readings: ONGOING, it re-examines each tick's
+#       fresh merges; RETROACTIVELY, a one-shot run with a widened JOURNAL_AUDIT_WINDOW_SECS sweeps as
+#       far back as the journal reaches.
+#
+#       POLICY-AWARE (HERD-644). Under HUMAN_VERIFY_POLICY=auto, EVERY PR declaring a HUMAN-VERIFY
+#       block merges with its steps recorded as informational and NO approval record — BY DESIGN
+#       (decisions.hold_decision merges unconditionally once hv_policy=="auto"; that is the standing
+#       human-verify authorization, not a bypass). The class-scoped auditor filed this fix after 3+
+#       recurrences of exactly that: a policy-sanctioned auto-merge (evidenced by the durable
+#       `human_verify_policy … policy=auto` journal line below) reported as if it were the genuine
+#       bypass class hold/coordinator without approval represents. So this check is now policy-aware:
+#       `hv-informed` evidence, or no evidence at all while the CURRENT effective policy (the shared
+#       resolver in human-verify.sh, `_effective_human_verify_policy` — never a second copy) reads
+#       `auto`, is NO finding. No evidence while the effective policy is `hold`/`coordinator` remains a
+#       REAL, loud finding — hold_decision only ever reaches MERGE under those policies once `approved`
+#       is true, so an evidence-free merge there IS the bypass this check exists to catch.
 #
 #       WHERE THE EVIDENCE LIVES. Not in the approval ledger: do_merge calls purge_pr_approvals the
 #       instant a PR merges, dropping every row for it (HERD-90), so by the time this check sees a
@@ -36,8 +50,9 @@
 #       The ledger is still consulted through approvals.sh (the seam herd-approve.sh writes), because a
 #       purge that failed, or a merge journaled without a later purge, leaves a real row worth reading.
 #       Evidence is the UNION; approval wins over hv-informed. A merge whose approval predates the
-#       `approval_recorded` event (i.e. history older than this check) has no evidence anywhere and is
-#       reported unproven — which is precisely what the retroactive sweep exists to surface.
+#       `approval_recorded` event (i.e. history older than this check) has no evidence anywhere and,
+#       under a non-auto effective policy, is reported unproven — which is precisely what the
+#       retroactive sweep exists to surface.
 #
 # FINDINGS BECOME ACTIONS (HERD-544, JOURNAL_AUDIT_ACT — off by default):
 #   Detection alone leaves the engine stuck in the seam between rails: every stall class that DOES
@@ -322,14 +337,35 @@ if [ -n "${HERD_JOURNAL_AUDIT_PR_BODY_CMD:-}" ] || command -v gh >/dev/null 2>&1
     if [ "$_hv_state" = "approved" ]; then
       _seen_mark "$_hv_memo"; continue
     fi
-    # `hv-informed` means HUMAN_VERIFY_POLICY=auto merged it as informational: the steps were journaled
-    # and commented, never signed off. That is a weaker record than an approval, so it still surfaces —
-    # the summary names it so an operator can tell a deliberate posture from a fail-open merge.
-    _hv_why="no approval record"
-    [ "$_hv_state" = "hv-informed" ] && _hv_why="hv-informed only (never signed off)"
+    # POLICY-AWARE (HERD-644): `hv-informed` PROVES HUMAN_VERIFY_POLICY=auto governed this merge — it
+    # is the journal event ONLY that policy branch writes (live_runtime.py's do_merge, right before the
+    # actuator merges: `human_verify_policy … policy=auto`). Under policy=auto the declared steps are
+    # ALWAYS merged as informational, unsigned, by design (decisions.hold_decision: mode=="auto" merges
+    # unconditionally once hv_policy=="auto") — that is the standing human-verify authorization, not a
+    # bypass. Reporting it as merged_hv_no_approval conflated a policy-sanctioned merge with the genuine
+    # approval-bypass class this check exists to catch, and did so on 3+ recurrences (PR #753 among
+    # them) before the class-scoped auditor flagged the pattern itself. Settled exactly like "approved".
+    if [ "$_hv_state" = "hv-informed" ]; then
+      _seen_mark "$_hv_memo"; continue
+    fi
+    # No evidence anywhere (journal or ledger) that the steps were ever signed off OR merged
+    # informationally. Resolve the POLICY IN EFFECT for this merge — through the ONE shared resolver
+    # (human-verify.sh's _effective_human_verify_policy, the same function agent-watch.sh's own launch
+    # resolution calls; never a second copy) — since HUMAN_VERIFY_POLICY is a project-level posture, not
+    # a per-merge choice, its current value is the auditor's best available signal for what governed a
+    # merge inside the (short, bounded) replay window. Under policy=auto, hold_decision proves EVERY
+    # hv-holding merge takes this exact unsigned path, so evidence-free here is presumptively the same
+    # by-design merge whose informational journal line predates this fix, fell outside the window, or was
+    # lost to an interrupted tick — never memoized as clean, so a later policy correction re-examines it.
+    # Under hold/coordinator, hold_decision only ever reaches MERGE once `approved` is true
+    # (pysrc/herd/decisions.py) — so evidence=none here is exactly the genuine bypass this check exists
+    # for, and it stays a REAL, loud finding. Do not weaken that half.
+    if [ "$(_effective_human_verify_policy)" = "auto" ]; then
+      continue
+    fi
     _ja_hv_add "merged_hv_no_approval" \
       "merged_hv_no_approval|pr=${_hv_pr}|sha=${_hv_sha}" \
-      "merged with HUMAN-VERIFY steps, ${_hv_why} · pr=${_hv_pr} sha=${_hv_sha:-?}" \
+      "merged with HUMAN-VERIFY steps, no approval record · pr=${_hv_pr} sha=${_hv_sha:-?}" \
       "pr=${_hv_pr} sha=${_hv_sha} ts=${_hv_ts}"
   done <<EOF
 $MERGES
@@ -526,11 +562,13 @@ _ja_act_mapped() {
 #                               sweep re-probes on its own (the seen-ledger only memoizes a SETTLED
 #                               verdict, never an unknown one — see the (g) check above), so filing a
 #                               permanent item for a transient read failure would be pure noise.
-#   merged_hv_no_approval    — a merge that declared a HUMAN-VERIFY block but carries no sha-keyed
-#                               approval record (see the (g) check above). Real signal — the declared
-#                               steps may never have run — but the PR is already MERGED: no rail can
-#                               retroactively verify unrun manual steps or undo the merge, so there is
-#                               nothing bounded to route this to. A human has to look.
+#   merged_hv_no_approval    — a merge under HUMAN_VERIFY_POLICY=hold|coordinator that declared a
+#                               HUMAN-VERIFY block but carries no sha-keyed approval record (see the (g)
+#                               check above — POLICY-AWARE since HERD-644, so an auto-policy merge never
+#                               reaches this class). Real signal — the declared steps may never have run
+#                               — but the PR is already MERGED: no rail can retroactively verify unrun
+#                               manual steps or undo the merge, so there is nothing bounded to route this
+#                               to. A human has to look.
 #   watcher_restart_blocked  — an orphaned lock holder is blocking watcher recovery, but the holder_pid
 #                               is an UNIDENTIFIED process to this auditor: a rail that auto-killed it
 #                               could just as easily kill a live builder mid-flight as an actual corpse.

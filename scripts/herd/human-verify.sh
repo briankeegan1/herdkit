@@ -74,3 +74,21 @@ human_verify_has() {
   _hv_out="$(human_verify_steps)"
   [ -n "$_hv_out" ]
 }
+
+# _effective_human_verify_policy — resolve HUMAN_VERIFY_POLICY (HERD-59) to hold | coordinator | auto.
+# It shapes ONLY how a PR that declares a HUMAN-VERIFY: block is handled under MERGE_POLICY=auto:
+#   hold        default; today's EXACT behavior — a sha-keyed approve-style hold released by
+#               herd-approve.sh approve. Byte-identical when the key is unset.
+#   coordinator keep the hold but notify loudly and flag it coordinator-actionable, so a coordinator/
+#               agent runs the declared steps then approves via herd-approve.sh approve.
+#   auto        treat the declared steps as INFORMATIONAL only — journal + PR-comment them and merge
+#               on green gates (the standing human-verify authorization codified as an engine switch).
+# Unknown/empty → hold (fail safe). Pure; no side effects, so any caller (agent-watch.sh's launch-time
+# resolution, journal-audit.sh's HERD-644 policy-aware check (g)) sources this one definition instead
+# of re-deriving the case statement — a second copy is exactly how the two drifted before.
+_effective_human_verify_policy() {
+  case "${HUMAN_VERIFY_POLICY:-}" in
+    hold|coordinator|auto) printf '%s' "${HUMAN_VERIFY_POLICY}" ;;
+    *)                     printf 'hold' ;;
+  esac
+}
