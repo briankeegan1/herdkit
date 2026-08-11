@@ -28,6 +28,8 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WATCH="$HERE/../scripts/herd/agent-watch.sh"
+# shellcheck source=tests/lib/await-file-contains.sh
+. "$HERE/lib/await-file-contains.sh"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 pass=0
@@ -86,22 +88,10 @@ export STUB_SPAWN_LOG="$T/spawns.log"; : > "$STUB_SPAWN_LOG"
 # recorded — BEFORE the child has necessarily been scheduled to run its first statement. Sampling the
 # child's log the instant the parent returns is therefore a RACE on fork+exec latency, and it is
 # exactly the race that turned this file red on a loaded 6-way ubuntu CI shard (PR #742) while every
-# other shard and every local run stayed green.
-#
-# The right repair is to fix the PROBE's invariant, not to retry the check: the assertion here is
-# "the reviewer WAS dispatched", and the honest observable for that is the child's line ARRIVING, not
-# it having arrived within one scheduler quantum. A reviewer that genuinely never runs still fails
-# this — it just takes the full window to say so. (The two synchronous observables the PARENT owns,
-# the RUNNING token and the inflight marker, are asserted separately at each call site and are not
-# subject to this; only the child's side effect is.)
-await_dispatch() {
-  local _ad_re="$1" _ad_n=0
-  while [ "$_ad_n" -lt 200 ]; do              # 200 × 0.05s = 10s ceiling
-    grep -qE "$_ad_re" "$STUB_SPAWN_LOG" 2>/dev/null && return 0
-    sleep 0.05; _ad_n=$(( _ad_n + 1 ))
-  done
-  return 1
-}
+# other shard and every local run stayed green. HERD-635 folded the fix into the shared
+# tests/lib/await-file-contains.sh helper (sourced above) so every other hit of this same class
+# converts to the same probe instead of each reinventing it; this file just names its own log.
+await_dispatch() { await_file_contains "$STUB_SPAWN_LOG" "$1"; }
 
 # git helpers ────────────────────────────────────────────────────────────────
 gc() { git -C "$1" "${@:2}"; }

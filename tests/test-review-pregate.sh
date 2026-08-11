@@ -44,6 +44,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/.." && pwd)"
 WATCH="$ROOT/scripts/herd/agent-watch.sh"
 PREGATE="$ROOT/scripts/herd/review-pregate.sh"
+# shellcheck source=tests/lib/await-file-contains.sh
+. "$HERE/lib/await-file-contains.sh"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 pass=0
@@ -285,7 +287,10 @@ SHA="$(gc "$D" rev-parse HEAD)"
 : > "$STUB_SPAWN_LOG"; : > "$JOURNAL_FILE"
 step="$(_review_gate_step 502 "$SLUG" "$SHA")"
 [ "$step" = "RUNNING" ] || fail "(2c-off) with the lever off a mechanical red must still review (got '$step')"
-[ -s "$STUB_SPAWN_LOG" ] || fail "(2c-off) with the lever off the reviewer must be dispatched"
+# The dispatch is BACKGROUNDED (_bg_new_session): the step above returns as soon as the fork is
+# recorded, before the child has necessarily run. Sampling the child's log immediately races fork+exec
+# latency (HERD-630/HERD-635) — await it instead of reading it cold.
+await_file_contains "$STUB_SPAWN_LOG" '.' || fail "(2c-off) with the lever off the reviewer must be dispatched"
 [ "$(journal_grep review_pregate_red)" = "0" ] || fail "(2c-off) the lever off must journal no pre-gate event"
 ok
 
@@ -296,12 +301,19 @@ SHA="$(gc "$D" rev-parse HEAD)"
 : > "$STUB_SPAWN_LOG"; : > "$JOURNAL_FILE"
 step="$(REVIEW_PREGATE=on _review_gate_step 503 "$SLUG" "$SHA")"
 [ "$step" = "RUNNING" ] || fail "(2c-clean) a clean diff must review as today (got '$step')"
-[ -s "$STUB_SPAWN_LOG" ] || fail "(2c-clean) a clean diff must dispatch the reviewer"
+# See (2c-off): the dispatch is backgrounded, so the child's log must be awaited, not read cold.
+await_file_contains "$STUB_SPAWN_LOG" '.' || fail "(2c-clean) a clean diff must dispatch the reviewer"
 [ "$(journal_grep review_dispatched)" != "0" ] || fail "(2c-clean) a clean diff must journal review_dispatched"
 ok
 
 # (4) LATENCY — collect the verdict the stub already wrote; the step must journal review_latency.
 : > "$JOURNAL_FILE"
+# The COLLECT call below reads the child's result file (_review_gate_step: `[ -f "$result" ]`); if the
+# child has not written it yet the step just re-echoes RUNNING instead of collecting PASS — the same
+# fork-latency race, on the result file instead of the spawn log. Await the artifact the collect step
+# itself will read before making the collect call.
+await_file_contains "$(_review_result_file 503 "$SHA")" '^REVIEW: ' \
+  || fail "(4) the stub reviewer never wrote a result file"
 step="$(REVIEW_PREGATE=on _review_gate_step 503 "$SLUG" "$SHA")"
 [ "$step" = "PASS" ] || fail "(4) the stub's verdict must collect as PASS (got '$step')"
 [ "$(journal_grep review_latency)" != "0" ] || fail "(4) a collected verdict must journal review_latency"
@@ -326,7 +338,9 @@ SHA="$(gc "$D" rev-parse HEAD)"
 : > "$STUB_MODEL_LOG"; : > "$JOURNAL_FILE"
 step="$(REVIEW_MECH_FLOOR=on _review_gate_step 505 "$SLUG" "$SHA")"
 [ "$step" = "RUNNING" ] || fail "(3g) the floor must still dispatch a (cheap) reviewer (got '$step')"
-grep -qx 'cheap-model' "$STUB_MODEL_LOG" || fail "(3g) the floor must dispatch on REVIEW_MODEL_CHEAP: $(cat "$STUB_MODEL_LOG")"
+# Backgrounded dispatch again (see (2c-off)): await the child's model-log line instead of reading cold.
+await_file_contains "$STUB_MODEL_LOG" '^cheap-model$' \
+  || fail "(3g) the floor must dispatch on REVIEW_MODEL_CHEAP: $(cat "$STUB_MODEL_LOG")"
 [ "$(journal_grep review_tier_floor)" != "0" ] || fail "(3g) the floor must journal review_tier_floor"
 ok
 
@@ -337,7 +351,10 @@ SHA="$(gc "$D" rev-parse HEAD)"
 : > "$STUB_MODEL_LOG"; : > "$JOURNAL_FILE"
 step="$(_review_gate_step 506 "$SLUG" "$SHA")"
 [ "$step" = "RUNNING" ] || fail "(3g-off) the default path must dispatch as today (got '$step')"
-grep -qx '' "$STUB_MODEL_LOG" || fail "(3g-off) with the floor off no tier model may be forced: $(cat "$STUB_MODEL_LOG")"
+# The stub logs an (empty) HERD_REVIEW_MODEL line unconditionally — still a child-written artifact, so
+# await its arrival rather than reading the (possibly still-empty-because-unwritten) file cold.
+await_file_contains "$STUB_MODEL_LOG" '^$' \
+  || fail "(3g-off) with the floor off no tier model may be forced: $(cat "$STUB_MODEL_LOG")"
 [ "$(journal_grep review_tier_floor)" = "0" ] || fail "(3g-off) the floor off must journal nothing"
 ok
 
