@@ -679,6 +679,28 @@ free, whether or not this seat is between turns:
 
     HERD_ITEM_REF=<id> HERD_SPAWN_PRIO=10 bash {{SCRIPTS_DIR}}/spawn.sh <slug> feature "<task>"
 
+**Publish the whole LIST as one plan** (`herd queue plan`, HERD-642) when you are queueing more than
+one candidate. Same rails — each line is enqueued through the same `spawn.sh` — but the list becomes
+the unit instead of the intent:
+
+    herd queue plan --file plan.tsv     # one TAB-separated candidate per line, TOP CANDIDATE FIRST:
+                                        #   <slug>  <lane>  <ref|->  <after|->  <task text>
+    herd queue list                     # the live plan: pending candidates in DRAIN order
+
+- **Line order IS the priority** — stamped into bands 10/20/30…, so you never restate a ranking you
+  already have, and can slot work between bands later.
+- **Changed your mind? Re-publish the whole list.** That SUPERSEDES the previous generation in one
+  atomic write: the new plan and the old one are never both live, and never neither. No hunting down N
+  intents to cancel, and no "did I get all of them?" — the failure mode per-intent cancels have.
+  Anything already CLAIMED is launching: countermand the BUILDER, not the queue.
+- **It validates before it publishes.** One bad line and NOTHING is published — the previous plan is
+  still live, and the refusal says which line.
+- **A second seat READS the plan instead of re-deriving it** — `herd queue list`, and the watch pane's
+  `planned work` section (top candidates, bands, refs, blockers). This is the plan-time visibility the
+  📌 markers only half-covered: publish the plan and stop expecting another seat to infer it.
+- **Refused from a builder worktree** (it launches builders in THIS control room). `herd queue list`
+  is a read and works anywhere.
+
 - **`HERD_SPAWN_PRIO=<n>` is a BAND, lowest first**, FIFO by enqueue order within a band. Unmarked
   intents share a default band, so a queue where you published no priorities is exactly today's FIFO
   — arming the lever alone re-orders nothing. Leave gaps (10/20/30) so you can slot work between
@@ -696,9 +718,10 @@ free, whether or not this seat is between turns:
 - **Countermand before it claims:** `bash {{SCRIPTS_DIR}}/spawn-step.sh cancel <intent-id>` retires a
   still-pending intent atomically (exit 3 means the drain already claimed it — countermand the
   BUILDER instead: close the PR, retire the worktree, release the claim).
-- **NOT multi-seat safe yet.** Each watcher sizes its spawn budget from its own worktree roster, so
-  two seats draining one pool can each admit up to their own cap. Arm it on one seat until Phase 4
-  leases the slot through the machine-wide capacity tenant.
+- **Multi-seat safe** (HERD-641). The drain admits through the machine-wide `agent` capacity lease
+  rather than counting its own worktree roster, so two seats draining one pool admit exactly one
+  builder between them. Arm it on every seat; when the ledger is absent it falls back to the legacy
+  per-seat budget unchanged.
 
 **Standing duty.** When engine mechanics or workflow behavior change, updating the affected skill
 template is part of FINISHING that change — a stale section here is a rail a seat will follow into

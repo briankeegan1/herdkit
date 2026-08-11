@@ -310,6 +310,14 @@ un-claimed intents retire silently. Countermanding a plan is then one write inst
 the "did I get all of them?" failure mode disappears. This also makes M3 fall out for free: publishing
 generation N+1 is precisely the event that supersedes generation N's 📌 markers.
 
+*As shipped (Phase 5, HERD-642):* an opaque generation id per publish rather than an "N+1" counter —
+two seats publishing in the same window would both compute the same N+1 and both go live on the first
+swap, which is the state this rule exists to forbid. The arbiter is the pointer alone (`<qdir>/.gen`,
+replaced by one rename), so last writer wins atomically and the loser's intents are superseded the
+instant it does. `iq_gen_retire` then drops the retired generation's still-pending intents as pure
+housekeeping — they left the drain set at the swap, not at the cleanup — and never touches a CLAIMED
+intent, which is level 2's problem, not this one's.
+
 ## 5. Multi-seat
 
 ### 5.1 Pool-shared by construction
@@ -404,9 +412,15 @@ by `drain_two_seats_one_admission`, `drain_crashed_holder_lease_frees` and
   the HERD-581 `agent` capacity tenant instead of counting this seat's `FEATS`, releasing by the
   tenant's own retirement invariant and falling back byte-identically when the ledger is absent;
   closes §5.5, and with it the last reason not to call this epic multi-seat safe.
-- **Phase 5 — the candidate list as a first-class surface.** Generation publish/supersede as a
-  coordinator command plus a console section showing the pending plan, so a second seat reads the
-  queue instead of re-deriving it.
+- **Phase 5 — the candidate list as a first-class surface. SHIPPED (HERD-642).** `herd queue plan`
+  publishes the whole priority-ordered candidate list as one **generation** (each candidate enqueued
+  through the shipped `spawn.sh`, stamped with the generation id) and makes it live in ONE rename of the
+  queue's `.gen` pointer, so re-publishing supersedes the previous plan atomically — §4.4's
+  supersede-over-delete, with no window where both generations drain and none where neither does.
+  `herd queue list` and the watch pane's `planned work` section render that plan from ONE reader
+  (`iq_plan_rows`), so a second seat reads the queue instead of re-deriving it. Unstamped intents
+  belong to no generation, which is why every ad-hoc `spawn.sh` enqueue — and every console that never
+  saw a published plan — is unaffected.
 
 ## 7. Verification plan (for the Phase 1 item, not for this doc)
 

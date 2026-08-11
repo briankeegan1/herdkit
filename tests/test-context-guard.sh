@@ -77,6 +77,7 @@ ACTUATORS=(
   "update"
   "upgrade"
   "agent-update"
+  "queue plan"
 )
 
 # ── (a) every actuator refuses from the linked worktree, loudly, exit 3 ──────────────────────────
@@ -128,6 +129,7 @@ READERS=(
   "symbol-index --check" "conformance report" "cost" "stats" "advise q" "deps list"
   "config get DEFAULT_BRANCH" "config list" "config lint" "config sync" "config models"
   "theme list" "theme preview" "governance export" "backend" "render" "init" "help"
+  "queue" "queue list"
   "map" "ledger list" "link list" "fleet status" "approve list" "changelog" "triage report"
 )
 for r in "${READERS[@]}"; do

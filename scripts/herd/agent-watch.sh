@@ -617,6 +617,18 @@ INTENT_TTL="${INTENT_TTL:-86400}"
 # which is every watcher with INTENT_QUEUE off (the ship default).
 INTENT_ESCALATION_LEDGER="$TREES/.agent-watch-intent-escalations"
 INTENT_ESCALATION_ACK="$TREES/.agent-watch-intent-escalations-acked"
+# ── The published plan (HERD-642 · Phase 5 of HERD-625) ──────────────────────────────────────────
+# QUEUE_PLAN_LEDGER — the console ledger behind the "planned work" section: one row per still-pending
+# candidate of the LIVE plan generation, in drain order. Unlike every other ledger this file renders it
+# is DERIVED, not appended: build_queue_plan rewrites it from live queue state each tick (atomic
+# replace) and DELETES it when there is no plan, so the section is a reconciled read of the pool — a
+# candidate that drains, is cancelled or is superseded leaves the console on the very next tick instead
+# of lingering as an event nobody retracted. No ack sidecar for the same reason: there is nothing to
+# acknowledge, only work to watch arrive.
+#
+# Absent — hence a byte-identical console — on every watcher where INTENT_QUEUE is off or no plan
+# generation was ever published (i.e. every project that only ever ran ad-hoc `spawn.sh`).
+QUEUE_PLAN_LEDGER="$TREES/.agent-watch-queue-plan"
 # ── The general intent queue (HERD-639 Phase 2 · HERD-640 Phase 3 of HERD-625) ───────────────────
 # The general intents ledger the design doc's §3.2 Option B calls for: a SIBLING of spawn-queue/ under
 # the same pool, sharing the same claim primitives through scripts/herd/intent-queue.sh but NOT the
@@ -980,6 +992,7 @@ TRACKER_DRIFT=""
 REF_UNPARSED_ROWS=""    # HERD-522: the "unlinked merges" section rows (empty when every merged PR's Refs: parsed)
 SPAWN_HOLDS=""
 INTENT_ESCALATION_ROWS=""  # HERD-630: the "spawn intents" needs-you section rows (empty unless an intent escalated → render omits it)
+QUEUE_PLAN_ROWS=""      # HERD-642: the "planned work" section rows — the pending candidates of the published plan (empty when no plan is live → render omits it)
 OPERATOR_INBOX_ROWS=""  # HERD-184: the "operator inbox" section rows (empty when off/none → render omits it)
 ORPHAN_PR_SECTION_ROWS=""  # HERD-330: the "orphan PRs" advisory section rows (empty when off/none → render omits it)
 UNGATED_PR_SECTION_ROWS=""  # HERD-460: the UNCONDITIONAL "ungated PRs" truth section rows (empty when none → render omits it)
@@ -1441,7 +1454,8 @@ EOF
       journal_append spawn_intent_retired intent "$id" slug "${slug:-}" lane "${lane:-}" \
         ref "${ref:-}" reason "${reason:-escalated}" age "$age"
     fi
-    rm -f "$q/$id.escalated" "$q/$id.cancelled" "$q/$id.ref" "$q/$id.after" "$q/$id.prio" 2>/dev/null || true
+    rm -f "$q/$id.escalated" "$q/$id.cancelled" "$q/$id.ref" "$q/$id.after" "$q/$id.prio" \
+          "$q/$id.gen" 2>/dev/null || true
   done < "$INTENT_ESCALATION_LEDGER"
   herd_console_trim "$INTENT_ESCALATION_ACK"
   return 0
@@ -1458,6 +1472,82 @@ build_intent_escalations() {
   rows="$(herd_console_section "$INTENT_ESCALATION_LEDGER" 3 \
     herd_console_classify_intent_escalation _intent_escalation_row "$INTENT_ESCALATION_ACK")"
   [ -n "$rows" ] && INTENT_ESCALATION_ROWS="${rows}"$'\n'
+  return 0
+}
+
+# ── The published plan · "planned work" (HERD-642 · Phase 5 of HERD-625) ──────────────────────────
+# The gap this closes (doc §1.3 / §6 Phase 5): the coordinator's ranked candidate list lived only in a
+# conversation. A second seat could see what is BUILDING (worktrees, PRs), what is HELD (spawn holds)
+# and what the engine GAVE UP on (spawn intents) — but not what this pool intends to build next, so it
+# re-derived the plan from the backlog and risked reaching a different answer. `herd queue plan`
+# publishes that plan into the queue; this section is the pane's face of it.
+#
+# Built on the SHARED bounded-section helper (console-section.sh) rather than a bespoke renderer, so
+# retention, the row limit and the ledger bound are the same decisions every other section makes.
+
+# _queue_plan_row — render ONE plan ledger line
+# ("<epoch>\t<intent_id>\t<prio>\t<slug>\t<lane>\t<ref>\t<blocker>") as a calm next-up row.
+# A blocked candidate is YELLOW and names its blocker; an unblocked one is dim. Never red: the loud
+# rails for this queue are build_spawn_holds (a hold past DEP_STALE_TTL) and build_intent_escalations
+# (a candidate past INTENT_TTL), and one condition must not alarm on two rails.
+_queue_plan_row() {
+  local epoch id prio slug lane ref blk hhmm sl color note
+  IFS=$'\t' read -r epoch id prio slug lane ref blk <<EOF
+$1
+EOF
+  [ -n "${id:-}" ] || return 1
+  hhmm="$(epoch_to_hhmm "$epoch")"
+  sl="$(_slug_cell "${slug:-?}")"
+  case "${blk:-}" in
+    '')     color="$C_DIM";    note="" ;;
+    ttl)    color="$C_YELLOW"; note=" · past INTENT_TTL — will escalate, not launch" ;;
+    after=*) color="$C_YELLOW"; note=" · after ${blk#after=}" ;;
+    *)      color="$C_YELLOW"; note=" · ${blk}" ;;
+  esac
+  printf '    %s📋%s %s%s%s %snext-up · p%s %s%s%s%s %s%s%s' \
+    "$color" "$C_RESET" "$color" "$sl" "$C_RESET" "$C_DIM" "${prio:-?}" "${lane:-?}" \
+    "${ref:+ (${ref})}" "$note" "$C_RESET" "$C_DIM" "$hhmm" "$C_RESET"
+}
+
+# build_queue_plan — the "planned work" section: the top pending candidates of the LIVE generation, in
+# DRAIN ORDER. Empty (QUEUE_PLAN_ROWS="") — so render() omits the section entirely and the console is
+# byte-identical — whenever INTENT_QUEUE is off, the shared library is absent, or no plan generation has
+# ever been published into this pool.
+#
+# WHY THE LEDGER IS WRITTEN BOTTOM-UP: herd_console_section reads a ledger NEWEST-LINE-FIRST, because
+# every other consumer of it is append-only. A plan is the opposite — its FIRST candidate matters most —
+# so the rows go in reversed and the shared reader hands them back in drain order. The alternative is a
+# second reader with its own retention and limit rules, which is precisely the drift console-section.sh
+# exists to prevent. herd_console_trim's tail-keep then bounds the file to the TOP candidates, which is
+# the right end to keep.
+build_queue_plan() {
+  QUEUE_PLAN_ROWS=""
+  type iq_plan_rows >/dev/null 2>&1 || return 0     # library absent (a partial engine tree) → no section
+  # Generations, like priority bands, are only CONSULTED under the Phase-1 lever (no second key). With
+  # it off the drain is plain FIFO, so a "plan" would not describe what this pool actually does next —
+  # and describing it anyway is the false-console failure this section must never introduce.
+  if ! iq_lever_on; then
+    rm -f "$QUEUE_PLAN_LEDGER" 2>/dev/null || true
+    return 0
+  fi
+  local plan rows tmp line rev=""
+  plan="$(iq_plan_rows "$TREES/spawn-queue" "${INTENT_TTL:-0}" "$(_now_epoch)")"
+  if [ -z "$plan" ]; then
+    rm -f "$QUEUE_PLAN_LEDGER" 2>/dev/null || true
+    return 0
+  fi
+  # Reverse in-shell (a plan is a handful of lines) rather than through `tac`/`tail -r`: this file must
+  # stay portable across the platforms the watcher runs on, and there is no reason to shell out for it.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    rev="${line}"$'\n'"${rev}"
+  done <<< "$plan"
+  tmp="$(mktemp "${QUEUE_PLAN_LEDGER}.XXXXXX" 2>/dev/null)" || return 0
+  printf '%s' "$rev" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 0; }
+  mv -f "$tmp" "$QUEUE_PLAN_LEDGER" 2>/dev/null || { rm -f "$tmp" 2>/dev/null || true; return 0; }
+  herd_console_trim "$QUEUE_PLAN_LEDGER"
+  rows="$(herd_console_section "$QUEUE_PLAN_LEDGER" 5 herd_console_classify_queue_plan _queue_plan_row)"
+  [ -n "$rows" ] && QUEUE_PLAN_ROWS="${rows}"$'\n'
   return 0
 }
 
@@ -3305,6 +3395,14 @@ render() {
   # the console is byte-identical when this never fires.
   if [ -n "${REF_UNPARSED_ROWS:-}" ]; then
     frame="${frame}  ${C_RED}unlinked merges${C_RESET}"$'\n'"${REF_UNPARSED_ROWS}"$'\n'
+  fi
+  # PLANNED WORK (HERD-642) — the pending candidates of the coordinator's PUBLISHED plan, in drain
+  # order, so a second seat reads this pool's next moves instead of re-deriving them from a conversation
+  # it was not in. Sits directly ABOVE "spawn holds" because the three sections below it are one queue
+  # read front-to-back: what is next up, what is waiting on a dependency, and what the drain refused.
+  # Empty — hence byte-identical — while INTENT_QUEUE is off or no plan was ever published.
+  if [ -n "${QUEUE_PLAN_ROWS:-}" ]; then
+    frame="${frame}  ${C_DIM}planned work${C_RESET}"$'\n'"${QUEUE_PLAN_ROWS}"$'\n'
   fi
   if [ -n "${SPAWN_HOLDS:-}" ]; then
     frame="${frame}  ${C_DIM}spawn holds${C_RESET}"$'\n'"${SPAWN_HOLDS}"$'\n'
@@ -17759,6 +17857,7 @@ _tick_render_reconcile() {
   build_ref_unparsed        # HERD-522: merged PRs whose `refs:` line parsed to nothing (empty when none)
   build_spawn_holds
   build_intent_escalations  # HERD-630: escalated spawn intents + their age-to-retired sweep (empty when none)
+  build_queue_plan          # HERD-642: the published plan's pending candidates (empty when no plan is live)
   build_engine_note
   build_engine_seat_note   # HERD-308: the dual-engine HALT/coexistence row (empty unless a mismatch)
   build_main_health
@@ -18842,6 +18941,18 @@ _drain_spawn_queue() {
   local _dsq_q="$TREES/spawn-queue"
   [ -d "$_dsq_q" ] || return 0
   ls "$_dsq_q"/*.req >/dev/null 2>&1 || return 0   # fast exit when queue is empty
+  # HERD-642 — the TICK-LEVEL repair for a superseded intent `herd queue plan` could not retire: one
+  # that was CLAIMED at publish time (a dependency hold keeps its claim for the tick and is released
+  # back to .req at the end of it). A claim is never retired from under a launching lane, so such an
+  # intent would otherwise sit in the queue forever — never claimable, but still keeping a "spawn holds
+  # ⏳ waiting" row on the console for work no plan asks for any more. Reconciled every tick against the
+  # live pointer, per docs/multi-seat-doctrine.md Rule 1, rather than left to the next publish.
+  # Byte-inert with no plan: no library (a hermetic harness that extracted this function alone) or no
+  # live generation → not called at all.
+  if type iq_gen_retire >/dev/null 2>&1 && type iq_generation >/dev/null 2>&1 \
+     && [ -n "$(iq_generation "$_dsq_q")" ]; then
+    iq_gen_retire "$_dsq_q" >/dev/null 2>&1 || true
+  fi
   # This tick's ONE launch slot. Taken already when a lane launched by an earlier tick is still
   # running (its intent is claimed, its outcome not yet observed) — the pre-HERD-237 foreground drain
   # could not have started a second lane there either.

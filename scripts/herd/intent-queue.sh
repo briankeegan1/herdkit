@@ -30,6 +30,12 @@
 # NOT pushed down here: only the spawn tenant consumes a builder slot, so only it has an admission to
 # bound — a marker intent leases nothing and needs nothing.
 #
+# GENERATIONS + THE PLAN SURFACE (HERD-642, Phase 5). The queue also owns the coordinator's PUBLISHED
+# PLAN: iq_gen_* stamp / swap / retire a whole priority-ordered generation of spawn intents through one
+# atomic pointer rename (doc §4.4 "supersede over delete"), and iq_plan_rows is the ONE reader both
+# `herd queue list` and the watcher's "planned work" console section render, so a second seat READS the
+# plan instead of re-deriving it. Both are inert on a queue no plan was ever published into.
+#
 # NO NEW CONFIG KEY. Phase 1's single operator lever (INTENT_QUEUE, herd-config.sh) governs every
 # behavior here that is not plain FIFO, exactly as it did before the extraction.
 #
@@ -41,6 +47,8 @@
 #                     copied into a hermetic harness) sets it explicitly so a harness never reaches a
 #                     real project's journal.
 #   IQ_SIDECARS       the sidecar suffixes a claim owns, GC'd together with it by done/skip/cancel.
+#                     (Includes `gen` — HERD-642's generation stamp — so a consumed intent never leaves
+#                     a stamp behind for a later id to collide with.)
 #   IQ_PRIO_DEFAULT   the band an intent with no .prio sidecar drains in.
 #   IQ_RECLAIM_MMIN   the abandoned-claim age threshold, in minutes.
 
@@ -55,7 +63,8 @@ IQ_PRIO_DEFAULT="${IQ_PRIO_DEFAULT:-50}"
 #   owner    HERD-237 the live pid working this claim
 #   prio     HERD-630 priority band
 #   attempts HERD-639 transient-failure counter (doc §4.3), used by the M3 tenant
-IQ_SIDECARS="${IQ_SIDECARS:-ref after owner prio attempts}"
+#   gen      HERD-642 the published GENERATION this intent belongs to (doc §4.4 supersede-over-delete)
+IQ_SIDECARS="${IQ_SIDECARS:-ref after owner prio attempts gen}"
 
 # Abandoned-claim threshold in MINUTES. Staleness is the CLAIM age, not the enqueue age: iq_claim and
 # iq_release deliberately touch the file whenever it changes hands (see below), so this measures
@@ -104,13 +113,69 @@ iq_prio() {
   printf '%s' "$_iqp_p"
 }
 
+# ── Generations: the coordinator's PUBLISHED PLAN, superseded atomically (HERD-642, doc §4.4) ─────
+#
+# "Supersede over delete." A coordinator changing its mind must not have to delete N intents one at a
+# time — "did I get all of them?" is the failure mode the design doc names. So every intent published
+# by ONE `herd queue plan` call carries the SAME opaque GENERATION id in a `.gen` sidecar, and a single
+# pointer file — `<qdir>/.gen` — names the generation that is LIVE. An intent is in the drain set only
+# when its stamp matches that pointer, which makes replacing the pointer the WHOLE supersede: one
+# atomic rename retires the previous generation and admits the new one in the same instant. There is no
+# moment when both generations are claimable, and none where neither is — which is why the new
+# generation's intents are published (stamped, un-live) BEFORE the swap rather than after it.
+#
+# UNSTAMPED INTENTS ARE ALWAYS LIVE, and that is what keeps this byte-identical on a queue nobody ever
+# published a plan into: an intent with no `.gen` sidecar — every ad-hoc `spawn.sh` enqueue, and every
+# intent written by an engine older than this one — belongs to no generation, so no publish can retire
+# it and no missing pointer can hide it (tests/test-spawn-queue-drain.sh passes UNMODIFIED).
+#
+# NO NEW CONFIG KEY: like the priority band, a generation stamp is only CONSULTED under the INTENT_QUEUE
+# lever (iq_order's lever-on branch), so publishing a plan on an unarmed project is inert.
+
+# iq_gen_pointer <qdir> — the LIVE-generation pointer path. A dotfile on purpose: the queue's own
+# `*.req` globs must never see it.
+iq_gen_pointer() { printf '%s/.gen' "${1:-}"; }
+
+# iq_generation <qdir> — the generation id currently LIVE here, empty when no plan was ever published.
+# Fail-soft: an absent, empty or unreadable pointer reads as "no generation", under which every STAMPED
+# intent is superseded and every unstamped one drains exactly as today.
+iq_generation() {
+  local _iqgn=""
+  _iqgn="$(sed -n 1p "$(iq_gen_pointer "${1:-}")" 2>/dev/null | tr -cd '0-9A-Za-z._-')"   # pipe-ok: one short pointer line, far under a pipe buffer
+  printf '%s' "$_iqgn"
+}
+
+# iq_gen_of <qdir> <intent-id> — the generation THIS intent was published under; empty when unstamped.
+# The empty-id guard is not defensive noise: `<qdir>/<empty>.gen` IS the pointer path, so without it a
+# caller that lost an id would read the LIVE generation back as that phantom intent's own stamp and
+# conclude it is current.
+iq_gen_of() {
+  local _iqgo=""
+  [ -n "${2:-}" ] || return 0
+  _iqgo="$(sed -n 1p "${1:-}/${2}.gen" 2>/dev/null | tr -cd '0-9A-Za-z._-')"              # pipe-ok: one short sidecar line
+  printf '%s' "$_iqgo"
+}
+
+# iq_gen_superseded <qdir> <intent-id> — 0 when this intent belongs to a RETIRED generation and must
+# therefore never be served again. THE one place that rule lives: iq_order, iq_gen_retire and the plan
+# readers all ask this function rather than comparing stamps themselves, because a per-surface copy of
+# "is this candidate still live" is exactly what docs/multi-seat-doctrine.md Rule 2 calls a correctness
+# defect. Unstamped intent, no live pointer, or a stamp equal to the pointer ⇒ NOT superseded.
+iq_gen_superseded() {
+  local _iqgs_stamp; _iqgs_stamp="$(iq_gen_of "${1:-}" "${2:-}")"
+  [ -n "$_iqgs_stamp" ] || return 1
+  [ "$_iqgs_stamp" != "$(iq_generation "${1:-}")" ]
+}
+
 # iq_order <qdir> — the PENDING intents (.req) in DRAIN ORDER, one path per line.
 #
 #   lever OFF → EXACTLY the pre-HERD-630 `ls -1 <q>/*.req | sort`: enqueue-ordered FIFO by INTENT_ID,
 #               which HERD-443 made deterministic even within one second.
-#   lever ON  → lowest priority band first, and FIFO by INTENT_ID *within* a band. A queue where NO
-#               intent carries a .prio is therefore STILL exactly that FIFO (every intent lands in the
-#               same default band) — the lever alone changes nothing; only a published priority does.
+#   lever ON  → lowest priority band first, and FIFO by INTENT_ID *within* a band, MINUS the intents of
+#               any superseded generation (HERD-642 — a retired plan is not in the drain set at all). A
+#               queue where NO intent carries a .prio or a .gen is therefore STILL exactly that FIFO
+#               (every intent lands in the same default band and belongs to no generation) — the lever
+#               alone changes nothing; only a published priority or plan does.
 iq_order() {
   local _iqo_q="$1"
   if ! iq_lever_on; then
@@ -121,6 +186,11 @@ iq_order() {
   for _iqo_f in "$_iqo_q"/*.req; do
     [ -e "$_iqo_f" ] || continue
     _iqo_id="$(iq_id_of "$_iqo_f")"
+    # HERD-642: an intent stamped with a generation the pointer no longer names was countermanded by a
+    # later `herd queue plan`. Dropping it HERE — in the one function every claim walks — is what makes
+    # the pointer swap a complete supersede: no drain can serve a retired plan even for one tick, and
+    # the physical cleanup (iq_gen_retire) is then pure housekeeping rather than a correctness step.
+    iq_gen_superseded "$_iqo_q" "$_iqo_id" && continue
     printf '%s\t%s\t%s\n' "$(iq_prio "$_iqo_q" "$_iqo_id")" "$_iqo_id" "$_iqo_f"
   done | sort -t"$(printf '\t')" -k1,1n -k2,2 | cut -f3-
   return 0
@@ -441,4 +511,100 @@ iq_attempt_bump() {
   local _iqu_n; _iqu_n=$(( $(iq_attempts "$1" "$2") + 1 ))
   printf '%s\n' "$_iqu_n" > "$1/$2.attempts" 2>/dev/null || true
   printf '%s' "$_iqu_n"
+}
+
+# ── Publish / supersede a generation (HERD-642) ───────────────────────────────────────────────────
+
+# iq_gen_mint <qdir> — a fresh, OPAQUE generation id.
+#
+# Deliberately iq_mint_id's shape (epoch + queue sequence + pid) rather than an incrementing "N+1"
+# counter: two seats publishing a plan in the same window would both compute the same N+1 and both
+# stamp their intents with it, so BOTH plans would go live on the first swap — precisely the state this
+# mechanism exists to make impossible. A unique id per publish makes the pointer the only arbiter: last
+# writer wins atomically, and the loser's intents are superseded the instant it does.
+iq_gen_mint() { iq_mint_id "${1:-}"; }
+
+# iq_gen_publish <qdir> <gen-id> — make <gen-id> the live generation in ONE atomic rename.
+#
+# The temp file is created INSIDE the queue dir so the rename can never cross a filesystem and degrade
+# into a copy (a copy has a window; a rename does not). rc 1 when the swap could not be made — and the
+# caller must be LOUD about that, because nothing was superseded: the previous generation is still live
+# and still draining, which is the safe direction but not the one the operator asked for.
+iq_gen_publish() {
+  local _iqgp_q="${1:-}" _iqgp_gen="${2:-}" _iqgp_tmp
+  [ -n "$_iqgp_q" ] && [ -n "$_iqgp_gen" ] || return 1
+  _iqgp_tmp="$(mktemp "$_iqgp_q/.tmp.gen.XXXXXX" 2>/dev/null)" || return 1
+  printf '%s\n' "$_iqgp_gen" > "$_iqgp_tmp" 2>/dev/null || { rm -f "$_iqgp_tmp" 2>/dev/null; return 1; }
+  mv "$_iqgp_tmp" "$(iq_gen_pointer "$_iqgp_q")" 2>/dev/null || { rm -f "$_iqgp_tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# iq_gen_retire <qdir> — drop the PENDING intents of every superseded generation, silently (doc §4.4:
+# "older un-claimed intents retire silently"). Prints how many were retired.
+#
+# Correctness does NOT depend on this — the pointer already took them out of iq_order — so it runs AFTER
+# the swap and a crash between the two leaves dead-but-harmless files rather than a half-published plan.
+#
+# The `mv` is the race guard, not a flourish: `rm -f` reports success on a path a drain renamed to
+# `.req.mine` a microsecond earlier, and we would then GC the sidecars out from under a LIVE claim.
+# Renaming first fails when the drain won, so a claimed intent is left strictly alone — which is also
+# the right semantics: a claim means the lane is already launching, and doc §4.4 level 2 says that is
+# countermanded through the BUILDER, never by editing the queue underneath it.
+iq_gen_retire() {
+  local _iqgr_q="${1:-}" _iqgr_f _iqgr_id _iqgr_n=0
+  for _iqgr_f in "$_iqgr_q"/*.req; do
+    [ -e "$_iqgr_f" ] || continue
+    _iqgr_id="$(iq_id_of "$_iqgr_f")"
+    iq_gen_superseded "$_iqgr_q" "$_iqgr_id" || continue
+    mv "$_iqgr_f" "$_iqgr_f.retiring" 2>/dev/null || continue
+    rm -f "$_iqgr_f.retiring" 2>/dev/null || true
+    iq_sidecars_rm "$_iqgr_q/$_iqgr_id"
+    _iqgr_n=$(( _iqgr_n + 1 ))
+  done
+  printf '%s' "$_iqgr_n"
+}
+
+# iq_plan_rows <qdir> [ttl-seconds] [now-epoch] — THE PUBLISHED PLAN, one TAB row per still-pending
+# candidate, in DRAIN ORDER:
+#
+#     <enqueue-epoch>\t<intent-id>\t<prio>\t<slug>\t<lane>\t<ref>\t<blocker>
+#
+# ONE implementation for BOTH readers — `herd queue list` (bin/herd) and the watcher's "planned work"
+# console section (agent-watch.sh's build_queue_plan) — so the CLI and the pane can never disagree about
+# what the plan is. Two surfaces re-deriving one queue is the drift this library exists to prevent.
+#
+# Prints NOTHING when no generation is live. That is deliberate and load-bearing: with no published plan
+# there is no plan to show, so a project that only ever ran ad-hoc `spawn.sh` renders no new console
+# section and its watch frame stays byte-identical. Superseded candidates are dropped through the same
+# iq_gen_superseded rule the drain uses, so a stale plan cannot linger on a surface after being retired
+# (including under a lever-off read, where iq_order itself does not filter).
+#
+# Reads the spawn tenant's FROZEN positional payload (line 1 = slug, line 2 = lane; doc §3.2) — the plan
+# surface is about builder candidates, and that shape is exactly what the doc froze so it could be.
+#
+# The blocker column is what the queue KNOWS, never a guess: `after=<dep>` names a published dependency
+# hold (whether the dep has since merged is the drain's live read, not a plan-time fact), `ttl` marks a
+# candidate the drain will ESCALATE rather than launch, and empty means nothing is in its way.
+iq_plan_rows() {
+  local _iqpr_q="${1:-}" _iqpr_ttl="${2:-0}" _iqpr_now="${3:-}"
+  local _iqpr_f _iqpr_id _iqpr_slug _iqpr_lane _iqpr_ref _iqpr_blk _iqpr_e
+  [ -n "$(iq_generation "$_iqpr_q")" ] || return 0
+  while IFS= read -r _iqpr_f; do
+    [ -n "$_iqpr_f" ] || continue
+    _iqpr_id="$(iq_id_of "$_iqpr_f")"
+    iq_gen_superseded "$_iqpr_q" "$_iqpr_id" && continue
+    _iqpr_slug="$(sed -n 1p "$_iqpr_f" 2>/dev/null || true)"
+    _iqpr_lane="$(sed -n 2p "$_iqpr_f" 2>/dev/null || true)"
+    _iqpr_ref=""
+    [ -f "$_iqpr_q/$_iqpr_id.ref" ] && _iqpr_ref="$(sed -n 1p "$_iqpr_q/$_iqpr_id.ref" 2>/dev/null || true)"
+    _iqpr_blk=""
+    [ -f "$_iqpr_q/$_iqpr_id.after" ] \
+      && _iqpr_blk="after=$(sed -n 1p "$_iqpr_q/$_iqpr_id.after" 2>/dev/null || true)"
+    iq_expired "$_iqpr_id" "$_iqpr_ttl" "$_iqpr_now" && _iqpr_blk="ttl"
+    _iqpr_e="$(iq_enqueue_epoch "$_iqpr_id")"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${_iqpr_e:-0}" "$_iqpr_id" "$(iq_prio "$_iqpr_q" "$_iqpr_id")" \
+      "${_iqpr_slug:-?}" "${_iqpr_lane:-?}" "$_iqpr_ref" "$_iqpr_blk"
+  done < <(iq_order "$_iqpr_q")
+  return 0
 }

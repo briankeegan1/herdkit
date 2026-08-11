@@ -2696,6 +2696,230 @@ EOF
   say "acked ${c_bold}${count}${c_rst} escalated spawn intent$([ "$count" = 1 ] || printf 's') · console cleared (ledger keeps the history)"
 }
 
+# ── herd queue: publish / read the coordinator's PLAN (HERD-642, Phase 5 of HERD-625) ─────────────
+# docs/spikes/coordinator-work-queue.md §4.4 ("supersede over delete") + §6 Phase 5.
+#
+# Phases 1–4 externalized spawn SELECTION one intent at a time: each `spawn.sh` call published one
+# candidate, and countermanding a plan meant cancelling N intents by id and hoping none was missed. This
+# command makes the CANDIDATE LIST itself the unit:
+#
+#   herd queue plan   publish the current priority-ordered candidate generation, superseding the
+#                     previous one ATOMICALLY — the new plan's intents are enqueued first (stamped with
+#                     the new generation, therefore not yet claimable), then ONE rename of the queue's
+#                     `.gen` pointer makes the new generation live and the old one dead in the same
+#                     instant. There is never a window where both generations are draining, and never
+#                     one where neither is.
+#   herd queue list   print the live plan — generation, candidates in DRAIN order, priorities, refs and
+#                     blockers. The same rows the watch pane's "planned work" section renders, from the
+#                     same reader (iq_plan_rows), so the CLI and the pane cannot disagree.
+#
+# NO PARALLEL IMPLEMENTATION, and that is the design constraint this command was written under: every
+# candidate is enqueued by running the shipped `spawn.sh` (so the tracked-spawn gate, the ref threading,
+# the priority sidecar and the M3 marker-publish intent all behave exactly as a hand-run enqueue), and
+# every queue mechanic — mint, publish, generation swap, retire, read — is intent-queue.sh's. This file
+# contributes the parse, the ordering convention and the operator-facing output, nothing more.
+#
+# NO NEW CONFIG KEY: publishing is always allowed, but a generation is only CONSULTED under Phase 1's
+# INTENT_QUEUE lever, so with the lever off this command says so loudly instead of implying the plan
+# governs a drain that is still plain FIFO.
+
+# _queue_lib — source the shared intent-queue library for a `herd queue` subcommand. The `[ -f ]` test
+# is LOAD-BEARING (HERD-632): bash treats `.` as a special builtin, so sourcing an absent path kills the
+# shell outright — `|| true` does not catch it.
+_queue_lib() {
+  [ -f "$SCRIPTS_DIR/intent-queue.sh" ] || die "herd queue: missing $SCRIPTS_DIR/intent-queue.sh (incomplete engine tree)"
+  IQ_LOG_PREFIX="herd-queue"
+  IQ_ENGINE_DIR="$SCRIPTS_DIR"
+  # shellcheck source=/dev/null
+  . "$SCRIPTS_DIR/intent-queue.sh"
+}
+
+# _queue_plan_lines <raw-plan> — the plan's candidate lines, comments and blanks dropped. The format
+# is TAB-separated so a task text can hold anything (the task is the LAST field and keeps its own tabs):
+#
+#     <slug>\t<lane>\t<ref>\t<after>\t<task text>
+#
+# ref and after may be empty; `-` reads as empty too, so a hand-written line does not need trailing
+# tabs to leave them out. LINE ORDER IS THE PRIORITY — the first line is the top candidate — because
+# that is the one ordering a coordinator always has and never has to restate; bands are stamped 10, 20,
+# 30 … so work can be slotted between them later without restamping the queue (the same convention
+# templates/coordinator.md.tmpl already teaches for HERD_SPAWN_PRIO).
+# Matched against a HERE-STRING, never a pipe: a here-string is a temp file, so this filter cannot
+# EPIPE its producer the way `<producer> | grep` can (HERD-299 / pipe-safety-lint.sh).
+_queue_plan_lines() { grep -v -e '^[[:space:]]*$' -e '^[[:space:]]*#' <<< "${1:-}" 2>/dev/null || true; }
+
+cmd_queue() {
+  local sub="list"
+  case "${1:-}" in
+    -h|--help) say "usage: herd queue [list] | herd queue plan [--file <path> | -]"; return 0 ;;
+    "") ;;
+    list|plan) sub="$1"; shift ;;
+    *) die "herd queue: unknown subcommand $1 (usage: herd queue [list] | herd queue plan [--file <path> | -])" ;;
+  esac
+
+  _journal_load_config
+  _queue_lib
+  local q="$WORKTREES_DIR/spawn-queue"
+  [ "$sub" = "list" ] && { _cmd_queue_list "$q"; return 0; }
+  _cmd_queue_publish "$q" "$@"
+}
+
+# _cmd_queue_list <qdir> — print the LIVE plan (or say plainly that none is published).
+_cmd_queue_list() {
+  local q="$1" gen rows n=0 line epoch id prio slug lane ref blk hhmm
+  gen="$(iq_generation "$q")"
+  if [ -z "$gen" ]; then
+    say "no plan published in this pool yet — publish one with: herd queue plan --file <plan.tsv>"
+    return 0
+  fi
+  rows="$(iq_plan_rows "$q" "${INTENT_TTL:-0}")"
+  hhmm="$(date -r "${gen%%-*}" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@${gen%%-*}" '+%Y-%m-%d %H:%M' 2>/dev/null || echo '?')"
+  if [ -z "$rows" ]; then
+    say "plan ${c_bold}${gen}${c_rst} (published ${hhmm}) · every candidate has drained or been retired"
+    return 0
+  fi
+  say "plan ${c_bold}${gen}${c_rst} (published ${hhmm}) · pending candidates in DRAIN order:"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n=$((n+1))
+    epoch="" id="" prio="" slug="" lane="" ref="" blk=""
+    IFS=$'\t' read -r epoch id prio slug lane ref blk <<EOF
+$line
+EOF
+    case "${blk:-}" in
+      '')      blk="" ;;
+      ttl)     blk="  ${c_yel}past INTENT_TTL — the drain will escalate this, not launch it${c_rst}" ;;
+      after=*) blk="  ${c_yel}after ${blk#after=}${c_rst}" ;;
+      *)       blk="  ${c_yel}${blk}${c_rst}" ;;
+    esac
+    say "  ${c_bold}${n}${c_rst}  📋 p${prio}  ${c_bold}${slug}${c_rst} (${lane})${ref:+  ${ref}}${blk}"
+  done <<< "$rows"
+  say ""
+  if ! iq_lever_on; then
+    say "  ${c_dim}INTENT_QUEUE is off, so this plan's generation and priorities are NOT consulted — the drain is plain FIFO. Arm it with: herd config set INTENT_QUEUE on${c_rst}"
+  fi
+  say "changed your mind? re-publish the whole list (herd queue plan) — that supersedes this generation in one write, no per-intent cancels"
+}
+
+# _cmd_queue_publish <qdir> [--file <path> | -] — publish a new generation, superseding the previous one.
+#
+# Order of operations, and every step of it is load-bearing:
+#   1. PARSE + VALIDATE EVERY LINE FIRST. A malformed plan must change nothing — publishing half a plan
+#      and then dying would leave the pool draining a list the operator never approved.
+#   2. Mint the generation, then enqueue each candidate through `spawn.sh` with its band. These intents
+#      are on disk but NOT claimable: their stamp is not the live generation yet.
+#   3. If any enqueue fails (the tracked-spawn gate refusing a ref-less candidate is the common case),
+#      RETIRE what this generation staged and die. The previous plan is untouched and still draining.
+#   4. Flip the pointer — ONE rename, the atomic supersede.
+#   5. Retire the previous generation's still-pending intents (housekeeping; they went dead at step 4).
+_cmd_queue_publish() {
+  local q="$1"; shift
+  local src="" raw="" gen prev n=0 launched=0 retired=0 line slug lane ref after task
+  case "${1:-}" in
+    ''|-) src="-" ;;
+    --file) src="${2:-}"; [ -n "$src" ] || die "herd queue plan: --file needs a path" ;;
+    *) die "herd queue plan: unexpected argument '$1' (usage: herd queue plan [--file <path> | -])" ;;
+  esac
+
+  mkdir -p "$q" 2>/dev/null || die "herd queue plan: cannot create $q"
+  # Read the plan into a VARIABLE, never a temp file: every failure path below is a `die`, and a
+  # temp file would need a trap that `exit` skips anyway.
+  if [ "$src" = "-" ]; then
+    if [ -t 0 ]; then
+      die "herd queue plan: nothing on stdin. Pass a plan file (herd queue plan --file plan.tsv) or pipe one in. One TAB-separated candidate per line, TOP CANDIDATE FIRST:
+    <slug>  <lane quick|feature>  <tracker ref or ->  <after dep or ->  <task text>      (fields separated by TABs)"
+    fi
+    raw="$(cat)" || die "herd queue plan: could not read the plan from stdin"
+  else
+    [ -f "$src" ] || die "herd queue plan: no such plan file: $src"
+    raw="$(cat -- "$src")" || die "herd queue plan: could not read $src"
+  fi
+
+  # ── 1. validate every line before publishing any of it ─────────────────────────────────────────
+  local plan; plan="$(_queue_plan_lines "$raw")"
+  [ -n "$plan" ] || die "herd queue plan: the plan is empty (no candidate lines). To stand the queue down, cancel the pending intents instead: bash $SCRIPTS_DIR/spawn-step.sh cancel <intent-id>"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n=$((n+1))
+    slug="" lane="" ref="" after="" task=""
+    IFS=$'\t' read -r slug lane ref after task <<EOF
+$line
+EOF
+    [ -n "$slug" ] || die "herd queue plan: line $n has no slug (fields are TAB-separated: <slug> <lane> <ref> <after> <task>)"
+    case "$slug" in *[!a-zA-Z0-9._-]*) die "herd queue plan: line $n slug '$slug' is not a plain branch-safe name" ;; esac
+    case "$lane" in
+      quick|feature) ;;
+      *) die "herd queue plan: line $n lane must be quick or feature (got: '${lane:-}')" ;;
+    esac
+    [ -n "$task" ] || die "herd queue plan: line $n ($slug) has no task text — a candidate with no task is not a candidate"
+  done <<< "$plan"
+
+  prev="$(iq_generation "$q")"
+  gen="$(iq_gen_mint "$q")"
+  [ -n "$gen" ] || die "herd queue plan: could not mint a generation id (is $q writable?)"
+
+  # ── 2. stage every candidate: enqueued, stamped with the NEW generation, therefore not yet live ─
+  n=0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    n=$((n+1))
+    slug="" lane="" ref="" after="" task=""
+    IFS=$'\t' read -r slug lane ref after task <<EOF
+$line
+EOF
+    [ "$ref" = "-" ] && ref=""
+    [ "$after" = "-" ] && after=""
+    local out=""
+    if ! out="$(HERD_ITEM_REF="$ref" HERD_SPAWN_AFTER="$after" HERD_SPAWN_PRIO="$(( n * 10 ))" \
+                HERD_SPAWN_GEN="$gen" bash "$SCRIPTS_DIR/spawn.sh" "$slug" "$lane" "$task" 2>&1)"; then
+      # ── 3. nothing of this generation may ever go live ───────────────────────────────────────
+      # It was never pointed at, so it is already dead; retiring it just keeps the pool clean. The
+      # PREVIOUS plan is untouched and still draining — the safe direction, stated loudly.
+      local swept; swept="$(_queue_stage_retire "$q" "$gen")"
+      die "herd queue plan: candidate $n ($slug) could not be enqueued — NOTHING was published, the previous plan is still live (dropped $swept staged intent(s)).
+    $out"
+    fi
+    launched=$((launched+1))
+  done <<< "$plan"
+
+  # ── 4. ONE rename: the new generation goes live and the previous one dies in the same instant ───
+  if ! iq_gen_publish "$q" "$gen"; then
+    local swept; swept="$(_queue_stage_retire "$q" "$gen")"
+    die "herd queue plan: could not publish generation $gen — NOTHING was superseded, the previous plan is still live (dropped $swept staged intent(s))"
+  fi
+
+  # ── 5. housekeeping: the superseded plan's still-pending intents (dead since step 4) ────────────
+  retired="$(iq_gen_retire "$q")"
+
+  { type journal_append >/dev/null 2>&1 && journal_append queue_plan_published \
+      generation "$gen" candidates "$launched" superseded "${prev:-none}" retired "${retired:-0}" \
+      component plan; } || true
+
+  say "📋 published plan ${c_bold}${gen}${c_rst} · ${c_bold}${launched}${c_rst} candidate$([ "$launched" = 1 ] || printf 's') queued in priority order"
+  [ -n "$prev" ] && say "   superseded ${prev} (retired ${retired:-0} of its still-pending intent$([ "${retired:-0}" = 1 ] || printf 's'); anything already claimed is launching — countermand the BUILDER, not the queue)"
+  if ! iq_lever_on; then
+    say "   ${c_dim}INTENT_QUEUE is off: these intents drain in plain FIFO and the generation is not consulted. Arm it with: herd config set INTENT_QUEUE on${c_rst}"
+  fi
+  say "read it back any time with: herd queue list"
+}
+
+# _queue_stage_retire <qdir> <gen-id> — drop the intents staged for a generation that will never go
+# live (a mid-publish failure). Prints how many were dropped. Deliberately keyed on the STAMP rather
+# than on the ids collected so far: an id whose spawn.sh printed nothing readable still gets swept.
+_queue_stage_retire() {
+  local q="$1" gen="$2" f id n=0
+  for f in "$q"/*.req; do
+    [ -e "$f" ] || continue
+    id="$(iq_id_of "$f")"
+    [ "$(iq_gen_of "$q" "$id")" = "$gen" ] || continue
+    mv "$f" "$f.retiring" 2>/dev/null || continue
+    rm -f "$f.retiring" 2>/dev/null || true
+    iq_sidecars_rm "$q/$id"
+    n=$((n+1))
+  done
+  printf '%s' "$n"
+}
+
 # ── herd config: view / validate / set .herd/config keys, aware of what each change requires ─────
 # `herd config list|get|set` is the safe, validated front door to .herd/config. The known-key set and
 # per-key metadata — including the optional 5th "requires" column (watcher | render | blank) — are
@@ -8897,6 +9121,19 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       (item:<ref> | pr:<num>) and the watcher acks the note once that
                                       artifact exists — routing stays your judgment, the ack leaves the
                                       seat. A note routed as 'dismiss' has no artifact: ack it yourself
+  herd queue [list]                   read the PUBLISHED PLAN this pool will build next (HERD-642):
+                                      the live generation's pending candidates in DRAIN order with
+                                      their priority band, tracker ref and blocker — the same rows the
+                                      watch pane's "planned work" section shows, from the same reader,
+                                      so a second seat READS the plan instead of re-deriving it
+  herd queue plan [--file <path>|-]    publish the current priority-ordered candidate generation and
+                                      SUPERSEDE the previous one atomically (one TAB-separated
+                                      candidate per line, top candidate first:
+                                      <slug> <lane> <ref|-> <after|-> <task>; line order IS the
+                                      priority, stamped 10/20/30…). Each candidate is enqueued through
+                                      the shipped spawn.sh — same gate, same ref threading — then ONE
+                                      pointer rename makes the new plan live and the old one dead, so
+                                      changing your mind is one write, never N cancels
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value
@@ -9133,6 +9370,7 @@ case "${1:-help}" in
   notes)   shift; cmd_notes "$@" ;;
   tracker-heals) shift; cmd_tracker_heals "$@" ;;
   intents) shift; cmd_intents "$@" ;;
+  queue)   shift; cmd_queue "$@" ;;
   config)  shift; cmd_config "$@" ;;
   theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;
