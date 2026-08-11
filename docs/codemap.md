@@ -71,6 +71,7 @@ Role summarized from each file's top-of-file comment.
 - `herd-watch.sh` — launcher / pane wrapper for the live "herd watch" status console (agent-watch.sh).
 - `hermetic-env-scrub.sh` — HERD-458: seal off herd-config.sh's own EXPORTED keys before a hermetic
 - `human-verify.sh` — the shared parser for the per-PR HUMAN-VERIFY hold convention.
+- `intent-queue.sh` — THE shared intent-queue library (HERD-639, Phase 2 of HERD-625; design doc
 - `journal-act.sh` — THE RAIL-DISPATCH half of "journal-audit findings become ACTIONS" (HERD-544).
 - `journal-audit-replay.sh` — THE REPLAY half of journal-audit.sh (HERD-608), split out for exactly one
 - `journal-audit.sh` — journal-driven self-audit / gap-finder (HERD-238 / N12).
@@ -101,7 +102,7 @@ Role summarized from each file's top-of-file comment.
 - `scribe-step.sh` — queue/git/report mechanics for the backlog drainer. The scribe Claude
 - `scribe.sh` — scribe.sh "<backlog change>" — ENQUEUE a backlog change and make sure exactly ONE async
 - `source-guard-lint.sh` — THE shared dot-source-guard drift guard (HERD-632): a fail-soft
-- `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
+- `spawn-step.sh` — the SPAWN QUEUE's tenant CLI over the shared intent-queue library
 - `spawn.sh` — spawn.sh <slug> <lane> <task> — ENQUEUE a builder spawn intent to the durable spawn queue and
 - `stale-dup-gate.sh` — the PRE-MERGE STALE-DUPLICATE gate (HERD-188).
 - `status.sh` — pure helpers + the orchestrator behind `herd status`, a ONE-SHOT, READ-ONLY,
@@ -156,7 +157,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `core-surface.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `ci-repair.sh`, `console-section.sh`, `core-surface.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `intent-queue.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
 - `backlog-reconcile.sh` → `herd-config.sh`
@@ -183,6 +184,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`, `resolver-pane.sh`
 - `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
 - `herd-watch.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
+- `intent-queue.sh` → `journal.sh`
 - `journal-act.sh` → `agent-watch.sh`, `journal.sh`
 - `journal-audit.sh` → `aging-pr.sh`, `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal-audit-replay.sh`, `journal.sh`
 - `ledger.sh` → `herd-config.sh`
@@ -197,8 +199,8 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `retirement.sh` → `agent-watch.sh`, `journal.sh`
 - `scribe-step.sh` → `create-retry.sh`, `drainer-liveness.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
-- `spawn-step.sh` → `herd-config.sh`, `journal.sh`
-- `spawn.sh` → `herd-config.sh`, `journal.sh`
+- `spawn-step.sh` → `herd-config.sh`
+- `spawn.sh` → `herd-config.sh`, `intent-queue.sh`, `journal.sh`
 - `stale-dup-gate.sh` → `derived-files.sh`, `pr-ref.sh`
 - `status.sh` → `watcher-exempt.sh`
 - `steps.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`
@@ -399,7 +401,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
 - `WATCHER_CRASHLOOP_GUARD` → `herd-watch.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
-- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`
+- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`, `spawn.sh`
 - `WATCHER_RESURRECT` → `bin/herd`, `watcher-resurrect.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`, `resolver-claim.sh`
 - `WATCHER_SELF_RESTART` → `agent-watch.sh`

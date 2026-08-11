@@ -570,3 +570,10 @@ TAB_DISCIPLINE	sim	tests/test-sandbox-real-panes.sh
 HEALTHCHECK_PROGRESS_LOG	unit	tests/test-healthcheck-progress-stream.sh
 HEALTHCHECK_PROGRESS_LOG	unit	tests/test-health-progress-header.sh
 HEALTHCHECK_PROGRESS_LOG	unit	tests/test-health-worker-progress-log.sh
+intent-queue.sh	unit	tests/test-intent-queue-lib.sh
+intent-queue.sh	unit	tests/test-spawn-queue-drain.sh
+intent-queue.sh	unit	tests/test-intent-queue-marker-tenant.sh
+INTENT_QUEUE	unit	tests/test-intent-queue-marker-tenant.sh
+spawn-step.sh	unit	tests/test-intent-queue-lib.sh
+spawn.sh	unit	tests/test-intent-queue-marker-tenant.sh
+agent-watch.sh	unit	tests/test-intent-queue-marker-tenant.sh

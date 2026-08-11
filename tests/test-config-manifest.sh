@@ -217,6 +217,12 @@ EXEMPT_PREFIX = (
     "BACKLOG_VIEW_",    # backlog viewer pane internals
     "TASK_PANE_VIEW_",  # task-spec viewer pane internals
     "AGENT_WATCH_",     # agent-watch.sh dry-run / lib-mode test seams
+    "IQ_",              # HERD-639: intent-queue.sh's TENANT knobs (IQ_LOG_PREFIX / IQ_ENGINE_DIR /
+                        # IQ_SIDECARS / IQ_PRIO_DEFAULT / IQ_RECLAIM_MMIN). Plain shell variables a
+                        # tenant sets before SOURCING the library — the spawn queue sets two of them
+                        # so its stderr and journal lookup stay byte-identical — never a .herd/config
+                        # knob and never operator-facing. Same class as the DEP_WATCHER_LIB /
+                        # WATCHER_RESURRECT_LIB library seams below.
 )
 # HERD_BRAND is the one HERD_-namespaced value that IS a real config knob (declared) — never exempt it.
 EXEMPT_PREFIX_EXCEPTIONS = {"HERD_BRAND"}
@@ -251,6 +257,14 @@ EXEMPT_NAMES = {
                    # no operator gain — the same call console-section.sh's CONSOLE_ROW_RETENTION /
                    # CONSOLE_LEDGER_MAX make above. Promote it to a real key if and when a fleet
                    # genuinely needs a different bound (docs/spikes/coordinator-work-queue.md §4.2)
+    "INTENT_DRAIN_BUDGET", "INTENT_MAX_ATTEMPTS",
+                   # HERD-639: agent-watch.sh's per-tick cap on the M3 marker drain, and the transient
+                   # retry bound before an intent is dropped loudly. EXEMPT for exactly the reason
+                   # INTENT_TTL above is: Phase 2 adds NO second operator lever — the whole work-queue
+                   # program ships behind INTENT_QUEUE (declared), and both bounds are only ever
+                   # evaluated while it is on. A marker intent is one backend round-trip on a queue
+                   # expected to be near-empty, so neither bound is a knob a fleet has had reason to
+                   # turn; promote them if one ever does (docs/spikes/coordinator-work-queue.md §4.3)
     "ITEM_STATE", "ITEM_UPDATED",
     "WATCHER_RESURRECT_LIB",  # watcher-resurrect.sh lib-mode test seam (HERD-489), same shape as
                               # DEP_WATCHER_LIB above — never a .herd/config knob
