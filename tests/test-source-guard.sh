@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 # test-source-guard.sh — hermetic RUNTIME proof for HERD-632: bash treats `.` (source) as a SPECIAL
-# BUILTIN, so sourcing a path that does not exist can KILL THE SHELL OUTRIGHT under `set -e`, bypassing
-# even a trailing `|| true`. This proves:
+# BUILTIN, and on SOME bash builds sourcing a path that does not exist KILLS THE SHELL OUTRIGHT under
+# `set -e`, bypassing even a trailing `|| true`. This proves:
 #
-#   (1) THE BUG IS REAL: the classic fail-soft idiom `. "$missing" 2>/dev/null || true` (no `[ -f ]`
-#       test) does NOT survive a missing file under `set -euo pipefail` — the process dies before the
-#       next statement runs. Without this negative control, a passing guard test could just mean the
-#       bug never existed, not that the fix does anything.
-#   (2) THE FIX WORKS: the SAME fail-soft idiom, guarded with a preceding `[ -f "$missing" ]` test,
-#       DOES survive a missing file — the next statement runs, exit 0.
-#   (3) A REAL SUBSHELL also protects, with no `[ -f ]` test needed — the fatal exit only kills the
-#       subshell; the parent sees an ordinary non-zero status.
-#   (4) A BARE `{ ... }` GROUP does NOT protect — only a real subshell does.
+#   (1) THE QUIRK, WHEN PRESENT, IS REAL: on a bash build where the unguarded fail-soft idiom
+#       `. "$missing" 2>/dev/null || true` does not survive a missing file, that is the exact
+#       HERD-632 crash — proven live on macOS's system /bin/bash 3.2.57 (arm64-apple-darwin), the
+#       interpreter the watcher pane resolves (see scripts/herd/bash-syntax-lint.sh's HERD-608 note
+#       for the same class of "old bash behaves differently" gotcha). NOT every bash build exhibits
+#       it — a modern non-POSIX-mode bash (5.x, common as $PATH's `bash` on Linux/Homebrew) treats a
+#       missing-file source leniently, as an ordinary non-zero status `||` catches fine — so this
+#       check is INFORMATIONAL, not a hard requirement: it never fails the suite on a lenient bash,
+#       it only reports what THIS bash does. The checks that must hold UNIVERSALLY, on every bash,
+#       are (2) and (3) below.
+#   (2) THE FIX WORKS EVERYWHERE: the SAME fail-soft idiom, guarded with a preceding
+#       `[ -f "$missing" ]` test, survives a missing file on EVERY bash — the danger in (1) may or
+#       may not exist on this build, but the guard is a no-op on a lenient bash and the actual fix on
+#       a strict one, so it must never regress either way.
+#   (3) A REAL SUBSHELL also protects UNIVERSALLY, with no `[ -f ]` test needed — the fatal exit (when
+#       present) only kills the subshell; the parent sees an ordinary non-zero status.
+#   (4) A BARE `{ ... }` GROUP does not add any protection beyond whatever this bash already gives an
+#       unguarded source — informational, same leniency caveat as (1).
 #   (5) THE ACTUAL PRODUCTION FIX (scripts/herd/herd-claim.sh) survives standalone with
 #       SCRIBE_BACKEND_DIR pointed at a directory with no journal.sh/engine-version.sh: herd_claim_or_abort
 #       still returns and the process does not die mid-source.
@@ -29,7 +38,8 @@ pass() { PASS=$((PASS+1)); }
 
 MISSING="$T/definitely-does-not-exist/lib.sh"
 
-# ── 1. Negative control: the unguarded fail-soft idiom does NOT survive ─────────────────────────────
+# ── 1. Informational: does THIS bash exhibit the special-builtin-fatal quirk at all? ────────────────
+# Never a hard failure either way — only (2)/(3) below (the guard itself) are universal requirements.
 cat > "$T/unguarded.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -37,10 +47,14 @@ set -euo pipefail
 echo SURVIVED
 EOF
 out="$(bash "$T/unguarded.sh" 2>/dev/null)"; rc=$?
-[ "$rc" -ne 0 ] && [ "$out" != "SURVIVED" ] \
-  || fail "(1) the UNGUARDED idiom should NOT survive a missing file under set -e (rc=$rc out='$out') — if this passes, the bug this lint exists for is not real and the whole guard is pointless"
+if [ "$rc" -ne 0 ] && [ "$out" != "SURVIVED" ]; then
+  QUIRKY_BASH=1
+  echo "INFO (1) this bash exhibits the HERD-632 quirk: an unguarded '. \"\$missing\" 2>/dev/null || true' KILLS the shell under set -e"
+else
+  QUIRKY_BASH=0
+  echo "INFO (1) this bash is lenient (no HERD-632 quirk): an unguarded '. \"\$missing\" 2>/dev/null || true' survives here — the guard is still required for the bash builds where it does not (e.g. macOS system /bin/bash 3.2.57)"
+fi
 pass
-echo "PASS (1) negative control: '. \"\$missing\" 2>/dev/null || true' alone KILLS the shell under set -e (proves the bug is real)"
 
 # ── 2. The fix: a preceding [ -f ] test survives ─────────────────────────────────────────────────────
 cat > "$T/guarded.sh" <<EOF
@@ -68,7 +82,10 @@ out="$(bash "$T/subshell.sh" 2>/dev/null)"; rc=$?
 pass
 echo "PASS (3) a real subshell '( . \"\$missing\" 2>/dev/null ) || true' also survives — no [ -f ] test required"
 
-# ── 4. A bare { ... } group does NOT protect ─────────────────────────────────────────────────────────
+# ── 4. A bare { ... } group adds no protection beyond (1)'s baseline ────────────────────────────────
+# Only meaningful on a QUIRKY bash (where (1) showed the fatal exit exists at all) — a bare `{ }` group
+# is not a real subshell, so it must reproduce the SAME fatal-or-survives verdict as the unguarded case.
+# On a lenient bash there is nothing to prove here (nothing was fatal to begin with); skip, not fail.
 cat > "$T/brace-group.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -76,10 +93,14 @@ set -euo pipefail
 echo SURVIVED
 EOF
 out="$(bash "$T/brace-group.sh" 2>/dev/null)"; rc=$?
-[ "$rc" -ne 0 ] && [ "$out" != "SURVIVED" ] \
-  || fail "(4) a bare { ... } group must NOT protect against the special-builtin fatal exit (rc=$rc out='$out') — if this survives, brace-group sites would not need the [ -f ] fix bin/herd received"
+if [ "$QUIRKY_BASH" -eq 1 ]; then
+  [ "$rc" -ne 0 ] && [ "$out" != "SURVIVED" ] \
+    || fail "(4) on a QUIRKY bash, a bare { ... } group must NOT protect against the special-builtin fatal exit (rc=$rc out='$out') — if this survives, brace-group sites (like the one fixed in bin/herd) would not have needed the [ -f ] fix"
+  echo "PASS (4) on this quirky bash, a bare '{ . \"\$missing\" 2>/dev/null; } || true' group still KILLS the shell — only a real subshell or [ -f ] protects"
+else
+  echo "SKIP (4) this bash is lenient (see (1)) — a bare { ... } group has nothing to prove here"
+fi
 pass
-echo "PASS (4) a bare '{ . \"\$missing\" 2>/dev/null; } || true' group still KILLS the shell — only a real subshell or [ -f ] protects"
 
 # ── 5. The actual production fix (herd-claim.sh) survives standalone ────────────────────────────────
 CLAIM="$ROOT/scripts/herd/herd-claim.sh"
