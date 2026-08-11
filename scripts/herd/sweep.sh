@@ -338,6 +338,28 @@ _sweep_unique_commits() {
   fi
 }
 
+# _sweep_anchor_ok <dir> <head> <oid> — HERD-646: true iff <head> IS the PR's headRefOid <oid>, or is a
+# strict ANCESTOR of it — the worktree's own commit carries nothing <oid> lacks, even though it has not
+# fetched whatever landed on the remote branch AFTER its own last push (a CI-unstick empty commit, a
+# late touch-up push, …). That is BEHIND, not unpushed work, and it is provably safe to reap: every
+# commit this worktree carries already exists on the remote. The exact-match fast path costs nothing;
+# the ancestor check runs one `git merge-base`, and — only when <oid>'s object is not yet known locally —
+# one quiet `git fetch origin` first (mirrors _sweep_unique_commits's own fail-soft fetch above).
+#
+# Fail-soft AND CONSERVATIVE throughout, same as every other proof in this file: a bad/foreign <oid> (a
+# reused slug's stale gh answer for a sha this repo never had), an unfetchable remote, or HEAD genuinely
+# AHEAD of or DIVERGED from <oid> (real local-only work) all resolve to "not anchored" — the caller's
+# existing "no anchor ⇒ untouchable" default. This never creates a new way to license a teardown; it
+# only widens what counts as proof that nothing local-only would be lost.
+_sweep_anchor_ok() {
+  local dir="$1" head="$2" oid="$3"
+  [ -n "$dir" ] && [ -n "$head" ] && [ -n "$oid" ] || return 1
+  [ "$head" = "$oid" ] && return 0
+  git -C "$dir" merge-base --is-ancestor "$head" "$oid" 2>/dev/null && return 0
+  git -C "$dir" fetch --quiet origin >/dev/null 2>&1 || true
+  git -C "$dir" merge-base --is-ancestor "$head" "$oid" 2>/dev/null
+}
+
 # _sweep_registry_has_slug <slug> — success iff the tab registry records a tab for this slug (an
 # "owned" scratch tree; leave it to its owner).
 _sweep_registry_has_slug() {
@@ -349,9 +371,11 @@ _sweep_registry_has_slug() {
 
 # sweep_leg_worktrees <dry> — leg 1. For each feature worktree, PROVE a reap or FLAG the finding.
 #
-# The proof obligation is _startup_reap_sweep's, unchanged: a PR whose headRefOid EQUALS this
-# worktree's current HEAD. Only that anchor distinguishes "the branch this tree built, and it
-# landed" from "a reused slug with new commits". No anchor ⇒ no action, ever.
+# The proof obligation is _startup_reap_sweep's: a PR whose headRefOid EQUALS this worktree's current
+# HEAD, or (HERD-646) whose current HEAD is a strict ANCESTOR of it — the worktree is merely BEHIND
+# its remote (missing others' commits), never carrying any commit the merged/closed PR lacks. Only
+# that anchor distinguishes "the branch this tree built, and it landed" from "a reused slug with new
+# commits". No anchor ⇒ no action, ever — see _sweep_anchor_ok.
 #
 #   MERGED + anchored + (clean | regenerable-only)  → REAP   (safe)
 #   MERGED + anchored + real dirt                   → FLAG   (judgment — uncommitted work)
@@ -406,7 +430,7 @@ sweep_leg_worktrees() {
     IFS=$'\t' read -r st oid num <<EOF
 $(_srs_gh_view "$branch")
 EOF
-    [ -n "${oid:-}" ] && [ "$oid" = "$head" ] || continue   # no sha anchor → never touch it
+    [ -n "${oid:-}" ] && _sweep_anchor_ok "$dir" "$head" "$oid" || continue   # no sha anchor → never touch it
     case "${st:-}" in
       MERGED)
         if [ "$dirt" = "dirty" ]; then
