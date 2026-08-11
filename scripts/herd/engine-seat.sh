@@ -50,12 +50,15 @@
 _HERD_SEAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # journal.sh provides journal_append (best-effort, never fails a caller). Source only if the caller has
-# not already — the same discipline herd-claim.sh / engine-version.sh use.
+# not already — the same discipline herd-claim.sh / engine-version.sh use. The `[ -f ]` test is
+# LOAD-BEARING (HERD-632): `.` is a bash SPECIAL BUILTIN, so sourcing a path that does not exist KILLS
+# THE SHELL outright — neither `2>/dev/null` nor the trailing `|| true` catches it.
 # shellcheck source=/dev/null
-command -v journal_append >/dev/null 2>&1 || . "$_HERD_SEAT_DIR/journal.sh" 2>/dev/null || true
+command -v journal_append >/dev/null 2>&1 || { [ -f "$_HERD_SEAT_DIR/journal.sh" ] && . "$_HERD_SEAT_DIR/journal.sh" 2>/dev/null; } || true
 # engine-version.sh provides herd_engine_level — THE level every stamp carries. Sourced only if absent.
+# The `[ -f ]` test is LOAD-BEARING — see the journal.sh note above (HERD-632).
 # shellcheck source=/dev/null
-command -v herd_engine_level >/dev/null 2>&1 || . "$_HERD_SEAT_DIR/engine-version.sh" 2>/dev/null || true
+command -v herd_engine_level >/dev/null 2>&1 || { [ -f "$_HERD_SEAT_DIR/engine-version.sh" ] && . "$_HERD_SEAT_DIR/engine-version.sh" 2>/dev/null; } || true
 
 # Reconcile-result globals — set by herd_engine_seat_reconcile, read by the console note + the hold
 # predicate. Initialised to the coherent single-seat answer so a caller that reads them before any
