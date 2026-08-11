@@ -297,7 +297,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HERD_REPO` → `bin/herd`, `herd-links.sh`, `oss-triage.sh`
 - `HERD_THEME` → `bin/herd`, `theme.sh`
 - `HERD_VERSION` → `bin/herd`
-- `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`, `journal-audit-replay.sh`, `posture-lint.sh`
+- `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`, `human-verify.sh`, `journal-audit-replay.sh`, `posture-lint.sh`
 - `INFRA_BREAKER_COOLDOWN` → `agent-watch.sh`
 - `INFRA_BREAKER_MAX` → `agent-watch.sh`
 - `INTENT_QUEUE` → `bin/herd`
