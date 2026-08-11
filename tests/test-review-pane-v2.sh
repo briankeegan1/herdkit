@@ -248,6 +248,21 @@ _reset_logs
 _agent_list_with_builder
 _tab_list_with_builder
 _agent_start_success
+# HERD-636: herd_close_pane_verified (HERD-134, driver.sh) only closes a pane after verifying its LIVE
+# identity via `herdr agent list` — that guard landed 2026-07-08, AFTER this scenario was written
+# (2026-07-02), and this roster was never updated to match, so the guard has read an empty roster for
+# "reviewPane1" ever since and REFUSED the close as identity-unreadable — deterministically, in every
+# environment (reproduced with `env -i`, no live herdr socket or control-room env at all; this is not
+# the HERD-616 live-control-room family). Register the just-started reviewer here — under its SANITIZED
+# name (see the HERD-418 note on scenario 6 below) — so the roster reflects what a real herdr would
+# report once `agent start` succeeds, and the timeout teardown can verify "reviewPane1" really is the
+# review·test-slug reviewer before closing it. Status "working" (not "idle"): an observable roster entry
+# also makes herd_review_wake_verify (HERD-523) engage its own poll-for-"working" preflight, which this
+# scenario is not testing — "working" satisfies that check on its very first (non-sleeping) look, so
+# agent-pane mode proceeds straight to the verdict-file poll this scenario DOES test, byte-identical to
+# the pre-wake-verify flow.
+printf '{"result":{"agents":[{"name":"test-slug","pane_id":"builderPane1","agent_status":"idle"},{"name":"review-test-slug","pane_id":"reviewPane1","agent_status":"working"}]}}\n' \
+  > "$HERDR_AGENT_LIST_RESP"
 
 AGENT_TEMP5="$T/agent-temp-5"
 RES="$T/result-5-sha5"
@@ -281,8 +296,20 @@ ok
 # PR #195). The fix closes the stale pane first and re-splits into the SAME builder tab, so the
 # net pane count is stable across the two dispatches (close one, open one) — never a new tab.
 _reset_logs
-# Agent list now carries BOTH the builder AND a stale review pane left by the prior round.
-printf '{"result":{"agents":[{"name":"test-slug","pane_id":"builderPane1","agent_status":"idle"},{"name":"review·test-slug","pane_id":"staleReviewPane1","agent_status":"idle"}]}}\n' \
+# Agent list now carries BOTH the builder AND a stale review pane left by the prior round. HERD-636:
+# the roster name is the SANITIZED form ("review-test-slug", not the dotted "review·test-slug") — HERD-418
+# (2026-07-22, driver.sh's herd_agent_name_sanitize) taught herdr registration to map the "·" separator to
+# "-" because herdr 0.7.5 rejects dotted agent names outright, and _pane_by_agent_name's lookup sanitizes
+# its query the same way, so a roster row still keyed on the pre-HERD-418 dotted name can never match —
+# this scenario's own close-verification step was silently skipped (never reached, let alone refused)
+# ever since, masked because scenario 5 (fixed above) aborted the file before scenario 6 ever ran.
+# Status "working" for the same reason as scenario 5's note above: this stale entry's NAME is the same
+# sanitized "review-test-slug" the ROUND-2 reviewer registers under too, and this stub is a static
+# response (it is never updated to reflect the stale pane's close or the new pane's start), so
+# herd_review_wake_verify's post-dispatch check reads this SAME row for the new pane — "working" lets
+# that preflight clear instantly for round 2 without perturbing the stale-pane-close assertion below,
+# which keys on name/pane_id, never on agent_status.
+printf '{"result":{"agents":[{"name":"test-slug","pane_id":"builderPane1","agent_status":"idle"},{"name":"review-test-slug","pane_id":"staleReviewPane1","agent_status":"working"}]}}\n' \
   > "$HERDR_AGENT_LIST_RESP"
 _tab_list_with_builder
 _agent_start_success
