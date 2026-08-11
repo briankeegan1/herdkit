@@ -19,9 +19,13 @@
 #       rows — byte-quiet.
 #   (4) IDEMPOTENT: a second run against the same dirty journal does not re-emit (seen-ledger).
 #   (5) FAIL-SOFT: empty/missing journal exits 0 with no writes.
-#   (7) The HERD-272 human-verify rule end-to-end: approved ⇒ clean; no record ⇒ finding; no block ⇒
-#       clean; unreadable body ⇒ an `unknown` finding, never a crash; hv-informed ⇒ still a finding;
-#       and a settled-clean PR's body is probed exactly once across ticks.
+#   (7) The HERD-272 human-verify rule end-to-end, POLICY-AWARE since HERD-644: approved ⇒ clean; no
+#       block ⇒ clean; unreadable body ⇒ an `unknown` finding, never a crash; hv-informed (proof that
+#       HUMAN_VERIFY_POLICY=auto governed the merge) ⇒ clean, by design, regardless of the CURRENT
+#       live policy; no record at all under the CURRENT effective policy=hold|coordinator ⇒ a real
+#       finding (the genuine bypass class); no record at all under policy=auto ⇒ clean (a
+#       policy-sanctioned merge whose informational journal line simply is not in evidence); and a
+#       settled-clean PR's body is probed exactly once across ticks.
 #
 # Fully hermetic: writes only under a mktemp dir, never touches the live watcher/panes/real journal.
 # Run:  bash tests/test-journal-audit.sh
@@ -40,11 +44,19 @@ command -v python3 >/dev/null 2>&1 || fail "python3 required"
 REPO_FIX="$T/repo"
 mkdir -p "$REPO_FIX/.herd" "$T/trees/.herd"
 export HERD_CONFIG_FILE="$REPO_FIX/.herd/config"
-cat > "$REPO_FIX/.herd/config" <<EOF
-PROJECT_ROOT="$REPO_FIX"
-WORKTREES_DIR="$T/trees"
-DEFAULT_BRANCH="main"
-EOF
+# write_hv_policy [hold|coordinator|auto] — rewrite the config FILE, not an exported env var: since
+# HERD_CONFIG_FILE points at a real on-disk file, herd-config.sh's HERD-465 engine-core-key reset
+# unsets any pre-exported HUMAN_VERIFY_POLICY before sourcing it, so the file is the only surface
+# that actually lands. Omit the arg to restore the byte-identical default (unset → hold).
+write_hv_policy() {
+  {
+    printf 'PROJECT_ROOT="%s"\n' "$REPO_FIX"
+    printf 'WORKTREES_DIR="%s"\n' "$T/trees"
+    printf 'DEFAULT_BRANCH="main"\n'
+    [ -n "${1:-}" ] && printf 'HUMAN_VERIFY_POLICY="%s"\n' "$1"
+  } > "$REPO_FIX/.herd/config"
+}
+write_hv_policy
 
 # Pin every surface the audit writes so nothing escapes the temp dir.
 export JOURNAL_FILE="$T/trees/.herd/journal.jsonl"
@@ -86,6 +98,7 @@ reset_surfaces() {
   rm -f "$HERD_JOURNAL_AUDIT_SEEN"
   rm -f "$HERD_APPROVALS_FILE" "$PROBES"
   rm -f "$BODIES"/*.md "$BODIES"/*.fail 2>/dev/null || true
+  write_hv_policy   # each (7e3*) case sets its own; default (no arg) resolves to hold
 }
 # approve <pr> <sha> — drive the REAL herd-approve.sh: it writes the sha-keyed ledger row AND journals
 # the durable `approval_recorded` event. Hand-writing the row instead would encode a ledger state that
@@ -550,18 +563,86 @@ out="$(run_audit on)" || fail "(7d) an unreadable body must not crash the audito
 pass
 echo "PASS (7d) unreadable PR body → unknown finding, auditor survives"
 
-# (7e) an `hv-informed` record (HUMAN_VERIFY_POLICY=auto) is a record, not an approval → still a
-# finding, and the posture survives the purge: the journal's human_verify_policy event carries it.
+# (7e) HERD-644: an `hv-informed` record PROVES HUMAN_VERIFY_POLICY=auto governed this merge (it is
+# the journal/ledger pair ONLY that policy branch writes) — that is the designed, policy-sanctioned
+# auto-merge-as-informational path, not a bypass, so it must be CLEAN, and the posture survives the
+# ledger purge via the durable journal event. Current live policy is left at the default (hold) on
+# purpose: the proof lives in the evidence for THIS merge, not in whatever the operator's config says
+# today, so hv-informed must clear even when today's policy differs from what governed the merge.
 reset_surfaces
 merged_pr 205 "feed0001"
 hv_body 205
 hv_informed 205 "feed0001"
 purge_merged_pr 205
 out="$(run_audit on)" || fail "(7e) audit exited non-zero: $out"
-[ "$(count_audit merged_hv_no_approval)" = "1" ] || fail "(7e) hv-informed must not clear the finding, got $(count_audit merged_hv_no_approval)"
-grep -q 'hv-informed only' "$JOURNAL_FILE" || fail "(7e) the summary must name the hv-informed posture"
+[ "$(count_audit)" = "0" ] || fail "(7e) hv-informed (policy=auto proof) must be clean, got $(count_audit): $(grep journal_audit "$JOURNAL_FILE" || true)"
+[ -z "$out" ] || fail "(7e) hv-informed must be silent, got: [$out]"
 pass
-echo "PASS (7e) hv-informed only → finding that names the posture"
+echo "PASS (7e) hv-informed (policy=auto proof) → no finding, regardless of the CURRENT live policy"
+
+# (7e2) hv-informed also memoizes the probe (byte-identical treatment to "approved"): a second tick
+# must not re-fetch the PR body.
+reset_surfaces
+merged_pr 205 "feed0001"
+hv_body 205
+hv_informed 205 "feed0001"
+purge_merged_pr 205
+run_audit on >/dev/null || fail "(7e2) first tick non-zero"
+[ "$(probe_count)" = "1" ] || fail "(7e2) first tick should probe once, got $(probe_count)"
+run_audit on >/dev/null || fail "(7e2) second tick non-zero"
+[ "$(probe_count)" = "1" ] || fail "(7e2) hv-informed must memoize like approved — no re-probe, got $(probe_count)"
+pass
+echo "PASS (7e2) hv-informed memoizes the settled-clean verdict like approved does"
+
+# (7e3) POLICY MATRIX: no evidence at all (no approval, no hv-informed) under each CURRENT effective
+# HUMAN_VERIFY_POLICY value — proves finding-only-under-hold/coordinator-without-approval (HERD-644
+# VERIFY). hold and coordinator both still MERGE only after `approved` is true (decisions.hold_decision),
+# so an evidence-free merge under either is the genuine bypass this check exists to catch; auto merges
+# an hv-holding PR unconditionally, so an evidence-free merge there is presumptively that same
+# by-design path (its informational journal line simply is not in the replay window).
+reset_surfaces
+write_hv_policy hold
+merged_pr 210 "aaaa0001"
+hv_body 210
+out="$(run_audit on)" || fail "(7e3-hold) audit exited non-zero: $out"
+[ "$(count_audit merged_hv_no_approval)" = "1" ] || fail "(7e3-hold) policy=hold + no evidence must still be a REAL finding, got $(count_audit merged_hv_no_approval)"
+pass
+echo "PASS (7e3-hold) no evidence under policy=hold → finding (genuine bypass)"
+
+reset_surfaces
+write_hv_policy coordinator
+merged_pr 211 "aaaa0002"
+hv_body 211
+out="$(run_audit on)" || fail "(7e3-coordinator) audit exited non-zero: $out"
+[ "$(count_audit merged_hv_no_approval)" = "1" ] || fail "(7e3-coordinator) policy=coordinator + no evidence must still be a REAL finding, got $(count_audit merged_hv_no_approval)"
+pass
+echo "PASS (7e3-coordinator) no evidence under policy=coordinator → finding (genuine bypass)"
+
+reset_surfaces
+write_hv_policy auto
+merged_pr 212 "aaaa0003"
+hv_body 212
+out="$(run_audit on)" || fail "(7e3-auto) audit exited non-zero: $out"
+[ "$(count_audit)" = "0" ] || fail "(7e3-auto) policy=auto + no evidence must be clean (policy-sanctioned), got $(count_audit)"
+[ -z "$out" ] || fail "(7e3-auto) must be silent, got: [$out]"
+pass
+echo "PASS (7e3-auto) no evidence under policy=auto → no finding (policy-sanctioned)"
+write_hv_policy
+
+# (7e4) the (7e3-auto) no-finding case is NOT memoized — a later policy correction (back to
+# hold/coordinator) must re-examine it rather than staying silently cleared forever.
+reset_surfaces
+write_hv_policy auto
+merged_pr 213 "aaaa0004"
+hv_body 213
+run_audit on >/dev/null || fail "(7e4) first tick (policy=auto) non-zero"
+[ "$(count_audit)" = "0" ] || fail "(7e4) first tick must be clean under policy=auto"
+write_hv_policy hold
+run_audit on >/dev/null || fail "(7e4) second tick (policy=hold) non-zero"
+[ "$(count_audit merged_hv_no_approval)" = "1" ] || fail "(7e4) a policy correction back to hold must surface the still-unproven merge, got $(count_audit merged_hv_no_approval)"
+pass
+echo "PASS (7e4) unproven-under-auto is never memoized clean — a policy correction re-examines it"
+write_hv_policy
 
 # (7f) a settled-clean merged PR is probed ONCE across ticks (the seen-ledger memoizes the verdict),
 #      and the finding itself stays idempotent on re-run.
