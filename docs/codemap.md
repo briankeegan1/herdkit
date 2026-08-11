@@ -207,7 +207,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `sweep.sh` → `agent-watch.sh`, `create-retry.sh`, `derived-files.sh`, `journal.sh`, `watcher-exempt.sh`
 - `symbol-index.sh` → `herd-config.sh`
 - `task-spec-view.sh` → `theme.sh`
-- `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `journal.sh`, `pr-ref.sh`
+- `tracker-state-sweep.sh` → `console-section.sh`, `herd-config.sh`, `intent-queue.sh`, `journal.sh`, `pr-ref.sh`
 - `triggers.sh` → `herd-config.sh`, `journal.sh`
 - `watcher-resurrect.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
 - `work-unit.sh` → `agent-watch.sh`, `journal.sh`
@@ -300,7 +300,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `HUMAN_VERIFY_POLICY` → `agent-watch.sh`, `herd-approve.sh`, `journal-audit-replay.sh`, `posture-lint.sh`
 - `INFRA_BREAKER_COOLDOWN` → `agent-watch.sh`
 - `INFRA_BREAKER_MAX` → `agent-watch.sh`
-- `INTENT_QUEUE` → —
+- `INTENT_QUEUE` → `bin/herd`
 - `INTERACTION_TEST_CMD` → `healthcheck.sh`
 - `JOURNAL_AUDIT` → `agent-watch.sh`, `journal-audit.sh`
 - `JOURNAL_AUDIT_ACT` → `journal-audit.sh`
@@ -401,7 +401,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
 - `WATCHER_CRASHLOOP_GUARD` → `herd-watch.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
-- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`, `spawn.sh`
+- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`, `spawn.sh`, `tracker-state-sweep.sh`
 - `WATCHER_RESURRECT` → `bin/herd`, `watcher-resurrect.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`, `resolver-claim.sh`
 - `WATCHER_SELF_RESTART` → `agent-watch.sh`
