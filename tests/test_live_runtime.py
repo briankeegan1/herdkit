@@ -21,6 +21,8 @@ Run:  PYTHONPATH=pysrc python3 tests/test_live_runtime.py
 """
 import json
 import os
+import shlex
+import shutil
 import sys
 import tempfile
 import unittest
@@ -1563,6 +1565,251 @@ class TestLiveMergeVerify(LiveCase):
         self.assertEqual(len([o for o in ev if o["event"] == "merge_gh_unreadable"]), 1)
         self.assertFalse([o for o in ev if o["event"] == "merge_refused"])
         self.assertFalse([o for o in ev if o["event"] == "merge"])
+
+
+class _RosterPaneSub(_RecordingSub):
+    """HERD-648: stubs `herdr agent list` (a constant agent_status/pane_id row) and `herdr pane read`
+    (a scripted sequence of pane-text frames, consumed in call order, empty once exhausted) — the two
+    real reads LiveActuator._status_resolved / _agent_lookup make."""
+
+    def __init__(self, agent_status, pane_texts, pane_id="pane-1", name="slug1"):
+        super().__init__()
+        self.agent_status = agent_status
+        self.pane_texts = list(pane_texts)
+        self.pane_id = pane_id
+        self.name = name
+
+    def run(self, argv, *a, **k):
+        if argv[:2] == ["herdr", "agent"]:
+            self.calls.append(list(argv))
+            agents = [{"name": self.name, "agent_status": self.agent_status, "pane_id": self.pane_id}]
+            return _FakeCompleted(json.dumps({"result": {"agents": agents}}))
+        if argv[:3] == ["herdr", "pane", "read"]:
+            self.calls.append(list(argv))
+            text = self.pane_texts.pop(0) if self.pane_texts else ""
+            return _FakeCompleted(text)
+        return super().run(argv, *a, **k)
+
+
+class TestStatusCorroboratePort(LiveCase):
+    """HERD-648: unit coverage for LiveActuator._status_resolved / _agent_lookup, the python port of
+    driver.sh's herd_driver_agent_status_resolved (HERD-647) — mirrors tests/test-status-corroborate.sh's
+    bash fixtures one for one so the two suites stay provably in sync."""
+
+    ACTIVE = "✳ Cogitating… (esc to interrupt)"
+    IDLE_PROMPT = "> "
+
+    def setUp(self):
+        super().setUp()
+        self.pool = tempfile.mkdtemp()
+        self._orig_trees = os.environ.get("WORKTREES_DIR")
+        self._orig_TREES = os.environ.get("TREES")
+        os.environ["WORKTREES_DIR"] = self.pool
+        os.environ.pop("TREES", None)
+
+    def tearDown(self):
+        if self._orig_trees is None:
+            os.environ.pop("WORKTREES_DIR", None)
+        else:
+            os.environ["WORKTREES_DIR"] = self._orig_trees
+        if self._orig_TREES is not None:
+            os.environ["TREES"] = self._orig_TREES
+        super().tearDown()
+
+    def _actuator(self, sub):
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        return LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+
+    def test_non_idle_status_passes_through_with_no_pane_read(self):
+        for raw in ("working", "done", "", "parked"):
+            sub = _RosterPaneSub(raw, [self.ACTIVE])
+            act = self._actuator(sub)
+            status, _ = act._agent_lookup("slug1")
+            self.assertEqual(status, raw)
+            self.assertFalse(any(c[:3] == ["herdr", "pane", "read"] for c in sub.calls))
+
+    def test_idle_active_delta_corroborates_to_working_and_journals(self):
+        sub = _RosterPaneSub("idle", [self.ACTIVE + " (frame 1)", self.ACTIVE + " (frame 2)"])
+        act = self._actuator(sub)
+        first, pane1 = act._agent_lookup("slug1")
+        second, _ = act._agent_lookup("slug1")
+        self.assertEqual(first, "idle")           # frame 1: chrome present, no prior snapshot -> no delta yet
+        self.assertEqual(second, "working")        # frame 2: chrome + real repaint -> corroborated
+        ev = [o for o in events(self.jpath) if o["event"] == "status_disagreement"]
+        self.assertEqual(len(ev), 1)
+        self.assertEqual(ev[0]["slug"], "slug1")
+        self.assertEqual(ev[0]["pane"], pane1)
+        self.assertEqual(ev[0]["agent_status"], "idle")
+        self.assertEqual(ev[0]["resolved"], "working")
+
+    def test_frozen_active_pane_never_corroborates(self):
+        # dead/wedge guardrail: a crashed process leaves the spinner frame sitting forever.
+        frozen = self.ACTIVE + " (frozen)"
+        sub = _RosterPaneSub("idle", [frozen, frozen, frozen])
+        act = self._actuator(sub)
+        for _ in range(3):
+            status, _ = act._agent_lookup("slug1")
+            self.assertEqual(status, "idle")
+        self.assertFalse(os.path.exists(self.jpath) and events(self.jpath))
+
+    def test_idle_static_prompt_with_delta_but_no_chrome_stays_idle(self):
+        sub = _RosterPaneSub("idle", [self.IDLE_PROMPT + " a", self.IDLE_PROMPT + " b"])
+        act = self._actuator(sub)
+        act._agent_lookup("slug1")
+        status, _ = act._agent_lookup("slug1")
+        self.assertEqual(status, "idle")
+        self.assertFalse(os.path.exists(self.jpath) and events(self.jpath))
+
+    def test_kill_switch_disables_corroboration(self):
+        sub = _RosterPaneSub("idle", [self.ACTIVE + " (frame 1)", self.ACTIVE + " (frame 2)"])
+        act = self._actuator(sub)
+        os.environ["HERD_STATUS_CORROBORATE"] = "off"
+        self.addCleanup(lambda: os.environ.pop("HERD_STATUS_CORROBORATE", None))
+        act._agent_lookup("slug1")
+        status, _ = act._agent_lookup("slug1")
+        self.assertEqual(status, "idle")
+        self.assertFalse(any(c[:3] == ["herdr", "pane", "read"] for c in sub.calls))
+
+    def test_missing_pane_id_fails_soft_to_raw(self):
+        sub = _RosterPaneSub("idle", [self.ACTIVE], pane_id="")
+        act = self._actuator(sub)
+        status, pane = act._agent_lookup("slug1")
+        self.assertEqual(status, "idle")
+        self.assertEqual(pane, "")
+
+
+class TestWakeBuilderCorroboratedNudge(LiveCase):
+    """HERD-648 VERIFY: replays the #632 nudge signature end to end through wake_builder — raw
+    agent_status stays 'idle' throughout (herdr's own state machine never observes the bare Enter as a
+    work-start signal, per HERD-647's root-cause hypothesis), but the pane's own active chrome plus a
+    real repaint corroborate a genuine wake, so wake_builder reports woke=True from the FIRST wait poll
+    with NO escalation — a single send_wake round, not the doomed second retry."""
+
+    def setUp(self):
+        super().setUp()
+        self.pool = tempfile.mkdtemp()
+        self._orig_trees = os.environ.get("WORKTREES_DIR")
+        os.environ["WORKTREES_DIR"] = self.pool
+        os.environ.pop("TREES", None)
+
+    def tearDown(self):
+        if self._orig_trees is None:
+            os.environ.pop("WORKTREES_DIR", None)
+        else:
+            os.environ["WORKTREES_DIR"] = self._orig_trees
+        super().tearDown()
+
+    def test_nudge_signature_wakes_without_escalation(self):
+        active = "✳ Cogitating… (esc to interrupt)"
+        idle_prompt = "> "
+        # pane-read sequence: (1) the pre-wake status_before check sees a genuinely static prompt (no
+        # chrome, so the delta store is never primed by it — active_signal gates the store write, same
+        # short-circuit the bash original uses); (2) the FIRST poll after send_wake sees the active
+        # chrome for the first time (chrome present but nothing to diff against YET, so still 'idle');
+        # (3) the SECOND poll sees a real repaint against frame 1's now-stored snapshot -> corroborated.
+        sub = _RosterPaneSub("idle", [idle_prompt, active + " (frame 1)", active + " (frame 2)"])
+        orig = LR.subprocess
+        LR.subprocess = sub
+        self.addCleanup(lambda: setattr(LR, "subprocess", orig))
+        act = LiveActuator("/nonexistent-home", LiveJournal(self.jpath))
+        cand = LiveCandidate(1, "sha1", slug="slug1", worktree="")
+        result = act.wake_builder(cand, "resume please")
+        self.assertEqual(result.status_before, "idle")
+        self.assertEqual(result.status_after, "working")
+        self.assertTrue(result.woke)
+        self.assertEqual(len([c for c in sub.calls if c[:3] == ["herdr", "pane", "run"]]), 1)
+
+
+class TestStatusCorroborateBashPythonParity(unittest.TestCase):
+    """HERD-648: per docs/multi-seat-doctrine.md there must not be a THIRD divergent copy of the
+    agent_status corroboration decision. driver.sh's herd_driver_agent_status_resolved is the bash
+    original; LiveActuator._status_resolved (via TestStatusCorroboratePort above) is this port. THIS
+    test runs both implementations over the SAME fixtures and asserts they agree, rather than trusting
+    each suite's own isolated assertions to stay in sync by hand."""
+
+    ACTIVE = "✳ Cogitating… (esc to interrupt)"
+    IDLE_PROMPT = "> "
+
+    FIXTURES = [
+        ("active_then_delta", [ACTIVE + " (frame 1)", ACTIVE + " (frame 2)"], "working"),
+        ("active_frozen", [ACTIVE + " (same)", ACTIVE + " (same)"], "idle"),
+        ("idle_static", [IDLE_PROMPT, IDLE_PROMPT], "idle"),
+        ("idle_changing_no_chrome", [IDLE_PROMPT + " a", IDLE_PROMPT + " b"], "idle"),
+    ]
+
+    def setUp(self):
+        if shutil.which("bash") is None:
+            self.skipTest("bash not on PATH")
+        self.driver_sh = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", "scripts", "herd", "driver.sh"))
+        if not os.path.exists(self.driver_sh):
+            self.skipTest("driver.sh not found at %s" % self.driver_sh)
+
+    def _bash_resolve(self, slug, frames):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        binp = os.path.join(tmp, "bin")
+        os.makedirs(binp)
+        herdr = os.path.join(binp, "herdr")
+        with open(herdr, "w", encoding="utf-8") as fh:
+            fh.write(
+                "#!/usr/bin/env bash\n"
+                'case "$1 $2" in\n'
+                '  "pane read") printf \'%s\' "$STUB_PANE_TEXT" ;;\n'
+                "  *) exit 0 ;;\n"
+                "esac\n"
+            )
+        os.chmod(herdr, 0o755)
+        script = [
+            "set -uo pipefail",
+            "export PATH=%s:$PATH" % shlex.quote(binp),
+            "export WORKTREES_DIR=%s" % shlex.quote(tmp),
+            ". %s" % shlex.quote(self.driver_sh),
+            "got=idle",
+        ]
+        for frame in frames:
+            script.append("export STUB_PANE_TEXT=%s" % shlex.quote(frame))
+            script.append("got=\"$(herd_driver_agent_status_resolved %s idle pane-1)\"" % shlex.quote(slug))
+        script.append('printf \'%s\' "$got"')
+        out = subprocess.run(["bash", "-c", "\n".join(script)],
+                             capture_output=True, text=True, timeout=15)
+        return out.stdout.strip()
+
+    def _python_resolve(self, slug, frames):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        orig_trees = os.environ.get("WORKTREES_DIR")
+        orig_TREES = os.environ.get("TREES")
+        os.environ["WORKTREES_DIR"] = tmp
+        os.environ.pop("TREES", None)
+        orig = LR.subprocess
+        LR.subprocess = _RosterPaneSub("idle", list(frames), pane_id="pane-1", name=slug)
+        try:
+            act = LiveActuator("/nonexistent-home", LiveJournal(os.path.join(tmp, "journal.jsonl")))
+            status = "idle"
+            for _ in frames:
+                status, _ = act._agent_lookup(slug)
+            return status
+        finally:
+            LR.subprocess = orig
+            if orig_trees is None:
+                os.environ.pop("WORKTREES_DIR", None)
+            else:
+                os.environ["WORKTREES_DIR"] = orig_trees
+            if orig_TREES is not None:
+                os.environ["TREES"] = orig_TREES
+
+    def test_bash_and_python_agree_on_every_fixture(self):
+        mismatches = []
+        for name, frames, expected in self.FIXTURES:
+            slug = "parity-" + name
+            bash_got = self._bash_resolve(slug, frames)
+            python_got = self._python_resolve(slug, frames)
+            if bash_got != expected or python_got != expected or bash_got != python_got:
+                mismatches.append((name, bash_got, python_got, expected))
+        self.assertFalse(mismatches, "bash/python status-resolve disagreement: %r" % (mismatches,))
 
 
 class _RecordingResolverSub:
