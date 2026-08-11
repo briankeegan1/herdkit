@@ -82,6 +82,16 @@ export JOURNAL_FILE="$T/journal.jsonl"
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 
+# HERD-647: _agent_status now corroborates a raw 'idle' with an EXTRA `herdr pane read` (harmless in
+# production — herdr reads are idempotent — but this file's STUB_PANE_READ_SEQ models a finite,
+# order-sensitive sequence of evolving pane snapshots consumed one-per-real-read). An uncounted extra
+# read desyncs that sequence and is orthogonal to what this file tests (the limit-menu mechanism, not
+# corroboration — which has its own dedicated coverage in tests/test-status-corroborate.sh and
+# tests/test-spawn-wake-verify.sh). Isolate the two: kill switch off here restores every _agent_status
+# call in this file to its pre-HERD-647 shape (one read, no corroboration), so the seq_reads fixtures
+# below stay exactly as authored.
+export HERD_STATUS_CORROBORATE=off
+
 render() { :; }   # no-op: tests don't need terminal output
 
 # Override _wait_agent_working to avoid real sleeps; STUB_WAIT_FILE lines = return codes in order.
