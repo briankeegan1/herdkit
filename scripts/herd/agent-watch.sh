@@ -11921,10 +11921,13 @@ except Exception:
 }
 
 # _agent_status <slug> — current agent_status string for this agent (empty if not found).
-# Identity match: `name` when set, else `agent` (same rule as _find_builder_pane_id).
+# Identity match: `name` when set, else `agent` (same rule as _find_builder_pane_id). HERD-647: routed
+# through the shared corroboration resolver (driver.sh) so every one of THIS function's ~30 callers
+# across the bounce/refix/wedge/finish-stall/dead-builder rails is covered by one edit — see
+# herd_driver_agent_status_resolved's header for why a raw 'idle' is corroborated before being trusted.
 _agent_status() {
-  local _as_slug="$1"
-  herdr agent list 2>/dev/null | SLUG="$_as_slug" python3 -c '
+  local _as_slug="$1" _as_raw
+  _as_raw="$(herdr agent list 2>/dev/null | SLUG="$_as_slug" python3 -c '
 import sys, json, os
 slug = os.environ["SLUG"]
 try:
@@ -11936,7 +11939,8 @@ try:
       break
 except Exception:
   pass
-' 2>/dev/null || true
+' 2>/dev/null || true)"
+  herd_driver_agent_status_resolved "$_as_slug" "$_as_raw"
 }
 
 # _agent_liveness <slug> — three-valued liveness (alive|dead|unknown) of this builder's agent SESSION
@@ -17938,6 +17942,11 @@ _tick_render_reconcile() {
     IFS=$'\037' read -r dir slug branch prnum mergeable mstate astatus headsha prauthor matchkind matchdetail isdraft <<EOF
 $rec
 EOF
+    # HERD-647: _discover_feature_worktrees computed astatus from a single tick-wide roster snapshot
+    # (no per-slug corroboration inside that python one-shot), so a raw 'idle' from it gets the same
+    # shared-resolver pass every other agent_status reader in this file gets — see
+    # herd_driver_agent_status_resolved (driver.sh). No-op for every non-idle astatus.
+    [ "$astatus" = "idle" ] && astatus="$(herd_driver_agent_status_resolved "$slug" "$astatus")"
     sl="$(_slug_cell "$slug")"
     pn=""; [ -n "$prnum" ] && pn=" ${C_DIM}#${prnum}${C_RESET} ·"
     # HERD-226: this row's PR was found by HEAD commit, not by branch name — the worktree sits on some

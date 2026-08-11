@@ -1608,16 +1608,102 @@ herd_driver_switch_model() {
 # contracts genuinely differ (a stalled builder is left running for the watcher's dead/wedge rails; a
 # stalled reviewer must be torn down, since a leaked reviewer pane is issue #634's other half).
 
-# _herd_wake_agent_status <name> — agent_status word for the agent REGISTERED as <name> out of
+# ── Shared status-corroboration resolver (HERD-647) ────────────────────────────────────────────────
+# GROUNDED TWICE on herdkit itself 2026-08-11 (builders hv-policy-aware-audit ~20:35Z and
+# merged-worktree-truth ~20:51Z): after the #632 Enter-nudge recovery lands, `herdr agent list` can
+# keep reporting agent_status=idle for MINUTES while the agent is demonstrably still working —
+# task-specific terminal chrome (a spinner glyph next to gerund status text) and fresh pane-content
+# repaint both say otherwise. The second instance also fooled herd_spawn_wake_verify below into
+# woke=0 and a pointless prompt-resend retry, so the wake-verify path is a CONSUMER of this bug, not
+# just the watcher's console. ROOT SUSPECT (undiagnosable from this repo — herdr is an external
+# binary): herdr's own status state machine most likely keys off its OWN `pane run` submit event, and
+# never observes a bare `send-keys Enter` (the #632 manual-nudge shape, and HERD-186's own
+# type-then-explicit-Enter convention) as "a prompt was submitted" — filed upstream via `herd report`
+# regardless of whether that root cause is ever confirmed; this corroboration fallback ships HERE
+# either way.
+#
+# herd_driver_agent_status_resolved <slug> <raw-status> [pane] — the ONE shared resolver every
+# agent_status consumer routes through (multi-seat doctrine: one oracle, not a fork per caller).
+# ONLY 'idle' is ever corroborated — every other word (working, done, empty, …) returns UNCHANGED, so
+# this adds no cost and no risk to the majority-case read and never touches a genuine working/done/dead
+# classification. Corroboration requires BOTH independent signals to agree before overriding a raw
+# 'idle' to 'working':
+#   • _herd_pane_active_signal — the pane's own live-activity chrome (a spinner glyph beside the
+#     "esc to interrupt" hint Claude Code's TUI shows ONLY while actively generating, never over its
+#     idle prompt box). This IS the "terminal title" signal: herdr exposes no separate window/tab-title
+#     field (neither `agent list` nor `pane list` carries one), so the signal is read out of the same
+#     visible-pane surface every other pane-content probe in this codebase already uses
+#     (herd_driver_read_pane … visible, e.g. agent-watch.sh's _pane_confirms_limit_wait).
+#   • _herd_pane_content_delta — the pane's content actually CHANGED since the last time this slug was
+#     resolved (a real repaint, not a stale frame).
+# Requiring BOTH is the guardrail against weakening genuine dead/wedge detection: a pane FROZEN on a
+# stale spinner frame (the process crashed mid-paint and nothing repaints it again) shows the active
+# pattern but no delta, and stays 'idle' — exactly the dead-builder signature the watcher's rails must
+# keep catching. A truly static idle prompt shows neither signal. Only a builder that is BOTH
+# currently rendering the active surface AND still repainting is rescued.
+#
+# Journals status_disagreement (slug, pane, agent_status idle, resolved working) exactly when it
+# fires — never on any other path — so a consumer can trust the journal as the complete rescue record.
+# Kill switch: HERD_STATUS_CORROBORATE=off returns the raw status untouched (no pane read, no
+# journal) — a bare env read (undocumented test seam), same class as HERD_SPAWN_WAKE_VERIFY.
+# Fail-soft throughout: headless (no pane_id), a missing herdr, an unresolvable pane, or an empty pane
+# read all fall straight back to the raw status — absent signals reproduce TODAY's behavior exactly.
+herd_driver_agent_status_resolved() {
+  local slug="${1:-}" raw="${2:-}" pane="${3:-}"
+  [ "$raw" = "idle" ] || { printf '%s' "$raw"; return 0; }
+  [ "${HERD_STATUS_CORROBORATE:-on}" != "off" ] || { printf '%s' "$raw"; return 0; }
+  [ -n "$slug" ] || { printf '%s' "$raw"; return 0; }
+  [ -n "$pane" ] || pane="$(herd_driver_agent_pane_id "$slug" 2>/dev/null || true)"
+  [ -n "$pane" ] || { printf '%s' "$raw"; return 0; }
+  local text; text="$(herd_driver_read_pane "$pane" visible 2>/dev/null || true)"
+  [ -n "$text" ] || { printf '%s' "$raw"; return 0; }
+  if _herd_pane_active_signal "$text" && _herd_pane_content_delta "$slug" "$text"; then
+    command -v journal_append >/dev/null 2>&1 \
+      && journal_append status_disagreement slug "$slug" pane "$pane" agent_status idle resolved working
+    printf 'working'
+    return 0
+  fi
+  printf '%s' "$raw"
+}
+
+# _herd_pane_active_signal <text> — 0 iff <text> carries a non-ASCII glyph on the same line as the
+# "esc to interrupt" hint (case-insensitive on the words, glyph-agnostic on the spinner frame itself —
+# the exact frame set is cosmetic and would only make this brittle). Never matches a plain static
+# prompt, which carries neither.
+_herd_pane_active_signal() {
+  LC_ALL=C grep -qiE '[^ -~].*esc to interrupt' <<< "$1"
+}
+
+# _herd_pane_content_delta <slug> <text> — 0 iff <text> differs from the last snapshot recorded for
+# <slug>. A fresh call with no prior snapshot returns 1 (no delta YET, never a false rescue on the
+# very first look — same fail-soft shape as _herd_wake_observable). ALWAYS refreshes the snapshot to
+# <text> before returning, so the next call's comparison is against this read — which is exactly what
+# lets a short polling loop (herd_spawn_wake_verify's ~20s window) observe a real delta across its own
+# retries. Best-effort store under WORKTREES_DIR/.herd/status-resolve/<slug>; an unwritable store
+# degrades to "no delta" (never corroborates, never blocks a caller).
+_herd_pane_content_delta() {
+  local slug="${1:-}" text="${2:-}" dir f prev cur
+  dir="${WORKTREES_DIR:-${TREES:-.}}/.herd/status-resolve"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  f="$dir/$slug"
+  prev="$(cat "$f" 2>/dev/null || true)"
+  cur="$(printf '%s' "$text" | cksum 2>/dev/null || true)"
+  printf '%s' "$cur" > "$f" 2>/dev/null || true
+  [ -n "$prev" ] && [ -n "$cur" ] && [ "$prev" != "$cur" ]
+}
+
+# _herd_wake_agent_status <name> [pane] — agent_status word for the agent REGISTERED as <name> out of
 # herd_driver_agent_list_json's roster (identity match on `name` OR `agent`, the same tolerance every
-# other roster reader in this file uses). <name> is the name herdr actually carries — a caller whose
-# requested name needed sanitizing (herd_agent_name_sanitize, e.g. the reviewer's "review·<slug>" →
-# "review-<slug>") must pass the SANITIZED form. Empty when not found / unparseable — never aborts
+# other roster reader in this file uses), passed through the shared corroboration resolver above.
+# <name> is the name herdr actually carries — a caller whose requested name needed sanitizing
+# (herd_agent_name_sanitize, e.g. the reviewer's "review·<slug>" → "review-<slug>") must pass the
+# SANITIZED form. [pane], when the caller already has it (both wake-verify entry points do), skips a
+# second roster round-trip inside the resolver. Empty when not found / unparseable — never aborts
 # the caller.
 _herd_wake_agent_status() {
-  local slug="${1:-}"
+  local slug="${1:-}" pane="${2:-}" raw
   [ -n "$slug" ] || return 0
-  herd_driver_agent_list_json 2>/dev/null | SLUG="$slug" python3 -c '
+  raw="$(herd_driver_agent_list_json 2>/dev/null | SLUG="$slug" python3 -c '
 import sys, json, os
 slug = os.environ["SLUG"]
 try:
@@ -1626,20 +1712,21 @@ try:
       print(a.get("agent_status", ""), end=""); break
 except Exception:
   pass
-' 2>/dev/null || true
+' 2>/dev/null || true)"
+  herd_driver_agent_status_resolved "$slug" "$raw" "$pane"
 }
 
-# _herd_wake_wait_working <name> <window-s> — poll until <name>'s agent_status is "working" or the
-# window expires, on the SAME backed-off cadence the watcher's refix wake-check uses (_wait_agent_working,
-# agent-watch.sh): an immediate check, then 1s, 2s, 3s… capped at 5s between checks. Returns 0 iff it
-# woke within the window.
+# _herd_wake_wait_working <name> <window-s> [pane] — poll until <name>'s agent_status is "working" or
+# the window expires, on the SAME backed-off cadence the watcher's refix wake-check uses
+# (_wait_agent_working, agent-watch.sh): an immediate check, then 1s, 2s, 3s… capped at 5s between
+# checks. Returns 0 iff it woke within the window.
 _herd_wake_wait_working() {
-  local slug="$1" window="$2" deadline int=1
+  local slug="$1" window="$2" pane="${3:-}" deadline int=1
   deadline=$(( $(date +%s) + window ))
-  [ "$(_herd_wake_agent_status "$slug")" = "working" ] && return 0
+  [ "$(_herd_wake_agent_status "$slug" "$pane")" = "working" ] && return 0
   while [ "$(date +%s)" -lt "$deadline" ]; do
     sleep "$int"
-    [ "$(_herd_wake_agent_status "$slug")" = "working" ] && return 0
+    [ "$(_herd_wake_agent_status "$slug" "$pane")" = "working" ] && return 0
     [ "$int" -lt 5 ] && int=$((int + 1))
   done
   return 1
@@ -1671,7 +1758,7 @@ _herd_wake_observable() {
   [ -n "$name" ] && [ -n "$pane" ] || return 1
   _herd_driver_is_headless && return 1
   command -v herdr >/dev/null 2>&1 || return 1
-  [ -n "$(_herd_wake_agent_status "$name")" ] || return 1
+  [ -n "$(_herd_wake_agent_status "$name" "$pane")" ] || return 1
   return 0
 }
 
@@ -1687,12 +1774,12 @@ _herd_wake_observable() {
 # "working" within the sequence, 1 if it never did.
 _herd_wake_attempts() {
   local name="$1" pane="$2" pointer="$3" window="$4"
-  if _herd_wake_wait_working "$name" "$window"; then printf none; return 0; fi
+  if _herd_wake_wait_working "$name" "$window" "$pane"; then printf none; return 0; fi
   herd_driver_send_keys "$pane" Enter
-  if _herd_wake_wait_working "$name" "$window"; then printf enter; return 0; fi
+  if _herd_wake_wait_working "$name" "$window" "$pane"; then printf enter; return 0; fi
   if [ -n "$pointer" ]; then
     herd_driver_send_text "$pane" "$pointer"
-    if _herd_wake_wait_working "$name" "$window"; then printf prompt; return 0; fi
+    if _herd_wake_wait_working "$name" "$window" "$pane"; then printf prompt; return 0; fi
     printf prompt; return 1
   fi
   printf enter; return 1

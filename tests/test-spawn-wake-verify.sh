@@ -47,6 +47,12 @@ done
 #   pane send-keys — logs pane+keys to $STUB_SENDKEYS_LOG; when keys include Enter AND
 #                    STUB_WAKE_ON_ENTER=1, flips $STUB_STATUS_FILE to "working" (models a kickoff that
 #                    was sitting unsubmitted in the TUI buffer — the bare-Enter retry wakes it).
+#   pane read      — HERD-647: serves $STUB_PANE_READ_TEXT (the pane's visible content, independent of
+#                    $STUB_STATUS_FILE — models herdr's own status word staying stuck 'idle' while the
+#                    pane keeps rendering). STUB_PANE_READ_VARY=1 appends a per-call frame counter
+#                    (tracked in $STUB_PANE_READ_COUNTER) so consecutive reads DIFFER — a repainting
+#                    pane; unset/0 serves byte-identical text every call — a FROZEN pane (the
+#                    genuinely-dead signature: the process crashed mid-paint and nothing repaints it).
 cat > "$BIN/herdr" <<'STUB'
 #!/usr/bin/env bash
 case "$1 $2" in
@@ -72,6 +78,18 @@ case "$1 $2" in
         fi
         ;;
     esac
+    ;;
+  "pane read")
+    if [ "${STUB_PANE_READ_VARY:-0}" = "1" ]; then
+      _pr_n=0
+      if [ -n "${STUB_PANE_READ_COUNTER:-}" ]; then
+        _pr_n="$(cat "$STUB_PANE_READ_COUNTER" 2>/dev/null || echo 0)"; _pr_n=$((_pr_n + 1))
+        echo "$_pr_n" > "$STUB_PANE_READ_COUNTER"
+      fi
+      printf '%s (frame %s)\n' "${STUB_PANE_READ_TEXT:-}" "$_pr_n"
+    else
+      printf '%s\n' "${STUB_PANE_READ_TEXT:-}"
+    fi
     ;;
   *) exit 0 ;;
 esac
@@ -182,5 +200,90 @@ ok
 [ ! -s "$SENDKEYS_LOG" ] && [ ! -s "$PANE_CALLS" ] && [ ! -s "$JOURNAL_FILE" ] \
   || fail "kill-switch: HERD_SPAWN_WAKE_VERIFY=off must skip verification entirely (no sends, no journal)"
 ok
+
+# ── HERD-647: STATUS CORROBORATION ─────────────────────────────────────────────────────────────────
+# Replays the grounded 2026-08-11 incident: herdr's OWN agent_status word never leaves "idle" (the
+# stub's $STAT file is never flipped — models the #632 nudge path herdr's state machine seemingly
+# never observes), but the pane keeps rendering the live-activity chrome (spinner glyph + "esc to
+# interrupt") with fresh content every read. The shared resolver must corroborate this into "working"
+# WITHOUT ever needing the Enter/prompt retry ladder, and must journal status_disagreement recording
+# exactly what it overrode.
+# ── (e) idle status word + active, REPAINTING pane → corroborated working, retried=none ───────────
+: > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$SENDKEYS_LOG"; : > "$JOURNAL_FILE"
+export STUB_AGENT_NAME="wake-e" STUB_AGENT_PANE_ID="pane-E" STUB_WAKE_ON_ENTER=0
+echo idle > "$STAT"   # herdr's own status word never flips — the whole point of this fixture
+export STUB_PANE_READ_TEXT="✳ Cogitating… (esc to interrupt)" STUB_PANE_READ_VARY=1
+STUB_PANE_READ_COUNTER="$T/pane-read-counter-e"; rm -f "$STUB_PANE_READ_COUNTER"; export STUB_PANE_READ_COUNTER
+herd_spawn_wake_verify "wake-e" "pane-E" "$POINTER"
+[ "$?" -eq 0 ] || fail "E: herd_spawn_wake_verify must return 0"
+ok
+wl="$(grep 'spawn_wake_result' "$JOURNAL_FILE" | tail -1)"
+grep -q '"woke":1' <<< "$wl" || fail "E: a corroborated agent must report woke=1 (got: $wl)"
+ok
+grep -q '"retried":"none"' <<< "$wl" \
+  || fail "E: corroboration must resolve inside the FIRST poll window, no Enter/prompt retry needed (got: $wl)"
+ok
+[ ! -s "$SENDKEYS_LOG" ] || fail "E: a corroborated-working agent must never be sent Enter (log: $(cat "$SENDKEYS_LOG"))"
+ok
+[ ! -s "$PANE_CALLS" ] || fail "E: a corroborated-working agent must never have its pointer re-sent (log: $(cat "$PANE_CALLS"))"
+ok
+dl="$(grep 'status_disagreement' "$JOURNAL_FILE" | tail -1)"
+[ -n "$dl" ] || fail "E: status_disagreement must be journaled when corroboration overrides idle (journal: $(cat "$JOURNAL_FILE"))"
+ok
+grep -q '"slug":"wake-e"' <<< "$dl" || fail "E: status_disagreement must carry the slug (got: $dl)"
+ok
+grep -q '"agent_status":"idle"' <<< "$dl" || fail "E: status_disagreement must record the raw idle status (got: $dl)"
+ok
+grep -q '"resolved":"working"' <<< "$dl" || fail "E: status_disagreement must record the resolved status (got: $dl)"
+ok
+
+# ── (f) GUARDRAIL — active-LOOKING but FROZEN pane (no delta) must still classify idle ─────────────
+# This is the genuinely-dead signature: a process that crashed mid-paint leaves the spinner/interrupt
+# chrome sitting in the pane forever, with nothing ever repainting it. Corroboration must NOT rescue
+# it — never weaken dead/wedge detection — so it runs the full retry ladder exactly like case (c) and
+# ends woke=0, with no status_disagreement ever journaled.
+: > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$SENDKEYS_LOG"; : > "$JOURNAL_FILE"
+export STUB_AGENT_NAME="wake-f" STUB_AGENT_PANE_ID="pane-F" STUB_WAKE_ON_ENTER=0
+echo idle > "$STAT"
+export STUB_PANE_READ_TEXT="✳ Cogitating… (esc to interrupt)" STUB_PANE_READ_VARY=0   # frozen: byte-identical every read
+herd_spawn_wake_verify "wake-f" "pane-F" "$POINTER" >/dev/null 2>&1
+[ "$?" -eq 0 ] || fail "F: a never-woken agent must still return 0"
+ok
+wl="$(grep 'spawn_wake_result' "$JOURNAL_FILE" | tail -1)"
+grep -q '"woke":0' <<< "$wl" \
+  || fail "F: a frozen active-looking pane with no content delta must NOT be rescued — dead-builder guardrail (got: $wl)"
+ok
+[ -z "$(grep 'status_disagreement' "$JOURNAL_FILE" || true)" ] \
+  || fail "F: status_disagreement must never fire without a genuine content delta (journal: $(cat "$JOURNAL_FILE"))"
+ok
+
+# ── (g) a genuinely-idle pane (no spinner chrome at all) is unchanged, even if its content churns ──
+# Proves the active-signal gate matters independently of delta: a static idle prompt box that merely
+# reflows (cursor blink, timestamp) must never be misread as work.
+: > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$SENDKEYS_LOG"; : > "$JOURNAL_FILE"
+export STUB_AGENT_NAME="wake-g" STUB_AGENT_PANE_ID="pane-G" STUB_WAKE_ON_ENTER=0
+echo idle > "$STAT"
+export STUB_PANE_READ_TEXT="> " STUB_PANE_READ_VARY=1
+STUB_PANE_READ_COUNTER="$T/pane-read-counter-g"; rm -f "$STUB_PANE_READ_COUNTER"; export STUB_PANE_READ_COUNTER
+herd_spawn_wake_verify "wake-g" "pane-G" "$POINTER" >/dev/null 2>&1
+wl="$(grep 'spawn_wake_result' "$JOURNAL_FILE" | tail -1)"
+grep -q '"woke":0' <<< "$wl" \
+  || fail "G: a static idle prompt (no spinner chrome) must never be rescued even if content churns (got: $wl)"
+ok
+[ -z "$(grep 'status_disagreement' "$JOURNAL_FILE" || true)" ] \
+  || fail "G: status_disagreement must never fire over a genuinely idle pane (journal: $(cat "$JOURNAL_FILE"))"
+ok
+
+# ── (h) HERD_STATUS_CORROBORATE=off disables the rescue, same fixture as (e) ────────────────────────
+: > "$PANE_LOG"; : > "$PANE_CALLS"; : > "$SENDKEYS_LOG"; : > "$JOURNAL_FILE"
+export STUB_AGENT_NAME="wake-h" STUB_AGENT_PANE_ID="pane-H" STUB_WAKE_ON_ENTER=0
+echo idle > "$STAT"
+export STUB_PANE_READ_TEXT="✳ Cogitating… (esc to interrupt)" STUB_PANE_READ_VARY=1
+STUB_PANE_READ_COUNTER="$T/pane-read-counter-h"; rm -f "$STUB_PANE_READ_COUNTER"; export STUB_PANE_READ_COUNTER
+HERD_STATUS_CORROBORATE=off herd_spawn_wake_verify "wake-h" "pane-H" "$POINTER" >/dev/null 2>&1
+wl="$(grep 'spawn_wake_result' "$JOURNAL_FILE" | tail -1)"
+grep -q '"woke":0' <<< "$wl" || fail "H: HERD_STATUS_CORROBORATE=off must disable corroboration (got: $wl)"
+ok
+unset STUB_PANE_READ_TEXT STUB_PANE_READ_VARY STUB_PANE_READ_COUNTER
 
 echo "ALL PASS ($pass checks)"

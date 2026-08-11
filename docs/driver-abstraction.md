@@ -738,3 +738,69 @@ Proof: `tests/test-review-dispatch-verify.sh` (stubbed driver: a stalled dispatc
 SAME pane and allocates no tab, the stalled pane is closed, the caller is told; teardown fires on verdict
 consumption with an EMPTY `.herd-tabs`; a failed registration journals) and `tests/test-spawn-wake-verify.sh`
 (the spawn twin, unchanged across the shared-helper extraction).
+
+## HERD-647: agent_status corroboration — a false 'idle' fools both the console and the wake-verify above
+
+GROUNDED TWICE on herdkit itself, 2026-08-11: after the #632 Enter-nudge recovery lands (previous
+section), `herdr agent list` can keep reporting `agent_status=idle` for a builder that is
+demonstrably still working — task-specific pane chrome (a spinner glyph beside a gerund status word)
+and a freshly repainting pane both say otherwise. Instance one (builder `hv-policy-aware-audit`,
+~20:35Z) sat idle on the console for minutes with an active agent underneath. Instance two (builder
+`merged-worktree-truth`, ~20:51Z) went further: it fooled `herd_spawn_wake_verify` itself (the section
+above) into `woke=0` and a pointless prompt-resend retry — the wake-verify path is a CONSUMER of this
+bug, not only the watcher's console.
+
+**Root suspect (unconfirmed — herdr is an external binary, opaque to this repo):** herdr's own status
+state machine most likely keys off its OWN `pane run` submit event, and never observes a bare
+`send-keys Enter` — the #632 manual-nudge shape, and also the SECOND half of `herd_driver_send_text`'s
+own HERD-186 convention (type via `pane run`, then an EXPLICIT `send-keys Enter` to actually submit)
+— as "a prompt was submitted." Filed upstream via `herd report` regardless of whether that root cause
+is ever confirmed; the corroboration fallback below ships independently of it.
+
+**Fix: one shared resolver, corroborate before trusting a raw `idle`.**
+`herd_driver_agent_status_resolved <slug> <raw-status> [pane]` (`scripts/herd/driver.sh`) is the ONE
+place every `agent_status` consumer now routes through (multi-seat doctrine: one oracle, not a fork
+per caller). It only ever touches a raw `idle` — `working`/`done`/empty/anything else returns
+unchanged, so the majority-case read pays no extra cost and no genuine working/done/dead
+classification is touched. A raw `idle` is corroborated against TWO independent signals, and BOTH
+must agree before it is overridden to `working`:
+
+- **Active pane chrome** (`_herd_pane_active_signal`) — a non-ASCII glyph on the same line as the
+  "esc to interrupt" hint Claude Code's TUI shows only while actively generating, never over its idle
+  prompt box. This is the "terminal title" signal the fix targets: herdr exposes no separate
+  window/tab-title field (confirmed — neither `agent list` nor `pane list` carries one), so it is read
+  out of the same visible-pane surface every other pane-content probe in this codebase already uses
+  (`herd_driver_read_pane … visible`, e.g. `agent-watch.sh`'s `_pane_confirms_limit_wait`).
+- **A content delta** (`_herd_pane_content_delta`) — the pane's content actually CHANGED since the
+  last time this slug was resolved (tracked as a `cksum` snapshot under
+  `$WORKTREES_DIR/.herd/status-resolve/<slug>`, best-effort).
+
+Requiring **both** is the guardrail against weakening genuine dead/wedge detection: a pane FROZEN on a
+stale spinner frame (a process that crashed mid-paint, so nothing repaints it again) shows the active
+pattern but no delta, and stays `idle` — exactly the dead-builder signature the watcher's rails must
+keep catching. A truly static idle prompt shows neither signal. Only a builder that is BOTH currently
+rendering the active surface AND still repainting is rescued.
+
+Journals `status_disagreement` (`slug`, `pane`, `agent_status idle`, `resolved working`) exactly when
+it fires — never on any other path. **Kill switch:** `HERD_STATUS_CORROBORATE=off` returns the raw
+status untouched, same class of bare-env-read escape hatch as `HERD_SPAWN_WAKE_VERIFY`.
+
+**Wired into every consumer with two edits, not thirty:**
+
+- `agent-watch.sh`'s `_agent_status <slug>` — the oracle ~30 call sites across the bounce/refix/wedge/
+  finish-stall/dead-builder rails all read — now pipes its raw roster read through the resolver before
+  returning. Every one of those callers inherits the fix from this single function.
+- `agent-watch.sh`'s per-tick `_discover_feature_worktrees` computes the WHOLE builder table's
+  `astatus` in one Python pass over a single roster snapshot (no per-slug corroboration inside that
+  one-shot) — feeding the main "awaiting task" classification. One line right after that record is
+  parsed re-resolves a raw `idle` through the same function before it reaches any downstream branch.
+- `driver.sh`'s own `_herd_wake_agent_status <name> [pane]` (the primitive both `herd_spawn_wake_verify`
+  and `herd_review_wake_verify` poll through) routes through the resolver too, so a nudged builder
+  never trips the false `woke=0` retry the second 2026-08-11 incident hit.
+
+Proof: `tests/test-status-corroborate.sh` (the resolver directly — non-idle passthrough, the AND-gated
+rescue, the frozen-pane guardrail, the static-idle-prompt case, the kill switch — plus
+`agent-watch.sh`'s `_agent_status` wired through the same resolver) and `tests/test-spawn-wake-verify.sh`
+cases (e)–(h) (the nudge-sequence replay end to end through `herd_spawn_wake_verify`: corroborated
+`woke=1`/`retried=none` with `status_disagreement` journaled, the frozen-pane guardrail, the
+genuinely-idle fixture, and the kill switch).
