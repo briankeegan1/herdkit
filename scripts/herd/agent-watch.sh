@@ -692,7 +692,8 @@ BUILDER_NOTES_ROUTES="$TREES/.agent-watch-builder-notes-routes"
 BUILDER_NOTES_LEDGER_MAX="$CONSOLE_LEDGER_MAX"
 # Phase-anomaly console surface (HERD-496). ANOMALY_BASELINES compares a just-completed phase
 # instance's wall-clock duration against a rolling median/p95 baseline (pysrc/herd/store.py); a
-# reading past 2x its own LEARNED p95 appends one row here ("<epoch>\t<phase>\t<seconds>\t<p95>",
+# reading past its own LEARNED p95's filing threshold (HERD-645: max(1.5x p95, p95+30s) — see
+# _phase_anomaly_observe) appends one row here ("<epoch>\t<phase>\t<seconds>\t<p95>",
 # a 5th "load_qualified" field when HERD-618's under-load margin applies — see below), rendered
 # newest-first by build_phase_anomalies (calm — it ages out after CONSOLE_ROW_RETENTION,
 # same as a builder note). Ship-dormant: off (default) never appends, so the ledger stays empty and
@@ -9121,10 +9122,21 @@ _anomaly_baselines_enabled() {
 # Inline constants (mirrors _MAIN_HEALTH_DIED_MAX / _MAIN_CI_SCAN_INTERVAL) — internal tuning, not
 # operator knobs: no config key, no manifest row.
 _ANOMALY_MIN_SAMPLES=5        # never judge a phase off a baseline that has not learned enough yet
-_ANOMALY_THRESHOLD_PCT=200    # an instance must exceed 2x its own LEARNED p95 to count as anomalous
-_ANOMALY_LOAD_MARGIN_PCT=200  # HERD-618: under load, the FILING bar widens to 2x the normal threshold
-                              # (i.e. 4x p95) — an exceedance short of that still journals/paints, tagged
-                              # load_qualified, but withholds the tracker filing. Ship-dormant with the
+_ANOMALY_THRESHOLD_PCT=150    # an instance must exceed 1.5x its own LEARNED p95 to count as anomalous
+                              # (HERD-645: lowered from 2x now that the absolute floor below covers the
+                              # tight-distribution case a pure multiplier misjudges on its own).
+_ANOMALY_FLOOR_MARGIN_SECS=30 # HERD-645: absolute floor composed with the pct multiplier above — the
+                              # class-default filing bar for every phase is max(1.5x p95, p95 + this
+                              # many seconds), never just 1.5x p95 alone. GROUNDED: tick_cadence's
+                              # learned p95 (~47-53s) sits within ordinary jitter of the nominal 60s
+                              # tick, so a pure multiplier let ordinary jitter clear the bar and file 4
+                              # marginal items in 2 days; a p95 within jitter of the nominal period must
+                              # not alarm on jitter. Internal tuning, not an operator knob: no config
+                              # key, no manifest row (mirrors _ANOMALY_THRESHOLD_PCT).
+_ANOMALY_LOAD_MARGIN_PCT=200  # HERD-618: under load, the FILING bar widens to 2x the (HERD-645-floored)
+                              # normal threshold — an exceedance short of that still journals/paints,
+                              # tagged load_qualified, but withholds the tracker filing. Composes on top
+                              # of the HERD-645 floor, not the other way round. Ship-dormant with the
                               # rest of ANOMALY_BASELINES; internal tuning, not an operator knob.
 
 # _anomaly_load_high — true iff this box's loadavg1m is at/above HEALTH_LOAD_THRESHOLD (default 4)
@@ -9300,9 +9312,10 @@ _anomaly_file_stamp() {
 # HERD-496's 5 measurement points calls once it knows how long its own instance just took. Ship-
 # dormant: returns immediately (no store touch, no journal, no row) unless ANOMALY_BASELINES is on.
 #
-# On enable: records <duration-secs> against <phase-key>'s rolling baseline; below
-# _ANOMALY_THRESHOLD_PCT of the LEARNED p95 (or before _ANOMALY_MIN_SAMPLES have accrued) is SILENT —
-# no journal, no row, no filing, exactly the mutation-prove's "below threshold" case. Past it:
+# On enable: records <duration-secs> against <phase-key>'s rolling baseline; below the filing
+# threshold (HERD-645: max(_ANOMALY_THRESHOLD_PCT of the LEARNED p95, p95 + _ANOMALY_FLOOR_MARGIN_SECS)
+# — see below) or before _ANOMALY_MIN_SAMPLES have accrued is SILENT — no journal, no row, no filing,
+# exactly the mutation-prove's "below threshold" case. Past it:
 # journals `phase_anomaly`, appends one calm advisory row to $ANOMALY_LEDGER, and FILES ONCE via the
 # SAME shared-pool dedup marker MAIN_HEALTH_AUTOFIX's filing leg uses (_main_health_fix_mark /
 # _main_health_scribe, HERD-371) — an HONEST identity of phase+THIS measurement+the baseline it beat,
@@ -9314,18 +9327,26 @@ _anomaly_file_stamp() {
 #       write — so sleep neither files nor pollutes the baseline (_interval_spans_wake);
 #   (b) a repeat filing for the SAME phase inside ANOMALY_FILE_COOLDOWN_SECS still journals and still
 #       paints its row, but withholds the tracker filing (journaled result=cooldown).
-# HERD-618 adds a third, same chokepoint, same shape: this box's own p95 baselines skew toward the
+# HERD-645 widens the base threshold itself with an ABSOLUTE floor: a phase whose LEARNED p95 sits
+# close to its nominal period (e.g. tick_cadence's p95 of ~47-53s against a 60s nominal tick) has a
+# pure pct multiplier fall WITHIN ordinary jitter of that period, so ordinary 60s ticks cleared 2x
+# p95's old bar and filed 4 marginal items in 2 days. The class-default bar for every phase is now
+# max(_ANOMALY_THRESHOLD_PCT of p95, p95 + _ANOMALY_FLOOR_MARGIN_SECS) — a p95 within jitter of the
+# nominal period must not alarm on jitter — and this is the ONE base threshold every guard below
+# composes on top of.
+# HERD-618 adds a third guard, same chokepoint, same shape: this box's own p95 baselines skew toward the
 # quiet-box conditions they were learned under, so a marginal exceedance under HEAVY DRAIN LOAD is
 # systematically a load artifact, not a regression (GROUNDED: two false-filed tick-cadence items on
 # 2026-08-10 under a ~11 15m-loadavg on 14 cores, for readings only marginally past their p95). While
 # this box looks contended (_anomaly_load_high, reusing ENV_SUSPECT_TIMEOUT's own
 # loadavg1m/HEALTH_LOAD_THRESHOLD probe — HERD-546 — independent of whether that lever is itself on),
-# the FILING bar widens to _ANOMALY_LOAD_MARGIN_PCT of the normal threshold (default 2x, i.e. 4x p95):
-# short of that widened bar the reading still journals and still paints its row (tagged
-# load_qualified so the signal stays visible), only the tracker filing is withheld.
+# the FILING bar widens to _ANOMALY_LOAD_MARGIN_PCT of the (HERD-645-floored) normal threshold (default
+# 2x): short of that widened bar the reading still journals and still paints its row (tagged
+# load_qualified so the signal stays visible — a sub-widened-floor exceedance is display signal without
+# tracker churn), only the tracker filing is withheld.
 _phase_anomaly_observe() {
   local _pa_phase="$1" _pa_label="$2" _pa_secs="$3"
-  local _pa_stats _pa_median _pa_p95 _pa_n _pa_threshold _pa_id _pa_mark_rc _pa_now
+  local _pa_stats _pa_median _pa_p95 _pa_n _pa_threshold _pa_floor _pa_id _pa_mark_rc _pa_now
   local _pa_load_qualified=0 _pa_widened _pa_tag=""
   _anomaly_baselines_enabled || return 0
   case "$_pa_secs" in ''|*[!0-9]*) return 0 ;; esac
@@ -9345,6 +9366,10 @@ EOF
   [ "$_pa_n" -ge "$_ANOMALY_MIN_SAMPLES" ] || return 0      # baseline not learned yet — never judge
   [ "$_pa_p95" -gt 0 ] || return 0
   _pa_threshold=$(( _pa_p95 * _ANOMALY_THRESHOLD_PCT / 100 ))
+  # HERD-645: the class-default filing bar is never lower than p95 + _ANOMALY_FLOOR_MARGIN_SECS, even
+  # when the pct multiplier alone would fall inside ordinary jitter of a tight-distribution phase.
+  _pa_floor=$(( _pa_p95 + _ANOMALY_FLOOR_MARGIN_SECS ))
+  [ "$_pa_floor" -gt "$_pa_threshold" ] && _pa_threshold="$_pa_floor"
   [ "$_pa_secs" -gt "$_pa_threshold" ] || return 0          # under threshold — silent, byte-inert
 
   # HERD-618: an exceedance that clears the normal threshold but falls short of the WIDENED under-load
