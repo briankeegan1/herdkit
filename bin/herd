@@ -2324,10 +2324,10 @@ sys.stdout.write(s if len(s) <= 300 else s[:299].rstrip() + "…")
 cmd_notes() {
   local sub="list"
   case "${1:-}" in
-    -h|--help) say "usage: herd notes [list] | herd notes show <n> | herd notes ack <n|all>"; return 0 ;;
+    -h|--help) say "usage: herd notes [list] | herd notes show <n> | herd notes route <n> <artifact> | herd notes ack <n|all>"; return 0 ;;
     "") ;;
-    list|ack|show) sub="$1"; shift ;;
-    *) die "herd notes: unknown subcommand $1 (usage: herd notes [list] | herd notes show <n> | herd notes ack <n|all>)" ;;
+    list|ack|show|route) sub="$1"; shift ;;
+    *) die "herd notes: unknown subcommand $1 (usage: herd notes [list] | herd notes show <n> | herd notes route <n> <artifact> | herd notes ack <n|all>)" ;;
   esac
 
   _journal_load_config
@@ -2335,6 +2335,7 @@ cmd_notes() {
   . "$SCRIPTS_DIR/console-section.sh"
   local ledger="$WORKTREES_DIR/.agent-watch-builder-notes"
   local ack="$WORKTREES_DIR/.agent-watch-builder-notes-acked"
+  local routes="$WORKTREES_DIR/.agent-watch-builder-notes-routes"
 
   # The notes still on the console: newest first, aged-out and already-acked rows dropped. ONE shared
   # decision (herd_console_visible_lines) with the watcher, so `herd notes` can never disagree with
@@ -2403,6 +2404,52 @@ sys.stdout.write(found)
       cat "$sidecar"
     else
       printf '%s\n' "$r_text"
+    fi
+    return 0
+  fi
+
+  # ── route: record the ARTIFACT a routing promised, so the ack can leave the seat (HERD-640 · M4) ──
+  # docs/spikes/coordinator-work-queue.md §1.4 splits this duty in two, and the split is the whole
+  # feature: ROUTING IS JUDGMENT (act now / file it / dismiss — still yours, still a turn), ACKING IS
+  # BOOKKEEPING. This verb records the judgment's OBSERVABLE consequence — the item the "file it"
+  # routing filed, or the PR a re-task will land — and the watcher acks the note the moment that
+  # artifact demonstrably exists (agent-watch.sh's _scan_note_routes → a `note-ack` intent → the SAME
+  # ack ledger `herd notes ack` writes). Nothing here acks anything now.
+  #
+  # A "dismiss" routing has NO artifact and therefore no row: it is never auto-acked, exactly as the
+  # doc requires. Ack it yourself (`herd notes ack <n>`) or let it age out, as today.
+  if [ "$sub" = "route" ]; then
+    local which="${1:-}" artifact="${2:-}" total row kind
+    [ -n "$which" ] || die "usage: herd notes route <n> <artifact>   (artifact: item:<ref> | pr:<num>; a dismissed note has none — use: herd notes ack <n>)"
+    case "$which" in ''|*[!0-9]*) die "herd notes route: <n> must be a number (got: $which)" ;; esac
+    [ -n "$artifact" ] || die "herd notes route: an artifact is required (item:<ref> | pr:<num>). A note routed as 'dismiss' has no artifact and is never auto-acked — clear it with: herd notes ack $which"
+    total="$(printf '%s\n' "$visible" | grep -c .)"
+    { [ "$which" -ge 1 ] && [ "$which" -le "$total" ]; } \
+      || die "herd notes route: no note #$which (${total} on the console — run: herd notes)"
+    row="$(printf '%s\n' "$visible" | sed -n "${which}p")"
+    # Kind resolution: an explicit prefix always wins; unprefixed, a bare number is a PR and anything
+    # else is a tracker ref. Explicit beats inferred here because under SCRIBE_BACKEND=github a bare
+    # number is a legitimate ISSUE ref, and guessing wrong would wait on the wrong artifact forever.
+    case "$artifact" in
+      item:*) kind="item"; artifact="${artifact#item:}" ;;
+      pr:*)   kind="pr";   artifact="${artifact#pr:}"; artifact="${artifact#\#}" ;;
+      \#*)    kind="pr";   artifact="${artifact#\#}" ;;
+      *[!0-9]*) kind="item" ;;
+      *)      kind="pr" ;;
+    esac
+    [ -n "$artifact" ] || die "herd notes route: empty artifact after the '$kind:' prefix"
+    local rdir="${routes%/*}"
+    [ -d "$rdir" ] || mkdir -p "$rdir" 2>/dev/null || die "herd notes route: cannot create $rdir"
+    printf '%s\t%s\t%s\t%s\n' "$(date +%s 2>/dev/null || echo 0)" "$kind" "$artifact" "$row" \
+      >> "$routes" 2>/dev/null || die "herd notes route: cannot write $routes"
+    # Bounded on write to the SAME tail the notes ledger itself keeps: a route whose note has already
+    # been displaced off that ledger has nothing left to clear, so the two bounds are the same bound.
+    herd_console_trim "$routes"
+    say "routed note ${c_bold}${which}${c_rst} → ${c_bold}${kind}:${artifact}${c_rst} · the watcher acks it once that artifact exists (journal keeps the note either way)"
+    # A route nothing drains would be a silent never-ack, which is the failure mode this whole surface
+    # exists to remove — so say it out loud rather than leaving the operator waiting on a dead lever.
+    if type herd_intent_queue_on >/dev/null 2>&1 && ! herd_intent_queue_on; then
+      say "  ${c_dim}INTENT_QUEUE is off, so nothing drains this route yet — arm the lever, or ack it yourself with: herd notes ack ${which}${c_rst}"
     fi
     return 0
   fi
@@ -8840,11 +8887,16 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       event (component=builder, slug, text ≤~300 chars); an over-cap
                                       note spills its FULL text to a sidecar (HERD-298). Ship-dormant:
                                       no behavior change unless a builder calls it
-  herd notes [list|show <n>|ack <n|all>] list the builder notes currently on the console (newest first,
+  herd notes [list|show <n>|route <n> <artifact>|ack <n|all>]
+                                      list the builder notes currently on the console (newest first,
                                       numbered), SHOW one note's full finding (HERD-298: prints the
                                       sidecar tail an over-cap note dropped) and ACK the handled ones
                                       (HERD-243): an acked note leaves the DISPLAY immediately; the
-                                      journal keeps every note. Unacked notes age out on their own after 2h
+                                      journal keeps every note. Unacked notes age out on their own after 2h.
+                                      ROUTE (HERD-640) records the artifact a routing promised
+                                      (item:<ref> | pr:<num>) and the watcher acks the note once that
+                                      artifact exists — routing stays your judgment, the ack leaves the
+                                      seat. A note routed as 'dismiss' has no artifact: ack it yourself
   herd config <list|get|set|sync|lint> view/validate/set .herd/config keys (key set + metadata from
                                         list          print effective keys+values (secrets masked)
                                         get <KEY>     print one validated key's value

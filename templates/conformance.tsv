@@ -577,3 +577,10 @@ INTENT_QUEUE	unit	tests/test-intent-queue-marker-tenant.sh
 spawn-step.sh	unit	tests/test-intent-queue-lib.sh
 spawn.sh	unit	tests/test-intent-queue-marker-tenant.sh
 agent-watch.sh	unit	tests/test-intent-queue-marker-tenant.sh
+intent-queue.sh	unit	tests/test-intent-queue-evidence-tenant.sh
+intent-queue.sh	unit	tests/test-intent-queue-note-ack-tenant.sh
+INTENT_QUEUE	unit	tests/test-intent-queue-evidence-tenant.sh
+INTENT_QUEUE	unit	tests/test-intent-queue-note-ack-tenant.sh
+agent-watch.sh	unit	tests/test-intent-queue-evidence-tenant.sh
+agent-watch.sh	unit	tests/test-intent-queue-note-ack-tenant.sh
+herd notes [list|ack <n|all>]	unit	tests/test-intent-queue-note-ack-tenant.sh
