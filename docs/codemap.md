@@ -155,7 +155,7 @@ Role summarized from each file's top-of-file comment.
 
 Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).
 
-- `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
+- `bin/herd` → `agent-update.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `intent-queue.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
 - `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `capacity-ledger.sh`, `ci-repair.sh`, `console-section.sh`, `core-surface.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `intent-queue.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `app-monitor.sh` → `herd-config.sh`
