@@ -16,7 +16,8 @@
 #
 # ONE implementation, SOURCED (never executed) by every surface that reads or writes those ledgers so
 # they can never disagree — sourced-library precedent: merge-policy.sh, caps-sync-lint.sh.
-#     • scripts/herd/agent-watch.sh       — renders both sections each tick
+#     • scripts/herd/agent-watch.sh       — renders each of those sections every tick (tracker heals,
+#                                           builder notes, escalated spawn intents, the published plan)
 #     • scripts/herd/tracker-state-sweep.sh — writes (and trims) the heal ledger
 #     • bin/herd                          — `herd notes` lists / acks builder notes
 #
@@ -89,6 +90,25 @@ herd_console_classify_intent_escalation() {
 $1
 EOF
   printf '%s\tloud' "${_cs_epoch:-}"
+}
+
+# herd_console_classify_queue_plan <line>
+#   ("<epoch>\t<intent_id>\t<prio>\t<slug>\t<lane>\t<ref>\t<blocker>", HERD-642)
+#   Prints "<epoch>\tcalm". A pending candidate of the coordinator's published plan is INFORMATIONAL —
+#   it tells a second seat what this pool will build next, and it leaves the display the moment the
+#   drain consumes it (the section is derived from live queue state each tick, not appended to). Calm is
+#   the right class precisely because the LOUD rails for this same queue already exist and must not be
+#   duplicated here: a dependency hold goes red through build_spawn_holds past DEP_STALE_TTL, and a
+#   candidate whose premises went stale escalates into the LOUD `spawn intents` section past INTENT_TTL.
+#   A plan row that ages past CONSOLE_ROW_RETENTION without draining is a plan nobody refreshed —
+#   re-publishing it (`herd queue plan`) is what puts it back on screen, which is the coordinator act
+#   the row would otherwise be nagging for.
+herd_console_classify_queue_plan() {
+  local _cs_epoch
+  IFS=$'\t' read -r _cs_epoch _ <<EOF
+$1
+EOF
+  printf '%s\tcalm' "${_cs_epoch:-}"
 }
 
 # herd_console_acked <ack-file> <line>  → 0 when this exact ledger line has been acknowledged.

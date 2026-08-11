@@ -33,6 +33,9 @@
 #   herd update            git-pulls the ENGINE checkout, upgrades the skill, reloads the workspace
 #   herd upgrade           runs migrations + rewrites .herd/config, re-renders the skill
 #   herd agent-update      replaces the AGENT RUNTIME binary shared by every live agent
+#   herd queue plan        publishes spawn intents into the shared pool the operator's watcher drains,
+#                          i.e. it decides what builders this control room launches next (HERD-642).
+#                          `herd queue plan` mutates; `herd queue list` is a READ and stays allowed.
 #
 # WHAT IS NOT GUARDED — builders legitimately READ control-room state, and every read stays fully
 # allowed: status, log, why, backlog, notes/note, config get|list|lint|sync|models, doctor, codemap,
@@ -106,6 +109,7 @@ _herd_context_is_actuator() {
     governance) [ "$sub" = "apply" ]  && { printf 'governance apply'; return 0; } ;;
     posture)    [ "$sub" = "apply" ]  && { printf 'posture apply';    return 0; } ;;
     backend)    [ "$sub" = "switch" ] && { printf 'backend switch';   return 0; } ;;
+    queue)      [ "$sub" = "plan" ]   && { printf 'queue plan';       return 0; } ;;
   esac
   return 1
 }

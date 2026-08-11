@@ -583,4 +583,9 @@ INTENT_QUEUE	unit	tests/test-intent-queue-evidence-tenant.sh
 INTENT_QUEUE	unit	tests/test-intent-queue-note-ack-tenant.sh
 agent-watch.sh	unit	tests/test-intent-queue-evidence-tenant.sh
 agent-watch.sh	unit	tests/test-intent-queue-note-ack-tenant.sh
+herd queue [list|plan]	unit	tests/test-queue-plan-surface.sh
+intent-queue.sh	unit	tests/test-queue-plan-surface.sh
+agent-watch.sh	unit	tests/test-queue-plan-surface.sh
+spawn.sh	unit	tests/test-queue-plan-surface.sh
+console-section.sh	unit	tests/test-queue-plan-surface.sh
 herd notes [list|ack <n|all>]	unit	tests/test-intent-queue-note-ack-tenant.sh

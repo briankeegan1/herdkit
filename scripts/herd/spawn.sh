@@ -15,6 +15,8 @@
 #   spawn.sh <slug> feature "<task text>"
 #   HERD_SPAWN_AFTER=<slug|pr#> spawn.sh <slug> feature "<task>"   # HELD until the dep merges (HERD-94)
 #   HERD_SPAWN_PRIO=<n> spawn.sh <slug> feature "<task>"           # drains in band <n> (HERD-630)
+#   HERD_SPAWN_GEN=<id> spawn.sh <slug> feature "<task>"           # part of published plan <id> (HERD-642;
+#                                                                  #   set by `herd queue plan`, not by hand)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
@@ -67,6 +69,21 @@ AFTER="${AFTER#\#}"
 PRIO="${HERD_SPAWN_PRIO:-}"
 case "$PRIO" in ''|*[!0-9]*) PRIO="" ;; esac
 
+# Generation stamp (HERD-642, Phase 5 of HERD-625; doc §4.4) — an OPTIONAL opaque id shared by every
+# intent that ONE `herd queue plan` publishes, recorded in its own SIDECAR ($INTENT_ID.gen) for the same
+# reason .ref/.after/.prio are: the .req body's positional parse is frozen. A stamped intent is
+# claimable only while the queue's `.gen` pointer still names its generation, so `herd queue plan`
+# publishes the whole new plan here FIRST (stamped, therefore not yet live) and then flips the pointer
+# in one rename — the atomic supersede.
+#
+# Set only by that command; empty on every ordinary enqueue (the default), in which case NO sidecar is
+# written, the intent belongs to no generation, no publish can ever retire it, and this enqueue is
+# byte-for-byte a pre-HERD-642 one. A value carrying anything other than plain id characters is dropped
+# rather than written — a typo must degrade to an unstamped (always-live) intent, never to a stamp that
+# silently makes the intent unclaimable.
+GEN="${HERD_SPAWN_GEN:-}"
+case "$GEN" in *[!0-9A-Za-z._-]*) GEN="" ;; esac
+
 # Enqueue atomically (temp then mv); filename sorts FIFO so oldest is drained first. The tracker ref
 # rides in a SIDECAR ($INTENT_ID.ref) rather than the .req body, so the positional slug/lane/task
 # parse (spawn-step.sh) is unchanged and an intent enqueued by an OLDER engine (no sidecar) still
@@ -104,6 +121,7 @@ INTENT_ID="$(iq_mint_id "$Q")"
 [ -n "$ITEM_REF" ] && printf '%s\n' "$ITEM_REF" > "$Q/$INTENT_ID.ref"
 [ -n "$AFTER" ] && printf '%s\n' "$AFTER" > "$Q/$INTENT_ID.after"
 [ -n "$PRIO" ] && printf '%s\n' "$PRIO" > "$Q/$INTENT_ID.prio"
+[ -n "$GEN" ] && printf '%s\n' "$GEN" > "$Q/$INTENT_ID.gen"
 # Sidecars FIRST, then the atomic publish (temp + one rename), so every sidecar is present the instant
 # the intent becomes claimable.
 iq_publish "$Q" "$INTENT_ID" "$SLUG
@@ -125,5 +143,5 @@ ${WATCHER_OWNER:-}
 sequenced next (spawn intent $INTENT_ID)" >/dev/null 2>&1 || true
 fi
 
-printf '🚀 queued: %s (%s)%s%s%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}" "${AFTER:+  after: $AFTER}" "${PRIO:+  prio: $PRIO}"
+printf '🚀 queued: %s (%s)%s%s%s%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}" "${AFTER:+  after: $AFTER}" "${PRIO:+  prio: $PRIO}" "${GEN:+  gen: $GEN}"
 printf 'INTENT_ID %s\n' "$INTENT_ID"
