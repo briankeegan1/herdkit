@@ -557,7 +557,8 @@ EOF
 #   active   — nothing to retire: an open PR, an in-flight builder with no PR yet, no sha anchor, or a
 #              `gh` we could not reach. The default for everything unproven; no action, ever.
 #   retiring — PROVABLY terminal and PROVABLY disposable: the worktree is already gone, or its HEAD is
-#              the head of a MERGED PR (dirt-free or regenerable-only), or of a CLOSED PR that carries
+#              the head of a MERGED PR (or a strict ancestor of it — HERD-646, BEHIND-but-not-diverged
+#              is not local-only work) and dirt-free or regenerable-only, or of a CLOSED PR that carries
 #              zero unique commits and no real dirt. Drive teardown.
 #   deferred — PROVABLY terminal and disposable, BUT a builder agent is still WORKING in the tree (HERD-356,
 #              _reap_agent_working). The reap is safe but would yank mid-flight work, so it WAITS, loudly,
@@ -587,8 +588,12 @@ retire_classify() {
 $(_retire_anchor "$slug" "$branch" "$head")
 EOF
   # No sha anchor → not provably terminal → untouchable. This single line is what makes a reused slug,
-  # a fresh commit, and a gh outage all safe.
-  [ -n "${oid:-}" ] && [ "$oid" = "$head" ] || { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
+  # a fresh commit, and a gh outage all safe. HERD-646: the anchor also holds when HEAD is a strict
+  # ANCESTOR of oid — the worktree is merely BEHIND its remote (missing a commit that landed there
+  # after this tree's own last push, e.g. a CI-unstick retry commit), never carrying local-only work.
+  # _sweep_anchor_ok stays exact-match-first and fails soft, so a reused slug or a genuinely AHEAD/
+  # diverged tree is refused exactly as before — see its header for the full safety argument.
+  [ -n "${oid:-}" ] && _sweep_anchor_ok "$dir" "$head" "$oid" || { printf 'active\x1f\x1f\x1f\x1f'; return 0; }
 
   dirt="$(_sweep_classify_dirt "$dir")"
   evidence="${dirt#*$'\t'}"; [ "$evidence" = "$dirt" ] && evidence=""

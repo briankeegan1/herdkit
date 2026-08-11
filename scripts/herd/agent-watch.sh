@@ -14276,15 +14276,29 @@ _maybe_release_claim() {
 }
 
 # _reconcile_dead_builder <slug> <worktree> <agent-status> — drive the ledger + notification for ONE
-# PR-less, non-working builder and echo the verdict (ALIVE | PENDING | DEAD). Called from the tick's
-# no-PR/non-working branch: an EMPTY agent-status means the slug has NO agent record at all (the dead
-# signature); a non-empty status means the agent is still listed (idle/done) and therefore alive.
-# has_pr is 0 here by construction (the caller only reaches this on a PR-less slug). Records the
-# first-seen anchor on the first sighting, clears it the instant any liveness signal returns, and
-# fires exactly one 💀 notification (+ journal event) when a slug crosses into DEAD.
+# PR-less, non-working builder and echo the verdict (ALIVE | PENDING | DEAD | a retirement state token
+# — retiring | held | deferred | stuck). Called from the tick's no-PR/non-working branch: an EMPTY
+# agent-status means the slug has NO agent record at all (the dead signature); a non-empty status means
+# the agent is still listed (idle/done) and therefore alive. has_pr is 0 here by construction (the
+# caller only reaches this on a PR-less slug). Records the first-seen anchor on the first sighting,
+# clears it the instant any liveness signal returns, and fires exactly one 💀 notification (+ journal
+# event) when a slug crosses into DEAD.
+#
+# HERD-646 leg 1 — ROW TRUTH: resolve the worktree's PR state BEFORE ever choosing a remedy. A slug
+# retirement.sh has already classified non-'active' (its PR resolved MERGED/CLOSED — retiring, held,
+# deferred, or stuck converging) is the sweep's to reap, never this function's to re-spawn: re-spawning
+# a fresh agent over SHIPPED work duplicates it. The caller already gates on this (agent-watch.sh only
+# reaches this function when its own "$_rt_state" read 'active'), but the check is pinned HERE too, at
+# the function's own boundary — Invariance-first: one shared, reconciled check reused at every surface
+# that could otherwise paint "re-spawn", not trusted to a single call site's ordering. No extra `gh`
+# call: retirement_tick already paid that cost this tick, so this is one in-memory array lookup.
 _reconcile_dead_builder() {
   local _rd_slug="$1" _rd_wt="$2" _rd_astatus="$3" _rd_liveness="${4:-}"
-  local _rd_now _rd_grace _rd_has_agent _rd_tgrow _rd_first _rd_verdict
+  local _rd_now _rd_grace _rd_has_agent _rd_tgrow _rd_first _rd_verdict _rd_retire
+  _rd_retire="$(_retire_state_of "$_rd_slug")"
+  if [ "$_rd_retire" != active ]; then
+    printf '%s' "$_rd_retire"; return 0
+  fi
   _rd_now="$(_now)"
   _rd_grace="$(_dead_grace_secs)"
   # A present agent record (any status) means the agent is still listed ⇒ normally alive. But a herdr
@@ -18049,6 +18063,19 @@ EOF
           # session. Surface a persistently-dead builder LOUDLY (💀 + notification) so it is never lost.
           _live="$(_agent_liveness "$slug")"
           case "$(_reconcile_dead_builder "$slug" "$dir" "$astatus" "$_live")" in
+            retiring|held|deferred|stuck)
+              # HERD-646 leg 1: retirement resolved this slug's PR MERGED/CLOSED before
+              # _reconcile_dead_builder ever looked at agent liveness — render ITS calm/red row (never
+              # 'died … re-spawn'; re-spawning here would duplicate work the sweep already knows is
+              # shipped). Practically unreachable given the caller's own "$_rt_state" gate above, but
+              # pinned as its own case so a future reorder of that gate can never paint 're-spawn' over
+              # a resolved PR.
+              _rdrt="$(_retire_state_of "$slug")"
+              DISPLAY[i]="$(_row_retirement "$sl" "$slug" "$_rdrt" "$(_retire_detail_of "$slug")")"
+              case "$_rdrt" in
+                retiring|deferred) FLAIR_STATE[i]="busy" ;;
+                *)                 FLAIR_STATE[i]="attention" ;;
+              esac ;;
             DEAD)
               # A dead builder is not a wedge — 💀 is the louder, truer row, and a corpse cannot be
               # woken. Drop any wedge/finish-stall record so no ledger keeps claiming this slug.
