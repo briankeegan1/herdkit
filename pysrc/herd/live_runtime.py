@@ -4017,6 +4017,67 @@ class WakeResult:
 _WAKEABLE_STATUSES = ("idle", "done")
 
 
+# ── shared agent_status corroboration (HERD-648) ────────────────────────────────────────────────────
+# Ports driver.sh's herd_driver_agent_status_resolved (HERD-647): after the #632 Enter-nudge recovery,
+# `herdr agent list` can report agent_status=idle for minutes while the pane is demonstrably still
+# working, fooling LiveActuator.wake_builder into a doomed retry/escalation even though it never spoke
+# to a genuinely idle agent. Per docs/multi-seat-doctrine.md there must be ONE decision, not a bash
+# copy and a diverging python copy — TestStatusCorroborateBashPythonParity (test_live_runtime.py)
+# proves this port and the bash original agree on shared fixtures. Only a raw 'idle' is ever touched;
+# every other status (working, done, dead, "") passes through unchanged in LiveActuator._status_resolved
+# below, so this adds no cost to the majority-case read.
+_STATUS_ACTIVE_RE = re.compile(r'[^ -~].*esc to interrupt', re.IGNORECASE)
+
+
+def _pane_active_signal(text):
+    """Port of driver.sh's _herd_pane_active_signal: True iff a non-ASCII glyph shares a line with the
+    "esc to interrupt" hint Claude Code's TUI shows only while actively generating, never over its idle
+    prompt box."""
+    return any(_STATUS_ACTIVE_RE.search(line) for line in (text or "").splitlines())
+
+
+def _pane_content_delta(slug, text):
+    """Port of driver.sh's _herd_pane_content_delta: True iff <text> differs from the last snapshot
+    recorded for <slug> — a real repaint, not a stale frame — always refreshing the snapshot to <text>
+    first. Best-effort store under the worktree pool's .herd/status-resolve/<slug>; an unwritable or
+    unconfigured store degrades to "no delta" (never corroborates, never blocks a caller), the same
+    fail-soft shape as the bash twin.
+
+    In production this store is SHARED with the bash twin: agent-watch.sh:391 sets
+    ``TREES=$WORKTREES_DIR`` and the python engine is launched with ``WORKTREES_DIR=${TREES:-}``, so
+    ``_pool_dir()`` here and driver.sh's own ``${WORKTREES_DIR:-${TREES:-.}}`` resolve to the identical
+    file. The snapshot is therefore hashed with the SAME ``cksum`` binary the bash twin pipes text
+    through (HERD-648 review finding) rather than a python-only digest — sha256 hex can never equal a
+    bash-written cksum line, which would make ``prev != cur`` spuriously True on every cross-process
+    read and defeat the frozen-pane/dead-builder guardrail the instant both engines touch one slug.
+    A failed/unavailable ``cksum`` degrades to "no delta" (``cur`` stays empty), never a false one."""
+    pool = _pool_dir()
+    if not pool or not slug:
+        return False
+    d = os.path.join(pool, ".herd", "status-resolve")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        return False
+    f = os.path.join(d, slug)
+    try:
+        with open(f, encoding="utf-8") as fh:
+            prev = fh.read()
+    except Exception:
+        prev = ""
+    try:
+        out = subprocess.run(["cksum"], input=(text or ""), capture_output=True, text=True, timeout=10)
+        cur = (out.stdout or "").strip()
+    except Exception:
+        cur = ""
+    try:
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write(cur)
+    except Exception:
+        pass
+    return bool(prev) and bool(cur) and prev != cur
+
+
 class DryRunActuator:
     """The side-effect-free apply twin: journals the SAME terminal events, actuates NOTHING.
 
@@ -5077,14 +5138,46 @@ class LiveActuator:
         except Exception:
             return []
 
+    def _status_resolved(self, slug, raw, pane_id):
+        """HERD-648: route a raw 'idle' through the shared corroboration port (module-level
+        ``_pane_active_signal``/``_pane_content_delta`` above, ported from driver.sh's
+        ``herd_driver_agent_status_resolved``) before any caller trusts it. Overrides to 'working'
+        ONLY when BOTH the pane's active-work chrome and a genuine content delta agree — a pane frozen
+        on a stale spinner frame (the dead/wedge signature) shows the chrome but never repaints, so it
+        stays 'idle'. Journals ``status_disagreement`` exactly when it fires, mirroring the bash
+        original's journal shape. ``HERD_STATUS_CORROBORATE=off`` is the bash twin's kill switch,
+        honored here too (a bare env read, no pane read, no journal). Fail-soft throughout: a missing
+        pane_id, a herdr fault, or an empty pane read all fall straight back to ``raw``."""
+        if raw != "idle" or not slug or not pane_id:
+            return raw
+        if os.environ.get("HERD_STATUS_CORROBORATE", "on") == "off":
+            return raw
+        try:
+            out = subprocess.run(["herdr", "pane", "read", pane_id, "--source", "visible"],
+                                 capture_output=True, text=True, timeout=10)
+            text = out.stdout or ""
+        except Exception:
+            text = ""
+        if not text:
+            return raw
+        if _pane_active_signal(text) and _pane_content_delta(slug, text):
+            self.journal.append("status_disagreement", "slug", slug, "pane", pane_id,
+                                "agent_status", "idle", "resolved", "working")
+            return "working"
+        return raw
+
     def _agent_lookup(self, slug):
         """``(agent_status, pane_id)`` for the agent whose identity (``name`` else ``agent``) == slug;
         ``("", "")`` when absent or the roster read failed. Mirrors ``_agent_status`` /
-        ``_find_builder_pane_id_any`` (``agent-watch.sh:7948``/``:8955``) folded into one read."""
+        ``_find_builder_pane_id_any`` (``agent-watch.sh:7948``/``:8955``) folded into one read. The
+        status is routed through :meth:`_status_resolved` (HERD-648) so every caller of this method —
+        wake_builder, reap, peek_status — inherits the idle-corroboration fix from one edit."""
         for a in self._herdr_agents():
             ident = a.get("name") or a.get("agent") or ""
             if ident == slug:
-                return str(a.get("agent_status") or ""), str(a.get("pane_id") or "")
+                raw = str(a.get("agent_status") or "")
+                pane_id = str(a.get("pane_id") or "")
+                return self._status_resolved(slug, raw, pane_id), pane_id
         return "", ""
 
     def _send_wake(self, pane_id, prompt):
