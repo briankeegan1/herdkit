@@ -122,8 +122,10 @@ fi
 if ! command -v _sweep_gate_corpses >/dev/null 2>&1; then
   # shellcheck disable=SC2034  # read by agent-watch.sh on the next line (its lib-mode guard)
   AGENT_WATCH_LIB=1
+  # The `[ -f ]` test is LOAD-BEARING (HERD-632): `.` is a bash SPECIAL BUILTIN, so sourcing a path
+  # that does not exist KILLS THE SHELL outright, bypassing the `|| { ...; exit 0; }` fallback below.
   # shellcheck source=/dev/null
-  . "$_JACT_HERE/agent-watch.sh" || { printf 'unavailable\n'; exit 0; }
+  [ -f "$_JACT_HERE/agent-watch.sh" ] && . "$_JACT_HERE/agent-watch.sh" || { printf 'unavailable\n'; exit 0; }
   unset AGENT_WATCH_LIB
 fi
 

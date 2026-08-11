@@ -227,6 +227,17 @@ else
   HERD_BASH_SYNTAX_SKIP_REASON="bash-syntax-lint.sh not present"
   herd_bash_syntax_lint() { return 2; }
 fi
+# Fail-soft on our own infra: a partially-upgraded engine tree missing the lint must SKIP the
+# source-guard guard (rc 2), never break the healthcheck it is a part of.
+# Prefer the tree-under-test's copy when present (HERD-309).
+_HERD_LINT_SRC="$HERE/source-guard-lint.sh"
+[ -f "$DIR/scripts/herd/source-guard-lint.sh" ] && _HERD_LINT_SRC="$DIR/scripts/herd/source-guard-lint.sh"
+if [ -f "$_HERD_LINT_SRC" ]; then
+  . "$_HERD_LINT_SRC"
+else
+  HERD_SOURCE_GUARD_SKIP_REASON="source-guard-lint.sh not present"
+  herd_source_guard_lint() { return 2; }
+fi
 # SHA-MATCHED BUILDER-LOCAL TRUST (HERD-531): the shared provenance-record library. Sourcing DEFINES
 # functions only and writes nothing; the record itself is written at the very END of this script, and
 # only when HEALTH_TRUST_BUILDER is on. Fail-soft on our own infra (a partially-upgraded engine tree
@@ -907,6 +918,20 @@ EOF
   if [ "$bs_rc" -eq 1 ]; then
     if [ -n "$ONELINE" ]; then echo "❌ bash-syntax — $(printf '%s' "$bs_errs" | grep '^BASH-SYNTAX' | head -1)";  # pipe-ok: head in a command substitution; status not gated
     else echo "❌ BASH-SYNTAX: a scripts/herd/*.sh file fails 'bash -n' under the SYSTEM /bin/bash (the watcher pane's interpreter) even though it may parse cleanly under a PATH-resolved bash"; printf '%s\n' "$bs_errs" | grep '^BASH-SYNTAX' || printf '%s\n' "$bs_errs"; fi
+    exit 1
+  fi
+
+  # source-guard guard (HERD-632) — a fail-soft `. "$VAR/lib.sh"` (meant to skip gracefully when the
+  # file is absent) must be preceded by a `[ -f ]` test or wrapped in a real subshell: bash treats `.`
+  # as a SPECIAL BUILTIN, so sourcing a missing path KILLS THE SHELL outright — neither `2>/dev/null`
+  # nor a trailing `|| true` catches it. The SAME lint the heavy gate runs
+  # (scripts/herd/source-guard-lint.sh). Same red semantics as bash-syntax / caps-sync. Skipped (never
+  # red) when the shared lint is absent or the tree has no scripts/herd or bin/herd surface.
+  local sg_errs sg_rc
+  sg_errs="$(herd_source_guard_lint ".")"; sg_rc=$?
+  if [ "$sg_rc" -eq 1 ]; then
+    if [ -n "$ONELINE" ]; then echo "❌ source-guard — $(printf '%s' "$sg_errs" | grep '^SOURCE-GUARD' | head -1)";  # pipe-ok: head in a command substitution; status not gated
+    else echo "❌ SOURCE-GUARD: a fail-soft dot-source of a variable path lacks a [ -f ] test (bash's special-builtin \`.\` kills the shell on a missing file even under '|| true')"; printf '%s\n' "$sg_errs" | grep '^SOURCE-GUARD' || printf '%s\n' "$sg_errs"; fi
     exit 1
   fi
 

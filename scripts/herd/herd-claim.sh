@@ -53,12 +53,17 @@ _HERD_CLAIM_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # journal.sh provides journal_append, which the backend's _backend_tw_journal uses to record a claim
 # as a tracker_write (HERD-85). Source it only if a caller (the lane) has not already — best-effort,
 # so a standalone claim without WORKTREES_DIR simply drops the entry and never blocks the claim.
-command -v journal_append >/dev/null 2>&1 || . "$_HERD_CLAIM_DIR/journal.sh" 2>/dev/null || true
+# The `[ -f ]` test is LOAD-BEARING (HERD-632): `.` is a bash SPECIAL BUILTIN, so sourcing a path
+# that does not exist KILLS THE SHELL outright — neither `2>/dev/null` nor the trailing `|| true`
+# catches it. Without the test, a partially-upgraded engine tree missing journal.sh would turn this
+# best-effort source into a silent whole-process death.
+command -v journal_append >/dev/null 2>&1 || { [ -f "$_HERD_CLAIM_DIR/journal.sh" ] && . "$_HERD_CLAIM_DIR/journal.sh" 2>/dev/null; } || true
 
 # engine-version.sh provides herd_engine_guard, the ENGINE VERSION HANDSHAKE (HERD-179) the claim
 # crosses before it writes tracker state. Sourced only if the lane has not already; functions only.
+# The `[ -f ]` test is LOAD-BEARING — see the journal.sh note above (HERD-632).
 # shellcheck source=/dev/null
-command -v herd_engine_guard >/dev/null 2>&1 || . "$_HERD_CLAIM_DIR/engine-version.sh" 2>/dev/null || true
+command -v herd_engine_guard >/dev/null 2>&1 || { [ -f "$_HERD_CLAIM_DIR/engine-version.sh" ] && . "$_HERD_CLAIM_DIR/engine-version.sh" 2>/dev/null; } || true
 
 # _herd_claim_identity — the operator identity a claim is stamped with. WATCHER_OWNER wins (an
 # explicit, gh-free identity), then WATCHER_VIEW_AUTHOR (reuse the watcher-lens identity, same order

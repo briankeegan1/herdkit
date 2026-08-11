@@ -100,6 +100,7 @@ Role summarized from each file's top-of-file comment.
 - `scope-escape.sh` — HERD-575 SCOPING-ESCAPE TELEMETRY: the shared detector both sides of a diff-scoped
 - `scribe-step.sh` — queue/git/report mechanics for the backlog drainer. The scribe Claude
 - `scribe.sh` — scribe.sh "<backlog change>" — ENQUEUE a backlog change and make sure exactly ONE async
+- `source-guard-lint.sh` — THE shared dot-source-guard drift guard (HERD-632): a fail-soft
 - `spawn-step.sh` — atomic queue mechanics for the durable spawn queue. Called from the watcher's
 - `spawn.sh` — spawn.sh <slug> <lane> <task> — ENQUEUE a builder spawn intent to the durable spawn queue and
 - `stale-dup-gate.sh` — the PRE-MERGE STALE-DUPLICATE gate (HERD-188).
