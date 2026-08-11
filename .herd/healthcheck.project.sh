@@ -1160,6 +1160,33 @@ case "$_hc_bs_rc" in
      exit 1 ;;
 esac
 
+# 5f0. source-guard guard (HERD-632) — a fail-soft `. "$VAR/lib.sh"` (meant to skip gracefully when the
+# file is absent) must be preceded by a `[ -f ]` test or wrapped in a real subshell: bash treats `.` as
+# a SPECIAL BUILTIN, so sourcing a missing path KILLS THE SHELL outright — neither `2>/dev/null` nor a
+# trailing `|| true` catches it. ONE implementation shared with the builder's light pre-PR gate
+# (scripts/herd/source-guard-lint.sh), so the two gates can never disagree.
+sg_note="source-guard: clean"
+HERD_SOURCE_GUARD_SKIP_REASON=""
+if [ -f scripts/herd/source-guard-lint.sh ]; then
+  . scripts/herd/source-guard-lint.sh
+  _hc_sg_errs="$(herd_source_guard_lint ".")"; _hc_sg_rc=$?
+else
+  _hc_sg_errs=""; _hc_sg_rc=2
+  HERD_SOURCE_GUARD_SKIP_REASON="scripts/herd/source-guard-lint.sh not present"
+fi
+case "$_hc_sg_rc" in
+  0) sg_note="source-guard: clean" ;;
+  2) sg_note="source-guard: skipped ($HERD_SOURCE_GUARD_SKIP_REASON)" ;;
+  *) sg_note="source-guard: UNGUARDED FAIL-SOFT DOT-SOURCE"
+     if [ -n "$ONELINE" ]; then
+       echo "source-guard: $(printf '%s' "$_hc_sg_errs" | grep '^SOURCE-GUARD' | head -1)"  # pipe-ok: head feeds a one-line message inside a command substitution; the pipeline status is not gated
+     else
+       echo "SOURCE-GUARD: a fail-soft dot-source of a variable path lacks a [ -f ] test (bash's special-builtin \`.\` kills the shell on a missing file even under '|| true')"
+       printf '%s\n' "$_hc_sg_errs" | grep '^SOURCE-GUARD' || printf '%s\n' "$_hc_sg_errs"
+     fi
+     exit 1 ;;
+esac
+
 # 5f. inert-lever guard (HERD-556) — a config key documented in templates/capabilities.tsv must have
 # a consumer the shipped engine can actually REACH. HEALTH_PANE and HEALTH_TRUST_BUILDER were both
 # silent no-ops for weeks — set, defaulted, documented and unit-tested, yet inert, because their only
@@ -1208,5 +1235,5 @@ if [ -f .herd/claude-hardcode-lint.sh ]; then
   esac
 fi
 
-[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $tabc_note; $eexp_note; $tcl_note; $lrch_note; $bs_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $tabc_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $bs_note"; echo "  $chl_note"; }
+[ -n "$ONELINE" ] && echo "clean — bash -n ok; $sc_note; $t_note; $dh_note; $leak_note; $lg_note; $caps_note; $gcov_note; $pipe_note; $gscope_note; $tabc_note; $eexp_note; $tcl_note; $lrch_note; $bs_note; $sg_note; $chl_note" || { echo "HEALTHCHECK CLEAN"; echo "  $sc_note"; echo "  $t_note"; echo "  $dh_note"; echo "  $leak_note"; echo "  $lg_note"; echo "  $caps_note"; echo "  $gcov_note"; echo "  $pipe_note"; echo "  $gscope_note"; echo "  $tabc_note"; echo "  $eexp_note"; echo "  $tcl_note"; echo "  $lrch_note"; echo "  $bs_note"; echo "  $sg_note"; echo "  $chl_note"; }
 exit 0

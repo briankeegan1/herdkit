@@ -53,9 +53,11 @@ _HERD_ENGINE_LEVEL=2
 
 # journal.sh provides journal_append (best-effort, never fails a caller). Source it only if the
 # caller has not already — the same discipline herd-claim.sh uses. A journal that cannot resolve a
-# destination simply drops the entry; a refusal is still printed and still refuses.
+# destination simply drops the entry; a refusal is still printed and still refuses. The `[ -f ]` test
+# is LOAD-BEARING (HERD-632): `.` is a bash SPECIAL BUILTIN, so sourcing a path that does not exist
+# KILLS THE SHELL outright — neither `2>/dev/null` nor the trailing `|| true` catches it.
 _HERD_ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-command -v journal_append >/dev/null 2>&1 || . "$_HERD_ENGINE_DIR/journal.sh" 2>/dev/null || true
+command -v journal_append >/dev/null 2>&1 || { [ -f "$_HERD_ENGINE_DIR/journal.sh" ] && . "$_HERD_ENGINE_DIR/journal.sh" 2>/dev/null; } || true
 
 # _herd_engine_int <value> — a non-negative integer, or 0. Guards every comparison below against a
 # garbage ENGINE_MIN ("v2", "", "latest"): a config typo must never fabricate a stale-engine lockout.

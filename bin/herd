@@ -2297,7 +2297,10 @@ sys.stdout.write(s if len(s) <= 300 else s[:299].rstrip() + "…")
     fi
   fi
 
-  type journal_append >/dev/null 2>&1 || . "$SCRIPTS_DIR/journal.sh" 2>/dev/null || true
+  # The `[ -f ]` test is LOAD-BEARING (HERD-632): `.` is a bash SPECIAL BUILTIN, so sourcing a path
+  # that does not exist KILLS THE SHELL outright — neither `2>/dev/null` nor the trailing `|| true`
+  # catches it.
+  type journal_append >/dev/null 2>&1 || { [ -f "$SCRIPTS_DIR/journal.sh" ] && . "$SCRIPTS_DIR/journal.sh" 2>/dev/null; } || true
   if type journal_append >/dev/null 2>&1; then
     if [ -n "$note_full" ]; then
       WORKTREES_DIR="${WORKTREES_DIR:-}" journal_append builder_note component builder slug "$slug" text "$text" note_full "$note_full"
@@ -5405,8 +5408,11 @@ _backend_switch_reconcile_intents() {
   local ledger="${WORKTREES_DIR:-}/.agent-watch-tracker-swept"
   local old_backend_file="$SCRIPTS_DIR/backends/${old}.sh"
   { [ -n "${WORKTREES_DIR:-}" ] && [ -s "$state" ] && [ -f "$old_backend_file" ]; } || return 0
+  # The `[ -f ]` test is LOAD-BEARING (HERD-632): `.` is a bash SPECIAL BUILTIN, so sourcing a path
+  # that does not exist KILLS THE SHELL outright — neither `2>/dev/null` nor the trailing `|| true`
+  # catches it.
   # shellcheck source=/dev/null
-  . "$SCRIPTS_DIR/journal.sh" 2>/dev/null || true
+  { [ -f "$SCRIPTS_DIR/journal.sh" ] && . "$SCRIPTS_DIR/journal.sh" 2>/dev/null; } || true
   local epoch pr slug ref n_done=0 n_retired=0 resolved
   while read -r epoch pr slug ref; do
     [ -n "${epoch:-}" ] && [ -n "${ref:-}" ] || continue
@@ -5686,8 +5692,10 @@ EOF
   if ! "$HERDKIT_HOME/bin/herd" pane backlog >/dev/null 2>&1; then
     warn "could not restart the backlog pane — run 'herd pane backlog' (and if it still shows the old backend, close the stale viewer process first)"
   fi
+  # The `[ -f ]` test is LOAD-BEARING (HERD-632): `.` is a bash SPECIAL BUILTIN, so sourcing a path
+  # that does not exist KILLS THE SHELL outright, even inside this `{ ... } || true` group.
   # shellcheck source=/dev/null
-  { . "$SCRIPTS_DIR/journal.sh" 2>/dev/null && journal_append backend_switched from "$current" to "$target"; } || true
+  { [ -f "$SCRIPTS_DIR/journal.sh" ] && . "$SCRIPTS_DIR/journal.sh" 2>/dev/null && journal_append backend_switched from "$current" to "$target"; } || true
   say ""
   say "✅ SCRIBE_BACKEND: $current → $target (scribe drainer, herd backlog, watcher mark-shipped, and the coordinator skill all follow this key)"
 }

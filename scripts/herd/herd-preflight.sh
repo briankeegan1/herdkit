@@ -38,15 +38,19 @@ _herd_brand() { printf '%s' "${HERD_BRAND:-${WORKSPACE_NAME:-herdkit}}"; }
 # through bin/herd. Defines functions only; a missing module leaves the guard call below undefined, so
 # the `command -v` check keeps a partial install fail-open rather than fatal.
 _HERD_PREFLIGHT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+# The `[ -f ]` test below is LOAD-BEARING (HERD-632): `.` is a bash SPECIAL BUILTIN, so sourcing a
+# path that does not exist KILLS THE SHELL outright — neither `2>/dev/null` nor the trailing `|| true`
+# catches it.
 # shellcheck source=/dev/null
-command -v herd_engine_guard >/dev/null 2>&1 || . "$_HERD_PREFLIGHT_DIR/engine-version.sh" 2>/dev/null || true
+command -v herd_engine_guard >/dev/null 2>&1 || { [ -f "$_HERD_PREFLIGHT_DIR/engine-version.sh" ] && . "$_HERD_PREFLIGHT_DIR/engine-version.sh" 2>/dev/null; } || true
 # Runtime driver shim (HERD-454): herd_driver_wsl_interop_guard + herd_driver_name/herd_driver_agent_
 # runtime live here. Some callers (herd-feature.sh, herd-quick.sh) already source driver.sh in-process
 # before shelling out to new-feature.sh, but new-feature.sh runs as its OWN bash process — sourcing
 # only happens there, not here — so guard-source it exactly like engine-version.sh above: defines
-# functions only, safe to source standalone, never a double-source problem.
+# functions only, safe to source standalone, never a double-source problem. Same `[ -f ]` load-bearing
+# note applies (HERD-632).
 # shellcheck source=/dev/null
-command -v herd_driver_wsl_interop_guard >/dev/null 2>&1 || . "$_HERD_PREFLIGHT_DIR/driver.sh" 2>/dev/null || true
+command -v herd_driver_wsl_interop_guard >/dev/null 2>&1 || { [ -f "$_HERD_PREFLIGHT_DIR/driver.sh" ] && . "$_HERD_PREFLIGHT_DIR/driver.sh" 2>/dev/null; } || true
 
 herd_preflight() {
   [ "${HERD_SKIP_PREFLIGHT:-}" = "1" ] && return 0
