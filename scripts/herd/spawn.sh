@@ -89,32 +89,41 @@ case "$PRIO" in ''|*[!0-9]*) PRIO="" ;; esac
 # read+write, sub-millisecond, so a bounded spin (no staleness shortcut) clears in practice; the
 # give-up-after-N-tries branch is the only recovery path, same tradeoff scribe.sh/research.sh accept.
 mkdir -p "$Q"
-_spawn_next_seq() {
-  local f="$Q/.seq" lockdir="$Q/.seq.lock.d" tries=0 n
-  if command -v flock >/dev/null 2>&1; then
-    exec 8>"$Q/.seq.lock"
-    flock 8
-  else
-    while ! mkdir "$lockdir" 2>/dev/null; do
-      tries=$((tries + 1))
-      [ "$tries" -ge 300 ] && break   # ~3s waited; proceed unlocked rather than wedge the enqueue
-      sleep 0.01
-    done
-  fi
-  n="$(cat "$f" 2>/dev/null || echo 0)"
-  case "$n" in ''|*[!0-9]*) n=0 ;; esac
-  n=$((n + 1))
-  printf '%s' "$n" > "$f"
-  if command -v flock >/dev/null 2>&1; then exec 8>&-; else rmdir "$lockdir" 2>/dev/null || true; fi
-  printf '%s' "$n"
-}
-INTENT_ID="$(date +%s)-$(printf '%010d' "$(_spawn_next_seq)")-$$"
+# HERD-639 (Phase 2 of HERD-625): the id minting, the queue-scoped sequence lock and the atomic
+# publish all live in the SHARED intent-queue library now — one implementation for every tenant of the
+# pool, rather than a per-queue copy whose ordering rules drift (docs/spikes/coordinator-work-queue.md
+# §3.2). The `[ -f ]` test is LOAD-BEARING (HERD-632): bash treats `.` as a SPECIAL BUILTIN, so
+# sourcing an absent path kills the shell outright, which `|| true` does not catch. The library is a
+# HARD dependency of an enqueue (like journal.sh above); the guard turns a broken engine tree into a
+# clean unbound-function error instead of a silent whole-process death.
+IQ_LOG_PREFIX="spawn.sh"
+IQ_ENGINE_DIR="$HERE"
+# shellcheck source=/dev/null
+[ -f "$HERE/intent-queue.sh" ] && . "$HERE/intent-queue.sh"
+INTENT_ID="$(iq_mint_id "$Q")"
 [ -n "$ITEM_REF" ] && printf '%s\n' "$ITEM_REF" > "$Q/$INTENT_ID.ref"
 [ -n "$AFTER" ] && printf '%s\n' "$AFTER" > "$Q/$INTENT_ID.after"
 [ -n "$PRIO" ] && printf '%s\n' "$PRIO" > "$Q/$INTENT_ID.prio"
-tmp=$(mktemp "$Q/.tmp.XXXXXX")
-printf '%s\n%s\n%s\n' "$SLUG" "$LANE" "$TASK" > "$tmp"
-mv "$tmp" "$Q/$INTENT_ID.req"
+# Sidecars FIRST, then the atomic publish (temp + one rename), so every sidecar is present the instant
+# the intent becomes claimable.
+iq_publish "$Q" "$INTENT_ID" "$SLUG
+$LANE
+$TASK"
+
+# M3 · QUEUE-MARKER PUBLISH (HERD-639, doc §1.3 / §2.2) — the intent queue's SECOND tenant. Enqueuing
+# a tracked spawn is precisely the moment a 📌 planned marker should appear on the item, and today
+# nothing publishes one unless an operator hand-runs `herd backlog queue`. Rides the same rails as the
+# spawn intent above (mint → publish → the watcher's drain → the backend op → journal), through the
+# same library, into a SIBLING queue dir so it can never consume a builder slot or queue behind one.
+# Ship-dormant: no new config key — Phase 1's INTENT_QUEUE lever governs, and with it off (the ship
+# default) this block is a hard no-op and the enqueue is byte-for-byte the pre-HERD-639 one. Fail-soft:
+# an unwritable pool is never an enqueue failure — the spawn is what matters, the marker is advisory.
+if [ -n "$ITEM_REF" ] && command -v herd_intent_queue_on >/dev/null 2>&1 && herd_intent_queue_on; then
+  iq_enqueue "$TREES/intent-queue" "marker-publish
+$ITEM_REF
+${WATCHER_OWNER:-}
+sequenced next (spawn intent $INTENT_ID)" >/dev/null 2>&1 || true
+fi
 
 printf '🚀 queued: %s (%s)%s%s%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}" "${AFTER:+  after: $AFTER}" "${PRIO:+  prio: $PRIO}"
 printf 'INTENT_ID %s\n' "$INTENT_ID"

@@ -72,9 +72,9 @@ out="$(herd_source_guard_lint "$TG")"; rc=$?
 pass
 echo "PASS (3) '{ [ -f \"\$DIR/lib.sh\" ] && . \"\$DIR/lib.sh\"; } || true' → clean"
 
-# ── 4. Preceding guard-clause [ -f ] (spawn-step.sh's shape) is clean ────────────────────────────
+# ── 4. Preceding guard-clause [ -f ] (intent-queue.sh's iq_journal shape) is clean ──────────────
 TG2="$T/guarded-clause"; make_file "$TG2" scripts/herd/probe.sh \
-  '_intent_journal() {' \
+  'iq_journal() {' \
   '  if ! command -v journal_append >/dev/null 2>&1; then' \
   '    [ -f "$HERE/journal.sh" ] || return 0' \
   '    . "$HERE/journal.sh" 2>/dev/null || return 0' \

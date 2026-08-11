@@ -96,6 +96,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/herd-config.sh"
 # Engine journal — append-only forensic record of every gate event (best-effort, never breaks us).
 . "$HERE/journal.sh"
+# THE shared intent-queue library (HERD-639, Phase 2 of HERD-625) — one implementation of the pool
+# queue mechanics (claim / own / release / skip / done / priority / owner liveness) for every tenant:
+# the spawn queue drains through it via spawn-step.sh, and _drain_intent_queue (the M3 queue-marker
+# tenant) calls it directly. Sourced AFTER journal.sh so iq_journal reuses this file's journal_append
+# rather than re-sourcing one. Defines functions + a few IQ_* defaults; wholly inert unless a tenant
+# calls it. The `[ -f ]` test is LOAD-BEARING (HERD-632) — `.` is a special builtin, so sourcing an
+# absent path kills the shell outright, and neither `|| true` nor `2>/dev/null` catches it.
+# shellcheck source=/dev/null
+[ -f "$HERE/intent-queue.sh" ] && { IQ_ENGINE_DIR="$HERE"; . "$HERE/intent-queue.sh"; }
 # Supervised-process contract (HERD-193) — owner/deadline/liveness/retire bookkeeping for every
 # population this watcher spawns. Pure library; wholly inert while LIFECYCLE_CONTRACTS=off (default).
 . "$HERE/lifecycle.sh"
@@ -594,6 +603,21 @@ INTENT_TTL="${INTENT_TTL:-86400}"
 # which is every watcher with INTENT_QUEUE off (the ship default).
 INTENT_ESCALATION_LEDGER="$TREES/.agent-watch-intent-escalations"
 INTENT_ESCALATION_ACK="$TREES/.agent-watch-intent-escalations-acked"
+# ── The M3 intent queue (HERD-639 · Phase 2 of HERD-625) ─────────────────────────────────────────
+# The general intents ledger the design doc's §3.2 Option B calls for: a SIBLING of spawn-queue/ under
+# the same pool, sharing the same claim primitives through scripts/herd/intent-queue.sh but NOT the
+# spawn queue's budget — a marker intent consumes no builder slot, so it must neither spend one nor
+# queue behind one. Its only tenant today is M3 (queue-marker publish/supersede, §1.3), deliberately
+# the smallest real tracker-write intent: it exists to prove a non-spawn intent rides these rails end
+# to end before anything load-bearing does. Drained only while INTENT_QUEUE=on (no second lever), and
+# the directory is not even created on a watcher where nothing ever enqueued one.
+INTENT_QUEUE_DIR="$TREES/intent-queue"
+# How many marker intents one tick may drain. Small on purpose: each is one backend round-trip, the
+# queue is expected to be near-empty, and an unbounded walk would put a slow tracker on the 4 s tick.
+INTENT_DRAIN_BUDGET="${INTENT_DRAIN_BUDGET:-4}"
+# Transient failures an intent may accumulate before it is dropped loudly (doc §4.3 — never loop
+# silently, never loop forever).
+INTENT_MAX_ATTEMPTS="${INTENT_MAX_ATTEMPTS:-3}"
 # Operator-inbox surfaces (HERD-184). Two files, both under $TREES, both untouched when OPERATOR_INBOX
 # is off (byte-inert):
 #   • INBOX_LEDGER — one TAB-separated entry per surfaced cross-seat comment
@@ -18291,6 +18315,19 @@ EOF
   # Spawn-queue drain: pop pending intents up to the pipeline concurrency cap and launch lanes.
   _drain_spawn_queue
 
+  # M3 intent drain (HERD-639): the queue-marker tenant of the SAME library, on its own SIBLING queue
+  # and its own small budget so a marker intent never consumes — or queues behind — a builder slot.
+  # Returns on its first line unless INTENT_QUEUE=on, so the tick is byte-identical while dormant.
+  # THROTTLED to ~60 s, not run every tick: each intent is a tracker/git round-trip, and this repo's
+  # standing rule is that a network write never rides the 4 s repaint (the same cadence class as
+  # _inbox_scan, _adopt_scan and the tracker sweep). A marker is advisory — a minute of latency on it
+  # is invisible, where a slow backend on every tick is not.
+  _INTENT_DRAIN_TICK=$((_INTENT_DRAIN_TICK + 1))
+  if [ "$_INTENT_DRAIN_TICK" -ge "$_INTENT_DRAIN_INTERVAL" ]; then
+    _INTENT_DRAIN_TICK=0
+    _drain_intent_queue
+  fi
+
   # Coordinator watchdog: ONE per-tick liveness check of the coordinator itself (which the feature
   # loop above never sees — it runs from $MAIN, not a worktree). Byte-inert unless COORDINATOR_WATCHDOG=on.
   _handle_coordinator_watchdog
@@ -18737,6 +18774,15 @@ _drain_lane_worker() {
     # Spawned: only now is the intent consumed.
     if bash "$HERE/spawn-step.sh" done "$_dlw_claimed" >/dev/null 2>&1; then
       journal_append spawn_launched slug "$_dlw_slug" lane "$_dlw_lane"
+      # M3 · SUPERSEDE (HERD-639) — the lane launched, so the item is now CLAIMED and its 📌 planned
+      # marker describes a decision that has already happened. §1.3 measured the consequence of nobody
+      # publishing that fact: 3 markers published, 0 ever superseded, one outliving its own claim by
+      # 90+ minutes and another still live on an item closed Done. Queue it rather than write it here:
+      # the intent must survive this worker dying, and a tracker round-trip must never sit on the
+      # launch path. `command -v` guards the call because the hermetic drain harnesses extract this
+      # function ALONE — no library, no producer, and the intended byte-identical no-op.
+      command -v _intent_marker_enqueue >/dev/null 2>&1 \
+        && _intent_marker_enqueue marker-supersede "$_dlw_ref" "${WATCHER_OWNER:-}" "claimed by $_dlw_slug"
     else
       journal_append spawn_claim_lost slug "$_dlw_slug" lane "$_dlw_lane" action done
     fi
@@ -18924,6 +18970,211 @@ _drain_spawn_queue() {
   fi
 }
 
+# ── M3 · queue-marker intents (HERD-639 · Phase 2 of HERD-625) ───────────────────────────────────
+# THE SECOND TENANT of the shared intent-queue library, and the reason Phase 2 is a structural change
+# rather than a rename: until a non-spawn intent actually rides these rails, "the queue generalizes" is
+# an assertion. This one is trivial BY DESIGN (docs/spikes/coordinator-work-queue.md §2.2/§6) — it is
+# the smallest real tracker-write intent there is — and it closes a measured gap: on 2026-08-10 three
+# 📌 markers were published and ZERO were ever superseded (§1.3), because `_backend_claim_item` does
+# not clear the marker and `_backend_unqueue_item`'s only caller was a hand-run `herd backlog unqueue`.
+# So a marker outlived its own claim by 90+ minutes, and an item closed Done still carrying one.
+#
+# The rails, end to end and all pre-existing: spawn.sh enqueues `marker-publish` when it accepts a
+# TRACKED spawn intent; _drain_lane_worker enqueues `marker-supersede` the moment that intent's lane
+# observably launched (the claim IS the supersede trigger §1.3 names); this drain claims them through
+# the same library the spawn queue uses and executes each through the SAME backend op `herd backlog
+# queue|unqueue` calls, with the same HERD_COMPONENT=plan attribution. The queue adds NO new mutation
+# surface (§4.1) — it only removes the requirement that a coordinator be present to type the command.
+#
+# Ship-dormant behind Phase 1's lever, with no second key: INTENT_QUEUE=off means nothing enqueues and
+# this drain returns on its first line, so the tick is byte-identical to before. NOT multi-seat safe
+# (§5.5) — but unlike a spawn, a duplicate marker write is CONVERGENT (§5.3): publish refreshes one
+# marker in place and supersede on an already-clear item is a NOCHANGE, so two seats draining one pool
+# converge on the same tracker state rather than double-spending anything.
+
+# _intent_marker_apply <kind> <ref> <who> <detail> — execute ONE marker intent through the active
+# backend and print its verdict: DONE (a real transition), NOCHANGE (the backend saw nothing to do),
+# NO-OP (this backend has no planned-marker op at all — advisory feature, fail-soft per §4.1) or
+# UNKNOWN-KIND. Sources the backend inside a SUBSHELL exactly as _reconcile_via_ref does, so the
+# _backend_* helpers never leak into the watcher's namespace.
+_intent_marker_apply() {
+  local _ima_kind="$1" _ima_ref="$2" _ima_who="$3" _ima_detail="${4:-}" _ima_bdir _ima_bfile _ima_op
+  case "$_ima_kind" in
+    marker-publish)   _ima_op=_backend_queue_item ;;
+    marker-supersede) _ima_op=_backend_unqueue_item ;;
+    *) printf 'UNKNOWN-KIND'; return 0 ;;
+  esac
+  _ima_bdir="${SCRIBE_BACKEND_DIR:-$HERE/backends}"
+  _ima_bfile="$_ima_bdir/${SCRIBE_BACKEND:-file}.sh"
+  [ -f "$_ima_bfile" ] || { printf 'NO-OP'; return 0; }
+  (
+    _secrets="$MAIN/.herd/secrets"
+    # shellcheck source=/dev/null
+    [ -f "$_secrets" ] && . "$_secrets"
+    # shellcheck source=/dev/null
+    . "$_ima_bfile" 2>/dev/null || { printf 'NO-OP'; exit 0; }
+    command -v "$_ima_op" >/dev/null 2>&1 || { printf 'NO-OP'; exit 0; }
+    cd "$MAIN" 2>/dev/null || true
+    # HERD-85: the same 'plan' component attribution `herd backlog queue|unqueue` sets, so a marker
+    # written by the drain is indistinguishable in the tracker_write journal from one an operator typed
+    # — which is the point: the queue moves the LATENCY off the seat, never the authority (§9).
+    export HERD_COMPONENT="plan"
+    _BACKEND_RESULT=""
+    if [ "$_ima_op" = "_backend_queue_item" ]; then
+      "$_ima_op" "$_ima_ref" "$_ima_who" "$_ima_detail" >/dev/null 2>&1 || true
+    else
+      "$_ima_op" "$_ima_ref" "$_ima_who" >/dev/null 2>&1 || true
+    fi
+    printf '%s' "${_BACKEND_RESULT:-}"
+  )
+}
+
+# _drain_intent_queue — one tick's drain of $WORKTREES_DIR/intent-queue/. Claims through iq_claim (the
+# same atomic-rename claim, abandoned-claim reclaim and priority ordering the spawn queue gets), reads
+# the intent's frozen positional payload —
+#     line 1  kind      marker-publish | marker-supersede
+#     line 2  ref       the tracker ref the marker belongs to
+#     line 3  who       the operator identity to attribute it to (may be empty)
+#     line 4  detail    free text (publish only; e.g. "sequenced next")
+# — and applies each outcome per §4.3's two-way split:
+#   • TERMINAL (unknown kind, no ref, past TTL, a backend with no marker op) → consumed on the FIRST
+#     occurrence with a journal row. Retrying cannot change the answer.
+#   • TRANSIENT (backend unreachable, item not resolvable yet) → RELEASED with its attempt counter
+#     bumped, and dropped loudly once it passes INTENT_MAX_ATTEMPTS. Never loop silently, never forever.
+# A supersede that finds nothing to clear is CONVERGED, not failed (§5.3): "no marker on this item" is
+# exactly the state the intent asked for.
+#
+# Fail-soft throughout: a malformed intent is skipped, never crash the watcher loop. Skipped entirely
+# in dry-run mode. Byte-inert while INTENT_QUEUE is off — nothing enqueues and this returns immediately.
+_drain_intent_queue() {
+  [ -z "${DRYRUN:-}" ] || return 0
+  # herd-config.sh owns the ONE truthiness rule for the lever, and a live watcher always has it
+  # sourced; a hermetic harness that extracts this function alone must read a missing resolver (or a
+  # missing library) as OFF, silently — the same `type` guard shape _drain_spawn_queue uses.
+  command -v iq_claim >/dev/null 2>&1 || return 0
+  type herd_intent_queue_on >/dev/null 2>&1 || return 0
+  herd_intent_queue_on || return 0
+  [ -d "$INTENT_QUEUE_DIR" ] || return 0
+  ls "$INTENT_QUEUE_DIR"/*.req >/dev/null 2>&1 || return 0   # fast exit when the queue is empty
+  local _diq_n=0 _diq_claimed _diq_id _diq_kind _diq_ref _diq_who _diq_detail _diq_result _diq_tries
+  local _diq_held=()
+  while [ "$_diq_n" -lt "$INTENT_DRAIN_BUDGET" ]; do
+    _diq_n=$(( _diq_n + 1 ))
+    _diq_claimed="$(iq_claim "$INTENT_QUEUE_DIR" 2>/dev/null || true)"
+    [ -n "$_diq_claimed" ] || break
+    _diq_id="$(iq_id_of "$_diq_claimed")"
+    _diq_kind=""; _diq_ref=""; _diq_who=""; _diq_detail=""
+    { IFS= read -r _diq_kind; IFS= read -r _diq_ref; IFS= read -r _diq_who; IFS= read -r _diq_detail; } \
+      < "$_diq_claimed" 2>/dev/null || true
+    # STALENESS (§4.2) — a marker intent whose plan is a day old describes a world that has moved on;
+    # writing it would publish a stale record, which is the class this design exists to remove.
+    if iq_expired "$_diq_id" "$INTENT_TTL"; then
+      iq_skip "$_diq_claimed" "aged past INTENT_TTL (${INTENT_TTL}s) undrained" 2>/dev/null
+      journal_append intent_skipped intent "$_diq_id" kind "${_diq_kind:-}" ref "${_diq_ref:-}" \
+        reason "aged past INTENT_TTL"
+      continue
+    fi
+    if [ -z "$_diq_kind" ] || [ -z "$_diq_ref" ]; then
+      iq_skip "$_diq_claimed" "empty kind or ref" 2>/dev/null
+      journal_append intent_skipped intent "$_diq_id" kind "${_diq_kind:-}" ref "${_diq_ref:-}" \
+        reason "empty kind or ref"
+      continue
+    fi
+    _diq_result="$(_intent_marker_apply "$_diq_kind" "$_diq_ref" "$_diq_who" "$_diq_detail")"
+    case "${_diq_kind}/${_diq_result}" in
+      */UNKNOWN-KIND)
+        iq_skip "$_diq_claimed" "unknown intent kind '$_diq_kind'" 2>/dev/null
+        journal_append intent_skipped intent "$_diq_id" kind "$_diq_kind" ref "$_diq_ref" \
+          reason "unknown kind"
+        ;;
+      */NO-OP)
+        # §4.1: a backend with no planned-marker op. Advisory feature — consume quietly-but-journaled
+        # rather than retry a capability that will never appear.
+        _intent_consume "$_diq_claimed" "$_diq_id" "$_diq_kind" "$_diq_ref" no-backend-op
+        ;;
+      */DONE|marker-supersede/NOCHANGE)
+        # DONE = a real transition. supersede+NOCHANGE = already clear, i.e. CONVERGED (§5.3).
+        _intent_consume "$_diq_claimed" "$_diq_id" "$_diq_kind" "$_diq_ref" \
+          "$(printf '%s' "${_diq_result:-DONE}" | tr '[:upper:]' '[:lower:]')"
+        ;;
+      *)
+        # TRANSIENT: the item is not resolvable (yet), or the backend round-trip failed. Release for a
+        # later tick with the attempt counter bumped; past INTENT_MAX_ATTEMPTS it is dropped loudly.
+        _diq_tries="$(iq_attempt_bump "$INTENT_QUEUE_DIR" "$_diq_id")"
+        if [ "${_diq_tries:-0}" -ge "$INTENT_MAX_ATTEMPTS" ]; then
+          iq_skip "$_diq_claimed" "$_diq_kind $_diq_ref: no effect after $_diq_tries attempts" 2>/dev/null
+          journal_append intent_skipped intent "$_diq_id" kind "$_diq_kind" ref "$_diq_ref" \
+            attempts "$_diq_tries" reason "max attempts"
+        else
+          # HELD, not released-in-place: the intent stays CLAIMED for the REST of this tick so the
+          # loop's own next iq_claim skips past it to a different intent, and it is released at the
+          # end (below). Releasing it here would let this same tick re-claim it immediately and burn
+          # its whole attempt budget against one unchanged backend answer — the HERD-116 re-serve spin,
+          # in its retry-counter form.
+          _diq_held+=("$_diq_claimed")
+          journal_append intent_deferred intent "$_diq_id" kind "$_diq_kind" ref "$_diq_ref" \
+            attempts "$_diq_tries" result "${_diq_result:-unreadable}"
+        fi
+        ;;
+    esac
+  done
+  # Release every held intent back to .req for a later tick. They were kept claimed only so this
+  # tick's later claims skipped them; the release preserves their sidecars (incl. .attempts), and they
+  # re-enter under their original INTENT_ID filenames, so ordering is unchanged.
+  local _diq_h
+  for _diq_h in ${_diq_held[@]+"${_diq_held[@]}"}; do
+    if iq_require_claim "$_diq_h" release 2>/dev/null; then
+      iq_release "$_diq_h"
+    else
+      journal_append intent_claim_lost intent "$(iq_id_of "$_diq_h")" action release
+    fi
+  done
+  return 0
+}
+
+# _intent_consume <claimed> <id> <kind> <ref> <result> — the shared success tail: consume the intent
+# and journal the effect under its own event name. A claim that vanished under us journals
+# intent_claim_lost instead of a phantom success — the same honesty rule _drain_lane_worker enforces
+# for a spawn (a lost claim must never read as a completed one).
+_intent_consume() {
+  local _ic_claimed="$1" _ic_id="$2" _ic_kind="$3" _ic_ref="$4" _ic_result="$5" _ic_event
+  case "$_ic_kind" in
+    marker-publish)   _ic_event=intent_marker_published ;;
+    marker-supersede) _ic_event=intent_marker_superseded ;;
+    *)                _ic_event=intent_executed ;;
+  esac
+  if iq_require_claim "$_ic_claimed" done 2>/dev/null; then
+    iq_done "$_ic_claimed"
+    journal_append "$_ic_event" intent "$_ic_id" kind "$_ic_kind" ref "$_ic_ref" result "$_ic_result"
+  else
+    journal_append intent_claim_lost intent "$_ic_id" kind "$_ic_kind" action done
+  fi
+  return 0
+}
+
+# _intent_marker_enqueue <kind> <ref> <who> <detail> — publish ONE marker intent into the M3 queue.
+# The producer side of the tenant, called from the drain's lane worker (supersede) exactly as spawn.sh
+# calls it on enqueue (publish). Hard no-op with the lever off, with no library sourced (a hermetic
+# harness that extracted the caller alone), or with no ref — and fail-soft otherwise: a marker is
+# advisory, and failing to queue one must never disturb the spawn it accompanies.
+_intent_marker_enqueue() {
+  local _ime_kind="$1" _ime_ref="${2:-}" _ime_who="${3:-}" _ime_detail="${4:-}"
+  [ -n "$_ime_ref" ] || return 0
+  command -v iq_enqueue >/dev/null 2>&1 || return 0
+  type herd_intent_queue_on >/dev/null 2>&1 || return 0
+  herd_intent_queue_on || return 0
+  iq_enqueue "${INTENT_QUEUE_DIR:-$TREES/intent-queue}" "$_ime_kind
+$_ime_ref
+$_ime_who
+$_ime_detail" >/dev/null 2>&1 || true
+  return 0
+}
+
+_INTENT_DRAIN_INTERVAL=15   # HERD-639: M3 marker drain every ~60 s (15 × 4 s sleep) — the backend
+                            # write never rides the 4 s repaint (the _INBOX_SCAN_INTERVAL cadence class)
+_INTENT_DRAIN_TICK=$_INTENT_DRAIN_INTERVAL  # PRIMED so the FIRST tick drains, then every interval: a
+                            # watcher restarting with intents already queued (the coordinator-paused
+                            # case this whole program exists for) must not idle a minute before acting
 _ORPHAN_SWEEP_TICK=0
 _ORPHAN_SWEEP_INTERVAL=15   # sweep every ~60 s (15 × 4 s sleep)
 _TRACKER_SWEEP_TICK=0

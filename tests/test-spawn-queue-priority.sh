@@ -55,8 +55,10 @@ done
 # ── Fake engine dir ──────────────────────────────────────────────────────────────────────────────
 # The REAL spawn-step.sh beside a stub herd-config.sh that carries (a) WORKTREES_DIR and (b) the REAL
 # herd_intent_queue_on, extracted verbatim from herd-config.sh. Extracting rather than re-declaring is
-# the point: spawn-step.sh's _intent_queue_on DELEGATES to that resolver, so if the shipped truthiness
-# rule ever changes, this harness changes with it instead of silently testing a stale copy.
+# the point: the shared library's iq_lever_on (intent-queue.sh, HERD-639) DELEGATES to that resolver, so
+# if the shipped truthiness rule ever changes, this harness changes with it instead of silently testing
+# a stale copy. (HERD-639: the copied spawn-step.sh finds the library by walking up from this repo — see
+# its own resolution comment — so the mechanics under test here are still the shipped ones.)
 ENG="$T/eng"; mkdir -p "$ENG"
 cp "$STEP" "$ENG/spawn-step.sh"
 {
@@ -104,7 +106,7 @@ for fn in _spawn_slug_key _spawn_inflight_file _lane_lifecycle_key _lane_lifecyc
 done
 
 JLOG="$T/journal.log"
-# The fake clock every case reasons against. PINNED TO THE REAL CLOCK on purpose: _intent_expired
+# The fake clock every case reasons against. PINNED TO THE REAL CLOCK on purpose: iq_expired
 # measures an intent's age from the INTENT_ID's own epoch against a real `date +%s` (that is the whole
 # point of the field — see spawn-step.sh), while the console surfaces read HERD_FAKE_NOW. A synthetic
 # far-future NOW would make an "aged" id look like it was enqueued in the future and silently never
