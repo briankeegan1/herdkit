@@ -55,10 +55,18 @@ That command is the whole setup, and it runs in gate order:
    create path new items use. It is idempotent — an item whose normalized title already appears in
    Jira's open list is skipped — and each migrated title carries a `(migrated from file)`
    provenance suffix. `--no-migrate` skips it; on a tty with neither flag you're asked.
-5. **Freeze the old file.** Leaving the `file` backend stamps `BACKLOG.md` with a dated
+5. **Retire the old backend's pending reconcile intents.** A merged PR whose tracker item was never
+   confirmed Done leaves a "reconcile pending" console row, and the sweep can heal that row only
+   through the *active* backend — so a ref minted under the old backend would nag forever once
+   `SCRIBE_BACKEND` flips. The switch walks the last 50 landed PRs and, **while the old backend is
+   still fully configured**, either completes the mark-shipped there (ledgering the ref Done) or
+   retires it with a `tracker_reconcile_retired` journal event so no future sweep re-probes it. It
+   is bounded and fail-soft: a row that cannot be probed just stays pending for the next sweep, and
+   this step never fails the switch.
+6. **Freeze the old file.** Leaving the `file` backend stamps `BACKLOG.md` with a dated
    **FROZEN ARCHIVE** banner pointing readers at `herd backlog`, so the file reads as history to
    everyone who opens it later.
-6. **Restart + journal.** The backlog viewer pane is restarted (it binds the backend at process
+7. **Restart + journal.** The backlog viewer pane is restarted (it binds the backend at process
    start) and a `backend_switched` event is journaled.
 
 **Off a tty** (CI, a headless seat) there is no prompt: the switch dies with
@@ -305,6 +313,22 @@ Known and honest, as of this adapter:
 | Every new issue lands in the wrong project | same cause — with no project key, creates go to the first project the token can see |
 | A merged PR left its issue open | either the `Refs:` line was missing/malformed, or the issue's current status offers no transition into a done-category status. `herd log` shows the attempted tracker write and its result |
 | The backlog pane still shows the old backend | the viewer binds the backend at process start — run `herd pane backlog` (and close a stale viewer process if it persists) |
+
+---
+
+## Future work — there is no Jira-side UI
+
+Everything above is driven from your terminal. The adapter reads and writes Jira issues; it does
+**not** put anything in Jira's own interface beyond the issue fields, comments, assignee and status
+it sets. A Jira user watching the board sees the fleet's effects (the issue moves to *In Progress*,
+a PR link comment appears, it lands in *Done*) but has no in-Jira view of agent status or gate
+verdicts, and no way to hand work to the fleet from a Jira screen.
+
+A "Herd Console for Jira" Forge panel — per-issue fleet state (agent → PR → gate verdicts → merged)
+plus a *send to fleet* action, fed by the watcher's existing journal — is **phase 2 of the same
+roadmap item** ([gh #626](https://github.com/briankeegan1/herdkit/issues/626), tracked as
+HERD-662). It is deliberately gated on real adoption signal and **is not built** — treat it as a
+direction, not a shipping date.
 
 ---
 
