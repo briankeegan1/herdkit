@@ -552,6 +552,57 @@ the prior approval — the gate cycle re-runs and a fresh approval is required. 
 `ready · awaiting approval` in the status pane for any PR that has passed all gates but is not
 yet approved.
 
+## How the engine acts on whose work
+
+A seat that cannot say "did that rail just touch my PR, or the other operator's?" cannot safely run
+write rails in a shared repo — the exact gap a live incident exposed (a seat unable to tell whether
+the conflict resolver had acted on its own PR or a teammate's). This section is ground truth, read
+from the rail sources, not the config-key prose. `docs/multi-operator-ownership.md` (forthcoming,
+HERD-655) will carry the fuller model; this is the compact version every seat needs today.
+
+### Seat identity
+
+Every rail that needs to know "is this my PR" resolves ONE identity, memoized once per watcher
+process: `WATCHER_OWNER` (explicit) → `WATCHER_VIEW_AUTHOR` (reuse the console-lens identity) → a
+live `gh api user` lookup. Set `WATCHER_OWNER` explicitly in any shared repo — an unresolved identity
+under `WATCHER_SCOPE=all` FAILS CLOSED (withholds auto-merge from every candidate rather than guess).
+
+### Per-rail ownership — who acts on whose PR, and with what
+
+Two tiers. **Discovery-scoped** rails only ever see candidates `WATCHER_SCOPE`/`WATCHER_OWNER`
+already filtered — under `WATCHER_SCOPE=all` a PR authored by someone else is dropped before any of
+these rails runs. **Unscoped** rails run their own sweep outside discovery and act on any qualifying
+PR/worktree regardless of author — no config key closes this gap yet; it is tracked as **HERD-655**.
+
+| Rail | Config key | Writes to | Whose PRs, today |
+|---|---|---|---|
+| Stale-base heal | `STALE_BASE_AUTOFIX` (off) | re-tasks the builder, or dispatches the resolver | Discovery-scoped |
+| Review / healthcheck bounce | `REVIEW_AUTOFIX`, `HEALTHCHECK_AUTOFIX` (off) | re-task prompt to the builder's agent pane | Discovery-scoped — but both keys are currently cosmetic no-ops on the live engine; the bounce fires on every BLOCK/CODEERROR regardless of either flag. Don't rely on `=false` to keep a red from bouncing. |
+| Auto-merge | `MERGE_POLICY=auto` (`HUMAN_VERIFY_POLICY=auto` treats a declared HUMAN-VERIFY block as informational rather than a hold) | `gh pr merge` | Discovery-scoped — the same gate as above |
+| **Conflict resolver** | `RESOLVE_AUTOFIX` (off) | merges `$DEFAULT_BRANCH` into the PR's branch and pushes | **Unscoped today — see HERD-655.** Fires on any CONFLICTING PR the tick finds; never reaches the discovery/scope path at all. |
+| Remote-PR adoption | `ADOPT_REMOTE_PRS` (off) | `git fetch` + `git worktree add` into this seat's local pool | **Unscoped today — see HERD-655.** Adopts any open, non-draft PR no worktree already owns — this is what feeds the other rails a foreign PR to act on. |
+| Merged-PR reaper | none (always on) | deletes THIS SEAT's local worktree/branch/tabs/ledger row | Unscoped by author, low blast-radius: it only tears down a local copy on a sha GitHub reports merged/closed — never touches the remote branch. |
+| Backlog / tracker-state reconcile | none (advisory) | prints candidates or files ONE scribe request; re-asserts tracker Done state | Unscoped by design — repo-wide bookkeeping, not a per-operator action; never edits `{{BACKLOG_FILE}}` directly. |
+
+### Before enabling a write rail in a shared repo
+
+- Set `WATCHER_OWNER` explicitly — don't rely on `gh api user` resolving to the seat you expect.
+- Read the row above before flipping a lever: an "unscoped" rail acts on a teammate's PR the moment
+  `ADOPT_REMOTE_PRS` (or any stray local worktree) puts it in this seat's pool.
+- `RESOLVE_AUTOFIX=on` is the highest-blast-radius lever here — it pushes a merge commit to whatever
+  branch is conflicting, with no author check at all. Turn it on only where every PR in the pool is
+  genuinely this seat's own.
+- After changing scope config, confirm with `herd why <pr#>` on a foreign PR (if one exists) rather
+  than trusting the config's word for what it scopes.
+
+### Orient before you diagnose
+
+Before answering "what did the engine just do, to whose PR, and why" from memory or a pane
+transcript, read (in this order): `docs/control-room-map.md` (the gate pipeline + refix rails),
+`docs/codemap.md` (module roles + config-key → consumer wiring — regenerate with `herd codemap`),
+`docs/symbol-index.md` (the def→caller index). They're deterministic and committed; re-deriving them
+from memory is exactly how a seat ends up unable to say whose PR a rail just touched.
+
 ## Verify GATE / MERGE / CONCURRENCY / LIMIT-PARK / PANE behavior → reproduce in the sim FIRST
 
 When you are investigating or verifying **gate / merge / concurrency / limit-park / pane** behavior —
