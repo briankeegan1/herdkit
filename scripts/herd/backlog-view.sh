@@ -11,11 +11,14 @@
 #     live open list via `herd backlog --rich` (falling back to plain `herd backlog` on an older
 #     CLI) on an interval (BACKLOG_VIEW_POLL_SECS, default 30s), render
 #     it under a styled header (workspace · backend · live · HH:MM), and re-render only when the list
-#     content actually changes (hashed). Fails SOFT (no-false-red rule): if `herd backlog` errors or
-#     comes back empty (API/network trouble), keep the last good list on screen and append one dim
+#     content actually changes (hashed). Fails SOFT (no-false-red rule): if `herd backlog` exits
+#     non-zero (API/network trouble), keep the last good list on screen and append one dim
 #     '⚠ backend unreachable since HH:MM (showing last good)' line — never blank, never red. The
 #     backend's stderr (which could echo an API error body or headers) is discarded, so no secret or
-#     raw error body ever reaches the pane; the warning is a fixed one-liner.
+#     raw error body ever reaches the pane; the warning is a fixed one-liner. An exit-0 EMPTY result is
+#     NOT a failure (HERD-652): a genuinely empty backlog renders its own honest, celebratory
+#     '✅ backlog clear — nothing open' line instead of the unreachable warning — only a non-zero exit
+#     (or transport error) counts as unreachable.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -494,7 +497,13 @@ render_backend_frame() {
       # fzf self-hint in `herd backlog browse`; does not touch $rc (a bad hint must never fail render).
       printf '\033[2mglow not found — showing raw markdown; run herd doctor for the install command\033[0m\n'
     fi
+  elif [ "$degraded" -eq 0 ]; then
+    # Empty list from a HEALTHY poll (exit 0) — an honest empty backend, not a failure (HERD-652).
+    # Celebrate rather than alarm: no unreachable warning follows (degraded is 0).
+    printf '\033[2m✅ backlog clear — nothing open\033[0m\n'
   else
+    # Empty list while degraded — nothing has ever been fetched successfully yet. The unreachable
+    # warning below explains why; this line just says there's nothing on screen.
     printf '\033[2m(no open items yet)\033[0m\n'
   fi
   if [ "$degraded" -eq 1 ]; then
@@ -535,7 +544,7 @@ run_backend_mode() {
   esac
 
   local last_good="" last_hash="" degraded=0 since="" refreshed="" frame="" polls=0
-  local raw="" rc=0 trimmed="" cur_hash="" incoming="" inc_hash="" w=""
+  local raw="" rc=0 cur_hash="" incoming="" inc_hash="" w=""
   # The FETCH clock, deliberately separate from the repaint clock (HERD-288). A resize must repaint
   # promptly, but it must NOT refetch: a drag-resize would otherwise hammer the backend once per
   # wiggle. next_fetch is the epoch second the backend may next be polled; a resize wake re-enters the
@@ -553,7 +562,6 @@ run_backend_mode() {
       if [ "$rc" -ne 0 ]; then
         raw="$(cd "$REPO" 2>/dev/null && "$herd_bin" backlog 2>/dev/null)"; rc=$?
       fi
-      trimmed="$(printf '%s' "$raw" | tr -d '[:space:]')"
 
       # Optional additive incoming section (github issues). Empty unless BACKLOG_VIEW_EXTRAS is on; its
       # content is folded into the frame key so a change in the incoming list also triggers a repaint.
@@ -561,16 +569,29 @@ run_backend_mode() {
       incoming="$(incoming_block)"
       inc_hash="$(printf '%s' "$incoming" | cksum)"
 
-      if [ "$rc" -eq 0 ] && [ -n "$trimmed" ]; then
-        # Healthy poll. Re-render only when the list content actually changed (hash it).
+      if [ "$rc" -eq 0 ]; then
+        # Healthy poll — exit 0, WHETHER OR NOT the list is empty. A genuinely empty backlog is a
+        # SUCCESS (HERD-652): treating exit-0-empty as degraded rendered a false 'backend unreachable'
+        # on a healthy, drained queue. Only a non-zero exit (transport/API error) counts as degraded.
+        # Re-render only when the list content actually changed (hash it) — an empty result still
+        # hashes differently from a prior non-empty one, so the transition into/out of empty repaints.
         degraded=0; since=""
         cur_hash="$(printf '%s' "$raw" | cksum)"
         if [ "$cur_hash" != "$last_hash" ]; then
-          last_hash="$cur_hash"; last_good="$raw"; refreshed="$(now_hhmm)"
+          last_hash="$cur_hash"
+          # All-whitespace output (e.g. a lone stripped newline) is effectively empty for render
+          # purposes — store it as "" so the empty-state branch below fires instead of glow-ing a
+          # blank body.
+          if [ -n "$(printf '%s' "$raw" | tr -d '[:space:]')" ]; then
+            last_good="$raw"
+          else
+            last_good=""
+          fi
+          refreshed="$(now_hhmm)"
         fi
       else
-        # Degraded poll (error or empty). Keep the last good list; never blank, never red. Stamp the
-        # unreachable-since time once, on the transition into degraded.
+        # Degraded poll (non-zero exit only). Keep the last good list; never blank, never red. Stamp
+        # the unreachable-since time once, on the transition into degraded.
         if [ "$degraded" -eq 0 ]; then degraded=1; since="$(now_hhmm)"; fi
       fi
       next_fetch=$(( now + poll ))

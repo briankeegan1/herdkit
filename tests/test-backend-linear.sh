@@ -204,6 +204,49 @@ grep -q "^#ENG-7${TAB}unstarted${TAB}Todo${TAB}first open issue${TAB}first open 
   || fail "list_open_rich did not flatten desc / place empty assignee then url; ENG-7 shape wrong ($rich)"
 pass
 
+# ── HERD-652 review finding: list_open/list_open_rich must disambiguate a real outage from a ──────
+# genuinely empty backlog, not collapse both into "exit 0, no output" via `| python3 ... || true`.
+#
+# 2e. Transport failure (curl-level, simulated by _linear_gql itself returning non-zero) → list_open
+#     must exit NON-ZERO with no output — never the false "empty success" the old code produced.
+set +e
+lo_fail_out="$( cd "$T" && . "$BACKEND"; _linear_gql() { return 7; }; _backend_list_open )"
+lo_fail_rc=$?
+set -e
+[ "$lo_fail_rc" -ne 0 ] || fail "list_open must exit non-zero on a transport failure (rc=$lo_fail_rc)"
+[ -z "$lo_fail_out" ] || fail "list_open must print nothing on a transport failure, got: $lo_fail_out"
+pass
+
+# 2f. GraphQL-level failure — curl succeeds, but Linear answers with a top-level "errors" body (no
+#     usable data). Must ALSO exit non-zero, not print an empty-but-successful list.
+set +e
+lo_err_out="$( cd "$T" && . "$BACKEND"; _linear_gql() { echo '{"errors":[{"message":"rate limited"}]}'; }; _backend_list_open )"
+lo_err_rc=$?
+set -e
+[ "$lo_err_rc" -ne 0 ] || fail "list_open must exit non-zero on a GraphQL errors response (rc=$lo_err_rc)"
+[ -z "$lo_err_out" ] || fail "list_open must print nothing on a GraphQL errors response, got: $lo_err_out"
+pass
+
+# 2g. Genuinely empty result — curl succeeds, valid JSON, zero nodes. This IS a success: exit 0,
+#     empty output. The fix must preserve this (the whole point of HERD-652).
+set +e
+lo_empty_out="$( cd "$T" && . "$BACKEND"; _linear_gql() { echo '{"data":{"issues":{"nodes":[]}}}'; }; _backend_list_open )"
+lo_empty_rc=$?
+set -e
+[ "$lo_empty_rc" -eq 0 ] || fail "list_open must exit 0 on a genuinely empty result, got rc=$lo_empty_rc"
+[ -z "$lo_empty_out" ] || fail "list_open must print nothing for a genuinely empty result, got: $lo_empty_out"
+pass
+
+# 2h. list_open_rich shares the same _linear_gql_or_fail seam — a transport failure must exit
+#     non-zero there too, not silently degrade to an empty-but-successful rich list.
+set +e
+lor_fail_out="$( cd "$T" && . "$BACKEND"; _linear_gql() { return 7; }; _backend_list_open_rich )"
+lor_fail_rc=$?
+set -e
+[ "$lor_fail_rc" -ne 0 ] || fail "list_open_rich must exit non-zero on a transport failure (rc=$lor_fail_rc)"
+[ -z "$lor_fail_out" ] || fail "list_open_rich must print nothing on a transport failure, got: $lor_fail_out"
+pass
+
 # 2d. show_item → single-issue detail via issues(filter:) (never issueSearch): identifier + live
 #     state on line 1, then title, the UNtruncated description, and url + updated date.
 : > "$GQLLOG"

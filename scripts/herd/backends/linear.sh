@@ -112,6 +112,26 @@ _linear_gql() {
         --data "$payload"
 }
 
+# _linear_gql_or_fail <query> <vars> — HERD-652 review finding: _backend_list_open/_rich used to run
+# `_linear_gql ... | python3 ... || true`, which forces exit 0 no matter what happened — a curl
+# timeout/5xx, or a `{"errors":[...]}` GraphQL response, all collapsed into "exit 0, empty output",
+# indistinguishable from a genuinely empty backlog. That let a real outage render as a false
+# 'backlog clear' GREEN instead of the honest unreachable warning. This is the ONE seam list_open and
+# list_open_rich both funnel through: it prints the raw response JSON on stdout ONLY when the
+# round-trip transport-succeeded (propagating _linear_gql's own rc verbatim on failure — never
+# swallowed), and logs one clean diagnostic line naming the failure WITHOUT echoing the (possibly
+# secret-bearing) response body. Callers still parse the body themselves and must independently reject
+# a top-level "errors" key — this only rules out transport-level failure.
+_linear_gql_or_fail() {
+    local query="$1" vars="$2" resp rc
+    resp="$(_linear_gql "$query" "$vars")"; rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "linear backend: API round-trip failed (rc=$rc) — treating as unreachable, not an empty result" >&2
+        return "$rc"
+    fi
+    printf '%s' "$resp"
+}
+
 _linear_team_id() {
     # Resolve the team new issues are created under: the configured LINEAR_TEAM_ID if present,
     # else the first team this key can see. Prints the id (empty if none).
@@ -655,6 +675,10 @@ _backend_list_open() {
     # "#<identifier> <title>" line each — the same shape the file/github backends emit.
     # When LINEAR_TEAM_ID is set the query is scoped to that team so a second private team's issues
     # never leak into 'herd backlog'; unset lists every team the key can see.
+    #
+    # HERD-652: exits NON-ZERO on a transport failure or a GraphQL "errors" response — via
+    # _linear_gql_or_fail and the explicit "errors" check below — so a real outage is never rendered
+    # as a false empty-success. Only a genuinely empty `nodes` array is exit 0 + no output.
     _linear_require_key
     local query vars
     if [ -n "${LINEAR_TEAM_ID:-}" ]; then
@@ -673,12 +697,16 @@ print(json.dumps({"team": os.environ["TEAM"]}))')"
 }'
         vars=""
     fi
-    _linear_gql "$query" "$vars" | python3 -c 'import sys, json
-try: d = json.load(sys.stdin)
-except Exception: d = {}
+    # 2>/dev/null on the parse step only hides a JSONDecodeError TRACEBACK for the "no body at all"
+    # case (transport failure already reported its own clean diagnostic above); it never hides the
+    # exit code, which is what every caller keys off.
+    _linear_gql_or_fail "$query" "$vars" | python3 -c 'import sys, json
+d = json.load(sys.stdin)
+if "errors" in d:
+    sys.exit(1)
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
 for n in nodes:
-    print("#%s %s" % (n.get("identifier", ""), n.get("title", "")))' 2>/dev/null || true
+    print("#%s %s" % (n.get("identifier", ""), n.get("title", "")))' 2>/dev/null
 }
 
 # _backend_list_closed — OPTIONAL. Print CLOSED (completed/canceled) issues as one
@@ -748,9 +776,12 @@ print(json.dumps({"team": os.environ["TEAM"]}))')"
 }'
         vars=""
     fi
-    _linear_gql "$query" "$vars" | python3 -c 'import sys, json
-try: d = json.load(sys.stdin)
-except Exception: d = {}
+    # HERD-652: same transport/errors disambiguation as _backend_list_open above — a real outage
+    # must exit non-zero, never render as an empty-but-successful rich list.
+    _linear_gql_or_fail "$query" "$vars" | python3 -c 'import sys, json
+d = json.load(sys.stdin)
+if "errors" in d:
+    sys.exit(1)
 nodes = (((d.get("data") or {}).get("issues") or {}).get("nodes")) or []
 rank = {"started": 0, "unstarted": 1, "backlog": 2, "triage": 3}
 def flat(s):
@@ -767,7 +798,7 @@ for _, _, n, st in rows:
     assignee = flat((n.get("assignee") or {}).get("displayName") or "")
     url = flat(n.get("url") or "")
     print("#%s\t%s\t%s\t%s\t%s\t%s\t%s" % (n.get("identifier", ""), st.get("type") or "",
-                                            flat(st.get("name")), flat(n.get("title")), desc, assignee, url))' 2>/dev/null || true
+                                            flat(st.get("name")), flat(n.get("title")), desc, assignee, url))' 2>/dev/null
 }
 
 _backend_show_item() {

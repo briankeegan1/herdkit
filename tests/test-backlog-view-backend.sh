@@ -164,8 +164,10 @@ warns=$(grep -c "backend unreachable since" <<<"$out4")
 [ "$warns" -eq 1 ] || fail "expected the unreachable warning exactly once, got $warns"
 pass
 
-# ── Case 5: empty result is also treated as degraded (keep last good) ─────────────────────────────
-# An API/network hiccup can surface as an empty (exit 0) list; that must NOT blank the pane either.
+# ── Case 5: exit-0 EMPTY result is an honest empty backlog, NOT degraded (HERD-652) ────────────────
+# A genuinely empty backend (herd backlog exits 0, prints nothing) must render the celebratory
+# empty-state, never the unreachable warning — an empty SUCCESS is not a FAILURE. Poll 1 has items,
+# poll 2 goes empty (rc 0): the transition must swap to the honest empty state, not latch "degraded".
 P5="$T/proj-empty"; make_project "$P5" "linear"
 SEQ5="$T/seq5"; mkdir -p "$SEQ5"
 printf '#H-1 held-item\n' > "$SEQ5/1"
@@ -173,8 +175,23 @@ printf '__EMPTY__\n'      > "$SEQ5/2"
 : > "$LOG"; : > "$T/empty.counter"
 out5="$(run_view "$P5" BACKLOG_VIEW_MAX_POLLS=2 BACKLOG_VIEW_POLL_SECS=0 \
         HERD_FAKE_SEQDIR="$SEQ5" HERD_FAKE_COUNTER="$T/empty.counter")"
-grep -q "held-item" <<<"$out5"                 || fail "empty-result: last good list was blanked"
-grep -q "backend unreachable since" <<<"$out5" || fail "empty-result: missing last-good warning line"
+grep -q "held-item" <<<"$out5"                    || fail "empty-result: poll 1's list never rendered"
+grep -q "backlog clear" <<<"$out5"                 || fail "empty-result: missing the honest empty-state line"
+grep -q "backend unreachable since" <<<"$out5"     && fail "empty-result: exit-0-empty must NOT render as unreachable"
+pass
+
+# ── Case 6: exit-0 EMPTY from the very first poll — the exact HERD-652 repro ───────────────────────
+# Grounded live report: the Linear API returned zero open issues (herd backlog exits 0, empty output,
+# tracker writes succeeding) yet the pane showed 'backend unreachable'. There was never a "last good"
+# list here at all — the very first poll is already the honest empty state.
+P6="$T/proj-empty-first"; make_project "$P6" "linear"
+SEQ6="$T/seq6"; mkdir -p "$SEQ6"
+printf '__EMPTY__\n' > "$SEQ6/1"
+: > "$LOG"; : > "$T/empty-first.counter"
+out6="$(run_view "$P6" BACKLOG_VIEW_MAX_POLLS=1 BACKLOG_VIEW_POLL_SECS=0 \
+        HERD_FAKE_SEQDIR="$SEQ6" HERD_FAKE_COUNTER="$T/empty-first.counter")"
+grep -q "backlog clear" <<<"$out6"             || fail "empty-first: missing the honest empty-state line"
+grep -q "backend unreachable since" <<<"$out6" && fail "empty-first: a genuinely empty backlog must never render as unreachable"
 pass
 
 echo "ALL PASS ($PASS checks)"
