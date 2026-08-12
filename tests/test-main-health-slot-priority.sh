@@ -240,10 +240,16 @@ DSHA="feedfacefeedfacefeedfacefeedfacefeedface"
 mkdir -p "$DTREES/feat-77"; printf 'gitdir: /pool\n' > "$DTREES/feat-77/.git"
 # The production shape: .herd/config is shell-sourced PLAIN assignments — no `export` here. The
 # fixture reuses $PMAIN (an unverified HEAD sha, no markers under $DTREES → main-health pending).
+# WATCHER_SCOPE=mine is declared explicitly (HERD-653): this section is proving MAIN_HEALTH_TICK
+# crosses the subprocess boundary, not scope, so it states the solo default itself rather than
+# relying on the now fail-closed "never set" default the child's real env genuinely has — an
+# unresolved scope would otherwise withhold PR 77 (the gh stub has no "api user" case to resolve an
+# owner against) and mask this section's own assertion.
 cat > "$DROOT/config" <<EOF
 MAIN_HEALTH_TICK=on
 PROJECT_ROOT=$PMAIN
 WORKTREES_DIR=$DTREES
+WATCHER_SCOPE=mine
 EOF
 # gh stub: one-PR GraphQL roster — discovery is the only gh the tick needs before the health gate.
 cat > "$DBIN/gh" <<EOF

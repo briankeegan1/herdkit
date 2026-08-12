@@ -2249,12 +2249,15 @@ _WATCHER_KEYS = ("WATCHER_SCOPE", "WATCHER_VIEW", "WATCHER_VIEW_AUTHOR", "WATCHE
                  "GATE_STATUS", "GATE_STATUS_PENDING")
 
 # HERD-653 (GH #769): a private config-dict marker — never a real env var name, so it can never
-# collide with a project's own config — that _config_from_env sets when the LIVE environment it just
-# read genuinely carried no WATCHER_SCOPE at all (never exported: a broken HERD-465 sweep, a config
-# wiring gap — anything short of a real resolved 'mine'/'all'). A bare test/fixture config dict
-# (FixtureDiscovery, or a unit test calling _select_candidates directly) never goes through
-# _config_from_env, so it never carries this marker and stays exactly as permissive as before this
-# fix — only the real environment-resolution path can trigger fail-closed behavior.
+# collide with a project's own config — that _config_from_env sets ONLY on a bare env-driven call
+# (the real `--tick` production path, `_run_live_tick`'s `_config_from_env()`) when the LIVE
+# environment it just read genuinely carried no WATCHER_SCOPE at all (never exported: a broken
+# HERD-465 sweep, a config wiring gap — anything short of a real resolved 'mine'/'all'). Neither a
+# bare test/fixture config dict (FixtureDiscovery, or a unit test calling _select_candidates
+# directly) nor a `--dry-run --fixture` scenario ever carries this marker — FixtureDiscovery
+# independently re-derives its OWN config straight from the scenario's own "config", never this
+# merged one, so marking a dry-run/sim scenario unresolved would journal a false "withheld" claim
+# with no matching discovery-time filter behind it. Only the real live tick can fail closed.
 _WATCHER_SCOPE_ENV_UNRESOLVED = "__WATCHER_SCOPE_ENV_UNRESOLVED__"
 
 # ── merge fairness / starvation freeze (MERGE_FAIRNESS, §6.2 / HERD-340) ───────────────────────────
@@ -7020,11 +7023,15 @@ def _config_from_env(scenario=None):
     for knob in _CORE_ENV_KEYS:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
-    # HERD-653: this is THE environment-resolution boundary — a bare scenario/fixture dict (unit tests,
-    # FixtureDiscovery) never passes through here, only a real --tick or --dry-run run reading actual
-    # os.environ does. When neither the scenario nor the environment supplied WATCHER_SCOPE, mark it
-    # unresolved so _watcher_scope fails closed instead of silently defaulting to the permissive 'mine'.
-    if "WATCHER_SCOPE" not in config:
+    # HERD-653: mark WATCHER_SCOPE unresolved ONLY for a bare env-driven call (``scenario is None`` —
+    # exactly _run_live_tick's ``_config_from_env()``, the one REAL --tick production path). A
+    # --dry-run/--fixture run always passes an explicit (if empty) scenario dict, and its
+    # FixtureDiscovery independently re-derives its OWN config straight from ``scenario["config"]`` —
+    # never this merged one — so a sentinel set here would reach the journal ("withheld") without
+    # ever actually reaching the discovery-time filter that withholds anything: a false claim, not a
+    # fail-closed proof. Every hermetic sim/test scenario that never configures WATCHER_SCOPE stays
+    # exactly as byte-identical as before this fix; only the real live tick can trigger fail-closed.
+    if scenario is None and "WATCHER_SCOPE" not in config:
         config[_WATCHER_SCOPE_ENV_UNRESOLVED] = True
     return config
 
