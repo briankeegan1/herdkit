@@ -1658,38 +1658,67 @@ herd_driver_switch_model() {
 # agent_status consumer routes through (multi-seat doctrine: one oracle, not a fork per caller).
 # ONLY 'idle' is ever corroborated — every other word (working, done, empty, …) returns UNCHANGED, so
 # this adds no cost and no risk to the majority-case read and never touches a genuine working/done/dead
-# classification. Corroboration requires BOTH independent signals to agree before overriding a raw
-# 'idle' to 'working':
-#   • _herd_pane_active_signal — the pane's own live-activity chrome (a spinner glyph beside the
-#     "esc to interrupt" hint Claude Code's TUI shows ONLY while actively generating, never over its
-#     idle prompt box). This IS the "terminal title" signal: herdr exposes no separate window/tab-title
-#     field (neither `agent list` nor `pane list` carries one), so the signal is read out of the same
-#     visible-pane surface every other pane-content probe in this codebase already uses
-#     (herd_driver_read_pane … visible, e.g. agent-watch.sh's _pane_confirms_limit_wait).
-#   • _herd_pane_content_delta — the pane's content actually CHANGED since the last time this slug was
-#     resolved (a real repaint, not a stale frame).
-# Requiring BOTH is the guardrail against weakening genuine dead/wedge detection: a pane FROZEN on a
-# stale spinner frame (the process crashed mid-paint and nothing repaints it again) shows the active
-# pattern but no delta, and stays 'idle' — exactly the dead-builder signature the watcher's rails must
-# keep catching. A truly static idle prompt shows neither signal. Only a builder that is BOTH
-# currently rendering the active surface AND still repainting is rescued.
+# classification. Two INDEPENDENT rescue paths are tried, either of which overrides a raw 'idle' to
+# 'working' (HERD-660: the pane-only path left a real gap — see below):
+#   1. PANE SIGNAL — requires BOTH of:
+#      • _herd_pane_active_signal — the pane's own live-activity chrome (a spinner glyph beside the
+#        "esc to interrupt" hint Claude Code's TUI shows ONLY while actively generating, never over its
+#        idle prompt box). This IS the "terminal title" signal: herdr exposes no separate window/tab-
+#        title field (neither `agent list` nor `pane list` carries one), so the signal is read out of
+#        the same visible-pane surface every other pane-content probe in this codebase already uses
+#        (herd_driver_read_pane … visible, e.g. agent-watch.sh's _pane_confirms_limit_wait).
+#      • _herd_pane_content_delta — the pane's content actually CHANGED since the last time this slug
+#        was resolved (a real repaint, not a stale frame).
+#      Requiring BOTH guards against weakening genuine dead/wedge detection: a pane FROZEN on a stale
+#      spinner frame (the process crashed mid-paint and nothing repaints it again) shows the active
+#      pattern but no delta, and stays 'idle' — exactly the dead-builder signature the watcher's rails
+#      must keep catching.
+#   2. TRANSCRIPT GROWTH (HERD-660) — _herd_wake_transcript_growing: the agent's Claude session
+#      transcript grew since the last time THIS resolver observed it, the same evidence
+#      agent-watch.sh's own _transcript_growing already trusts for dead-classification. GROUNDED ON
+#      herdkit's OWN journal (2026-08-11/12): raw agent_status=idle persisted CONTINUOUSLY for up to
+#      ~30 minutes (slug actuator-status-port, 22:46:50Z→23:16:44Z, 15 straight corroborated ticks) —
+#      the pane path rescued every one of those ticks because it happened to land on an active-and-
+#      repainting snapshot each time, but a caller with a SHORT observation window (herd_spawn_wake_
+#      verify's ~20s / 1-4 polls, a one-shot wedge/dead-classification read) has no such guarantee: a
+#      poll that lands between repaints, or whose "visible" pane text is scrolled/truncated past the
+#      hint line, sees neither pane signal and misreads idle — the exact failure the header comment
+#      above already named ("fooled herd_spawn_wake_verify … into woke=0 and a pointless prompt-resend
+#      retry"). Transcript growth is immune to terminal rendering entirely (Claude flushes the session
+#      file on every turn/tool call regardless of what is currently painted), so it closes that gap
+#      without touching the pane path's own guardrail. Same one-way-veto shape: a truly stuck agent
+#      (crashed, no more transcript writes) still reads 'idle' — this can only ever RESCUE, never
+#      fabricate a false 'working'. Needs the slug's worktree (derived as $WORKTREES_DIR/<slug>,
+#      the standard builder-worktree layout — see agent-watch.sh's TREES="$WORKTREES_DIR" / "$TREES/
+#      $slug" convention); a caller whose slug has no worktree at that path (e.g. a headless registration
+#      with no worktree at all) simply sees no transcript and this path contributes nothing, unchanged
+#      from before HERD-660.
 #
-# Journals status_disagreement (slug, pane, agent_status idle, resolved working) exactly when it
-# fires — never on any other path — so a consumer can trust the journal as the complete rescue record.
-# Kill switch: HERD_STATUS_CORROBORATE=off returns the raw status untouched (no pane read, no
-# journal) — a bare env read (undocumented test seam), same class as HERD_SPAWN_WAKE_VERIFY.
-# Fail-soft throughout: headless (no pane_id), a missing herdr, an unresolvable pane, or an empty pane
-# read all fall straight back to the raw status — absent signals reproduce TODAY's behavior exactly.
+# Journals status_disagreement (slug, pane, agent_status idle, resolved working) exactly when EITHER
+# path fires — never on any other path — so a consumer can trust the journal as the complete rescue
+# record. Kill switch: HERD_STATUS_CORROBORATE=off returns the raw status untouched (no pane read, no
+# transcript read, no journal) — a bare env read (undocumented test seam), same class as
+# HERD_SPAWN_WAKE_VERIFY; it gates BOTH rescue paths, not just the pane one.
+# Fail-soft throughout: headless (no pane_id), a missing herdr, an unresolvable pane, an empty pane
+# read, a missing worktree, or a missing/unwritable transcript store all fall straight back to the raw
+# status (or to trying the OTHER path) — absent signals reproduce TODAY's behavior exactly.
 herd_driver_agent_status_resolved() {
   local slug="${1:-}" raw="${2:-}" pane="${3:-}"
   [ "$raw" = "idle" ] || { printf '%s' "$raw"; return 0; }
   [ "${HERD_STATUS_CORROBORATE:-on}" != "off" ] || { printf '%s' "$raw"; return 0; }
   [ -n "$slug" ] || { printf '%s' "$raw"; return 0; }
+  local rescued=1
   [ -n "$pane" ] || pane="$(herd_driver_agent_pane_id "$slug" 2>/dev/null || true)"
-  [ -n "$pane" ] || { printf '%s' "$raw"; return 0; }
-  local text; text="$(herd_driver_read_pane "$pane" visible 2>/dev/null || true)"
-  [ -n "$text" ] || { printf '%s' "$raw"; return 0; }
-  if _herd_pane_active_signal "$text" && _herd_pane_content_delta "$slug" "$text"; then
+  if [ -n "$pane" ]; then
+    local text; text="$(herd_driver_read_pane "$pane" visible 2>/dev/null || true)"
+    if [ -n "$text" ] && _herd_pane_active_signal "$text" && _herd_pane_content_delta "$slug" "$text"; then
+      rescued=0
+    fi
+  fi
+  if [ "$rescued" -ne 0 ] && _herd_wake_transcript_growing "$slug" "${WORKTREES_DIR:-${TREES:-.}}/$slug"; then
+    rescued=0
+  fi
+  if [ "$rescued" -eq 0 ]; then
     command -v journal_append >/dev/null 2>&1 \
       && journal_append status_disagreement slug "$slug" pane "$pane" agent_status idle resolved working
     printf 'working'
@@ -1722,6 +1751,68 @@ _herd_pane_content_delta() {
   cur="$(printf '%s' "$text" | cksum 2>/dev/null || true)"
   printf '%s' "$cur" > "$f" 2>/dev/null || true
   [ -n "$prev" ] && [ -n "$cur" ] && [ "$prev" != "$cur" ]
+}
+
+# file_mtime / _file_size — portable stat helpers (GNU stat -c vs BSD/macOS stat -f), prefixed to this
+# file to avoid clashing with agent-watch.sh's OWN identically-purposed pair (agent-watch.sh sources
+# driver.sh, not the reverse, so this file cannot borrow theirs — same duplication precedent as
+# cost.sh's _cost_transcript_dir, HERD-660). Detected once at load, mirroring agent-watch.sh's guard
+# against uutils' '-f' meaning --file-system (HERD-207).
+if stat --version 2>/dev/null | grep -qE "GNU|uutils"; then  # pipe-ok: fixed short version banner, far under a pipe buffer
+  _herd_wake_file_mtime() { stat -c %Y "$1" 2>/dev/null || echo 0; }
+  _herd_wake_file_size()  { stat -c %s "$1" 2>/dev/null || echo 0; }
+else
+  _herd_wake_file_mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
+  _herd_wake_file_size()  { stat -f %z "$1" 2>/dev/null || echo 0; }
+fi
+
+# _herd_wake_transcript_obs <worktree> — echo "<total-bytes> <newest-mtime>" over the Claude session
+# transcript(s) for <worktree>, or nothing if none exist. Mirrors agent-watch.sh's _transcript_obs /
+# cost.sh's _cost_transcript_dir EXACTLY (same $HERD_TRANSCRIPT_ROOT root, same '/'+'.'→'-' munge) —
+# reimplemented here rather than sourced because the dependency runs the other way (agent-watch.sh
+# sources driver.sh) and this resolver also serves callers that never load agent-watch.sh at all
+# (herd-feature.sh, herd-quick.sh, herd-review.sh's spawn/review wake-verify).
+_herd_wake_transcript_obs() {
+  local wt="${1:-}" root munged d total=0 newest=0 f sz m
+  [ -n "$wt" ] || return 0
+  root="${HERD_TRANSCRIPT_ROOT:-$HOME/.claude/projects}"
+  munged="$(printf '%s' "$wt" | tr '/.' '-')"
+  d="$root/$munged"
+  [ -d "$d" ] || return 0
+  for f in "$d"/*.jsonl; do
+    [ -f "$f" ] || continue
+    sz="$(_herd_wake_file_size "$f")"; total=$(( total + ${sz:-0} ))
+    m="$(_herd_wake_file_mtime "$f")"; [ "${m:-0}" -gt "$newest" ] && newest="$m"
+  done
+  [ "$total" -gt 0 ] && printf '%s %s' "$total" "$newest"
+}
+
+# _herd_wake_transcript_growing <slug> <worktree> — 0 iff <slug>'s Claude session transcript under
+# <worktree> has grown (bytes OR mtime increased) since the LAST time this resolver observed it
+# (HERD-660). Same "since last poll" shape as _herd_pane_content_delta above — NOT agent-watch.sh's
+# longer quiet-window variant (that one exists to avoid flapping a multi-minute STALL warning across
+# Claude's bursty transcript flushes; this one only ever runs inside the tight, actively-polled
+# wake-verify/status-read path, where "grew since we last looked" is the exact question). A fresh call
+# with no prior snapshot returns 1 (no delta YET — never a false rescue on the very first look, same
+# fail-soft shape as _herd_pane_content_delta). ALWAYS refreshes the snapshot before returning, so a
+# short polling loop observes a real delta across its own retries. Best-effort store under
+# WORKTREES_DIR/.herd/status-resolve/<slug>.transcript (sibling of, never the same file as,
+# _herd_pane_content_delta's cache); an unwritable store, absent worktree, or absent transcript all
+# degrade to "not growing" (never corroborates, never blocks a caller).
+_herd_wake_transcript_growing() {
+  local slug="${1:-}" wt="${2:-}" obs cur_size cur_mt dir f prev prev_size prev_mt
+  [ -n "$slug" ] && [ -n "$wt" ] || return 1
+  obs="$(_herd_wake_transcript_obs "$wt")"
+  [ -n "$obs" ] || return 1
+  cur_size="${obs%% *}"; cur_mt="${obs##* }"
+  dir="${WORKTREES_DIR:-${TREES:-.}}/.herd/status-resolve"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  f="$dir/$slug.transcript"
+  prev="$(cat "$f" 2>/dev/null || true)"
+  printf '%s %s' "$cur_size" "$cur_mt" > "$f" 2>/dev/null || true
+  [ -n "$prev" ] || return 1
+  prev_size="${prev%% *}"; prev_mt="${prev##* }"
+  { [ "${cur_size:-0}" -gt "${prev_size:-0}" ] || [ "${cur_mt:-0}" -gt "${prev_mt:-0}" ]; }
 }
 
 # _herd_wake_agent_status <name> [pane] — agent_status word for the agent REGISTERED as <name> out of
