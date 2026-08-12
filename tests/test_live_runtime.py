@@ -8636,9 +8636,17 @@ class TestCiConclusiveMemo(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.state.ci_conclusive_memo_file("feat/nested/thing")))
 
     def test_no_state_dir_is_inert(self):
-        blackhole = LiveState(None)
-        blackhole.record_ci_conclusive_memo("feat/x", "shaA", "CLEAN", "")
-        self.assertIsNone(blackhole.ci_conclusive_memo("feat/x"))
+        # LiveState(None) falls back to TREES/WORKTREES_DIR when either is set in the environment — a
+        # watcher- or gate-wrapper-descended run exports one (tests/test-py-live-runtime.sh runs this
+        # suite with WORKTREES_DIR set), which would hand this "stateless" probe a REAL ledger and
+        # invert the assertion (see TestTransitionDedupe.test_no_state_dir_never_suppresses, same fix).
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for k in ("TREES", "WORKTREES_DIR"):
+                os.environ.pop(k, None)
+            blackhole = LiveState(None)
+            self.assertIsNone(blackhole.dir)
+            blackhole.record_ci_conclusive_memo("feat/x", "shaA", "CLEAN", "")
+            self.assertIsNone(blackhole.ci_conclusive_memo("feat/x"))
 
     def _gates(self, journal_path):
         return LiveGates("/nonexistent-home", self.state, LiveJournal(journal_path),
