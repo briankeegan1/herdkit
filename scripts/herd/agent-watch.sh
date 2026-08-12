@@ -1652,9 +1652,9 @@ build_main_health() {
 
 # build_main_freshness — the MAIN-checkout freshness rows (HERD-233), both read from state files the
 # tick reconcile writes: (1) a LOUD row while $MAIN diverged in a way only a human can resolve, and
-# (2) a "restart recommended" note when a fast-forward pulled engine code this watcher process is no
-# longer running. Both files are absent on the happy path, so a fresh $MAIN renders NOTHING and the
-# console stays byte-identical to before this feature.
+# (2) a "restart recommended" note once $MAIN holds engine code this watcher process is not running
+# (HERD-651: any loaded path, however HEAD got there). Both files are absent on the happy path, so a
+# fresh $MAIN renders NOTHING and the console stays byte-identical to before this feature.
 #
 # RENDER-TICK RECONCILE (HERD-455 / GitHub issue #569): the row is a LEDGER read, and every mechanism
 # that invalidates that ledger — _main_fresh_recheck, reconcile_main_freshness — sits BESIDE this
@@ -7574,11 +7574,12 @@ refresh_symbol_index() {
 #   • Already fresh (0 ahead, 0 behind) → byte-inert: no journal, no state file, no console row.
 #   • A fetch failure never blocks the tick (offline / gh outage → silent, retried next tick).
 #   • Held reasons journal ONCE per transition (the row persists; the journal does not spam).
-#   • The watcher executes the engine code it loaded at startup, so a pull that carries a new
-#     agent-watch.sh leaves a "restart recommended" note — cleared at the next watcher startup.
+#   • The watcher executes the engine code it loaded at startup, so a delta that carries new engine
+#     code — agent-watch.sh OR any sibling it loads (HERD-651) — leaves a "restart recommended" note,
+#     cleared at the next watcher startup.
 
 MAIN_FRESH_STATE="$TREES/.agent-watch-main-freshness"   # one line while UNHEALABLE: "<reason> <behind> <ahead>"
-MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"   # one line: the sha whose pull carried new engine code
+MAIN_FRESH_RESTART="$TREES/.agent-watch-main-restart"   # one line: the sha $MAIN reached carrying new engine code
 MAIN_DETACHED_STATE="$TREES/.agent-watch-main-detached" # HERD-336: the detached-HEAD sha, deduped so a persisting detachment journals once
 CHECKOUT_CLEAN_STATE="$TREES/.agent-watch-checkout-clean" # HERD-361: the shared-checkout cleanliness violation signature (absent = clean); drives the row + dedups the journal
 CHECKOUT_CLEAN_PENDING="$TREES/.agent-watch-checkout-clean.pending" # HERD-414: one-tick-old offender signature; a signature must repeat here before it is promoted into CHECKOUT_CLEAN_STATE
@@ -7615,9 +7616,11 @@ _count_gate_workers() {
 }
 
 # ── Watcher SELF-RESTART on stale engine code (HERD-251) ─────────────────────────────────────────
-# The watcher executes the engine code it loaded at startup. HERD-233 detects the case where a pulled
-# delta rewrote agent-watch.sh and leaves a "restart recommended" note ($MAIN_FRESH_RESTART) for the
-# operator — who then restarts by hand (six times on 2026-07-09 alone). This closes that loop.
+# The watcher executes the engine code it loaded at startup. HERD-233 detects the case where $MAIN
+# reached a sha whose delta carried new engine code — agent-watch.sh or any sibling it loads (HERD-651
+# widened that condition; see _main_fresh_engine_delta / _main_fresh_engine_staleness) — and leaves a
+# "restart recommended" note ($MAIN_FRESH_RESTART) for the operator, who then restarts by hand (six
+# times on 2026-07-09 alone). This closes that loop.
 #
 # WATCHER_SELF_RESTART=on → the note ARMS a QUIESCE-THEN-EXEC:
 #   (a) QUIESCE — stop dispatching NEW gate work (reviews, healthchecks, resolver spawns, and the
@@ -7943,16 +7946,102 @@ _main_fresh_generated_only() {
   return 0
 }
 
-# _main_fresh_note_restart <old-sha> <new-sha> — success (and leave a note) iff the pulled delta
-# rewrote agent-watch.sh: the running watcher is now executing code $MAIN no longer holds. The note is
-# also the ARM signal for the HERD-251 self-restart quiesce (see _self_restart_tick); $_SELF_RESTART_FROM
-# carries the pre-pull sha the note file itself cannot hold, for the journal's shas=<old>..<new> field.
+# ── The engine surface the RUNNING watcher loads (HERD-651) ───────────────────────────────────────
+# agent-watch.sh is one file of many. It sources a dozen-plus siblings out of scripts/herd/ (sweep.sh,
+# retirement.sh, console-section.sh, driver.sh, journal-audit.sh, resolver-pane.sh, …) and shells out to
+# pysrc/herd/ (live_runtime.py — the sole engine core — store.py, …) and to bin/herd. Every one of those
+# is loaded ONCE, into THIS process image: a merged change to ANY of them leaves the watcher executing
+# code $MAIN no longer holds, which is exactly the staleness the HERD-233 note names. Before this the
+# note armed ONLY on a delta that rewrote agent-watch.sh itself, so the far more common sibling merge
+# left the watcher stale indefinitely — LIVE 2026-08-11: PR #749's scratch-worktree reaper landed in
+# sweep.sh at 13:31 and the running watcher missed the dead basewt row it fixes for ~7 hours (until a
+# hand restart) with WATCHER_SELF_RESTART=on the whole time.
+#
+# ALLOWLIST, so everything else is excluded BY CONSTRUCTION — a restart is cheap but never free (it
+# drains the gate first), so only code this process actually runs may cost one. Worth saying out loud:
+#   • docs/      — prose plus the generated maps. Nothing sources them: a docs merge must NEVER restart
+#                  the watcher.
+#   • templates/ — checked deliberately and deliberately EXCLUDED: templates are RENDER inputs (`herd
+#                  render` writes the control-room artifacts from them). The running watcher never loads
+#                  one, so a templates-only delta changes what the next render emits, not what this
+#                  process executes.
+#   • tests/, packaging/, migrations/, README.md, … — never loaded by the watcher either.
+# scripts/herd/ is taken WHOLE rather than enumerating the sourced list: the watcher also EXECUTES its
+# siblings out of that directory (herd-review.sh, healthcheck.sh, herd-resolve.sh, the sim scenarios the
+# core-surface gate dispatches), and a directory rule cannot drift — a lib added tomorrow is covered on
+# the day it lands, where a hand-maintained file list would go quietly blind exactly like the one this
+# item replaces.
+#
+# _main_fresh_engine_delta <old-sha> <new-sha> — success iff the delta between two $MAIN shas touches a
+# path the watcher loads. Pathspec-limited, so the membership test IS git's (no pipe, no regex): a
+# directory pathspec covers its whole subtree, `bin/herd` is the literal file. FAIL-SOFT: an unreadable
+# git state (bad sha, no repo) returns 1 — never guess a restart into existence.
+_main_fresh_engine_delta() {
+  local _me_out
+  _me_out="$(git -C "$MAIN" diff --name-only "$1" "$2" -- \
+               scripts/herd pysrc/herd bin/herd 2>/dev/null)" || return 1
+  [ -n "$_me_out" ]
+}
+
+# _main_fresh_note_restart <old-sha> <new-sha> — success (and leave a note) iff the delta carried engine
+# code the watcher LOADS (_main_fresh_engine_delta): the running watcher is now executing code $MAIN no
+# longer holds. The note is also the ARM signal for the HERD-251 self-restart quiesce (see
+# _self_restart_tick); $_SELF_RESTART_FROM carries the older sha the note file itself cannot hold, for
+# the journal's shas=<old>..<new> field.
 _main_fresh_note_restart() {
-  git -C "$MAIN" diff --name-only "$1" "$2" 2>/dev/null \
-    | grep -qx 'scripts/herd/agent-watch.sh' || return 1  # pipe-ok: bounded membership list, under a pipe buffer
+  _main_fresh_engine_delta "$1" "$2" || return 1
   mkdir -p "$TREES" 2>/dev/null || true
   printf '%s\n' "$2" > "$MAIN_FRESH_RESTART" 2>/dev/null || true
   _SELF_RESTART_FROM="$1"
+  return 0
+}
+
+# WATCH_START_HEAD — $MAIN's HEAD sha at the moment THIS process loaded its engine code (HERD-651).
+# Empty ⇒ no baseline (a lib-mode source, an unreadable checkout), and the staleness leg below is
+# skipped entirely: the note then arms exactly as it did before, off the reconcile's own ff/heal delta.
+WATCH_START_HEAD=""
+
+# _watch_record_start_head — pin that baseline. Called ONCE from the startup one-shot that drops a
+# pending restart note, because the note and the baseline are the same statement ("this image runs the
+# code at THIS sha"), and because the self-restart exec re-runs that one-shot, so the incoming image
+# re-pins its own. $HERE (where the sourced libs actually come from) resolves inside $MAIN for every
+# real launch, so $MAIN's HEAD is the sha this image loaded. Fail-soft: an unreadable HEAD leaves the
+# baseline empty rather than pinning a wrong one.
+_watch_record_start_head() {
+  WATCH_START_HEAD=""
+  [ -n "${MAIN:-}" ] || return 0
+  WATCH_START_HEAD="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  return 0
+}
+
+# _main_fresh_engine_staleness — the WIDENED arm condition (HERD-651). The reconcile's ff/heal legs can
+# only arm the note when THIS tick moved $MAIN; but HEAD moves out from under the watcher by several
+# other routes — do_merge fast-forwards $MAIN right after this seat's own merge, an operator pulls by
+# hand, `herd update` runs — and by the time the reconcile looks, $MAIN is already 0-ahead/0-behind
+# origin and the whole leg is byte-inert. That is the 2026-08-11 miss: the engine code changed, nothing
+# ever compared it against what the watcher is running. So the note is ALSO armed by comparing OBSERVED
+# HEAD against the sha this process loaded from — the honest statement of "am I running stale code", no
+# matter who moved HEAD.
+#
+# Read-only and fetch-free, so it is called ABOVE the reconcile's defers for the same reason
+# _main_fresh_recheck is: a live gate or an unreachable remote must not starve it.
+#
+# The baseline is NEVER advanced here. This process goes on running the code it loaded, so the note
+# stands until a restart re-pins it (the startup one-shot drops the note and re-records the sha
+# together) — and the [ -s $MAIN_FRESH_RESTART ] guard makes a standing note byte-inert, so a stale
+# watcher re-derives nothing and journals once, not once per tick.
+_main_fresh_engine_staleness() {
+  local _es_head
+  [ -n "${WATCH_START_HEAD:-}" ] || return 0     # no baseline → pre-HERD-651 behavior, unchanged
+  [ -s "${MAIN_FRESH_RESTART:-}" ] && return 0   # already noted: nothing to re-arm, nothing to re-journal
+  _es_head="$(git -C "$MAIN" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$_es_head" ] || return 0                 # unreadable HEAD → fail-soft, never guess
+  [ "$_es_head" = "$WATCH_START_HEAD" ] && return 0
+  # HEAD moved. Arm ONLY when the delta touched loaded engine code; a docs/templates-only delta moves
+  # HEAD every bit as much and must leave the watcher alone.
+  _main_fresh_note_restart "$WATCH_START_HEAD" "$_es_head" || return 0
+  journal_append main_freshness result restart-note reason engine-stale \
+    shas "${WATCH_START_HEAD}..${_es_head}"
   return 0
 }
 
@@ -8009,6 +8098,10 @@ reconcile_main_freshness() {
   # a recovered $MAIN must clear its row on the very next tick even while a gate owns the tree or the
   # fetch is failing. Read-only, and a no-op when no row is held.
   _main_fresh_recheck
+  # HERD-651: the widened stale-engine arm. Read-only and fetch-free, so it sits WITH the recheck above
+  # every defer below it — a busy gate or an unreachable remote must not delay noticing that the code
+  # this process is executing is no longer the code on disk.
+  _main_fresh_engine_staleness
   # A live gate owns the tree this tick — defer silently; the next tick reconciles.
   _watch_gate_inflight && return 0
   # HERD-336: a detached shared checkout — journal + reattach (when the detached commits are only our
@@ -19737,6 +19830,14 @@ _startup_reap_sweep
 # "main pulled new engine code — restart recommended" note (HERD-233) has been satisfied by the very
 # restart that got us here. Drop it, or the row would outlive the condition it warns about.
 rm -f "$MAIN_FRESH_RESTART" 2>/dev/null || true
+
+# …and PIN the sha that statement is true OF (HERD-651). The note above says "this image runs the code
+# at $MAIN's HEAD right now"; every later tick re-checks that claim by comparing OBSERVED HEAD against
+# this baseline (_main_fresh_engine_staleness), so a sibling lib that lands by ANY route — this seat's
+# own do_merge fast-forward, another seat, a hand pull — re-raises the note instead of leaving the
+# watcher on stale code until someone notices. The self-restart exec re-runs this same one-shot, so the
+# incoming image immediately re-pins its own baseline.
+_watch_record_start_head
 
 # …and the SAME reasoning for its sibling (HERD-259): a restart re-validates the restart note but used
 # to inherit $MAIN_FRESH_STATE unread, so a MAIN-STALE row whose divergence a human had already resolved

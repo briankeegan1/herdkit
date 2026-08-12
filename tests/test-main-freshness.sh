@@ -24,6 +24,15 @@
 #  (13) a GENUINELY stale MAIN is untouched: state file + rendered row byte-identical, no journal
 #  (14) a still-dirty tree keeps its own hold; DRYRUN clears nothing; no state file ⇒ byte-inert
 #
+# HERD-651 — the RESTART NOTE arms on the whole surface the watcher LOADS, not just agent-watch.sh:
+#  (20) a delta to scripts/herd/<any lib>, pysrc/herd/, or bin/herd arms it (agent-watch.sh unchanged)
+#  (21) docs-only, templates-only and README-only deltas NEVER arm it
+#  (22) the live miss: HEAD moved OUT-OF-BAND (do_merge's own ff) so the reconcile sees 0-ahead/0-behind
+#       — the startup baseline sha still arms the note, journals once, and never advances itself
+#  (23) fail-soft: no baseline / an unreadable sha / DRYRUN ⇒ pre-HERD-651 behavior, no note invented
+#  (24) end to end: a sweep.sh-only merge arms the note AND the HERD-251 self-restart fires after the
+#       quiesce drains; with the lever off the same note only renders 'restart recommended'
+#
 # Sources agent-watch.sh in lib mode and drives reconcile_main_freshness against a REAL local git
 # repo wired to a bare "origin", with a second clone standing in for the other seat that pushes.
 # journal_append is overridden to a log.
@@ -53,7 +62,9 @@ export HERD_CONFIG_FILE="$T/no-such-config"
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 for fn in reconcile_main_freshness build_main_freshness _main_fresh_generated_only \
           _main_fresh_note_restart _main_fresh_hold _main_fresh_recheck _main_fresh_recovered \
-          _watch_gate_inflight; do
+          _watch_gate_inflight _main_fresh_engine_delta _main_fresh_engine_staleness \
+          _watch_record_start_head _self_restart_tick _self_restart_quiescing \
+          _self_restart_hold_dispatch; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
 done
 
@@ -428,6 +439,139 @@ jhas 'main_freshness result held reason ff-failed behind 1 ahead 0' \
 build_main_freshness
 case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*) ;; *) fail "(19) ff-failed row not rendered: ${MAIN_FRESHNESS:-<empty>}" ;; esac
 rm -f "$MAIN/COLLIDE.md"
+ok
+
+# ══ HERD-651: the RESTART NOTE's arm condition is the whole surface the watcher LOADS ══════════════
+# The watcher sources a dozen-plus libs out of scripts/herd/ and shells out to pysrc/herd/ + bin/herd,
+# but the note used to arm ONLY when the delta rewrote agent-watch.sh itself — so a merged sibling left
+# it running stale code indefinitely (LIVE 2026-08-11: PR #749's reaper landed in sweep.sh; the watcher
+# missed the dead row it fixes for ~7 hours with WATCHER_SELF_RESTART=on).
+git -C "$MAIN" fetch -q origin main >/dev/null 2>&1
+git -C "$MAIN" reset -q --hard origin/main        # legs above left MAIN behind an ff-failed hold
+
+# armed <file> <label> — a seat lands <file>, we reconcile: the ff MUST leave a restart note.
+armed() {
+  reset_state
+  seat_push "$1" "engine delta for $2" "feat: $2"
+  reconcile_main_freshness
+  [ "$(head_sha)" = "$(origin_sha)" ] || fail "(20) $2: the ff did not happen"
+  jhas 'restart yes'                  || fail "(20) $2 did not journal restart=yes: $(cat "$JLOG")"
+  [ -s "$MAIN_FRESH_RESTART" ]        || fail "(20) $2 left no restart note"
+}
+# unarmed <file> <label> — the same, for a path the watcher never loads: NO note, ever.
+unarmed() {
+  reset_state
+  seat_push "$1" "not engine code — $2" "docs: $2"
+  reconcile_main_freshness
+  [ "$(head_sha)" = "$(origin_sha)" ] || fail "(21) $2: the ff did not happen"
+  jhas 'restart no'                   || fail "(21) $2 did not journal restart=no: $(cat "$JLOG")"
+  [ ! -e "$MAIN_FRESH_RESTART" ]      || fail "(21) $2 armed a restart the watcher does not need"
+}
+
+# ── (20) a delta to any LOADED path arms the note ────────────────────────────────────────────────
+armed scripts/herd/sweep.sh          "sweep.sh sibling lib (the live 2026-08-11 miss)"
+armed pysrc/herd/live_runtime.py     "the python engine core the watcher shells out to"
+armed bin/herd                       "the CLI the watcher shells out to"
+armed scripts/herd/agent-watch.sh    "agent-watch.sh itself — exactly as before"
+ok
+
+# ── (21) docs-only and templates-only deltas NEVER arm ───────────────────────────────────────────
+# templates/ is the one worth stating: templates are RENDER inputs (`herd render` writes the control-room
+# artifacts from them), never sourced by the running watcher — a templates merge changes what the next
+# render emits, not what this process executes, so it must not cost a restart.
+unarmed docs/COORDINATOR-SOP.md      "a docs-only merge"
+unarmed templates/capabilities.tsv   "a templates-only merge"
+unarmed README.md                    "a README-only merge"
+ok
+
+# ── (22) THE LIVE MISS: HEAD moves OUT-OF-BAND, so the reconcile never sees a delta at all ────────
+# do_merge fast-forwards $MAIN itself right after this seat's own merge (an operator pull, `herd update`
+# and a sibling seat's checkout do the same). By the time the reconcile looks, $MAIN is 0-ahead/0-behind
+# and the whole leg is byte-inert — which is why 13:31's merge went unnoticed until a hand restart. The
+# baseline sha this process loaded from closes that: the note arms off OBSERVED HEAD vs that baseline.
+reset_state
+_watch_record_start_head                                   # pin: this "process" loaded the code at HEAD
+base="$WATCH_START_HEAD"
+[ -n "$base" ]                       || fail "(22) the startup baseline was never recorded"
+seat_push scripts/herd/retirement.sh "retirement v2" "feat: sibling lib landed while we ran"
+git -C "$MAIN" fetch -q origin main >/dev/null 2>&1
+git -C "$MAIN" reset -q --hard origin/main                 # ← do_merge's own ff: HEAD moved, not by us
+reconcile_main_freshness
+[ -s "$MAIN_FRESH_RESTART" ]         || fail "(22) an out-of-band engine move left no restart note"
+jhas "main_freshness result restart-note reason engine-stale shas ${base}..$(head_sha)" \
+                                     || fail "(22) the stale-engine arm was not journaled: $(cat "$JLOG")"
+build_main_freshness
+case "${MAIN_FRESHNESS:-}" in *"restart recommended"*) ;; *) fail "(22) restart row not rendered: ${MAIN_FRESHNESS:-<empty>}" ;; esac
+case "${MAIN_FRESHNESS:-}" in *"MAIN STALE"*) fail "(22) a fresh-but-stale-engine MAIN must not paint a STALE row" ;; esac
+# A STANDING note is byte-inert: the row persists, the journal does not spam, and the baseline is NOT
+# advanced (this process still runs the old code) — the restart is what re-pins it.
+: > "$JLOG"
+reconcile_main_freshness
+[ ! -s "$JLOG" ]                     || fail "(22) a standing restart note re-journaled: $(cat "$JLOG")"
+[ "$WATCH_START_HEAD" = "$base" ]    || fail "(22) the baseline advanced without a restart"
+ok
+
+# …and the same out-of-band move with a DOCS-only delta arms nothing.
+reset_state
+_watch_record_start_head
+seat_push docs/NOTES-651.md "prose" "docs: prose only, out of band"
+git -C "$MAIN" fetch -q origin main >/dev/null 2>&1
+git -C "$MAIN" reset -q --hard origin/main
+reconcile_main_freshness
+[ ! -e "$MAIN_FRESH_RESTART" ]       || fail "(22b) a docs-only out-of-band move restarted the watcher"
+[ ! -s "$JLOG" ]                     || fail "(22b) a docs-only out-of-band move journaled: $(cat "$JLOG")"
+ok
+
+# ── (23) FAIL-SOFT + byte-inert without a baseline ───────────────────────────────────────────────
+# No baseline (a lib-mode source, an unreadable checkout) ⇒ pre-HERD-651 behavior exactly: the leg is
+# skipped and only the reconcile's own ff/heal delta can arm. An unreadable sha never guesses a restart.
+reset_state
+WATCH_START_HEAD=""
+seat_push scripts/herd/driver.sh "driver v2" "feat: sibling lib, no baseline pinned"
+git -C "$MAIN" fetch -q origin main >/dev/null 2>&1
+git -C "$MAIN" reset -q --hard origin/main
+reconcile_main_freshness
+[ ! -e "$MAIN_FRESH_RESTART" ]       || fail "(23) an empty baseline still armed a note"
+[ ! -s "$JLOG" ]                     || fail "(23) an empty baseline journaled: $(cat "$JLOG")"
+_main_fresh_engine_delta "deadbeef" "$(head_sha)" && fail "(23) an unreadable sha claimed an engine delta"
+_watch_record_start_head
+DRYRUN=1 reconcile_main_freshness
+[ ! -e "$MAIN_FRESH_RESTART" ]       || fail "(23) DRYRUN armed a restart note"
+ok
+
+# ── (24) END TO END: a sweep.sh-only merge arms the note AND the self-restart fires after quiesce ──
+# The whole point of the widening: with WATCHER_SELF_RESTART=on, the note the sibling merge now raises
+# drains the gate and re-execs, instead of sitting on the console for hours. The exec itself is stubbed
+# (this process must never replace its own image); the DECISION is what is under test.
+reset_state
+_watch_record_start_head
+seat_push scripts/herd/sweep.sh "sweep v2 — scratch-worktree reaper" "fix(sweep): reap dead scratch worktrees"
+reconcile_main_freshness
+[ -s "$MAIN_FRESH_RESTART" ]         || fail "(24) the sibling merge did not arm the note"
+EXECED=""
+_self_restart_exec() { EXECED="$1"; return 0; }
+_SELF_RESTART_ARMED=""; _SELF_RESTART_IDLE_TICKS=0; _SELF_RESTART_GAVE_UP=""
+export WATCHER_SELF_RESTART=on
+_self_restart_tick                                          # arms the quiesce; 0 workers → idle=1
+_self_restart_quiescing              || fail "(24) the note did not arm the quiesce"
+_self_restart_hold_dispatch          || fail "(24) the quiesce is not holding new gate dispatch"
+[ -z "$EXECED" ]                     || fail "(24) restarted after a single quiet tick"
+_self_restart_tick                                          # idle=2 → re-exec
+[ "$EXECED" = "drained" ]            || fail "(24) the self-restart never fired after the drain (got '${EXECED:-<none>}')"
+jhas 'watcher_quiesce reason engine-update'                 || fail "(24) the quiesce was not journaled: $(cat "$JLOG")"
+# …and with the lever OFF the same note only RECOMMENDS a restart: no quiesce, no hold, no exec.
+reset_state; _watch_record_start_head
+seat_push scripts/herd/sweep.sh "sweep v3" "fix(sweep): another sibling change"
+reconcile_main_freshness
+[ -s "$MAIN_FRESH_RESTART" ]         || fail "(24) lever-off: the note must still be raised"
+EXECED=""; _SELF_RESTART_ARMED=""; _SELF_RESTART_IDLE_TICKS=0; _SELF_RESTART_GAVE_UP=""
+WATCHER_SELF_RESTART=off _self_restart_tick
+WATCHER_SELF_RESTART=off _self_restart_tick
+_self_restart_quiescing              && fail "(24) lever-off armed the quiesce"
+[ -z "$EXECED" ]                     || fail "(24) lever-off re-execed the watcher"
+build_main_freshness
+case "${MAIN_FRESHNESS:-}" in *"restart recommended"*) ;; *) fail "(24) lever-off lost the recommendation row: ${MAIN_FRESHNESS:-<empty>}" ;; esac
+unset WATCHER_SELF_RESTART
 ok
 
 echo "PASS: test-main-freshness.sh ($pass checks)"
