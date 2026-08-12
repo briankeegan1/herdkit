@@ -6,12 +6,14 @@
 # Design (mirrors test-cli-reload.sh's rich-stub approach):
 #   • herdr is STUBBED on PATH — a file-backed simulation of the pane/tab JSON API. State lives
 #     under $HERDR_STATE:  panes/<id>/tab = tab_id · panes/<id>/cmd = foreground cmdline (the role
-#     signal) · tabs/<id> = tab label. `tab close` deletes the tab file. NO process is ever spawned
-#     and no real herdr tab/pane is touched — the tab-leak-guard stays green.
+#     signal) · panes/<id>/label = last `pane rename` label (HERD-650) · tabs/<id> = tab label.
+#     `tab close` deletes the tab file. NO process is ever spawned and no real herdr tab/pane is
+#     touched — the tab-leak-guard stays green.
 #   • The library is SOURCED directly and its functions called with faked pane/process-info JSON,
 #     so the reconciler's decisions are asserted in isolation.
 #
-# Covers the three cases the backlog item names: stale-registry, duplicate-viewer, missing-pane.
+# Covers the three cases the backlog item names: stale-registry, duplicate-viewer, missing-pane —
+# plus (HERD-650) the role-LABEL reconcile layout_write_registry now performs on every pass.
 # Run:  bash tests/test-layout-reconcile.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -59,6 +61,10 @@ PY
     ;;
   "tab close")
     rm -f "$S/tabs/${3:-}"; printf '{"result":{}}\n' ;;
+  "pane rename")
+    p="${3:-}"; shift 3 || true
+    if [ -n "$p" ] && [ -d "$S/panes/$p" ]; then printf '%s' "$*" > "$S/panes/$p/label"; fi
+    printf '{"result":{}}\n' ;;
   *) printf '{"result":{}}\n' ;;
 esac
 exit 0
@@ -147,18 +153,61 @@ ok
 
 # ── 6. layout_write_registry rewrites from OBSERVED ids, stamping the workspace ─
 S="$T/s6"; mkdir -p "$S"; export HERDR_STATE="$S"
+_pane "$S" pA tC 'claude /coordinator'
+_pane "$S" pL tC 'bash /x/backlog-view.sh'
+_pane "$S" pW tC 'bash /x/herd-watch.sh'
 reg="$S/.herd-panes"
-layout_write_registry "$reg" w1 tC pA pL pW
+layout_write_registry "$reg" w1 tC pA pL pW wsX
 grep -qx 'coordinator-agent pA tC w1' "$reg" || fail "registry: coordinator-agent row wrong/missing"
 grep -qx 'backlog pL tC w1'           "$reg" || fail "registry: backlog row wrong/missing"
 grep -qx 'watch pW tC w1'             "$reg" || fail "registry: watch row wrong/missing"
 # Empty roles omit their row entirely.
-layout_write_registry "$reg" w1 tC pA pL ''
+layout_write_registry "$reg" w1 tC pA pL '' wsX
 grep -q '^watch ' "$reg" && fail "registry: watch row written despite an empty watch pane" || true
 [ "$(wc -l < "$reg")" -eq 2 ] || fail "registry: expected exactly 2 rows when watch is empty"
 # The writer creates the parent dir if absent.
-layout_write_registry "$S/nested/dir/.herd-panes" w1 tC pA '' ''
+layout_write_registry "$S/nested/dir/.herd-panes" w1 tC pA '' '' wsX
 [ -f "$S/nested/dir/.herd-panes" ] || fail "registry: writer did not create the parent directory"
+ok
+
+# ── 6b. HERD-650: layout_write_registry re-asserts each resolved pane's role LABEL ──────────────
+# The write above (pA/pL/pW all present) must ALSO have labelled every resolved pane via the stub's
+# `pane rename` — this is the actual reconcile the fix adds, not just the registry text file. Reuses
+# coordinator.sh's PRE-EXISTING `<role>·<ws>` family (HERD-310 stamp coverage) rather than a
+# conflicting scheme, so a workspace-qualified ws_name arg yields a workspace-qualified label.
+[ "$(cat "$S/panes/pA/label" 2>/dev/null)" = "coordinator·wsX" ] || fail "label: coordinator-agent pane not labelled 'coordinator·wsX'"
+[ "$(cat "$S/panes/pL/label" 2>/dev/null)" = "backlog·wsX" ]     || fail "label: backlog pane not labelled 'backlog·wsX'"
+[ "$(cat "$S/panes/pW/label" 2>/dev/null)" = "watch·wsX" ]       || fail "label: watch pane not labelled 'watch·wsX'"
+ok
+
+# ── 6c. HERD-650: a hand-cleared label self-heals on the NEXT write_registry pass ────────────────
+# Simulates the exact incident: a restart erodes the label (here, a human/older-herdr clears it) —
+# the next reconcile pass (any caller of layout_write_registry: reload / herd pane * / coordinator.sh)
+# must restore it WITHOUT anything else changing hands.
+: > "$S/panes/pL/label"
+[ -z "$(cat "$S/panes/pL/label")" ] || fail "label self-heal setup: clear did not take"
+layout_write_registry "$reg" w1 tC pA pL pW wsX
+[ "$(cat "$S/panes/pL/label")" = "backlog·wsX" ] || fail "label self-heal: hand-cleared backlog label was not restored on the next pass"
+ok
+
+# ── 6d. HERD-650: agent-pane naming (herd_driver_pane_rename's OWN callers) is UNTOUCHED ─────────
+# layout_write_registry must label ONLY the three control-room roles it was given — never reach for
+# or rename any OTHER pane (e.g. a builder agent pane a different lane already named by slug).
+_pane "$S" pOther tC 'claude /builder'
+layout_write_registry "$reg" w1 tC pA pL pW wsX
+[ -f "$S/panes/pOther/label" ] && fail "label: layout_write_registry touched an unrelated pane's label" || true
+ok
+
+# ── 6e. HERD-650: no ws_name supplied → fails soft to the bare (unqualified) role word ────────────
+S6E="$T/s6e"; mkdir -p "$S6E"; export HERDR_STATE="$S6E"
+_pane "$S6E" pA tC 'claude /coordinator'
+_pane "$S6E" pL tC 'bash /x/backlog-view.sh'
+_pane "$S6E" pW tC 'bash /x/herd-watch.sh'
+layout_write_registry "$S6E/.herd-panes" w1 tC pA pL pW
+[ "$(cat "$S6E/panes/pA/label" 2>/dev/null)" = "coordinator" ] || fail "label fallback: coordinator-agent pane not labelled 'coordinator' without a ws_name"
+[ "$(cat "$S6E/panes/pL/label" 2>/dev/null)" = "backlog" ]     || fail "label fallback: backlog pane not labelled 'backlog' without a ws_name"
+[ "$(cat "$S6E/panes/pW/label" 2>/dev/null)" = "watch" ]       || fail "label fallback: watch pane not labelled 'watch' without a ws_name"
+export HERDR_STATE="$S"
 ok
 
 # ── 7. layout_fold_stray_tabs closes standalone watch-/backlog- tabs, keeps coordinator ─
@@ -203,6 +252,28 @@ export HERD_DRIVER=codex
 [ "$(_reload_pane_role pClaude)" = "busy"  ] || fail "driver-aware: HERD_DRIVER=codex should not recognize a claude process as its own agent"
 [ "$(_reload_pane_role pBare)"   = "bare"  ] || fail "driver-aware: HERD_DRIVER=codex misclassified a bare pane"
 unset HERD_DRIVER
+ok
+
+# ── 9. HERD-650: once driver.sh is sourced, layout_write_registry labels via
+# herd_driver_pane_rename — which is headless-AWARE, so a headless driver is a clean no-op (no
+# `pane rename` call reaches herdr at all) while herdr-claude (the default) still labels normally.
+S="$T/s9"; mkdir -p "$S"; export HERDR_STATE="$S"
+_pane "$S" pA tC 'claude /coordinator'
+_pane "$S" pL tC 'bash /x/backlog-view.sh'
+_pane "$S" pW tC 'bash /x/herd-watch.sh'
+reg="$S/.herd-panes"
+
+export HERD_DRIVER=headless
+layout_write_registry "$reg" w1 tC pA pL pW wsX
+[ -f "$S/panes/pA/label" ] && fail "label: headless driver must NOT rename any pane" || true
+[ -f "$S/panes/pL/label" ] && fail "label: headless driver must NOT rename any pane" || true
+[ -f "$S/panes/pW/label" ] && fail "label: headless driver must NOT rename any pane" || true
+
+unset HERD_DRIVER
+layout_write_registry "$reg" w1 tC pA pL pW wsX
+[ "$(cat "$S/panes/pA/label" 2>/dev/null)" = "coordinator·wsX" ] || fail "label: default driver (via herd_driver_pane_rename) did not label the agent pane"
+[ "$(cat "$S/panes/pL/label" 2>/dev/null)" = "backlog·wsX" ]     || fail "label: default driver (via herd_driver_pane_rename) did not label the backlog pane"
+[ "$(cat "$S/panes/pW/label" 2>/dev/null)" = "watch·wsX" ]       || fail "label: default driver (via herd_driver_pane_rename) did not label the watch pane"
 ok
 
 echo "ALL PASS ($pass checks)"
