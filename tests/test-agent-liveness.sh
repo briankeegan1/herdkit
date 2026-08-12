@@ -185,6 +185,31 @@ ok
 ) || fail "A6: headless pid liveness"
 ok
 
+# ── HERD-654: driver-aware fingerprint + non-native dead→unknown degrade ──────
+# templates/drivers/grok.driver ships DRIVER_AGENT_PROCESS_SIGNATURE='grok' — the pane-fingerprint the
+# probe must now match instead of the hardcoded 'claude' literal (which used to blind it to every
+# foreign runtime, see HERD-654's driver.sh header). A live grok pane ⇒ alive.
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+mk_pane pane-grok "grok --model x --always-approve" tab-g
+set_agent grokbob pane-grok working
+( export HERD_DRIVER=grok
+  [ "$(herd_driver_agent_liveness grokbob)" = "alive" ] || { echo "A7 FAIL"; exit 1; }
+) || fail "A7: a live grok pane fingerprints as alive under HERD_DRIVER=grok"
+ok
+# same pane gone bare (grok process killed) under the NON-native driver ⇒ DEGRADES to unknown, never a
+# positive 'dead' — the conservative non-native safety net (a foreign runtime's process tree shape is
+# far less battle-tested than claude's, so a fingerprint miss stays probe-blind, not a fabricated death).
+mk_pane pane-grok "" tab-g
+( export HERD_DRIVER=grok
+  [ "$(herd_driver_agent_liveness grokbob)" = "unknown" ] || { echo "A8 FAIL"; exit 1; }
+) || fail "A8: a bare pane under a NON-native driver degrades to unknown, never dead"
+ok
+# the SAME bare pane under the NATIVE (default) driver is unaffected — still reads dead.
+( unset HERD_DRIVER
+  [ "$(herd_driver_agent_liveness grokbob)" = "dead" ] || { echo "A9 FAIL"; exit 1; }
+) || fail "A9: a bare pane under the native driver still reads dead (byte-identical)"
+ok
+
 # ════════════════════════════════════════════════════════════════════════════
 # (B) _status_classify_builder — the 'agentdead' bucket
 # ════════════════════════════════════════════════════════════════════════════
@@ -317,6 +342,44 @@ grep -q "coordinator-proj" <<< "$out" && fail "E5: a multi-pane control room mus
 ok
 # every flagged row carries a bare|gone role
 grep -qE '	(bare|gone)$' <<< "$(printf '%s\n' "$out" | grep "review·featx")" || fail "E6: a flagged row must record the dead role"
+ok
+
+# ════════════════════════════════════════════════════════════════════════════
+# (F) _respawn_report_non_native_agent — HERD-654 fix (c): the auto-respawn path must register a
+# NON-native runtime's session identity (report-agent), same as the original lane spawn already does,
+# so a re-tasked foreign-runtime builder's pane is visible to herd_driver_agent_liveness afterward
+# instead of reading dead forever.
+# ════════════════════════════════════════════════════════════════════════════
+REPORT_CALLS="$T/report-agent.calls"
+herd_driver_report_agent() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$REPORT_CALLS"; }
+
+# F1: native driver (herdr-claude) ⇒ clean no-op, never calls report-agent.
+: > "$REPORT_CALLS"
+_respawn_report_non_native_agent "nativebob" "herdr-claude" ""
+[ ! -s "$REPORT_CALLS" ] || fail "F1: native driver must never call report-agent (got: $(cat "$REPORT_CALLS"))"
+ok
+
+# F2: non-native driver, pane id resolved from the captured agent-start JSON.
+: > "$REPORT_CALLS"
+_respawn_report_non_native_agent "grokbob" "grok" '{"result":{"agent":{"pane_id":"pane-json"}}}'
+grep -qF "$(printf 'grokbob\tpane-json\tworking')" "$REPORT_CALLS" || \
+  fail "F2: non-native respawn with JSON must report-agent the JSON-extracted pane (got: $(cat "$REPORT_CALLS"))"
+ok
+
+# F3: non-native driver, no JSON — falls back to a roster lookup (herd_driver_agent_pane_id).
+: > "$REPORT_CALLS"
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+set_agent codexbob pane-fallback working
+_respawn_report_non_native_agent "codexbob" "codex" ""
+grep -qF "$(printf 'codexbob\tpane-fallback\tworking')" "$REPORT_CALLS" || \
+  fail "F3: non-native respawn with no JSON must fall back to the roster pane id (got: $(cat "$REPORT_CALLS"))"
+ok
+
+# F4: non-native driver, no pane resolvable either way ⇒ fail-soft no-op (never calls report-agent).
+: > "$REPORT_CALLS"
+reset_agents
+_respawn_report_non_native_agent "ghostbob" "grok" ""
+[ ! -s "$REPORT_CALLS" ] || fail "F4: an unresolvable pane must skip report-agent (got: $(cat "$REPORT_CALLS"))"
 ok
 
 echo "ALL PASS ($pass checks)"

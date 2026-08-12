@@ -14611,6 +14611,26 @@ except Exception:
 ' 2>/dev/null || true
 }
 
+# _respawn_report_non_native_agent <slug> <driver> [agent-start-json] — HERD-178/HERD-654 session-
+# identity registration for a respawned NON-native runtime builder. The ORIGINAL lane spawn
+# (herd-feature.sh/herd-quick.sh, via herd_driver_launch_agent) already registers a foreign runtime's
+# pane through herd_driver_report_agent so the mux's roster/liveness surface can see it; the
+# auto-respawn path below (_respawn_builder_in_worktree, reached only from
+# _maybe_autorespawn_dead_builder) launches the SAME runtime tail through the SAME driver seam but
+# never called report-agent — so a re-tasked non-native builder's freshly-launched pane stayed
+# invisible to herd_driver_agent_liveness's roster lookup and could read 'dead' forever, even though
+# the process it just started is alive. A clean no-op for the native runtime (byte-identical — the mux
+# already tracks it by its own foreground-process fingerprint). FAIL-SOFT: an unresolvable pane id just
+# skips the registration, mirroring the lane's own best-effort contract.
+_respawn_report_non_native_agent() {
+  local _rrn_slug="$1" _rrn_driver="$2" _rrn_json="${3:-}" _rrn_pane=""
+  herd_driver_agent_runtime_native "$_rrn_driver" && return 0
+  [ -n "$_rrn_json" ] && _rrn_pane="$(herd_driver_pane_id_from_agent_start "$_rrn_json")"
+  [ -n "$_rrn_pane" ] || _rrn_pane="$(herd_driver_agent_pane_id "$_rrn_slug" 2>/dev/null || true)"
+  [ -n "$_rrn_pane" ] && herd_driver_report_agent "$_rrn_slug" "$_rrn_pane" working
+  return 0
+}
+
 # _respawn_builder_in_worktree <slug> <worktree> — surgically restart a FRESH builder agent in the
 # EXISTING worktree, pointed at the EXISTING $WORKTREES_DIR/<slug>.task.md. Returns 0 iff a tab AND
 # agent were started. Mirrors the herd-feature spawn WITHOUT re-running the lane (no new-feature.sh,
@@ -14660,10 +14680,13 @@ _respawn_builder_in_worktree() {
   # root and attaches (same one-pane-right layout); pre-0.7.5 keeps the byte-identical argv.
   # shellcheck disable=SC2086  # $_rw_wsid intentionally word-splits (mirrors the lane's args).
   if _herd_herdr_attach_cli; then
-    if herd_driver_herdr_attach_agent "$_rw_slug" "$_rw_driver" "$_rw_root" "$_rw_wt" right "" -- "${_rw_rt[@]}" >/dev/null 2>&1; then
+    local _rw_out
+    if _rw_out="$(herd_driver_herdr_attach_agent "$_rw_slug" "$_rw_driver" "$_rw_root" "$_rw_wt" right "" -- "${_rw_rt[@]}" 2>/dev/null)"; then
+      _respawn_report_non_native_agent "$_rw_slug" "$_rw_driver" "$_rw_out"
       return 0
     fi
   elif herdr agent start "$_rw_slug" ${_rw_wsid:+--workspace "$_rw_wsid"} --cwd "$_rw_wt" --tab "$_rw_tab" --split right --no-focus -- "${_rw_rt[@]}" >/dev/null 2>&1; then
+    _respawn_report_non_native_agent "$_rw_slug" "$_rw_driver" ""
     return 0
   fi
   # agent start FAILED after the tab was already created — the exact HERD-136 corpse-tab shape: a

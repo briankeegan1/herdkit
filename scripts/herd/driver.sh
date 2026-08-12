@@ -727,9 +727,27 @@ herd_driver_pane_alive() {
 #             surface 'agent missing' and never bounce a refix into nobody. Only ever returned when
 #             herdr responded, so it is never a fabricated absence. Headless never returns this (its
 #             liveness is registry-pid based, not pane based — a gone record reads 'unknown').
-#   unknown — cannot tell (herdr/process-info absent or unparseable, pane gone, no registry record).
+#   unknown — cannot tell (herdr/process-info absent or unparseable, pane gone, no registry record); ALSO
+#             (HERD-654) a NON-native runtime pane whose fingerprint found no live process — see below.
 #             FAIL-SOFT: a probe that cannot see the truth NEVER fabricates a death/absence, so a
 #             caller degrades to its prior behavior and never false-reds (no-false-red).
+#
+# DRIVER-AWARE FINGERPRINT (HERD-654): the pane-foreground probe used to substring-match the literal
+# 'claude', so a LIVE grok/codex builder's pane (no claude process to find) always read POSITIVE 'dead'
+# — and _reconcile_dead_builder treats a positive 'dead' as an OVERRIDE of the roster listing (see its
+# header), so a healthy non-native builder crossed into DEAD and, with DEAD_BUILDER_AUTORESPAWN=on,
+# would have been respawned out from under itself. Two fixes, same as the HERD-428 pane-role probe:
+#   (a) fingerprint the ACTIVE driver's OWN runtime binary — herd_driver_agent_process_signature's
+#       DRIVER_AGENT_PROCESS_SIGNATURE substrings (space-separated, plain `in` match) — instead of the
+#       hardcoded 'claude' literal. FAIL-SOFT: an unbound/unreadable signature falls back to 'claude',
+#       so herdr-claude/headless are byte-identical to before.
+#   (b) a NON-native runtime (herd_driver_agent_runtime_native fails for the active driver) can never
+#       have its fingerprint-miss read as a positive 'dead': the verdict degrades to 'unknown' instead,
+#       so it never overrides the roster listing. This is deliberately CONSERVATIVE — a foreign
+#       runtime's process tree shape is far less battle-tested than claude's shell_pid-as-root case, so
+#       a fingerprint miss there stays probe-blind rather than a fabricated death. A genuinely dead
+#       non-native builder still reads dead via the roster-absence path elsewhere (has_agent=0 when
+#       delisted); this probe just never MANUFACTURES that verdict for a pane it cannot confidently read.
 herd_driver_agent_liveness() {
   local slug="${1:-}" pane="${2:-}"
   [ -n "$slug" ] || { printf 'unknown'; return 0; }
@@ -785,17 +803,26 @@ except Exception:
   # probe-blind 'unknown') so a caller surfaces 'agent missing' and never bounces a refix into nobody.
   [ -n "$pane" ] || { printf 'missing'; return 0; }
   # Classify the pane by the process in its FOREGROUND — the same ground-truth eyes layout-reconcile
-  # uses: a live `claude` ⇒ alive; a shell with no claude foreground ⇒ dead (the process was killed
-  # but the pane persists as a bare shell); missing/opaque process-info or a gone pane ⇒ unknown.
+  # uses: a live agent-runtime process ⇒ alive; a shell with no such foreground ⇒ dead for the NATIVE
+  # driver, unknown for a non-native one (HERD-654, see the function header); missing/opaque
+  # process-info or a gone pane ⇒ unknown. The fingerprint itself is driver-aware: the ACTIVE driver's
+  # DRIVER_AGENT_PROCESS_SIGNATURE substring(s), same seam layout-reconcile's pane-role probe uses,
+  # falling back to the 'claude' literal so herdr-claude/headless are byte-identical to before.
   #
   # The pane's OWN shell (shell_pid) is normally excluded so an idle BARE shell reads 'dead' — but the
-  # lane launches claude AS the pane ROOT (no wrapping shell), so shell_pid == the claude pid. Blindly
-  # dropping the shell_pid entry then filters the live claude out and fabricates a death (a live idle
-  # builder read '💀 AGENT DEAD'). So we exclude the shell_pid entry ONLY when it is a real shell
-  # WRAPPER (no claude in its cmdline): a claude-as-root pane keeps its own entry and reads 'alive'.
-  herdr pane process-info --pane "$pane" 2>/dev/null | python3 -c '
-import sys, json
-def has_claude(p): return "claude" in (p.get("cmdline") or "")
+  # lane launches the runtime AS the pane ROOT (no wrapping shell), so shell_pid == the runtime pid.
+  # Blindly dropping the shell_pid entry then filters the live runtime out and fabricates a death (a
+  # live idle builder read '💀 AGENT DEAD'). So we exclude the shell_pid entry ONLY when it is a real
+  # shell WRAPPER (no runtime signature in its cmdline): a runtime-as-root pane keeps its own entry.
+  local sig native
+  sig="$(herd_driver_agent_process_signature 2>/dev/null || true)"
+  [ -n "$sig" ] || sig='claude'
+  if herd_driver_agent_runtime_native; then native=1; else native=0; fi
+  herdr pane process-info --pane "$pane" 2>/dev/null | SIG="$sig" NATIVE="$native" python3 -c '
+import sys, json, os
+sigs = os.environ.get("SIG", "claude").split() or ["claude"]
+native = os.environ.get("NATIVE", "1") == "1"
+def has_sig(p): return any(s in (p.get("cmdline") or "") for s in sigs)
 try:
   pi = (json.load(sys.stdin).get("result") or {}).get("process_info")
 except Exception:
@@ -806,9 +833,14 @@ sh = pi.get("shell_pid") or 0
 if not sh:
   print("unknown"); sys.exit(0)
 # Keep any foreground process that is NOT the pane shell, OR that IS the shell_pid entry but is itself
-# claude (claude launched as the pane root) — the latter is POSITIVE alive evidence, never a wrapper.
-fg = [p for p in (pi.get("foreground_processes") or []) if p.get("pid") != sh or has_claude(p)]
-print("alive" if any(has_claude(p) for p in fg) else "dead")
+# a runtime match (runtime launched as the pane root) — POSITIVE alive evidence, never a wrapper.
+fg = [p for p in (pi.get("foreground_processes") or []) if p.get("pid") != sh or has_sig(p)]
+if any(has_sig(p) for p in fg):
+  print("alive")
+elif native:
+  print("dead")
+else:
+  print("unknown")
 ' 2>/dev/null || printf 'unknown'
 }
 
