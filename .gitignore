@@ -33,6 +33,11 @@
 .claude/settings.local.json
 .claude/settings.json
 
+# rate_limit StopFailure hook sentinel (HERD-656) — _limit_sentinel_file in agent-watch.sh writes this
+# straight into the worktree root the instant a builder or resolver hits a usage limit. Runtime
+# evidence, never work; a fresh spawn never needs it restored.
+.herd-limit-sentinel
+
 # Rendered coordinator skill (HERD-214) — `render_skill` regenerates it from
 # templates/coordinator.md.tmpl + .herd/config on every init/update/reload/render, so a tracked copy
 # meant EVERY one of those commands dirtied the checkout it ran in (six worktree-interference
