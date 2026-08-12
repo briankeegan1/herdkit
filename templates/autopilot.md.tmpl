@@ -34,6 +34,17 @@ single PR, `TRACKED_SPAWNS`/`CLAIM_REQUIRED` still make every spawn file-then-cl
 never self-merge. What disappears is the *pause* — between cycles, and between the last merge and
 the next arrival of work.
 
+## How the engine acts on whose work (read before running yolo in a shared repo)
+
+The `{{COORDINATOR_CMD}}` skill's **§ How the engine acts on whose work** is the full per-rail
+ownership table; read it before autopilot drains unattended in ANY repo another operator also
+touches. The one fact worth restating here because the `yolo` posture turns it on by default:
+**`RESOLVE_AUTOFIX=on` and `ADOPT_REMOTE_PRS=on` are both unscoped today** (HERD-655) — the resolver
+pushes a merge commit to whatever branch is conflicting, and adoption pulls any open PR into this
+seat's local pool, neither checking authorship. Set `WATCHER_OWNER` explicitly before autopilot runs
+`yolo` in a shared repo, and confirm every open PR in the pool is genuinely this seat's own before
+trusting the drain loop with someone else's work.
+
 ## 1. Posture check — idempotent, never a blind re-apply
 
 Run this **once at startup**, and again only after something changes `.herd/config`.
