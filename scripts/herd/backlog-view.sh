@@ -578,7 +578,16 @@ run_backend_mode() {
         degraded=0; since=""
         cur_hash="$(printf '%s' "$raw" | cksum)"
         if [ "$cur_hash" != "$last_hash" ]; then
-          last_hash="$cur_hash"; last_good="$raw"; refreshed="$(now_hhmm)"
+          last_hash="$cur_hash"
+          # All-whitespace output (e.g. a lone stripped newline) is effectively empty for render
+          # purposes — store it as "" so the empty-state branch below fires instead of glow-ing a
+          # blank body.
+          if [ -n "$(printf '%s' "$raw" | tr -d '[:space:]')" ]; then
+            last_good="$raw"
+          else
+            last_good=""
+          fi
+          refreshed="$(now_hhmm)"
         fi
       else
         # Degraded poll (non-zero exit only). Keep the last good list; never blank, never red. Stamp
