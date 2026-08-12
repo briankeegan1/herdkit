@@ -953,6 +953,41 @@ class LiveState:
         ``CLAUDE_HANG_STATE``): one line, the epoch the CURRENT hang episode began, absent when healthy."""
         return self._p(".agent-watch-claude-hang")
 
+    def scope_unresolved_marker(self):
+        """HERD-653: the once-per-signature dedup marker for the ``scope_unresolved`` journal event —
+        mirrors the ``.agent-watch-view-warned`` idiom bash's ``_watcher_view_warn_once`` uses (a
+        distinct file, so the python core's own dedup never cross-talks with a bash-side warning)."""
+        return self._p(".agent-watch-scope-unresolved")
+
+    def scope_unresolved_once(self):
+        """True the FIRST tick WATCHER_SCOPE is observed unresolved (and records the marker); False on
+        every subsequent tick while it stays unresolved — the once-per-signature journal dedup so an
+        ongoing wiring gap never spams the journal every ~4s tick. With no state dir it always proceeds
+        (a sim/dry-run tick has no cross-tick marker to discover, matching :meth:`once`'s degrade)."""
+        path = self.scope_unresolved_marker()
+        if not path:
+            return True
+        if os.path.exists(path):
+            return False
+        try:
+            open(path, "w", encoding="utf-8").close()
+        except Exception:
+            pass
+        return True
+
+    def clear_scope_unresolved(self):
+        """Drop the marker once WATCHER_SCOPE resolves cleanly again — the recovery path, mirroring
+        :meth:`clear_gh_rate_limited` — so a LATER regression is loud again instead of silenced forever
+        by a marker from a long-since-fixed episode."""
+        path = self.scope_unresolved_marker()
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+
     def recorded_review(self, pr, sha):
         """The recorded verdict for this exact ``(pr, sha)`` — review-once reuse (agent-watch.sh:1687).
         ``awk '$2==pr && $3==sha {v=$4} END{print v}'`` — the LAST matching row wins."""
@@ -2203,12 +2238,24 @@ def discover_via_graphql(repo=None, limit=50):
 # The watcher-view lens (WATCHER_VIEW*) and the WATCHER_SCOPE ownership gate NARROW discovery exactly
 # as the bash tick does (agent-watch.sh:10620–10810): a foreign-owner PR never enters the gate DAG, so
 # the port can never merge a teammate's PR. Both are read-time SELECTION filters — they only ever
-# WITHHOLD a candidate, never authorize a merge the gates would otherwise deny. Default (WATCHER_VIEW
-# unset/all + WATCHER_SCOPE unset/mine) is a byte-identical passthrough: every discovered PR flows through.
+# WITHHOLD a candidate, never authorize a merge the gates would otherwise deny. A config that carries
+# an explicit WATCHER_SCOPE ("mine" default, or "all") is a byte-identical passthrough/gate exactly as
+# before. A config ASSEMBLED FROM THE LIVE ENVIRONMENT (_config_from_env) that never saw WATCHER_SCOPE
+# at all — HERD-653 — is a DIFFERENT case: FAIL-CLOSED, not a permissive passthrough (see
+# _WATCHER_SCOPE_ENV_UNRESOLVED below).
 
 _WATCHER_KEYS = ("WATCHER_SCOPE", "WATCHER_VIEW", "WATCHER_VIEW_AUTHOR", "WATCHER_VIEW_ASSIGNEE",
                  "WATCHER_VIEW_LABEL", "WATCHER_VIEW_STATUS", "WATCHER_VIEW_DEPS_LABEL", "WATCHER_OWNER",
                  "GATE_STATUS", "GATE_STATUS_PENDING")
+
+# HERD-653 (GH #769): a private config-dict marker — never a real env var name, so it can never
+# collide with a project's own config — that _config_from_env sets when the LIVE environment it just
+# read genuinely carried no WATCHER_SCOPE at all (never exported: a broken HERD-465 sweep, a config
+# wiring gap — anything short of a real resolved 'mine'/'all'). A bare test/fixture config dict
+# (FixtureDiscovery, or a unit test calling _select_candidates directly) never goes through
+# _config_from_env, so it never carries this marker and stays exactly as permissive as before this
+# fix — only the real environment-resolution path can trigger fail-closed behavior.
+_WATCHER_SCOPE_ENV_UNRESOLVED = "__WATCHER_SCOPE_ENV_UNRESOLVED__"
 
 # ── merge fairness / starvation freeze (MERGE_FAIRNESS, §6.2 / HERD-340) ───────────────────────────
 # SHIP-DORMANT. MERGE_FAIRNESS=off (the default, and any unrecognized value) disables every re-stale
@@ -2295,6 +2342,14 @@ def _core_surface_enabled(config):
 
 
 def _watcher_scope(config):
+    """``mine`` | ``all`` | ``unresolved`` (HERD-653). ``unresolved`` is a FAIL-CLOSED sentinel: the
+    LIVE environment (_config_from_env) carried no WATCHER_SCOPE at all, so there is no config to
+    trust either way — a safety gate must never degrade PERMISSIVE on a missing env var (the emberglen
+    incident: the engine auto-merged a teammate's PR while the console correctly showed 'not mine -
+    manual'). An explicit-but-unrecognized value is a DIFFERENT, resolved (if garbled) case and keeps
+    degrading to the safe 'mine' default exactly as before (10764) — only genuine absence fails closed."""
+    if (config or {}).get(_WATCHER_SCOPE_ENV_UNRESOLVED):
+        return "unresolved"
     v = str(config.get("WATCHER_SCOPE", "") or "mine")
     return v if v in ("mine", "all") else "mine"                      # unknown → safe default (10764)
 
@@ -2349,10 +2404,17 @@ def _view_keeps(cand, config):
 def _select_candidates(cands, config):
     """Apply the watcher-view lens then the WATCHER_SCOPE ownership gate to a discovered candidate list.
     In team mode (scope=all) a PR NOT authored by the resolved operator identity is dropped — FAIL-CLOSED:
-    an unresolvable owner drops every foreign candidate rather than blind-merge one (agent-watch.sh:10801)."""
+    an unresolvable owner drops every foreign candidate rather than blind-merge one (agent-watch.sh:10801).
+
+    HERD-653: an ``unresolved`` scope (the live environment carried no WATCHER_SCOPE at all) applies the
+    SAME ownership gate as team mode rather than the permissive solo passthrough — a candidate is kept
+    only when it is PROVABLY the resolved operator's own PR. A genuine solo install (no WATCHER_OWNER /
+    WATCHER_VIEW_AUTHOR configured either) still resolves its own gh identity and matches every one of
+    its own PRs exactly as before; only a foreign-owner candidate — the one case this fix exists for —
+    is ever newly dropped."""
     config = config or {}
     kept = [c for c in cands if _view_keeps(c, config)]
-    if _watcher_scope(config) == "all":
+    if _watcher_scope(config) in ("all", "unresolved"):
         owner = _resolve_owner(config)
         kept = [c for c in kept if owner and c.author == owner]
     return kept
@@ -6122,6 +6184,21 @@ class LiveTick:
         except Exception:
             return False
 
+    def _check_scope_unresolved(self):
+        """HERD-653 (GH #769): journal ONE loud ``scope_unresolved`` event the first tick WATCHER_SCOPE
+        comes back unresolved (never exported by the live environment at all), so the withhold this
+        drives in :func:`_select_candidates` is never a silent, undiscoverable auto-merge freeze — and
+        clear the marker the moment it resolves again, so a LATER regression is loud too rather than
+        permanently silenced by a long-since-fixed episode's marker. Runs before discovery so it fires
+        even on a tick that short-circuits (rate limit) before ever walking a candidate."""
+        if _watcher_scope(self.config) != "unresolved":
+            self.state.clear_scope_unresolved()
+            return
+        if self.state.scope_unresolved_once():
+            self.journal.append("scope_unresolved", "gate", "watcher_scope",
+                                "detail", "WATCHER_SCOPE missing from the live environment — "
+                                "auto-merge withheld for PRs not provably the seat's own")
+
     def _core_prepass(self, candidates):
         """Resolve THIS tick's CORE front BEFORE any candidate is walked — the same prepass shape as
         :meth:`_queue_prepass`, scoped to core-glob matches (task HERD-577 leg 2: "the merge decision
@@ -6822,6 +6899,7 @@ class LiveTick:
 
     def run(self):
         """Run one tick over all discovered candidates; return the summary."""
+        self._check_scope_unresolved()
         # gh rate-limit backoff (HERD-582), checked BEFORE any discovery call: a still-active window
         # from a PRIOR tick's classified rate limit skips the gh round-trip entirely rather than
         # re-drawing the same rejection tick after tick — local legs (bash's render/reconcile/sweeps)
@@ -6942,6 +7020,12 @@ def _config_from_env(scenario=None):
     for knob in _CORE_ENV_KEYS:
         if knob not in config and os.environ.get(knob) is not None:
             config[knob] = os.environ[knob]
+    # HERD-653: this is THE environment-resolution boundary — a bare scenario/fixture dict (unit tests,
+    # FixtureDiscovery) never passes through here, only a real --tick or --dry-run run reading actual
+    # os.environ does. When neither the scenario nor the environment supplied WATCHER_SCOPE, mark it
+    # unresolved so _watcher_scope fails closed instead of silently defaulting to the permissive 'mine'.
+    if "WATCHER_SCOPE" not in config:
+        config[_WATCHER_SCOPE_ENV_UNRESOLVED] = True
     return config
 
 

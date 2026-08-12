@@ -40,7 +40,7 @@ from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, Live
                                LiveActuator, LiveHoldSource,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
                                parse_rubric_verdicts, parse_block_fields, parse_block_reason,
-                               _select_candidates, _marker_write, _marker_live, _terminate_worker,
+                               _select_candidates, _watcher_scope, _marker_write, _marker_live, _terminate_worker,
                                _marker_nonce, _dispatch_nonce,
                                _main_health_pending,
                                WAIT, PENDING,
@@ -2599,9 +2599,14 @@ class TestStaleDupGate(LiveCase):
         self.addCleanup(os.environ.pop, "STALE_BASE_AUTOFIX", None)
         self.addCleanup(os.environ.pop, "MERGE_POLICY", None)
         self.addCleanup(os.environ.pop, "DEFAULT_BRANCH", None)
+        self.addCleanup(os.environ.pop, "WATCHER_SCOPE", None)
         os.environ["STALE_BASE_AUTOFIX"] = "on"
         os.environ["MERGE_POLICY"] = "auto"
         os.environ["DEFAULT_BRANCH"] = "main"
+        # HERD-653: an intact (explicit) WATCHER_SCOPE stays byte-identical — this test is about
+        # STALE_BASE_AUTOFIX plumbing, not scope, so it declares the solo default itself rather than
+        # relying on the now fail-closed "never set" default the env genuinely has in this process.
+        os.environ["WATCHER_SCOPE"] = "mine"
         config = LR._config_from_env()
         self.assertEqual(config.get("STALE_BASE_AUTOFIX"), "on",
                           "_config_from_env must thread an exported STALE_BASE_AUTOFIX through — "
@@ -3197,6 +3202,99 @@ class TestScopeFilter(unittest.TestCase):
             self.assertNotIn("2", res["outcomes"])       # bob never classified
         finally:
             os.environ.pop("HERD_JOURNAL_NOW", None)
+
+
+class TestScopeEnvUnresolved(unittest.TestCase):
+    """HERD-653 (GH #769): the missing-env path. Grounded on emberglen — the engine auto-merged a
+    teammate's PR while the console correctly showed 'not mine - manual' because WATCHER_SCOPE never
+    reached the python core's os.environ. A safety gate must never degrade permissive on a missing
+    env var: _config_from_env (the ONLY environment-resolution boundary) must mark this unresolved,
+    and the gate must WITHHOLD rather than pass every candidate through."""
+
+    def setUp(self):
+        for k in ("WATCHER_SCOPE", "WATCHER_OWNER", "WATCHER_VIEW_AUTHOR"):
+            os.environ.pop(k, None)
+            self.addCleanup(os.environ.pop, k, None)
+
+    def cands(self):
+        return [LiveCandidate(pr=1, sha="a", author="alice"),
+                LiveCandidate(pr=2, sha="b", author="bob")]
+
+    def test_config_from_env_marks_missing_scope_unresolved(self):
+        config = LR._config_from_env()
+        self.assertNotIn("WATCHER_SCOPE", config)
+        self.assertEqual(_watcher_scope(config), "unresolved")
+
+    def test_config_from_env_leaves_an_intact_scope_untouched(self):
+        # An explicit env value is a RESOLVED (if garbled) config, not a missing one — byte-identical.
+        for val, want in (("mine", "mine"), ("all", "all"), ("bogus", "mine")):
+            os.environ["WATCHER_SCOPE"] = val
+            self.assertEqual(_watcher_scope(LR._config_from_env()), want)
+        os.environ.pop("WATCHER_SCOPE", None)
+
+    def test_bare_fixture_config_is_unaffected(self):
+        # A raw scenario/test dict never passes through _config_from_env, so its silence about
+        # WATCHER_SCOPE still means "solo, byte-identical passthrough" — never fail-closed.
+        self.assertEqual(_watcher_scope({}), "mine")
+
+    def test_unresolved_scope_withholds_every_candidate_when_owner_also_unresolvable(self):
+        config = LR._config_from_env()
+        orig = LR._resolve_owner
+        LR._resolve_owner = lambda cfg: ""      # no live gh call in a hermetic test
+        try:
+            got = _select_candidates(self.cands(), config)
+        finally:
+            LR._resolve_owner = orig
+        self.assertEqual(got, [])
+
+    def test_unresolved_scope_still_keeps_the_seats_own_pr(self):
+        # A solo operator with no WATCHER_SCOPE configured still resolves their OWN identity (e.g. via
+        # gh) and keeps merging their own PRs — only a foreign-author candidate is newly dropped.
+        config = LR._config_from_env()
+        orig = LR._resolve_owner
+        LR._resolve_owner = lambda cfg: "alice"
+        try:
+            got = _select_candidates(self.cands(), config)
+        finally:
+            LR._resolve_owner = orig
+        self.assertEqual([c.pr for c in got], ["1"])
+
+    def test_unresolved_scope_journals_once_per_signature_and_self_heals(self):
+        tmp = tempfile.mkdtemp()
+        jpath = os.path.join(tmp, "j.jsonl")
+        journal = LiveJournal(jpath)
+        state_dir = os.path.join(tmp, "state")
+        os.makedirs(state_dir, exist_ok=True)
+        orig = LR._resolve_owner
+        LR._resolve_owner = lambda cfg: ""
+        try:
+            unresolved_config = LR._config_from_env()
+            scenario = {"config": unresolved_config, "candidates": []}
+            for _ in range(3):
+                t = LiveTick(unresolved_config, FixtureDiscovery(scenario), FixtureGates(scenario),
+                             DryRunActuator(journal), journal, state=LiveState(state_dir))
+                t.run()
+            scope_events = [e for e in events(jpath) if e["event"] == "scope_unresolved"]
+            self.assertEqual(len(scope_events), 1, "must journal exactly once while unresolved persists")
+
+            # Recovery: an intact scope clears the marker so a LATER regression is loud again.
+            os.environ["WATCHER_SCOPE"] = "mine"
+            resolved_config = LR._config_from_env()
+            scenario2 = {"config": resolved_config, "candidates": []}
+            t = LiveTick(resolved_config, FixtureDiscovery(scenario2), FixtureGates(scenario2),
+                         DryRunActuator(journal), journal, state=LiveState(state_dir))
+            t.run()
+            os.environ.pop("WATCHER_SCOPE", None)
+
+            reunresolved_config = LR._config_from_env()
+            scenario3 = {"config": reunresolved_config, "candidates": []}
+            t = LiveTick(reunresolved_config, FixtureDiscovery(scenario3), FixtureGates(scenario3),
+                         DryRunActuator(journal), journal, state=LiveState(state_dir))
+            t.run()
+            scope_events = [e for e in events(jpath) if e["event"] == "scope_unresolved"]
+            self.assertEqual(len(scope_events), 2, "a later regression must journal again after recovery")
+        finally:
+            LR._resolve_owner = orig
 
 
 class MergeFairnessFreeze(unittest.TestCase):

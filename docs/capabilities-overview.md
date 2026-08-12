@@ -166,7 +166,7 @@ change that needs a pattern must enumerate the files instead.
 | key | purpose |
 |---|---|
 | `WATCHER_VIEW` (+ `WATCHER_VIEW_AUTHOR` / `_ASSIGNEE` / `_LABEL` / `_STATUS` / `_DEPS_LABEL`) | Narrow **which** open PRs the console displays each tick: `all` (default) \| `mine` \| `review-queue` \| `deps`, ANDed with the filters. **Selection only** — it never relaxes a merge gate. |
-| `WATCHER_SCOPE` / `WATCHER_OWNER` | **Team mode (opt-in).** `mine` (default) = today's exact solo behavior. `all` = teammates' PRs are **displayed** but auto-merge is strictly scoped to PRs owned by `WATCHER_OWNER`; a teammate's PR shows "not mine — manual" and is never auto-merged. A **narrowing** gate — it can only withhold a merge, never authorize one the gates would deny. Fail-closed: an unresolvable owner withholds auto-merge. |
+| `WATCHER_SCOPE` / `WATCHER_OWNER` | **Team mode (opt-in).** `mine` (default) = today's exact solo behavior. `all` = teammates' PRs are **displayed** but auto-merge is strictly scoped to PRs owned by `WATCHER_OWNER`; a teammate's PR shows "not mine — manual" and is never auto-merged. A **narrowing** gate — it can only withhold a merge, never authorize one the gates would deny. Fail-closed: an unresolvable owner withholds auto-merge. The python engine core additionally fails closed (HERD-653) when `WATCHER_SCOPE` never reaches its environment at all — a wiring gap, not a real `mine` — journaling one loud `scope_unresolved` event rather than silently defaulting permissive. |
 
 ### Conflict-resolver pane (`RESOLVER_PANE`)
 
