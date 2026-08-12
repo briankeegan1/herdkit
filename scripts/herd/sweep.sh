@@ -111,6 +111,17 @@ fi
 # modified, which is exactly how they appear in a worktree cut before the untracking migration.
 SWEEP_REGENERABLE_GLOBS='.DS_Store:*.log:*.pyc:*.pyo:*.tmp:__pycache__:.pytest_cache:.mypy_cache:.ruff_cache:.coverage:coverage:node_modules:.venv:venv:dist:build:target'
 
+# LANE-GENERATED paths (HERD-656, GH #762): exact, repo-relative paths a builder's own SPAWN lane
+# writes into the worktree before the agent ever runs — never user-authored, so their presence (or a
+# same-named file the agent regenerated) is never real work. `.claude/settings.json` is also gitignored
+# (belt-and-suspenders: a worktree cut before that gitignore rule landed would otherwise still see it
+# as untracked "??" real dirt). `.herd-limit-sentinel` is the rate_limit StopFailure hook's marker
+# (_limit_sentinel_file in agent-watch.sh) — written straight into the worktree root, was NOT
+# gitignored, so a merged builder that ever hit a usage limit carried one real-dirt path forever. The
+# per-slug task-spec ($TREES/<slug>.task.md, written by the spawn lane) is a SIBLING of the worktree,
+# not a path inside it, so it never reaches `git status` here and needs no entry.
+SWEEP_LANE_GENERATED_PATHS='.claude/settings.json:.herd-limit-sentinel'
+
 # Basenames that mark a DETACHED worktree as engine/agent scratch, wherever it lives — a fast-path
 # name check, belt-and-suspenders with the PROOF-based test below. Even a MATCHING scratch tree is
 # only reaped when it carries zero unique commits (see sweep_leg_worktrees).
@@ -203,33 +214,60 @@ emit(wt, branch, det)
 #   regenerable                — only untracked, regenerable droppings (safe to reap over)
 #   dirty<TAB><evidence>       — real work present; evidence is "<n> path(s): a, b, c"
 # The evidence string is what a FLAG row shows the operator, so it names the actual files.
+#
+# HERD-656 / GH #762: a genuinely-untracked gitignored path never reaches this function at all — plain
+# `git status --porcelain` already omits it, which is why a worktree holding ONLY ignored droppings
+# already read `clean` before this change. What slipped through was narrower: (a) LANE files the spawn
+# lane writes that are not (or were not yet) gitignored — SWEEP_LANE_GENERATED_PATHS below — and (b) a
+# path that matches the project's OWN gitignore PATTERN but is still TRACKED (committed before the
+# pattern existed, the classic "checked in a build cache, gitignored it later" shape — Godot's own
+# .uid/.godot/ caches are exactly this). gitignore never governs an already-tracked path, so such a
+# file keeps showing up as modified/deleted real dirt forever, even though the project has explicitly
+# declared its working-tree content disposable. `git check-ignore --no-index` re-evaluates the PATTERN
+# regardless of tracked status, which is the check that catches it.
 _sweep_classify_dirt() {
   local dir="$1" porcelain
   porcelain="$(git -C "$dir" status --porcelain 2>/dev/null || true)"
   [ -n "$porcelain" ] || { printf 'clean'; return 0; }
-  printf '%s\n' "$porcelain" | GLOBS="$SWEEP_REGENERABLE_GLOBS" DERIVED="$(herd_derived_paths | tr '\n' ':')" python3 -c '
-import os, sys, fnmatch
+  printf '%s\n' "$porcelain" | GLOBS="$SWEEP_REGENERABLE_GLOBS" DERIVED="$(herd_derived_paths | tr '\n' ':')" LANE="$SWEEP_LANE_GENERATED_PATHS" DIR="$dir" python3 -c '
+import os, sys, fnmatch, subprocess
 globs = [g for g in os.environ["GLOBS"].split(":") if g]
 derived = {p for p in os.environ.get("DERIVED", "").split(":") if p}
+lane = {p for p in os.environ.get("LANE", "").split(":") if p}
+dir_ = os.environ["DIR"]
 def regenerable(path):
     # Match per path SEGMENT so nested droppings (a/__pycache__/b.pyc) classify correctly.
     for seg in path.rstrip("/").split("/"):
         if any(fnmatch.fnmatch(seg, g) for g in globs):
             return True
     return False
-real = []
+candidates = []
 for line in sys.stdin.read().splitlines():
     if len(line) < 4:
         continue
     xy, path = line[:2], line[3:]
-    # A DERIVED file (the rendered coordinator skill, .herd/config.local) is regenerable whatever its
-    # status: the engine rewrites it from the template + config, so no state of it is real work.
-    if path in derived:
+    # A DERIVED file (the rendered coordinator skill, .herd/config.local) or a LANE-GENERATED one
+    # (.claude/settings.json, .herd-limit-sentinel) is regenerable whatever its status: the engine (or
+    # a fresh spawn) rewrites it from committed inputs, so no state of it is real work.
+    if path in derived or path in lane:
         continue
-    # Otherwise a tracked file that is modified/staged/deleted/renamed is ALWAYS real work. Only an
-    # untracked ("??") path can be excused as a regenerable dropping.
-    if xy != "??" or not regenerable(path):
-        real.append(path)
+    # An untracked ("??") path is excused as a regenerable dropping when its name matches a known
+    # build/test/editor glob. Anything else (a tracked modify/delete/rename, or an untracked path that
+    # matches neither a glob nor a gitignore pattern) is a CANDIDATE for real work, resolved below.
+    if xy == "??" and regenerable(path):
+        continue
+    candidates.append(path)
+real = list(candidates)
+if candidates:
+    try:
+        out = subprocess.run(
+            ["git", "-C", dir_, "check-ignore", "--no-index", "--stdin"],
+            input="\n".join(candidates), capture_output=True, text=True, timeout=10,
+        ).stdout
+        ignored = set(out.splitlines())
+        real = [p for p in candidates if p not in ignored]
+    except Exception:
+        pass  # unreadable ignore check → keep every candidate as real (fail conservative)
 if not real:
     sys.stdout.write("regenerable")
 else:
