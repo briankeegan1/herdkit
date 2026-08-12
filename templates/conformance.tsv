@@ -441,6 +441,8 @@ ORPHAN_PR_ROWS	unit	tests/test-orphan-pr-rows.sh
 ADOPT_REMOTE_PRS	unit	tests/test-adopt-remote-prs.sh
 ADOPT_REMOTE_PRS	unit	tests/test-adopt-worktree-prep.sh
 TEAM_PRESENCE	unit	tests/test-team-presence.sh
+TEAM_ALIASES	unit	tests/test-team-presence.sh
+TEAM_ALIASES	unit	tests/test-ungated-pr-rows.sh
 BUDGET_DAILY	unit	tests/test-budget-governance.sh
 MODEL_ESCALATE_GLOB	unit	tests/test-model-escalate.sh
 MODEL_ESCALATE	unit	tests/test-model-escalate.sh
