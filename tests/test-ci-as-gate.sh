@@ -19,6 +19,10 @@
 #                                                  `gh run rerun --failed`, and NEVER a CODEERROR —
 #                                                  a repeat tick re-reads and reruns nothing more
 #   (7) HEALTH_SOURCE=local                      → ZERO gh calls, zero ci_* events: byte-inert
+#   (8) HERD-649b conclusive memo                 → a CLEAN/CODEERROR verdict for one (branch, sha)
+#                                                  costs no gh call on a LATER tick (a separate
+#                                                  process, same shared state dir); a new sha
+#                                                  invalidates it and re-polls (8c)
 #
 # Hermetic: no network, no real gh, no suite dispatch, no merge (DryRunActuator). The review rail is
 # stubbed to PASS in the driver so the walk reaches a merge decision without shelling a reviewer.
@@ -110,7 +114,7 @@ hits()  { local n; n="$(grep -c "$2" "$T/$1/gh-calls.log" 2>/dev/null)"; printf 
 calls() { awk 'END{print NR+0}' "$T/$1/gh-calls.log" 2>/dev/null || printf 0; }
 
 # ── (1) green → CLEAN → merge ─────────────────────────────────────────────────────────────────────
-export GH_RUNS='[{"headSha":"shaG","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":101}]'
+export GH_RUNS='[{"headSha":"shaG","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":101,"headBranch":"feat/x"}]'
 export GH_LOG=''
 export GH_CALLS="$T/green/gh-calls.log"; mkdir -p "$T/green"; : > "$GH_CALLS"
 OUT="$(PATH="$BIN:$PATH" drive green 1 shaG)" || fail "(1) driver errored"
@@ -120,7 +124,7 @@ grep -q '"reason":"ci-green"' "$T/green/j.jsonl" || fail "(1) must journal the c
 ok "(1) green checks-run for the head sha → CLEAN, the PR merges, no local suite runs"
 
 # ── (2) red naming a real test → CODEERROR bounce carrying the extracted identity ─────────────────
-export GH_RUNS='[{"headSha":"shaR","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":202}]'
+export GH_RUNS='[{"headSha":"shaR","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":202,"headBranch":"feat/x"}]'
 export GH_LOG=$'ci-suite\t✗ tests/test-thing.sh (rc=1)\nci-suite\t✗ tests/test-other.sh\n'
 export GH_CALLS="$T/red/gh-calls.log"; mkdir -p "$T/red"; : > "$GH_CALLS"
 OUT="$(PATH="$BIN:$PATH" drive red 2 shaR)" || fail "(2) driver errored"
@@ -135,7 +139,7 @@ grep -q 'run view 202 --log-failed' "$T/red/gh-calls.log" || fail "(2) must read
 ok "(2) red naming a real test → CODEERROR, one health-rail bounce with the extracted identity"
 
 # ── (3) pending → WAIT ────────────────────────────────────────────────────────────────────────────
-export GH_RUNS='[{"headSha":"shaP","status":"IN_PROGRESS","conclusion":null,"workflowName":"CI","databaseId":303}]'
+export GH_RUNS='[{"headSha":"shaP","status":"IN_PROGRESS","conclusion":null,"workflowName":"CI","databaseId":303,"headBranch":"feat/x"}]'
 export GH_LOG=''
 export GH_CALLS="$T/pend/gh-calls.log"; mkdir -p "$T/pend"; : > "$GH_CALLS"
 OUT="$(PATH="$BIN:$PATH" drive pend 3 shaP)" || fail "(3) driver errored"
@@ -145,8 +149,8 @@ grep -q '"verdict":"CODEERROR"' "$T/pend/j.jsonl" && fail "(3) pending must NEVE
 ok "(3) a run still in progress → WAIT, never a red, never a merge"
 
 # ── (4) cancelled chain → WAIT, qualified ─────────────────────────────────────────────────────────
-export GH_RUNS='[{"headSha":"shaC","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"CI","databaseId":404},
-                 {"headSha":"shaC","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"CI","databaseId":405}]'
+export GH_RUNS='[{"headSha":"shaC","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"CI","databaseId":404,"headBranch":"feat/x"},
+                 {"headSha":"shaC","status":"COMPLETED","conclusion":"CANCELLED","workflowName":"CI","databaseId":405,"headBranch":"feat/x"}]'
 export GH_LOG=''
 export GH_CALLS="$T/cxl/gh-calls.log"; mkdir -p "$T/cxl"; : > "$GH_CALLS"
 OUT="$(PATH="$BIN:$PATH" drive cxl 4 shaC)" || fail "(4) driver errored"
@@ -180,7 +184,7 @@ grep -q '"verdict":"CODEERROR"' "$T/nogh/j.jsonl" && fail "(5b) an unusable gh m
 ok "(5b) an unreachable gh is fail-soft: loud fallback, never a red"
 
 # ── (6) HERD-609: infra signature → WAIT-infra-transient + exactly ONE bounded rerun ──────────────
-export GH_RUNS='[{"headSha":"shaI","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":606}]'
+export GH_RUNS='[{"headSha":"shaI","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":606,"headBranch":"feat/x"}]'
 export GH_LOG=$'setup\tError: Failed to resolve action download info. Error: Service Unavailable\n'
 export GH_CALLS="$T/infra/gh-calls.log"; mkdir -p "$T/infra"; : > "$GH_CALLS"
 OUT="$(PATH="$BIN:$PATH" drive infra 7 shaI)" || fail "(6) driver errored"
@@ -200,7 +204,7 @@ OUT="$(PATH="$BIN:$PATH" drive infra 7 shaI)" || fail "(6b) second driver run er
 ok "(6) infra signature → WAIT-infra-transient, exactly one bounded rerun, re-read fresh each tick"
 
 # ── (7) HEALTH_SOURCE=local is byte-inert: no gh call, no ci_* event ──────────────────────────────
-export GH_RUNS='[{"headSha":"shaL","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":707}]'
+export GH_RUNS='[{"headSha":"shaL","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":707,"headBranch":"feat/x"}]'
 export GH_CALLS="$T/local/gh-calls.log"; mkdir -p "$T/local"; : > "$GH_CALLS"
 OUT="$(PATH="$BIN:$PATH" drive local 8 shaL '{}')" || fail "(7) driver errored"
 [ "$(calls local)" = "0" ] || fail "(7) HEALTH_SOURCE=local must never call gh (got $(calls local) calls)"
@@ -214,5 +218,31 @@ PATH="$BIN:$PATH" drive typo 9 shaL '{"HEALTH_SOURCE":"CI-please"}' >/dev/null |
 [ "$(calls typo)" = "0" ] || fail "(7b) an unrecognized HEALTH_SOURCE must read as local (no gh call)"
 ok "(7) HEALTH_SOURCE=local (and any unrecognized value) is byte-inert: no gh call, no ci_* event"
 
+# ── (8) HERD-649b: a CONCLUSIVE verdict is memoized ACROSS ticks (separate processes, shared state
+#       dir) — the same branch+sha costs no second gh call, even when a later tick's CI fixture would
+#       answer differently if it were actually re-read ─────────────────────────────────────────────
+export GH_RUNS='[{"headSha":"shaM","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":808,"headBranch":"feat/x"}]'
+export GH_LOG=''
+export GH_CALLS="$T/memo/gh-calls.log"; mkdir -p "$T/memo"; : > "$GH_CALLS"
+OUT="$(PATH="$BIN:$PATH" drive memo 10 shaM)" || fail "(8) driver errored"
+grep -q '"10": *"MERGE"' <<< "$OUT" || fail "(8) first tick: green CI must merge (got: $OUT)"
+[ "$(hits memo 'run list')" = "1" ] || fail "(8) first tick must poll gh exactly once"
+# Second tick, SAME (pr, sha) — flip GH_RUNS to a FAILURE that would BLOCK if actually re-read, to
+# prove the memoized CLEAN is reused rather than a fresh (and here deliberately wrong-looking) poll.
+export GH_RUNS='[{"headSha":"shaM","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":809,"headBranch":"feat/x"}]'
+: > "$T/memo/gh-calls.log"
+OUT="$(PATH="$BIN:$PATH" drive memo 10 shaM)" || fail "(8b) driver errored"
+grep -q '"10": *"MERGE"' <<< "$OUT" || fail "(8b) a memoized CLEAN must be reused, not re-read (got: $OUT)"
+[ "$(calls memo)" = "0" ] || fail "(8b) a memoized branch+sha must cost NO gh call on the next tick"
+ok "(8) a CONCLUSIVE verdict is memoized across ticks — same branch+sha, zero further gh calls"
+
+# ── (8c) a NEW sha on the same branch invalidates the memo and re-polls ────────────────────────────
+export GH_RUNS='[{"headSha":"shaM2","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":810,"headBranch":"feat/x"}]'
+: > "$T/memo/gh-calls.log"
+OUT="$(PATH="$BIN:$PATH" drive memo 10 shaM2)" || fail "(8c) driver errored"
+grep -q '"10": *"MERGE"' <<< "$OUT" || fail "(8c) the new sha's own CI word must merge (got: $OUT)"
+[ "$(hits memo 'run list')" = "1" ] || fail "(8c) a new sha must re-poll gh exactly once, not reuse the old memo"
+ok "(8c) a new head sha on the same branch invalidates the memo and re-polls"
+
 echo
-echo "ALL PASS ($pass checks) — HEALTH_SOURCE=ci gate sim (HERD-578 / HERD-609 / HERD-612)"
+echo "ALL PASS ($pass checks) — HEALTH_SOURCE=ci gate sim (HERD-578 / HERD-609 / HERD-612 / HERD-649)"

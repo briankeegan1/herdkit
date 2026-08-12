@@ -53,7 +53,14 @@ case "$*" in
     exit 0
     ;;
   *"rate_limit"*)
-    printf '%s\n' "$GH_STUB_RESET_EPOCH"
+    # HERD-649c: the live tick also probes `-q .rate.remaining` (the stale-deadline re-probe) once a
+    # backoff marker is already in force. This suite models a budget that is STILL exhausted across
+    # every tick it drives — 0 keeps that re-probe honoring the backoff exactly as before HERD-649c,
+    # which is what lets the "second tick makes ZERO further graphql calls" assertion below hold.
+    case "$*" in
+      *".rate.remaining"*) printf '0\n' ;;
+      *) printf '%s\n' "$GH_STUB_RESET_EPOCH" ;;
+    esac
     exit 0
     ;;
   *"graphql"*)

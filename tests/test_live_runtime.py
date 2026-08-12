@@ -8240,8 +8240,12 @@ class TestLiveTickRateLimitBackoff(LiveCase):
         journal = LiveJournal(self.jpath)
         t = LiveTick({}, _CountingDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
                      state=state)
-        result = t.run()
-        self.assertEqual(calls, [], "discovery must not be called while the backoff window is active")
+        # HERD-649c: an active window now runs ONE cheap re-probe before honoring the backoff — a
+        # genuinely-exhausted budget (mocked here so this stays hermetic, no real `gh`) must still
+        # skip discovery exactly as before this leg existed.
+        with mock.patch.object(LR, "_gh_rate_limit_remaining", return_value=0):
+            result = t.run()
+        self.assertEqual(calls, [], "discovery must not be called while the budget is still exhausted")
         self.assertTrue(result.get("rate_limited"))
         self.assertEqual(result.get("rate_limited_until"), 4102444800)
 
@@ -8531,6 +8535,231 @@ class TestCiInfraRerunBound(unittest.TestCase):
     def test_no_state_dir_never_reruns(self):
         self.assertFalse(LR._ci_rerun_allowed("", "77"))
         self.assertFalse(LR._ci_rerun_allowed(self.tmp, ""))
+
+
+class TestCiPoolPriming(unittest.TestCase):
+    """HERD-649a: `LiveGates.prime_ci_pool` replaces one `gh run list` PER BRANCH with ONE pooled call
+    for the whole tick, grouped locally by `headBranch`. Hermetic: `_ci_runs_pooled`/`_ci_runs` are
+    mocked, never a real subprocess."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = LiveState(self.tmp)
+        self.journal = LiveJournal(os.path.join(self.tmp, "j.jsonl"))
+        self.gates = LiveGates("/nonexistent-home", self.state, self.journal,
+                               config={"HEALTH_SOURCE": "ci"})
+
+    def _cand(self, pr, sha, branch):
+        return LiveCandidate(pr=pr, sha=sha, slug="feat-%s" % pr, branch=branch,
+                             worktree="/nonexistent-wt-%s" % pr)
+
+    def test_one_pooled_call_serves_every_candidate_branch(self):
+        cands = [self._cand(1, "sha1", "feat/a"), self._cand(2, "sha2", "feat/b"),
+                 self._cand(3, "sha3", "feat/c")]
+        runs = [
+            {"headSha": "sha1", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "workflowName": "CI", "databaseId": 1, "headBranch": "feat/a"},
+            {"headSha": "sha2", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "workflowName": "CI", "databaseId": 2, "headBranch": "feat/b"},
+            {"headSha": "sha3", "status": "IN_PROGRESS", "conclusion": None,
+             "workflowName": "CI", "databaseId": 3, "headBranch": "feat/c"},
+        ]
+        with mock.patch.object(LR, "_ci_runs_pooled", return_value=runs) as pooled, \
+             mock.patch.object(LR, "_ci_runs") as solo:
+            self.gates.prime_ci_pool(cands)
+            self.assertEqual(pooled.call_count, 1, "3 branches must cost exactly ONE pooled call")
+            self.assertEqual(self.gates.health(cands[0]), "CLEAN")
+            self.assertEqual(self.gates.health(cands[1]), "CLEAN")
+            self.assertEqual(self.gates.health(cands[2]), WAIT)
+            self.assertEqual(pooled.call_count, 1, "consuming 3 candidates must not trigger a 2nd poll")
+            self.assertEqual(solo.call_count, 0, "the primed pool must serve every branch — no fallback")
+        budget = self.gates.ci_poll_budget()
+        self.assertEqual(budget["calls"], 1)
+        self.assertEqual(budget["branches_polled"], 3)
+        self.assertEqual(budget["branches_memoized"], 0)
+
+    def test_pool_limit_scales_with_branch_count_and_caps(self):
+        cands = [self._cand(i, "sha%d" % i, "feat/%d" % i) for i in range(6)]
+        with mock.patch.object(LR, "_ci_runs_pooled", return_value=[]) as pooled:
+            self.gates.prime_ci_pool(cands)
+            limit = pooled.call_args[0][0]
+            self.assertEqual(limit, min(LR._CI_POOL_LIMIT_CAP, LR._CI_RUN_LIMIT * 6))
+            self.assertLessEqual(limit, LR._CI_POOL_LIMIT_CAP)
+
+    def test_no_candidates_or_local_mode_makes_no_gh_call(self):
+        local_gates = LiveGates("/nonexistent-home", self.state, self.journal, config={})
+        with mock.patch.object(LR, "_ci_runs_pooled") as pooled:
+            local_gates.prime_ci_pool([self._cand(1, "sha1", "feat/a")])
+            self.gates.prime_ci_pool([])
+            self.assertEqual(pooled.call_count, 0)
+        self.assertIsNone(local_gates.ci_poll_budget())
+
+    def test_a_branch_the_pool_never_covered_falls_back_to_a_solo_poll(self):
+        """A branch discovered mid-tick (never passed to prime_ci_pool) still gets a correct answer —
+        just via the pre-HERD-649a solo `_ci_runs` path, not the pooled one."""
+        cand = self._cand(9, "sha9", "feat/late")
+        with mock.patch.object(LR, "_ci_runs_pooled") as pooled, \
+             mock.patch.object(LR, "_ci_runs", return_value=[
+                 {"headSha": "sha9", "status": "COMPLETED", "conclusion": "SUCCESS",
+                  "workflowName": "CI", "databaseId": 9}]) as solo:
+            self.assertEqual(self.gates.health(cand), "CLEAN")
+            self.assertEqual(pooled.call_count, 0)
+            self.assertEqual(solo.call_count, 1)
+
+
+class TestCiConclusiveMemo(unittest.TestCase):
+    """HERD-649b: a CONCLUSIVE (CLEAN/CODEERROR) CI verdict is memoized per branch+sha so the NEXT
+    tick needs no gh call for that exact commit; a WAIT is NEVER memoized (HERD-612)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = LiveState(self.tmp)
+
+    def test_round_trip_clean_and_codeerror(self):
+        self.assertIsNone(self.state.ci_conclusive_memo("feat/x"))
+        self.state.record_ci_conclusive_memo("feat/x", "shaA", "CLEAN", "")
+        self.assertEqual(self.state.ci_conclusive_memo("feat/x"),
+                         {"sha": "shaA", "verdict": "CLEAN", "detail": ""})
+        self.state.record_ci_conclusive_memo("feat/x", "shaB", "CODEERROR", "tests/a.sh")
+        self.assertEqual(self.state.ci_conclusive_memo("feat/x"),
+                         {"sha": "shaB", "verdict": "CODEERROR", "detail": "tests/a.sh"})
+
+    def test_wait_is_never_written(self):
+        """The ONLY writer refuses anything but CLEAN/CODEERROR — belt-and-suspenders under the real
+        invariant, which is that `_ci_health` never calls it for a WAIT."""
+        self.state.record_ci_conclusive_memo("feat/x", "shaA", "WAIT", "")
+        self.assertIsNone(self.state.ci_conclusive_memo("feat/x"))
+
+    def test_branch_with_a_slash_is_filesystem_safe(self):
+        self.state.record_ci_conclusive_memo("feat/nested/thing", "shaA", "CLEAN", "")
+        self.assertEqual(self.state.ci_conclusive_memo("feat/nested/thing")["sha"], "shaA")
+        self.assertTrue(os.path.isfile(self.state.ci_conclusive_memo_file("feat/nested/thing")))
+
+    def test_no_state_dir_is_inert(self):
+        # LiveState(None) falls back to TREES/WORKTREES_DIR when either is set in the environment — a
+        # watcher- or gate-wrapper-descended run exports one (tests/test-py-live-runtime.sh runs this
+        # suite with WORKTREES_DIR set), which would hand this "stateless" probe a REAL ledger and
+        # invert the assertion (see TestTransitionDedupe.test_no_state_dir_never_suppresses, same fix).
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for k in ("TREES", "WORKTREES_DIR"):
+                os.environ.pop(k, None)
+            blackhole = LiveState(None)
+            self.assertIsNone(blackhole.dir)
+            blackhole.record_ci_conclusive_memo("feat/x", "shaA", "CLEAN", "")
+            self.assertIsNone(blackhole.ci_conclusive_memo("feat/x"))
+
+    def _gates(self, journal_path):
+        return LiveGates("/nonexistent-home", self.state, LiveJournal(journal_path),
+                         config={"HEALTH_SOURCE": "ci"})
+
+    def _cand(self, sha):
+        return LiveCandidate(pr=1, sha=sha, slug="feat-1", branch="feat/x", worktree="/nonexistent-wt")
+
+    def test_conclusive_verdict_is_reused_with_no_gh_call_next_tick(self):
+        cand = self._cand("shaA")
+        runs = [{"headSha": "shaA", "status": "COMPLETED", "conclusion": "SUCCESS",
+                "workflowName": "CI", "databaseId": 1, "headBranch": "feat/x"}]
+        gates1 = self._gates(os.path.join(self.tmp, "j1.jsonl"))
+        with mock.patch.object(LR, "_ci_runs_pooled", return_value=runs):
+            gates1.prime_ci_pool([cand])
+            self.assertEqual(gates1.health(cand), "CLEAN")
+        # A FRESH LiveGates instance — models a new tick's own process (HERD-373: one instance lives
+        # exactly one tick). The pooled/solo fetchers are poisoned: any gh call at all is a bug.
+        gates2 = self._gates(os.path.join(self.tmp, "j2.jsonl"))
+        with mock.patch.object(LR, "_ci_runs_pooled") as pooled, \
+             mock.patch.object(LR, "_ci_runs") as solo:
+            gates2.prime_ci_pool([cand])
+            self.assertEqual(gates2.health(cand), "CLEAN")
+            self.assertEqual(pooled.call_count, 0)
+            self.assertEqual(solo.call_count, 0)
+        self.assertTrue(gates2.reused_health)
+
+    def test_pending_never_memoized_reruns_every_tick(self):
+        cand = self._cand("shaP")
+        pending_runs = [{"headSha": "shaP", "status": "IN_PROGRESS", "conclusion": None,
+                         "workflowName": "CI", "databaseId": 2, "headBranch": "feat/x"}]
+        for i in range(3):
+            gates = self._gates(os.path.join(self.tmp, "j%d.jsonl" % i))
+            with mock.patch.object(LR, "_ci_runs_pooled", return_value=pending_runs) as pooled:
+                gates.prime_ci_pool([cand])
+                self.assertEqual(gates.health(cand), WAIT)
+                self.assertEqual(pooled.call_count, 1, "a pending verdict must re-poll EVERY tick")
+        self.assertIsNone(self.state.ci_conclusive_memo("feat/x"))
+
+    def test_new_sha_on_same_branch_invalidates_the_memo(self):
+        runs_a = [{"headSha": "shaA", "status": "COMPLETED", "conclusion": "SUCCESS",
+                  "workflowName": "CI", "databaseId": 1, "headBranch": "feat/x"}]
+        gates1 = self._gates(os.path.join(self.tmp, "j1.jsonl"))
+        with mock.patch.object(LR, "_ci_runs_pooled", return_value=runs_a):
+            gates1.prime_ci_pool([self._cand("shaA")])
+            self.assertEqual(gates1.health(self._cand("shaA")), "CLEAN")
+        cand_b = self._cand("shaB")
+        runs_b = [{"headSha": "shaB", "status": "COMPLETED", "conclusion": "SUCCESS",
+                  "workflowName": "CI", "databaseId": 2, "headBranch": "feat/x"}]
+        gates2 = self._gates(os.path.join(self.tmp, "j2.jsonl"))
+        with mock.patch.object(LR, "_ci_runs_pooled", return_value=runs_b) as pooled:
+            gates2.prime_ci_pool([cand_b])
+            self.assertEqual(gates2.health(cand_b), "CLEAN")
+            self.assertEqual(pooled.call_count, 1, "a new sha must re-poll, never trust the old memo")
+
+
+class TestGhRateLimitStaleDeadlineReprobe(unittest.TestCase):
+    """HERD-649c: a still-future rate-limit backoff deadline is a SNAPSHOT, not a promise — one cheap
+    `gh api rate_limit` probe, only when a marker exists, can clear it early on a refilled budget."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+        os.environ["HERD_JOURNAL_NOW"] = "2026-08-11T22:10:00Z"
+
+    def tearDown(self):
+        os.environ.pop("HERD_JOURNAL_NOW", None)
+
+    def _tick(self):
+        state = LiveState(self.tmp)
+        journal = LiveJournal(self.jpath)
+        scenario = {"candidates": [], "config": {}}
+        return LiveTick({}, FixtureDiscovery(scenario), FixtureGates(scenario),
+                        DryRunActuator(journal), journal, state=state), state
+
+    def test_refilled_budget_clears_the_marker_early_and_runs_the_tick(self):
+        tick, state = self._tick()
+        future = int(LR._now_epoch()) + 1200
+        state.set_gh_rate_limited_until(future)
+        with mock.patch.object(LR, "_gh_rate_limit_remaining", return_value=500) as probe:
+            res = tick.run()
+            self.assertEqual(probe.call_count, 1)
+        self.assertNotIn("rate_limited", res)
+        self.assertEqual(state.gh_rate_limited_until(), 0, "a refilled budget must clear the marker")
+        self.assertTrue(any(e.get("event") == "gh_rate_limit_refilled_early"
+                            for e in events(self.jpath)))
+
+    def test_genuinely_exhausted_budget_keeps_the_backoff(self):
+        tick, state = self._tick()
+        future = int(LR._now_epoch()) + 1200
+        state.set_gh_rate_limited_until(future)
+        with mock.patch.object(LR, "_gh_rate_limit_remaining", return_value=0) as probe:
+            res = tick.run()
+            self.assertEqual(probe.call_count, 1)
+        self.assertTrue(res.get("rate_limited"))
+        self.assertEqual(state.gh_rate_limited_until(), future, "the marker must survive an exhausted probe")
+
+    def test_a_failed_probe_keeps_the_backoff(self):
+        tick, state = self._tick()
+        future = int(LR._now_epoch()) + 1200
+        state.set_gh_rate_limited_until(future)
+        with mock.patch.object(LR, "_gh_rate_limit_remaining", return_value=None):
+            res = tick.run()
+        self.assertTrue(res.get("rate_limited"))
+        self.assertEqual(state.gh_rate_limited_until(), future)
+
+    def test_no_marker_never_spends_the_probe(self):
+        """The re-probe is ONLY spent when a backoff is actually in force — a normal tick must never
+        pay for it."""
+        tick, _state = self._tick()
+        with mock.patch.object(LR, "_gh_rate_limit_remaining") as probe:
+            tick.run()
+            self.assertEqual(probe.call_count, 0)
 
 
 if __name__ == "__main__":
