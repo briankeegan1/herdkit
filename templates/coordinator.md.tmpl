@@ -24,16 +24,21 @@ in parallel.
 2. Get current state of in-flight work (run all three, they're fast):
    - `git worktree list` — existing feature worktrees
    - `{{DRIVER_LIST_AGENTS}}` — which sub-agents are running / idle / blocked <!-- DRIVER:list-agents -->
-   - `herd log | grep builder_note` — **builder notes**: mid-build findings your builders filed for
-     you (`herd note "<finding>"`). Drain and route them per *Builder notes* below **before** you act
-     on any red row — a note is often the reason a row is red, and it is state no pane transcript
-     will hand you.
-   - `herd log | grep config_viability` — **config viability**: external-consistency probe results
-     (HERD-355). A `status":"MISMATCH"` line means `.herd/config` disagrees with LIVE external reality
-     (a `MERGE_METHOD` the repo disallows, a required `herd/gates` check `GATE_STATUS=off` never posts,
-     an undriveable `MODEL_REVIEW` driver) — the reason a gate is "mysteriously stuck". The full
-     machine-readable snapshot is `$WORKTREES_DIR/.herd/config-viability.json`; run `herd doctor` to
-     refresh every probe. Fix the config (or the external side) before spawning against that gate.
+   - `_hl=$(mktemp); herd log > "$_hl"` **once**, then grep that snapshot for both patterns below
+     (HERD-658: `herd log` re-parses the whole journal on every invocation — running it twice back to
+     back to grep two different patterns paid that parse cost twice for nothing; snapshotting once and
+     grepping the file cut this step's wall-clock ~45% on this repo's journal). Remove the snapshot
+     (`rm -f "$_hl"`) once both greps below are done.
+     - `grep builder_note "$_hl"` — **builder notes**: mid-build findings your builders filed for you
+       (`herd note "<finding>"`). Drain and route them per *Builder notes* below **before** you act on
+       any red row — a note is often the reason a row is red, and it is state no pane transcript will
+       hand you.
+     - `grep config_viability "$_hl"` — **config viability**: external-consistency probe results
+       (HERD-355). A `status":"MISMATCH"` line means `.herd/config` disagrees with LIVE external reality
+       (a `MERGE_METHOD` the repo disallows, a required `herd/gates` check `GATE_STATUS=off` never posts,
+       an undriveable `MODEL_REVIEW` driver) — the reason a gate is "mysteriously stuck". The full
+       machine-readable snapshot is `$WORKTREES_DIR/.herd/config-viability.json`; run `herd doctor` to
+       refresh every probe. Fix the config (or the external side) before spawning against that gate.
 3. Present the menu with **AskUserQuestion**, header "Backlog", options:
    - **Implement an item** — pick a 🔜 item and spin up a sub-agent for it
    - **Browse backlog** — summarize what's planned / in progress / shipped, grounded against the repo
