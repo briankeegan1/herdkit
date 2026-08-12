@@ -137,7 +137,7 @@ fi
 # creating standalone tabs — written from the OBSERVED pane IDs this run just created, through the
 # shared writer (each row stamped with this workspace_id as a 4th column so a later reader can drop
 # a hint that names a foreign workspace, issue #60). reload re-writes on every run.
-layout_write_registry "$WORKTREES_DIR/.herd-panes" "$WS" "$TAB" "$AGENT_PANE" "$ROOT" "${WPANE:-}"
+layout_write_registry "$WORKTREES_DIR/.herd-panes" "$WS" "$TAB" "$AGENT_PANE" "$ROOT" "${WPANE:-}" "$WORKSPACE_NAME"
 
 echo "   jump to it:   herdr agent focus $HERD_AGENT_COORDINATOR"
 

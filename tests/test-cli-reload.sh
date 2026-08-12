@@ -583,6 +583,10 @@ grep -q "visible ✓" <<< "$out" || fail "watcher visibility not reported (coord
 grep -q "tab close tC" "$S/log" && fail "reload CLOSED the coordinator tab (must never happen)" || true
 grep -q "pane split" "$S/log" && fail "reload split a pane when both panes were reusable" || true
 [ -f "$S/tabs/tC" ] || fail "coordinator tab is gone from state"
+# HERD-650: reload labels all three control-room panes on every pass, not just at create.
+grep -q "pane rename pA coordinator·reloadtest" "$S/log" || fail "reload did not label the coordinator pane"
+grep -q "pane rename pL backlog·reloadtest"     "$S/log" || fail "reload did not label the backlog pane"
+grep -q "pane rename pW watch·reloadtest"       "$S/log" || fail "reload did not label the watch pane"
 ok
 
 # ── 13. live backlog pane is left completely untouched ────────────────────────

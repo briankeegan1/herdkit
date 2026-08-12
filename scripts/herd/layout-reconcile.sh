@@ -196,13 +196,66 @@ print("missing=%s"%" ".join(missing))
 ' 2>/dev/null || printf 'agent=\nbacklog=\nwatch=\ndup_backlog=\nmissing=agent backlog watch\n'
 }
 
-# layout_write_registry <file> <workspace_id> <tab_id> <agent> <backlog> <watch> — rewrite the
-# .herd-panes role registry from the OBSERVED final pane-ids (empty rows omitted). Every row carries
-# the tab id and the resolved workspace_id as a 4th column so a later reader can drop a hint that
-# names a foreign workspace (issue #60). The single writer shared by cmd_reload, the herd pane
-# subcommands, and coordinator.sh — so "rewrite from what we observed" is enforced in one place.
+# ── role-label reconciliation (HERD-650) ──────────────────────────────────────────────────────────
+# The role LABEL (the cosmetic 'label' field `herdr pane list` displays) used to be set only once, at
+# pane CREATE — an invariant living in a single event instead of a reconciled property. Every restart
+# path (herd pane watch/backlog/coordinator, herd reload, coordinator.sh) rebuilds or RECREATES panes
+# without re-asserting the label, so a pane recreated by a restart (the watch/backlog pane going GONE
+# and getting split fresh, e.g.) never receives the label its predecessor had — the erosion observed
+# live (wE:p2P3/p2P4 went blank). layout_label_roles ties the label to the SAME observed-state write
+# every caller already performs, so it self-heals within one pass instead of needing a human
+# `herdr pane rename`.
+#
+# Reuses coordinator.sh's PRE-EXISTING `backlog·<ws>` / `watch·<ws>` convention (HERD-310 stamp
+# coverage — the HERD-134 pane-close identity guard proves a close against this exact family of
+# labels) rather than inventing a second, conflicting label scheme: writing a plain unqualified label
+# here would silently downgrade/overwrite that stamp on every single coordinator.sh run (it calls
+# layout_write_registry immediately after stamping backlog/watch), defeating the identity guard's
+# workspace-scoped disambiguation for no reason. `coordinator·<ws>` extends the same family to the
+# anchor pane, which previously carried no pane-level label at all (only the herdr AGENT name).
+
+# _layout_label_pane <pane> <label> — set <pane>'s label, fail-soft. Prefers herd_driver_pane_rename
+# (driver.sh, HERD-135) when driver.sh has ALSO been sourced — it is headless-aware, so a headless
+# driver stays a clean no-op; else falls back to the raw herdr call. A missing herdr, a gone pane, or
+# an older herdr without `pane rename` is a silent no-op — NEVER a red row, NEVER aborts a caller
+# running under set -euo pipefail.
+_layout_label_pane() {
+  local target="${1:-}" label="${2:-}"
+  [ -n "$target" ] && [ -n "$label" ] || return 0
+  if command -v herd_driver_pane_rename >/dev/null 2>&1; then
+    herd_driver_pane_rename "$target" "$label"
+  else
+    command -v herdr >/dev/null 2>&1 || return 0
+    herdr pane rename "$target" "$label" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# layout_label_roles <agent> <backlog> <watch> <ws_name> — reconcile the three control-room panes'
+# role labels to coordinator·<ws_name> / backlog·<ws_name> / watch·<ws_name> (empty pane ids are
+# skipped). Without a ws_name (a caller that cannot supply one) falls back to the bare role word —
+# still readable/non-empty, just not workspace-disambiguated. Display-only, fail-soft, no config key:
+# always runs, never gates anything.
+layout_label_roles() {
+  local agent="${1:-}" backlog="${2:-}" watch="${3:-}" wsn="${4:-}"
+  local lc=coordinator lb=backlog lw=watch
+  if [ -n "$wsn" ]; then lc="coordinator·$wsn"; lb="backlog·$wsn"; lw="watch·$wsn"; fi
+  _layout_label_pane "$agent"   "$lc"
+  _layout_label_pane "$backlog" "$lb"
+  _layout_label_pane "$watch"   "$lw"
+  return 0
+}
+
+# layout_write_registry <file> <workspace_id> <tab_id> <agent> <backlog> <watch> [ws_name] — rewrite
+# the .herd-panes role registry from the OBSERVED final pane-ids (empty rows omitted). Every row
+# carries the tab id and the resolved workspace_id as a 4th column so a later reader can drop a hint
+# that names a foreign workspace (issue #60). The single writer shared by cmd_reload, the herd pane
+# subcommands, and coordinator.sh — so "rewrite from what we observed" is enforced in one place, and
+# (HERD-650) so is the role-label reconcile: every pass that writes the registry also re-asserts each
+# resolved pane's label. ws_name (the human-readable WORKSPACE_NAME, distinct from the workspace_id
+# 2nd arg) is optional — omitted, layout_label_roles falls back to unqualified labels.
 layout_write_registry() {
-  local file="$1" ws="$2" tab="$3" agent="$4" backlog="$5" watch="$6"
+  local file="$1" ws="$2" tab="$3" agent="$4" backlog="$5" watch="$6" wsn="${7:-}"
   mkdir -p "$(dirname "$file")"
   {
     [ -n "$agent" ]   && printf 'coordinator-agent %s %s %s\n' "$agent" "$tab" "$ws"
@@ -210,6 +263,7 @@ layout_write_registry() {
     [ -n "$watch" ]   && printf 'watch %s %s %s\n' "$watch" "$tab" "$ws"
     :   # never let an omitted trailing row make the group (and the caller, under set -e) fail
   } > "$file"
+  layout_label_roles "$agent" "$backlog" "$watch" "$wsn"
 }
 
 # ── stale single-pane drainer/reviewer tab flagging (HERD-114 crash sweep) ────

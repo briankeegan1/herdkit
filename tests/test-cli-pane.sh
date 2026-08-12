@@ -263,6 +263,9 @@ grep -q "visible ✓" <<< "$out" || fail "watch summary missing 'visible ✓'"
 grep -q "^watch pW tC" "$R1/trees/.herd-panes" || fail "registry watch row not rewritten to pW"
 grep -q "^coordinator-agent pA" "$R1/trees/.herd-panes" || fail "registry coordinator-agent row missing"
 grep -q "^backlog pL" "$R1/trees/.herd-panes" || fail "registry backlog row not preserved"
+# HERD-650: the restarted watch pane carries the role label 'watcher' afterward — the reconcile
+# ties the label to the SAME registry write every restart path already performs.
+grep -q "pane rename pW watch·panetest" "$S/log" || fail "watch pane not labelled 'watch·panetest' after 'herd pane watch'"
 ok
 
 # ── 2. watch pane GONE → recreated below the coordinator (canonical spot) ─────────────────────────
@@ -366,6 +369,8 @@ grep -q "tab create" "$S/log" && fail "created a tab when rerunning the backlog 
 grep -q "visible ✓" <<< "$out" || fail "backlog summary missing 'visible ✓'"
 grep -q "^backlog pL tC" "$R4/trees/.herd-panes" || fail "registry backlog row not rewritten to pL"
 grep -q "^watch pW"      "$R4/trees/.herd-panes" || fail "registry watch row not preserved on backlog restart"
+# HERD-650: labelled 'backlog' after the restart.
+grep -q "pane rename pL backlog·panetest" "$S/log" || fail "backlog pane not labelled 'backlog·panetest' after 'herd pane backlog'"
 ok
 
 # ── 5. backlog pane GONE → recreated beside the coordinator + swapped into the LEFT slot ──────────
@@ -457,6 +462,8 @@ new_c="$(awk '$1=="coordinator-agent" {print $2}' "$R7/trees/.herd-panes")"
 [ -n "$new_c" ] && [ "$new_c" != "pA" ] || fail "registry coordinator-agent not updated to the new pane (got '$new_c')"
 grep -q "^backlog pL" "$R7/trees/.herd-panes" || fail "registry backlog row not preserved on coordinator relaunch"
 grep -q "^watch pW"   "$R7/trees/.herd-panes" || fail "registry watch row not preserved on coordinator relaunch"
+# HERD-650: the FRESH coordinator pane carries the role label 'coordinator' afterward.
+grep -q "pane rename $new_c coordinator·panetest" "$S/log" || fail "new coordinator pane not labelled 'coordinator·panetest' after 'herd pane coordinator --yes'"
 ok
 
 # ── 7b. coordinator PROCEEDS with -y (short flag) ─────────────────────────────────────────────────
