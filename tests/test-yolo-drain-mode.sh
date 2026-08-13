@@ -284,9 +284,21 @@ ok "C5 the render leaves no {{token}} and the drain section is driver-independen
 
 # RENDER EQUIVALENCE: the section is GENERATED. Deleting the render and re-rendering reproduces it
 # byte-identically — proof the content lives in the template, never in a hand-edited render.
+#
+# HERD-676: the baseline is an EXPLICIT render taken right here, not the file `herd init` happened to
+# leave behind above. `herd init` is a heavier, multi-step flow (scout, interview, healthcheck
+# seeding, governance adoption, …) whose render is just one side effect of it; comparing that
+# leftover against a render taken much later (after C1-C5) means the two sides of this proof are
+# produced by two DIFFERENT code paths, an arbitrary distance apart in the run. A shard reshuffle
+# that changes how many tests run before this one changes that distance, and this test flaked once in
+# CI under exactly that kind of reshuffle (8-way → 5-way sharding, PR #785) despite an exhaustive
+# audit finding no test that mutates any of render_skill's shared inputs — own the fixture instead of
+# trusting prior render state: render fresh, twice, back-to-back, through the SAME `herd render` path
+# both times, so this check depends on nothing but itself.
+_herd "$R" render >/dev/null 2>&1 || fail "C6: 'herd render' (baseline) failed"
 cp "$R/$SKILL_REL" "$T/render-1.md"
 rm -f "$R/$SKILL_REL"
-_herd "$R" render >/dev/null 2>&1 || fail "C6: 'herd render' failed"
+_herd "$R" render >/dev/null 2>&1 || fail "C6: 'herd render' (re-render) failed"
 cmp -s "$T/render-1.md" "$R/$SKILL_REL" || fail "C6: re-rendering did not reproduce the skill byte-identically"
 ok "C6 the drain section is generated: delete + 'herd render' reproduces the skill byte-identically"
 
