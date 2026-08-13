@@ -518,6 +518,8 @@ GH_TOKEN	unit	tests/test-gh-token-passthrough.sh
 .herd/steps.tsv	sim	tests/test-sandbox-sim.sh
 triggers.sh	unit	tests/test-triggers.sh
 .herd/triggers.tsv	unit	tests/test-triggers.sh
+scripts/herd/gardener.sh	unit	tests/test-gardener.sh
+MAINTENANCE_GARDENER	unit	tests/test-gardener.sh
 herd conformance <report|run>	unit	tests/test-conformance.sh
 MODEL_* ref <driver>:<model>	unit	tests/test-model-matrix.sh
 templates/models.tsv	unit	tests/test-model-matrix.sh
