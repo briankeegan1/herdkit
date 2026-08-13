@@ -50,7 +50,7 @@ Role summarized from each file's top-of-file comment.
 - `engine-version.sh` — the ENGINE VERSION HANDSHAKE + ENGINE_AUTOUPDATE (HERD-179).
 - `env-export-lint.sh` — THE shared shell→python EXPORT guard (HERD-449): a config knob the Python
 - `fleet.sh` — helpers for the DETERMINISTIC (no-LLM) multi-project fan-out behind `herd fleet`
-- `gardener.sh` — the MAINTENANCE GARDENER (HERD-673): a periodic, ADVISORY doc-drift sweep that files
+- `gardener.sh` — the MAINTENANCE GARDENER (HERD-673, tuned HERD-730): a periodic, ADVISORY doc-drift
 - `gate-coverage-lint.sh` — THE shared gate-coverage drift guard (HERD-292, flipped for HERD-295
 - `git-scope-lint.sh` — THE shared engine/project ISOLATION guard (HERD-435, GitHub issue #547): every
 - `governance-drift-sweep.sh` — periodic, ADVISORY governance-DRIFT sweep (HERD-125).
