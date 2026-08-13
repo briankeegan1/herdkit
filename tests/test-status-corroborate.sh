@@ -58,7 +58,22 @@ chmod +x "$BIN/herdr"
 export PATH="$BIN:$PATH"
 
 export WORKTREES_DIR="$T/trees"; mkdir -p "$T/trees"
+export HERD_TRANSCRIPT_ROOT="$T/claude-projects"; mkdir -p "$HERD_TRANSCRIPT_ROOT"
 export JOURNAL_FILE="$T/journal.jsonl"
+
+# write_transcript <slug> <bytes> — create/replace a single-file transcript for <slug>'s worktree
+# ($WORKTREES_DIR/<slug>, the standard builder-worktree layout) with exactly <bytes> of content, at a
+# FRESH mtime (touch after write, since some filesystems have 1s mtime resolution and two writes in
+# the same wall-clock second would otherwise look byte-grown but not mtime-grown, or vice versa —
+# either signal alone is enough for _herd_wake_transcript_growing, but keeping both moving avoids a
+# flaky assertion on a fast filesystem).
+write_transcript() {
+  local slug="$1" n="$2" wt dir
+  wt="$WORKTREES_DIR/$slug"; mkdir -p "$wt"
+  dir="$HERD_TRANSCRIPT_ROOT/$(printf '%s' "$wt" | tr '/.' '-')"; mkdir -p "$dir"
+  python3 -c "import sys; sys.stdout.write('x' * int(sys.argv[1]))" "$n" > "$dir/session.jsonl"
+  touch "$dir/session.jsonl"
+}
 # shellcheck source=/dev/null
 . "$JOURNAL_SRC" || fail "sourcing journal.sh failed"
 # shellcheck source=/dev/null
@@ -179,6 +194,77 @@ ok
 export STUB_AGENT_NAME="aw-spare" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-9"
 export STUB_PANE_TEXT="$IDLE_PROMPT"
 [ "$(_agent_status "aw-spare")" = "idle" ] || fail "9: a genuinely idle spare builder must stay idle"
+ok
+unset STUB_PANE_TEXT
+
+unset STUB_AGENT_NAME STUB_AGENT_STATUS STUB_AGENT_PANE_ID
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# PART 3 (HERD-660) — transcript-growth corroboration: the SECOND, pane-independent rescue path
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# Regression target: HERD-647's pane path alone left a real gap — herdkit's own journal
+# (2026-08-11/12) shows raw agent_status=idle persisting CONTINUOUSLY for up to ~30 minutes
+# (actuator-status-port, 15 straight corroborated ticks) while the pane path happened to catch every
+# poll; a caller with a SHORT observation window (wake-verify's ~20s / 1-4 polls) has no such
+# guarantee — a poll that lands between repaints, or whose visible pane text is scrolled past the
+# "esc to interrupt" hint, sees neither pane signal and misreads idle. These cases prove
+# _herd_wake_transcript_growing closes that gap independently of the pane.
+
+# (10) idle + a pane that shows NO active chrome at all (pane signal fails outright) + a GROWING
+#      transcript for the slug's worktree ⇒ still corroborated to working via the transcript path
+#      alone. This is the exact gap: the pane path contributes nothing here.
+: > "$JOURNAL_FILE"
+write_transcript "tgrow-a" 100
+export STUB_PANE_TEXT="$IDLE_PROMPT"
+got="$(herd_driver_agent_status_resolved "tgrow-a" "idle" "pane-10")"
+write_transcript "tgrow-a" 250
+got="$(herd_driver_agent_status_resolved "tgrow-a" "idle" "pane-10")"
+[ "$got" = "working" ] || fail "10: idle + static pane + growing transcript must resolve to working (got '$got')"
+ok
+grep -q 'status_disagreement' "$JOURNAL_FILE" || fail "10: transcript-path rescue must journal status_disagreement"
+ok
+grep -q '"slug":"tgrow-a"' "$JOURNAL_FILE" || fail "10: journal must carry the slug"
+ok
+
+# (11) idle + NO pane resolvable AT ALL (headless-shaped: empty pane, no roster match) + a growing
+#      transcript ⇒ still corroborated. Proves the transcript path needs no pane whatsoever.
+: > "$JOURNAL_FILE"
+write_transcript "tgrow-b" 100
+got="$(herd_driver_agent_status_resolved "tgrow-b" "idle" "")"
+write_transcript "tgrow-b" 400
+got="$(herd_driver_agent_status_resolved "tgrow-b" "idle" "")"
+[ "$got" = "working" ] || fail "11: idle + no pane + growing transcript must resolve to working (got '$got')"
+ok
+
+# (12) idle + a transcript that EXISTS but has stopped growing (repeated identical size/mtime) ⇒
+#      never corroborated — the guardrail: a genuinely stuck/crashed agent must stay idle even though
+#      it once had a transcript.
+: > "$JOURNAL_FILE"
+write_transcript "tgrow-c" 200
+got="$(herd_driver_agent_status_resolved "tgrow-c" "idle" "pane-12")"
+got="$(herd_driver_agent_status_resolved "tgrow-c" "idle" "pane-12")"
+got="$(herd_driver_agent_status_resolved "tgrow-c" "idle" "pane-12")"
+[ "$got" = "idle" ] || fail "12: idle + flat transcript (no growth) must stay idle (got '$got')"
+ok
+[ ! -s "$JOURNAL_FILE" ] || fail "12: a flat transcript must never journal (got: $(cat "$JOURNAL_FILE"))"
+ok
+
+# (13) idle + no pane + no transcript at all for this slug's worktree ⇒ fail-soft to raw idle
+#      (absent signal = today's behavior, unchanged by HERD-660).
+: > "$JOURNAL_FILE"
+got="$(herd_driver_agent_status_resolved "tgrow-d-no-transcript" "idle" "")"
+[ "$got" = "idle" ] || fail "13: idle + no pane + no transcript must fail-soft to idle (got '$got')"
+ok
+
+# (14) HERD_STATUS_CORROBORATE=off also disables the transcript path (one kill switch for both).
+: > "$JOURNAL_FILE"
+write_transcript "tgrow-e" 100
+got="$(HERD_STATUS_CORROBORATE=off herd_driver_agent_status_resolved "tgrow-e" "idle" "")"
+write_transcript "tgrow-e" 500
+got="$(HERD_STATUS_CORROBORATE=off herd_driver_agent_status_resolved "tgrow-e" "idle" "")"
+[ "$got" = "idle" ] || fail "14: kill switch must also disable the transcript path (got '$got')"
+ok
+[ ! -s "$JOURNAL_FILE" ] || fail "14: kill switch must never journal (got: $(cat "$JOURNAL_FILE"))"
 ok
 unset STUB_PANE_TEXT
 
