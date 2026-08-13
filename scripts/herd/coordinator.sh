@@ -128,6 +128,24 @@ if [ "${HERD_NO_WATCH:-}" != "1" ]; then
   # worker runs INSIDE) so the identity guard can refuse a mismatched close of it, just like the
   # review/builder panes. This is the pane the 2026-07-10 incident's "healthcheck pane" belongs to.
   herd_driver_pane_rename "$WPANE" "watch·$WORKSPACE_NAME"
+
+  # 4b. AGENTS_PANE=on (HERD-668, epic HERD-666): a compact READ-ONLY specialist-agent-roster pane,
+  # split off the RIGHT of the watch pane (watcher keeps ~0.72 of the width, this pane the
+  # remainder) — OPERATOR-SPECIFIED layout, never the coordinator/backlog geometry. Ship-dormant:
+  # off (default) is a hard no-op — no split, no launch, no registry row, no label; the block below
+  # never runs and $APANE stays empty, so the registry write two lines down is byte-identical to
+  # before this lever existed.
+  APANE=""
+  if [ "${AGENTS_PANE:-off}" = "on" ]; then
+    asplit=$(herdr pane split "$WPANE" --direction right --ratio 0.72 --cwd "$REPO" --no-focus \
+              2>"$_CE") || _coord_die "agents pane/split"
+    APANE=$(printf '%s' "$asplit" | python3 -c \
+      'import sys,json; print(json.load(sys.stdin)["result"]["pane"]["pane_id"])' \
+      2>"$_CE") || _coord_die "agents pane/parse"
+    herd_pane_launch "$APANE" "bash $HERE/agents-pane-view.sh"
+    herd_driver_pane_rename "$APANE" "agents·$WORKSPACE_NAME"
+  fi
+
   echo "🛰  Coordinator up:  [ $BACKLOG_FILE | $COORDINATOR_CMD agent ⟂ 🐑 herd watch ]   tab $TAB"
 else
   echo "🛰  Coordinator up:  [ $BACKLOG_FILE | $COORDINATOR_CMD agent ]   tab $TAB"
@@ -136,8 +154,9 @@ fi
 # Record control-room pane IDs so 'herd reload' can refresh them in-place rather than always
 # creating standalone tabs — written from the OBSERVED pane IDs this run just created, through the
 # shared writer (each row stamped with this workspace_id as a 4th column so a later reader can drop
-# a hint that names a foreign workspace, issue #60). reload re-writes on every run.
-layout_write_registry "$WORKTREES_DIR/.herd-panes" "$WS" "$TAB" "$AGENT_PANE" "$ROOT" "${WPANE:-}" "$WORKSPACE_NAME"
+# a hint that names a foreign workspace, issue #60). reload re-writes on every run. The 8th arg
+# (${APANE:-}) is the AGENTS_PANE pane, empty unless AGENTS_PANE=on just built one (HERD-668).
+layout_write_registry "$WORKTREES_DIR/.herd-panes" "$WS" "$TAB" "$AGENT_PANE" "$ROOT" "${WPANE:-}" "$WORKSPACE_NAME" "${APANE:-}"
 
 echo "   jump to it:   herdr agent focus $HERD_AGENT_COORDINATOR"
 

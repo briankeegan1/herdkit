@@ -298,12 +298,15 @@ _retire_drop_probes() {
 #
 # What IS slug-keyed, and therefore ours:
 #   .herd-ref-<slug>          the per-worktree tracker-ref marker (_slug_ref_file)
+#   .herd-agent-<slug>        the per-worktree specialist-agent marker (HERD-668, herd-feature.sh/
+#                              herd-quick.sh; read by scripts/herd/agents-pane-view.sh)
 #   .retire-anchor-<slug>-<sha> / .retire-probe-<slug>-<sha>   this file's own memo scratch
 # (`.retire-<slug>` and `.retire-noted-<slug>-<kind>` are also ours but are escalation memory, cleared
 #  by _retire_state_clear — counting them here would make a slug its own leftover and never converge.)
 _retire_ledger_files() {
   local slug="$1" p
   [ -e "$TREES/.herd-ref-$slug" ] && printf '%s\n' "$TREES/.herd-ref-$slug"
+  [ -e "$TREES/.herd-agent-$slug" ] && printf '%s\n' "$TREES/.herd-agent-$slug"
   for p in "$TREES/.retire-anchor-$slug-" "$TREES/.retire-probe-$slug-"; do
     _retire_suffixed "$p"
   done
@@ -803,6 +806,11 @@ _retire_worktrees_enumerable() {
 #   .retire-anchor-<slug>-<sha> / .retire-probe-<slug>-<sha>
 #                                        our memo scratch; the trailing -<sha> is stripped, and a tail
 #                                        that is not a lone sha (i.e. a sibling slug's name) is skipped
+# NOT a discovery key: .herd-agent-<slug> (HERD-668) is deliberately excluded from this prefix-glob
+# scan even though _retire_ledger_files deletes it by exact match for an ALREADY-known slug — globbing
+# `.herd-agent-*` here would also match the roster's own shared, non-slug-keyed cache file
+# `.herd-agent-verify` (scripts/herd/agents.sh's herd_roster_cache_file) and manufacture a phantom slug
+# named "verify", exactly the false-orphan trap this comment block warns about for the PR-keyed ledgers.
 _retire_residual_slugs() {
   local f base p tail
   for p in .herd-ref- .retire-; do

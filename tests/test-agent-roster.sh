@@ -343,6 +343,9 @@ for lane in herd-feature.sh herd-quick.sh; do
   "$GREP" -q 'herd_roster_lane_warn' "$f" || fail "(13) $lane does not warn on an unresolved agent"
   # BOTH seams must be guarded by HERD_AGENT, or the lever is not really off when it is off.
   "$GREP" -q 'if \[ -n "\${HERD_AGENT:-}" \]' "$f" || fail "(13) $lane does not guard the seams on HERD_AGENT"
+  # HERD-668: the spawn-record marker the AGENTS_PANE control-room pane reads (agents-pane-view.sh's
+  # _in_flight_builders) — mirrors HERD_ITEM_REF's .herd-ref-<slug> marker, guarded the same way.
+  "$GREP" -q '\.herd-agent-\$SLUG' "$f" || fail "(13) $lane does not write the .herd-agent-<slug> spawn marker"
 done
 "$GREP" -q 'INTENT_ID.agent' "$ROOT/scripts/herd/spawn.sh" \
   || fail "(13) spawn.sh does not record the agent sidecar"

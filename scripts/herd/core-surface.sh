@@ -108,7 +108,7 @@ _herd_core_surface_scenario_for() {
     */agent-update.sh|*/driver.sh)
       printf 'sandbox-limit-resume-scenario.sh' ;;
     # PANES seam — anything whose product is a pane/tab in the control room.
-    */herd-feature.sh|*/herd-quick.sh|*/resolver-pane.sh|*/tab-discipline.sh|*/coordinator.sh|*/herd-watch.sh)
+    */herd-feature.sh|*/herd-quick.sh|*/resolver-pane.sh|*/tab-discipline.sh|*/coordinator.sh|*/herd-watch.sh|*/layout-reconcile.sh|*/agents-pane-view.sh)
       printf 'sandbox-real-panes-scenario.sh' ;;
     # GATE seam — the load-bearing six, and the fail-toward-more-proof default for everything else
     # the operator's glob chose to call core.
