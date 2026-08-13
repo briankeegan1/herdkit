@@ -14,6 +14,20 @@
 #      builder and the only symptom is the agent making the mistakes its definition forbids. So
 #      verification must be EMPIRICAL (spawn it and look for content that exists ONLY in that
 #      definition) and it must be able to FAIL — a probe with no negative control is worthless.
+#   T3 SUBAGENT DIR ≠ MAIN-SESSION PERSONA (HERD-729) — a runtime's NATIVE per-project definition
+#      directory may be scoped to a different FEATURE than the one HERD_AGENT needs. Claude Code's
+#      `.claude/agents/*.md` is real and IS read natively by `claude` — but as SUBAGENT types for the
+#      harness's own Agent/Task tool, delegated to at the orchestrator's discretion, never as the
+#      MAIN session's persona a top-level `claude -p` oneshot loads for the whole run. Publishing a
+#      roster definition there (as `mode=native`/`install` would) is therefore a no-op for what
+#      HERD_AGENT promises — "govern this whole build" — even though the file is genuinely read by
+#      *something*. `templates/drivers/herdr-claude.driver` and `headless.driver` bind
+#      DRIVER_AGENT_DEFINITION_MODE=inject for exactly this reason: injecting the body into the task
+#      spec is the one mechanism that provably governs a claude oneshot's whole session, and it is
+#      independently what `herd_roster_probe_kind` already resolves to for claude (no by-name
+#      selector), so mode now agrees with the mechanism actually in use instead of contradicting it.
+#      Lesson for the NEXT runtime: a definition dir binding must be audited for WHO reads it and
+#      WHEN, not just whether the runtime reads it at all.
 #
 # THE THREE DRIVER BINDINGS this file reads (added to templates/drivers/*.driver by HERD-667):
 #   DRIVER_AGENT_DEFINITION_DIR   where the runtime LOOKS UP named definitions (repo- or user-scope)
@@ -356,12 +370,12 @@ _herd_roster_probe_model() {
   herd_model_for_spawn "$ref" 2>/dev/null || true
 }
 
-# _herd_roster_probe <driver> <prompt> [select-arg …] — run ONE headless probe through the shared
+# _herd_roster_probe <driver> <prompt> [select-arg …] — run a headless probe through the shared
 # one-shot seam (DRIVER_AGENT_ONESHOT_EXEC) and echo its output, truncated to a tiny budget. Never
 # fails the caller: a non-zero runtime exit yields whatever it printed (usually nothing), which the
 # sentinel test then reads as "no sentinel".
 _herd_roster_probe() {
-  local drv="${1:-}" prompt="${2:-}" model flags out
+  local drv="${1:-}" prompt="${2:-}" model flags out attempt
   shift 2 2>/dev/null || set --
   model="$(_herd_roster_probe_model)"
   # The runtime's OWN permission flag (never claude's), via the shared resolver the lanes use.
@@ -370,27 +384,41 @@ _herd_roster_probe() {
   #   • WALL CLOCK — a wedged runtime would otherwise hang `herd agents verify` and, worse,
   #     `herd doctor --probe`, forever. `timeout` is used when present (stock macOS ships none, hence
   #     the gtimeout fallback and the run-anyway final branch — a missing bound must not disable the
-  #     check, only leave it unbounded, and the probe prompt already asks for one token).
+  #     check, only leave it unbounded). The default was raised 90s → 150s (HERD-729): a live probe
+  #     against a LONG definition (a multi-hundred-line body, injected whole ahead of the sentinel
+  #     ask) intermittently ran past 90s on real model latency alone — reproduced live, not a guess —
+  #     which killed a genuinely-resolving probe mid-generation and reported the silent-fallback trap
+  #     (T2) for a definition that was never actually ignored. 150s gives real headroom without
+  #     making a wedged runtime hang meaningfully longer.
   #   • OUTPUT — the reply is truncated before anything looks at it, so a runtime that ignores "print
   #     ONLY the value" and writes an essay costs a substring compare, not a buffer.
   local -a bound=()
-  if command -v timeout >/dev/null 2>&1; then bound=(timeout "${HERD_AGENT_VERIFY_TIMEOUT:-90}")
-  elif command -v gtimeout >/dev/null 2>&1; then bound=(gtimeout "${HERD_AGENT_VERIFY_TIMEOUT:-90}")
+  if command -v timeout >/dev/null 2>&1; then bound=(timeout "${HERD_AGENT_VERIFY_TIMEOUT:-150}")
+  elif command -v gtimeout >/dev/null 2>&1; then bound=(gtimeout "${HERD_AGENT_VERIFY_TIMEOUT:-150}")
   fi
   local here; here="${_HERD_ROSTER_HERE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
   # `timeout` cannot wrap a shell FUNCTION, so the bounded path re-enters a fresh bash that sources
   # driver.sh and calls the SAME seam — the runtime incantation still lives in exactly one place
   # (DRIVER_AGENT_ONESHOT_EXEC via herd_driver_oneshot_exec_as), never re-implemented here.
-  # shellcheck disable=SC2086  # $flags is a whitespace-separated flag list — deliberate word-split
-  if [ "${#bound[@]}" -gt 0 ] && [ -f "$here/driver.sh" ]; then
-    out="$("${bound[@]}" bash -c '
-        . "$1/driver.sh"
-        _d="$2"; _p="$3"; _m="$4"; shift 4
-        herd_driver_oneshot_exec_as "$_d" "$_p" "$_m" "$@"
-      ' _ "$here" "$drv" "$prompt" "$model" $flags "$@" 2>/dev/null || true)"
-  else
-    out="$(herd_driver_oneshot_exec_as "$drv" "$prompt" "$model" $flags "$@" 2>/dev/null || true)"
-  fi
+  #
+  # ONE retry, ONLY on a completely empty result (HERD-729): a `timeout`-killed run yields empty
+  # output (never a real-but-wrong answer — a runtime that genuinely ignores the definition, trap T2,
+  # still prints SOMETHING, e.g. "I am a plain agent…"), so retrying on empty catches a transient
+  # timeout/latency spike without ever masking a real silent-fallback verdict. Bounded at 2 attempts —
+  # this is a diagnostic, not a resilience system.
+  for attempt in 1 2; do
+    # shellcheck disable=SC2086  # $flags is a whitespace-separated flag list — deliberate word-split
+    if [ "${#bound[@]}" -gt 0 ] && [ -f "$here/driver.sh" ]; then
+      out="$("${bound[@]}" bash -c '
+          . "$1/driver.sh"
+          _d="$2"; _p="$3"; _m="$4"; shift 4
+          herd_driver_oneshot_exec_as "$_d" "$_p" "$_m" "$@"
+        ' _ "$here" "$drv" "$prompt" "$model" $flags "$@" 2>/dev/null || true)"
+    else
+      out="$(herd_driver_oneshot_exec_as "$drv" "$prompt" "$model" $flags "$@" 2>/dev/null || true)"
+    fi
+    [ -n "$out" ] && break
+  done
   printf '%s' "${out:0:2000}"
 }
 

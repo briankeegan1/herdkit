@@ -68,11 +68,14 @@ DRIVER_AGENT_PROCESS_SIGNATURE='claude'
 
 # ── Specialist-agent ROSTER bindings (HERD-667, epic HERD-666) ────────────────────────────────────
 # Same AGENT RUNTIME as herdr-claude (headless swaps the MUX, not the runtime), so definition
-# resolution is IDENTICAL: repo-scope `.claude/agents/*.md` read natively (mode=native, nothing to
-# publish), and no by-name spawn selector — bound to the honest @degrade sentinel so
-# scripts/herd/agents.sh takes the portable INJECT path (definition body prepended to the task spec).
+# resolution is IDENTICAL, INCLUDING the HERD-729 correction: repo-scope `.claude/agents/*.md` is
+# read natively by claude, but only as SUBAGENT definitions for the Agent/Task tool — never as the
+# MAIN session's persona a detached `claude -p` oneshot runs the whole build as (see
+# scripts/herd/agents.sh's T3 trap note). mode=inject is the honest claim, matching the no-by-name-
+# selector @degrade binding below: scripts/herd/agents.sh takes the portable INJECT path (definition
+# body prepended to the task spec) — the one mechanism that provably governs the whole session.
 DRIVER_AGENT_DEFINITION_DIR='.claude/agents'
-DRIVER_AGENT_DEFINITION_MODE='native'
+DRIVER_AGENT_DEFINITION_MODE='inject'
 DRIVER_AGENT_SELECT_FLAG='@degrade:no-by-name-agent-selection-flag-claude-2.1.229'
 
 # ── Agent-runtime UPDATE bindings (HERD-149 — the AGENT_UPDATE knob) ───────────────────────────────

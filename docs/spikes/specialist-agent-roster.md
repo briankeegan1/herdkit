@@ -64,10 +64,40 @@ from the cache without spawning anything. `herd doctor --probe` re-runs the prob
 
 | runtime | definition dir | by-name selector | mode | how it was established |
 |---|---|---|---|---|
-| **claude 2.1.229** (`herdr-claude`, `headless`) | `.claude/agents/*.md`, **repo scope** | none | `native` | verified on this machine |
+| **claude 2.1.229** (`herdr-claude`, `headless`) | `.claude/agents/*.md`, **repo scope** | none | ~~`native`~~ **`inject`** — see § 3a | verified on this machine |
 | **codex 0.147.0** | none | none | `inject` | verified on this machine |
 | **grok 1.0.3** | `~/.grok/agents/`, **user scope** | `--agent <name>` | `install` | **verified by report** — grok is not installed here |
 | **stub** (proof driver) | `$HOME/.stub-agent/agents` | `--agent <name>` | `install` | the hermetic test vehicle |
+
+### 3a. Correction (2026-08-13, HERD-729): claude's mode was `native`, and that was wrong
+
+The 2026-08-12 pre-audit called claude `native` on a true-but-insufficient fact: claude 2.1.229 does
+read `.claude/agents/*.md` with no publishing step. What the pre-audit missed is *what kind of
+reading* that is. `.claude/agents/*.md` defines **subagent types for Claude Code's own Agent/Task
+tool** — delegated to at the orchestrating model's discretion, inside an interactive/harness session.
+It is not, and was never, a mechanism for loading a definition as the **main session's own persona**
+for a detached `claude -p` oneshot. A lane spawn (`herd-feature.sh` / `herd-quick.sh` under
+`HERD_AGENT=<name>`) needs the LATTER — the whole build governed by the specialist's rules — and a
+top-level oneshot never automatically invokes a same-named subagent just because a file with that
+name happens to sit in `.claude/agents/`.
+
+This surfaced from real use, not a re-audit: HERD-729 was grounded live when `herd agents install`
+published `docs-gardener` + `engine-rails` to `.claude/agents/` (mode said `native`, "nothing to
+publish needed" — true, and irrelevant) and `herd agents verify docs-gardener` still reported
+`unresolved`, while `engine-rails` reported `ok`. The `ok`/`unresolved` split turned out to be
+ordinary probe-timeout flakiness on a long injected definition (fixed by raising
+`HERD_AGENT_VERIFY_TIMEOUT` and retrying once on an empty probe result — see
+`scripts/herd/agents.sh`), not a mechanism difference; both agents were always resolving through
+**inject**, because `herd_roster_probe_kind` was already independent of `DEFINITION_MODE` and had
+already resolved to `inject` for claude (no by-name selector — see § 5). The `native` *label* was
+simply asserting a fact that, while true, never mattered: nothing in the roster's actual resolution
+path — not `verify`, not a lane spawn — ever reads `.claude/agents/*.md` for HERD_AGENT's purpose.
+`templates/drivers/herdr-claude.driver` and `headless.driver` now bind
+`DRIVER_AGENT_DEFINITION_MODE=inject`, so the field agrees with the mechanism in use, and
+`herd agents install` correctly reports "nothing to publish" for these drivers instead of copying
+files nothing reads for this purpose. `DRIVER_AGENT_DEFINITION_DIR` stays bound — the fact itself is
+still true and may matter for a future Task-tool-delegation capability — only `DEFINITION_MODE`
+changed.
 
 Notes that matter for the bindings:
 
