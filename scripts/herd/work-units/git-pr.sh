@@ -469,6 +469,110 @@ _watcher_tick_fields() {
   printf '%s' "$_wtf"
 }
 
+# ── HERD-675: unify the per-tick PR-list fetch ──────────────────────────────────────────────────────
+# Before this, `_prs_fetch_tick` below (`gh pr list --json ...`) and pysrc/herd/live_runtime.py's
+# `discover_via_graphql` (`gh api graphql`) each independently fetched the full open-PR roster every
+# tick — HERD-671 pooled and throttled both, but deliberately left the two transports separate. Python's
+# graphql query is the richer schema (it already carries body/baseRefName/reviewDecision/isDraft in one
+# round-trip, and now title/mergeable too), so it is the FETCH OWNER: `_write_pr_fetch_cache`
+# (live_runtime.py) writes its raw roster to a tick-scoped, seat-stamped cache under the worktree pool
+# after every successful graphql discovery, and `_pr_fetch_cache_read` below reads a PROJECTED view of
+# it — the exact field set `_watcher_tick_fields()` would have requested from `gh pr list` — instead of
+# `_prs_fetch_tick` paying its own round-trip, whenever that cache is still fresh.
+#
+# ORDERING CAVEAT (load-bearing finding, journaled via `herd note` at build time): within one bash
+# watcher tick, `_prs_fetch_tick` runs BEFORE the Python engine tick even starts (`_tick_render_reconcile`
+# calls this, then later `_engine_tick_watchdog` → `herd_engine_live_tick` → `python3 -m herd.live_runtime
+# --tick`, which is what reaches `discover_via_graphql`) — see `_watcher_remote_tick_due`'s own comment.
+# So this leg can never consume THIS tick's cache; it consumes the PREVIOUS due tick's, and
+# `_pr_fetch_cache_max_age_secs` sizes the freshness bound to span exactly that one-tick gap. The very
+# first due tick after a restart (no cache written yet) still pays two independent fetches, exactly as
+# today; every steady-state due tick after that pays exactly one.
+#
+# SHIP-DORMANT: PR_FETCH_UNIFY defaults off. Off, `_pr_fetch_unify_enabled` short-circuits every helper
+# below to "no cache" and `_prs_fetch_tick` never even looks at the filesystem — behavior (and the `gh`
+# round-trip count) is byte-identical to before this task.
+
+# _pr_fetch_unify_enabled — PR_FETCH_UNIFY: on | off (default off). Mirrors live_runtime.py's OWN
+# `_pr_fetch_unify_enabled` EXACTLY (same key, same accepted spellings) so bash and python can never
+# disagree about whether the unified cache is active.
+_pr_fetch_unify_enabled() {
+  case "${PR_FETCH_UNIFY:-off}" in
+    on|ON|On|true|TRUE|1|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _pr_fetch_cache_seat — this seat's id, filesystem-safe (non [A-Za-z0-9_.-] squashed to '_'), for the
+# cache filename. Reuses engine-seat.sh's `herd_engine_seat_id` (WATCHER_OWNER → WATCHER_VIEW_AUTHOR →
+# host:pid) when available — agent-watch.sh always sources engine-seat.sh, so this is the normal case —
+# else falls back to "solo" (a hermetic caller that sourced only this file), matching the same
+# fail-soft posture live_runtime.py's own `_pr_fetch_cache_seat` uses when HERD_ENGINE_SEAT_ID is unset.
+_pr_fetch_cache_seat() {
+  local _pfcs=""
+  if command -v herd_engine_seat_id >/dev/null 2>&1; then
+    _pfcs="$(herd_engine_seat_id 2>/dev/null)"
+  fi
+  [ -n "$_pfcs" ] || _pfcs="solo"
+  printf '%s' "$_pfcs" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+# _pr_fetch_cache_path — $TREES/.pr-list-cache-<seat>.json; fails (rc 1, no output) when $TREES is
+# unresolved, mirroring every other pooled-file path helper in this tree.
+_pr_fetch_cache_path() {
+  [ -n "${TREES:-}" ] || return 1
+  printf '%s/.pr-list-cache-%s.json' "$TREES" "$(_pr_fetch_cache_seat)"
+}
+
+# _pr_fetch_cache_max_age_secs — the freshness bound for a cache written by the PREVIOUS due tick's
+# python leg (see the ordering caveat above): roughly one due-interval, plus an 8s grace band for
+# process-startup/scheduling jitter, so a genuinely-current cache never reads stale. Scales with
+# WATCHER_IDLE_CADENCE's own widened interval when that lever is on, so the two throttles never fight
+# each other (a due tick up to WATCHER_IDLE_REMOTE_SECS apart still finds its own cache fresh).
+_pr_fetch_cache_max_age_secs() {
+  if _watcher_idle_cadence_enabled; then
+    printf '%s' "$(( $(_watcher_idle_remote_interval) * 4 + 8 ))"
+  else
+    printf '12'
+  fi
+}
+
+# _pr_fetch_cache_read <fields> — emit the cache's PRs projected to exactly <fields> (a comma-separated
+# list, the `_watcher_tick_fields()` shape) on stdout and return 0, ONLY when PR_FETCH_UNIFY is on, a
+# cache file exists at this seat's path, it parses as the expected {"written_at","prs":[...]} shape, and
+# `written_at` is within `_pr_fetch_cache_max_age_secs` of now. Every other case — the lever off, no
+# cache, a stale cache, a malformed/unreadable cache, a clock that reads negative age — returns 1 with
+# NO stdout, so the caller's own fallback fetch is reached exactly as if this function did not exist.
+_pr_fetch_cache_read() {
+  local _pfcr_fields="${1:-}" _pfcr_path _pfcr_now
+  _pr_fetch_unify_enabled || return 1
+  _pfcr_path="$(_pr_fetch_cache_path)" || return 1
+  [ -r "$_pfcr_path" ] || return 1
+  if command -v _now_epoch >/dev/null 2>&1; then
+    _pfcr_now="$(_now_epoch 2>/dev/null)"
+  fi
+  [ -n "${_pfcr_now:-}" ] || _pfcr_now="$(date +%s 2>/dev/null || printf 0)"
+  FIELDS="$_pfcr_fields" MAX_AGE="$(_pr_fetch_cache_max_age_secs)" NOW="$_pfcr_now" python3 -c '
+import json, os, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        doc = json.load(fh)
+    written = int(doc.get("written_at") or 0)
+    now = int(os.environ.get("NOW") or 0)
+    max_age = int(os.environ.get("MAX_AGE") or 0)
+    if now < written or (now - written) > max_age:
+        sys.exit(1)
+    prs = doc.get("prs")
+    if not isinstance(prs, list):
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+fields = [f for f in os.environ.get("FIELDS", "").split(",") if f]
+out = [{k: p.get(k) for k in fields if k in p} for p in prs if isinstance(p, dict)]
+print(json.dumps(out))
+' "$_pfcr_path"
+}
+
 # _prs_fetch_tick — set PRS_JSON + PRS_LOOKUP_OK for this watch tick (HERD-224).
 # Captures the EXIT STATUS of `gh pr list` so a transient fetch failure is NEVER collapsed into an
 # empty roster. The pre-fix form (`|| echo '[]'`) made a failed fetch look identical to "zero open
@@ -477,8 +581,16 @@ _watcher_tick_fields() {
 #   • PRS_LOOKUP_OK=0 — the list call failed/errored; PRS_JSON is `[]` only as a safe placeholder
 #     for discovery, and the console must paint the degraded "PR match pending" row, never the
 #     definitive awaiting-task / died-(no PR) claims. The view filter still applies on success.
+# HERD-675: under PR_FETCH_UNIFY=on, a fresh unified cache (see above) is consumed FIRST — skipping the
+# `gh pr list` round-trip entirely — and only a missing/stale/malformed cache falls through to the
+# live fetch below, unchanged.
 _prs_fetch_tick() {
   local _raw _rc=0
+  if _raw="$(_pr_fetch_cache_read "$(_watcher_tick_fields)")"; then
+    PRS_LOOKUP_OK=1
+    PRS_JSON="$(printf '%s' "$_raw" | _watcher_view_filter)"
+    return 0
+  fi
   _raw="$(_gh_timeout tick_pr_list pr list --json "$(_watcher_tick_fields)" 2>/dev/null)" || _rc=$?
   if [ "$_rc" -ne 0 ]; then
     PRS_LOOKUP_OK=0

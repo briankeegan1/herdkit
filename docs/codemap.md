@@ -353,6 +353,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `OSS_TRIAGE` → `bin/herd`, `oss-triage.sh`
 - `PROJECT_ARCHETYPE` → `bin/herd`
 - `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `agents.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `changelog.sh`, `codemap.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `oss-triage.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`, `watcher-resurrect.sh`
+- `PR_FETCH_UNIFY` → `git-pr.sh`
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `PUSH_GATE` → `bin/herd`, `governance-hook.sh`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`, `push-gate.sh`

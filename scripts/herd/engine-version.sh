@@ -338,7 +338,7 @@ herd_engine_shadow_tick() {
 herd_engine_live_tick() {
   herd_engine_impl >/dev/null 2>&1   # resolve (fires the retired-value warning once if ENGINE_IMPL is stale)
   command -v python3 >/dev/null 2>&1 || return 1
-  local home pyp _tick_stderr _tick_rc _gs_health="" _gs_review=""
+  local home pyp _tick_stderr _tick_rc _gs_health="" _gs_review="" _gs_seat=""
   home="${HERDKIT_HOME:-$(cd "$_HERD_ENGINE_DIR/../.." 2>/dev/null && pwd)}"
   pyp="$home/pysrc"
   [ -f "$pyp/herd/live_runtime.py" ] || return 1
@@ -346,8 +346,16 @@ herd_engine_live_tick() {
   _tick_stderr="$(mktemp 2>/dev/null || printf '%s' "/tmp/herd-tick-err-$$")"
   type _health_conc >/dev/null 2>&1 && _gs_health="$(_health_conc 2>/dev/null)"
   type _review_conc >/dev/null 2>&1 && _gs_review="$(_review_conc 2>/dev/null)"
+  # HERD-675: pass THIS bash process's already-resolved seat id through as an explicit env override —
+  # the SAME pattern as _gs_health/_gs_review above — so live_runtime.py's `_pr_fetch_cache_seat` (the
+  # unified PR-list cache's filename stamp under PR_FETCH_UNIFY=on) names the IDENTICAL file this
+  # process's own `_pr_fetch_cache_path` (git-pr.sh) reads. herd_engine_seat_id is unconditionally
+  # sourced by agent-watch.sh (engine-seat.sh); the `type` guard only covers the rare hermetic caller
+  # that sourced this file standalone, where the child falls back to its own "solo" default.
+  type herd_engine_seat_id >/dev/null 2>&1 && _gs_seat="$(herd_engine_seat_id 2>/dev/null)"
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" WORKTREES_DIR="${WORKTREES_DIR:-}" PROJECT_ROOT="${PROJECT_ROOT:-}" \
     HEALTH_CONCURRENCY="${_gs_health:-${HEALTH_CONCURRENCY:-}}" REVIEW_CONCURRENCY="${_gs_review:-${REVIEW_CONCURRENCY:-}}" \
+    HERD_ENGINE_SEAT_ID="${_gs_seat:-${HERD_ENGINE_SEAT_ID:-}}" \
     python3 -m herd.live_runtime --tick >/dev/null 2>"$_tick_stderr"
   _tick_rc=$?
   # Capture the last non-empty stderr line so the caller can surface a self-explaining fault reason.
