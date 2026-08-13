@@ -610,7 +610,7 @@ this scan cannot see).
 - `_herd_roster_skip_reason` — def `scripts/herd/agents.sh:150` — callers: —
 - `_herd_soft_dep_startup_notice` — def `scripts/herd/herd-preflight.sh:494` — callers: `bin/herd:7729`, `scripts/herd/coordinator.sh:186`
 - `_herd_state_dispatch` — def `scripts/herd/herd-claim.sh:113` — callers: `scripts/herd/agent-watch.sh:19677`
-- `_herd_suite_deps_table` — def `scripts/herd/suite-shard.sh:181` — callers: —
+- `_herd_suite_deps_table` — def `scripts/herd/suite-shard.sh:204` — callers: —
 - `_herd_tabs_drop_row` — def `scripts/herd/agent-watch.sh:11197` — callers: `scripts/herd/tab-discipline.sh:258`
 - `_herd_tabs_prune_orphans` — def `scripts/herd/agent-watch.sh:11239` — callers: —
 - `_herd_theme_dir_ok` — def `scripts/herd/theme.sh:39` — callers: —
@@ -1847,13 +1847,13 @@ this scan cannot see).
 - `herd_spawn_gate_saturated` — def `scripts/herd/herd-spawn-gate.sh:142` — callers: —
 - `herd_spawn_wake_verify` — def `scripts/herd/driver.sh:1927` — callers: `scripts/herd/herd-feature.sh:408`, `scripts/herd/herd-quick.sh:410`
 - `herd_strip_derived` — def `scripts/herd/derived-files.sh:66` — callers: `scripts/herd/agent-watch.sh:8037`, `scripts/herd/agent-watch.sh:8456`, `scripts/herd/agent-watch.sh:10982`, `scripts/herd/agent-watch.sh:11746`, `scripts/herd/stale-dup-gate.sh:164`
-- `herd_suite_core_tests` — def `scripts/herd/suite-shard.sh:89` — callers: —
-- `herd_suite_curated_tests` — def `scripts/herd/suite-shard.sh:113` — callers: `scripts/herd/scope-escape.sh:116`
-- `herd_suite_scope_mode` — def `scripts/herd/suite-shard.sh:168` — callers: —
-- `herd_suite_shard_hash` — def `scripts/herd/suite-shard.sh:136` — callers: —
-- `herd_suite_shard_of` — def `scripts/herd/suite-shard.sh:142` — callers: —
-- `herd_suite_tests_for_diff` — def `scripts/herd/suite-shard.sh:213` — callers: `scripts/herd/scope-escape.sh:115`
-- `herd_suite_tests_for_shard` — def `scripts/herd/suite-shard.sh:151` — callers: —
+- `herd_suite_core_tests` — def `scripts/herd/suite-shard.sh:105` — callers: —
+- `herd_suite_curated_tests` — def `scripts/herd/suite-shard.sh:136` — callers: `scripts/herd/scope-escape.sh:116`
+- `herd_suite_scope_mode` — def `scripts/herd/suite-shard.sh:191` — callers: —
+- `herd_suite_shard_hash` — def `scripts/herd/suite-shard.sh:159` — callers: —
+- `herd_suite_shard_of` — def `scripts/herd/suite-shard.sh:165` — callers: —
+- `herd_suite_tests_for_diff` — def `scripts/herd/suite-shard.sh:236` — callers: `scripts/herd/scope-escape.sh:115`
+- `herd_suite_tests_for_shard` — def `scripts/herd/suite-shard.sh:174` — callers: —
 - `herd_tab_create_check` — def `scripts/herd/tab-create-lint.sh:143` — callers: —
 - `herd_tab_create_lint` — def `scripts/herd/healthcheck.sh:184`, `scripts/herd/tab-create-lint.sh:218` — callers: —
 - `herd_tab_discipline_classify` — def `scripts/herd/tab-discipline.sh:108` — callers: —
