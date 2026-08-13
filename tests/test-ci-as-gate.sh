@@ -23,6 +23,11 @@
 #                                                  costs no gh call on a LATER tick (a separate
 #                                                  process, same shared state dir); a new sha
 #                                                  invalidates it and re-polls (8c)
+#   (9) HERD-677 CODEERROR heals on a live rerun  → a memoized CODEERROR is NOT trusted forever: a
+#                                                  just-stamped recheck marker still costs no gh call
+#                                                  (9b), but a backdated one re-reads and, on a rerun
+#                                                  that now concludes green, clears the BLOCK, merges,
+#                                                  journals ci_verdict_healed, and refunds the rail (9c)
 #
 # Hermetic: no network, no real gh, no suite dispatch, no merge (DryRunActuator). The review rail is
 # stubbed to PASS in the driver so the walk reaches a merge decision without shelling a reviewer.
@@ -244,5 +249,34 @@ grep -q '"10": *"MERGE"' <<< "$OUT" || fail "(8c) the new sha's own CI word must
 [ "$(hits memo 'run list')" = "1" ] || fail "(8c) a new sha must re-poll gh exactly once, not reuse the old memo"
 ok "(8c) a new head sha on the same branch invalidates the memo and re-polls"
 
+# ── (9) HERD-677: a CI-sourced CODEERROR is NOT trusted forever — a rerun that flips the SAME sha
+#       green heals the block, merges, journals ci_verdict_healed, and refunds the refix rail ─────────
+export GH_RUNS='[{"headSha":"shaH","status":"COMPLETED","conclusion":"FAILURE","workflowName":"CI","databaseId":901,"headBranch":"feat/x"}]'
+export GH_LOG=$'ci-suite\t✗ tests/test-heal.sh\n'
+export GH_CALLS="$T/heal/gh-calls.log"; mkdir -p "$T/heal"; : > "$GH_CALLS"
+OUT="$(PATH="$BIN:$PATH" drive heal 11 shaH)" || fail "(9) driver errored"
+grep -q '"11": *"BLOCK"' <<< "$OUT" || fail "(9) first tick: a CI red must BLOCK (got: $OUT)"
+[ "$(ev heal refix_bounce)" = "1" ] || fail "(9) first tick must bounce exactly once"
+[ "$(hits heal 'run list')" = "1" ] || fail "(9) first tick must poll gh exactly once"
+
+# An IMMEDIATELY-following tick: the recheck marker was just stamped, so it is NOT due yet — the
+# memo is trusted and NO further gh call happens, even though the fixture below (SUCCESS) would heal
+# it if it were actually read.
+export GH_RUNS='[{"headSha":"shaH","status":"COMPLETED","conclusion":"SUCCESS","workflowName":"CI","databaseId":902,"headBranch":"feat/x"}]'
+: > "$T/heal/gh-calls.log"
+OUT="$(PATH="$BIN:$PATH" drive heal 11 shaH)" || fail "(9b) driver errored"
+grep -q '"11": *"BLOCK"' <<< "$OUT" || fail "(9b) an immediately-following tick must still trust the memo (got: $OUT)"
+[ "$(calls heal)" = "0" ] || fail "(9b) a just-stamped recheck marker must cost NO gh call yet"
+
+# Backdate the recheck marker past the cadence window (simulating time passed) — the SAME
+# still-green GH_RUNS from above must now heal the block.
+find "$T/heal" -maxdepth 1 -name '.ci-recheck-*' -exec touch -t 200001010000 {} \;
+OUT="$(PATH="$BIN:$PATH" drive heal 11 shaH)" || fail "(9c) driver errored"
+grep -q '"11": *"MERGE"' <<< "$OUT" || fail "(9c) a healed CODEERROR must merge, not stay BLOCKED (got: $OUT)"
+grep -q '"event":"ci_verdict_healed"' "$T/heal/j.jsonl" || fail "(9c) must journal ci_verdict_healed"
+grep -q '"reason":"rerun"' "$T/heal/j.jsonl" || fail "(9c) the heal must record reason=rerun"
+[ "$(ev heal refix_rail_reset)" = "1" ] || fail "(9c) the healed rail must refund its refix budget"
+ok "(9) HERD-677: a CI-sourced CODEERROR heals on a live rerun — no bounce trusts a memo forever"
+
 echo
-echo "ALL PASS ($pass checks) — HEALTH_SOURCE=ci gate sim (HERD-578 / HERD-609 / HERD-612 / HERD-649)"
+echo "ALL PASS ($pass checks) — HEALTH_SOURCE=ci gate sim (HERD-578 / HERD-609 / HERD-612 / HERD-649 / HERD-677)"

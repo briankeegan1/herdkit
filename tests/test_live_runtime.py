@@ -9248,6 +9248,150 @@ class TestCiConclusiveMemo(unittest.TestCase):
             self.assertEqual(pooled.call_count, 1, "a new sha must re-poll, never trust the old memo")
 
 
+class TestCiCodeerrorRecheckMarker(unittest.TestCase):
+    """HERD-677: the throttle marker behind `ci_verdict_recheck` — a plain mtime-keyed file, exactly
+    like `_ci_rerun_cooldown_marker`, so a standing CODEERROR gets re-verified on a bounded cadence
+    instead of never again."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_due_when_no_marker_exists(self):
+        self.assertTrue(LR._ci_codeerror_recheck_due(self.tmp, "feat/x", "shaR"))
+
+    def test_not_due_immediately_after_marking(self):
+        LR._mark_ci_codeerror_rechecked(self.tmp, "feat/x", "shaR")
+        self.assertFalse(LR._ci_codeerror_recheck_due(self.tmp, "feat/x", "shaR"))
+
+    def test_due_after_the_cadence_window_elapses(self):
+        marker = LR._ci_codeerror_recheck_marker(self.tmp, "feat/x", "shaR")
+        open(marker, "w").close()
+        old = time.time() - (LR._CI_CODEERROR_RECHECK_SECS + 60)
+        os.utime(marker, (old, old))
+        self.assertTrue(LR._ci_codeerror_recheck_due(self.tmp, "feat/x", "shaR"))
+
+    def test_no_state_dir_or_key_is_always_due(self):
+        self.assertTrue(LR._ci_codeerror_recheck_due("", "feat/x", "shaR"))
+        self.assertTrue(LR._ci_codeerror_recheck_due(self.tmp, "", "shaR"))
+        self.assertTrue(LR._ci_codeerror_recheck_due(self.tmp, "feat/x", ""))
+
+    def test_marker_is_keyed_on_branch_and_sha_not_just_branch(self):
+        LR._mark_ci_codeerror_rechecked(self.tmp, "feat/x", "shaA")
+        self.assertTrue(LR._ci_codeerror_recheck_due(self.tmp, "feat/x", "shaB"),
+                        "a new sha must not inherit an old sha's recheck clock")
+
+
+class TestCiVerdictHeal(unittest.TestCase):
+    """HERD-677: a CI-sourced CODEERROR memo is not trusted forever — `ci_verdict_recheck` re-polls
+    live CI on a bounded cadence and heals a stale BLOCKED red the instant a rerun flips the SAME sha
+    green, exactly the gap that let PR #785 bounce a builder 4 dry rounds against evidence that had
+    already healed minutes earlier."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.state = LiveState(self.tmp)
+        self.jpath = os.path.join(self.tmp, "j.jsonl")
+
+    def _gates(self, health_source="ci"):
+        config = {"HEALTH_SOURCE": health_source} if health_source else {}
+        return LiveGates("/nonexistent-home", self.state, LiveJournal(self.jpath), config=config)
+
+    def _cand(self, sha="shaR", branch="feat/x"):
+        return LiveCandidate(pr=1, sha=sha, slug="feat-1", branch=branch, worktree="/nonexistent-wt")
+
+    def _events(self):
+        out = []
+        if not os.path.exists(self.jpath):
+            return out
+        with open(self.jpath, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    out.append(json.loads(line))
+        return out
+
+    def _backdated_codeerror_memo(self, sha="shaR", detail="tests/a.sh"):
+        self.state.record_ci_conclusive_memo("feat/x", sha, "CODEERROR", detail)
+        marker = LR._ci_codeerror_recheck_marker(self.tmp, "feat/x", sha)
+        open(marker, "w").close()
+        old = time.time() - (LR._CI_CODEERROR_RECHECK_SECS + 60)
+        os.utime(marker, (old, old))
+
+    def test_no_memo_is_a_noop(self):
+        self.assertIsNone(self._gates().ci_verdict_recheck(self._cand()))
+
+    def test_clean_memo_is_never_re_asked_about(self):
+        self.state.record_ci_conclusive_memo("feat/x", "shaR", "CLEAN", "")
+        gates = self._gates()
+        with mock.patch.object(LR, "_ci_runs") as solo:
+            self.assertIsNone(gates.ci_verdict_recheck(self._cand()))
+            self.assertEqual(solo.call_count, 0, "only a CODEERROR memo is ever re-verified")
+
+    def test_local_health_source_is_a_noop(self):
+        self._backdated_codeerror_memo()
+        gates = self._gates(health_source=None)
+        with mock.patch.object(LR, "_ci_runs") as solo:
+            self.assertIsNone(gates.ci_verdict_recheck(self._cand()))
+            self.assertEqual(solo.call_count, 0)
+
+    def test_just_recorded_codeerror_is_not_due_yet(self):
+        """`_ci_health`'s own writer stamps the recheck marker the instant it records the memo — the
+        very next call must not immediately re-poll."""
+        self.state.record_ci_conclusive_memo("feat/x", "shaR", "CODEERROR", "tests/a.sh")
+        LR._mark_ci_codeerror_rechecked(self.tmp, "feat/x", "shaR")
+        gates = self._gates()
+        with mock.patch.object(LR, "_ci_runs") as solo:
+            self.assertIsNone(gates.ci_verdict_recheck(self._cand()))
+            self.assertEqual(solo.call_count, 0, "a just-stamped recheck marker must not be due yet")
+
+    def test_due_after_the_cadence_window_heals_to_clean(self):
+        self._backdated_codeerror_memo()
+        gates = self._gates()
+        green = [{"headSha": "shaR", "status": "COMPLETED", "conclusion": "SUCCESS",
+                 "workflowName": "CI", "databaseId": 2, "headBranch": "feat/x"}]
+        with mock.patch.object(LR, "_ci_runs", return_value=green):
+            self.assertEqual(gates.ci_verdict_recheck(self._cand()), "CLEAN")
+        self.assertEqual(self.state.ci_conclusive_memo("feat/x"),
+                         {"sha": "shaR", "verdict": "CLEAN", "detail": ""})
+        self.assertFalse(gates.reused_health, "a genuine heal must not read as a reused cache hit")
+        healed = [e for e in self._events() if e.get("event") == "ci_verdict_healed"]
+        self.assertEqual(len(healed), 1)
+        self.assertEqual(healed[0]["reason"], "rerun")
+        self.assertEqual(healed[0]["pr"], 1)
+        self.assertEqual(healed[0]["sha"], "shaR")
+
+    def test_due_but_still_red_refreshes_evidence_and_rearms_the_throttle(self):
+        self._backdated_codeerror_memo(detail="tests/old.sh")
+        gates = self._gates()
+        red = [{"headSha": "shaR", "status": "COMPLETED", "conclusion": "FAILURE",
+               "workflowName": "CI", "databaseId": 3, "headBranch": "feat/x"}]
+        with mock.patch.object(LR, "_ci_runs", return_value=red), \
+             mock.patch.object(LR, "_ci_failed_log", return_value="ci-suite\t✗ tests/new.sh\n"):
+            self.assertIsNone(gates.ci_verdict_recheck(self._cand()))
+        self.assertEqual(self.state.ci_conclusive_memo("feat/x"),
+                         {"sha": "shaR", "verdict": "CODEERROR", "detail": "tests/new.sh"})
+        self.assertEqual([e for e in self._events() if e.get("event") == "ci_verdict_healed"], [])
+        with mock.patch.object(LR, "_ci_runs") as solo:
+            self.assertIsNone(gates.ci_verdict_recheck(self._cand()))
+            self.assertEqual(solo.call_count, 0, "a re-confirmed red must re-arm the throttle too")
+
+    def test_gh_unreadable_leaves_the_stale_verdict_standing(self):
+        self._backdated_codeerror_memo()
+        gates = self._gates()
+        with mock.patch.object(LR, "_ci_runs", return_value=None):
+            self.assertIsNone(gates.ci_verdict_recheck(self._cand()))
+        self.assertEqual(self.state.ci_conclusive_memo("feat/x")["verdict"], "CODEERROR")
+
+    def test_still_pending_leaves_the_stale_verdict_standing_and_does_not_memoize(self):
+        self._backdated_codeerror_memo()
+        gates = self._gates()
+        pending = [{"headSha": "shaR", "status": "IN_PROGRESS", "conclusion": None,
+                   "workflowName": "CI", "databaseId": 4, "headBranch": "feat/x"}]
+        with mock.patch.object(LR, "_ci_runs", return_value=pending):
+            self.assertIsNone(gates.ci_verdict_recheck(self._cand()))
+        self.assertEqual(self.state.ci_conclusive_memo("feat/x")["verdict"], "CODEERROR")
+
+
 class TestGhRateLimitStaleDeadlineReprobe(unittest.TestCase):
     """HERD-649c: a still-future rate-limit backoff deadline is a SNAPSHOT, not a promise — one cheap
     `gh api rate_limit` probe, only when a marker exists, can clear it early on a refilled budget."""

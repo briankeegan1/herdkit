@@ -2786,9 +2786,16 @@ def _health_trust_check(trees, sha, worktree):
 #       and stranded a MAIN RED for three days). So this leg lays NO marker, spawns NO worker and
 #       writes NO sha-cache: every tick re-reads the live conclusion from observed state. A tick that
 #       dies mid-read costs one re-read, never a stranded verdict. A CONCLUSIVE (CLEAN/CODEERROR) read
-#       is memoized ACROSS ticks, keyed by branch+sha (HERD-649b — a completed conclusion cannot
-#       un-complete); a WAIT (pending/infra-transient/cancelled) is NEVER memoized and re-polls every
-#       tick, so HERD-612 holds for every non-terminal read exactly as before.
+#       is memoized ACROSS ticks, keyed by branch+sha (HERD-649b); a WAIT (pending/infra-transient/
+#       cancelled) is NEVER memoized and re-polls every tick, so HERD-612 holds for every non-terminal
+#       read exactly as before. CLEAN truly cannot un-complete for a given sha — but CODEERROR can
+#       (HERD-677, grounded 2026-08-12: PR #785's CI went red, a `gh run rerun` flipped the SAME sha
+#       green minutes later, and nothing ever asked again — the refix rail bounced the builder 4 dry
+#       rounds against evidence that had already healed). So a CODEERROR memo is re-verified against
+#       live CI on a bounded cadence (`_ci_codeerror_recheck_due`, `LiveGates.ci_verdict_recheck`,
+#       called from `LiveTick._walk` before any refix-bounce decision) instead of being trusted
+#       forever like a CLEAN memo — a healed red clears (journaled `ci_verdict_healed`, refix budget
+#       refunded via the ordinary `_refix_rail_reset`) with no bounce ever having to be pending.
 #
 #   (C) ONE POOLED `gh run list` PER TICK, NOT ONE PER BRANCH (HERD-649a, grounded in the 2026-08-11
 #       backoff: a 30-PR day of one-call-per-branch-per-tick exhausted the 5000/hr REST budget with
@@ -2812,6 +2819,10 @@ _CI_RUN_LIMIT = 20             # runs per branch worth of window the pool tries 
 # this leg exists to cut.
 _CI_POOL_LIMIT_CAP = 100
 _CI_RERUN_COOLDOWN_SECS = 900  # min seconds between ANY two infra-transient reruns (bounded, HERD-609)
+# HERD-677: how often a memoized CODEERROR is re-verified against live CI while a PR sits BLOCKED — a
+# fixed internal cadence (not a config lever; this is a bugfix on an already ship-dormant feature, not
+# a new opt-in) bounding the API cost of healing against HERD-649a/c's per-tick budget concern.
+_CI_CODEERROR_RECHECK_SECS = 300
 
 
 def _health_source(config):
@@ -2964,6 +2975,46 @@ def _ci_rerun_failed(state_dir, run_id):
     except Exception:
         return False
     return out.returncode == 0
+
+
+# ── HERD-677: the CODEERROR-heal recheck throttle ──────────────────────────────────────────────────
+# A CONCLUSIVE memo is right to trust a CLEAN forever (HERD-649b: a completed conclusion cannot
+# un-complete for THIS sha), but a CODEERROR is not symmetric: `gh run rerun` — ours (HERD-609's
+# bounded infra retry) or a human's — can rerun the SAME sha's SAME run id and flip its conclusion,
+# which the memo has no way to notice on its own. This marker is the throttle on re-asking: a plain
+# mtime-keyed file, exactly like `_ci_rerun_cooldown_marker` above, so a standing BLOCK gets re-verified
+# every `_CI_CODEERROR_RECHECK_SECS`, never every tick.
+def _ci_codeerror_recheck_marker(state_dir, branch, sha):
+    if not state_dir or not branch or not sha:
+        return None
+    return os.path.join(state_dir, ".ci-recheck-%s-%s" % (_branch_worktree_slug(branch), sha))
+
+
+def _ci_codeerror_recheck_due(state_dir, branch, sha):
+    """True iff `_CI_CODEERROR_RECHECK_SECS` have elapsed since the marker was last stamped, or the
+    marker was never stamped at all (no state dir, sim/dry-run, or a caller that never marked one) —
+    fails toward RE-VERIFYING, never toward trusting a red forever."""
+    marker = _ci_codeerror_recheck_marker(state_dir, branch, sha)
+    if not marker or not os.path.exists(marker):
+        return True
+    try:
+        return (int(_now_epoch()) - int(os.path.getmtime(marker))) >= _CI_CODEERROR_RECHECK_SECS
+    except Exception:
+        return True
+
+
+def _mark_ci_codeerror_rechecked(state_dir, branch, sha):
+    """Stamp (or re-stamp) the recheck clock for this (branch, sha) — called both the FIRST time a
+    CODEERROR is recorded (so the very next tick does not immediately re-poll) and after every later
+    reverify (whether it healed or re-confirmed red), so the throttle always measures from the last
+    LIVE read, never from a stale prior one."""
+    marker = _ci_codeerror_recheck_marker(state_dir, branch, sha)
+    if not marker:
+        return
+    try:
+        open(marker, "w", encoding="utf-8").close()
+    except Exception:
+        pass
 
 
 class LiveGates:
@@ -3351,11 +3402,78 @@ class LiveGates:
         # after CI itself has moved on (HERD-612).
         self.ci_health_detail = detail if verdict == CV.CODEERROR else ""
         if verdict in (CV.CLEAN, CV.CODEERROR):
-            # HERD-649b: a TERMINAL word for this exact sha cannot un-complete — memoize it so the next
-            # tick (same branch, same sha) needs no gh call at all. Never reached for WAIT, by
-            # construction (the LOCAL/infra/pending paths above all return before this line).
+            # HERD-649b: a TERMINAL word for this exact sha needs no gh call on the NEXT tick —
+            # memoize it. CLEAN truly cannot un-complete for this sha; CODEERROR can (HERD-677: a
+            # rerun of the same run id can flip it green after the fact), which is exactly what
+            # `_ci_codeerror_recheck_due`/`ci_verdict_recheck` exist to notice on a bounded cadence
+            # rather than trusting this memo forever the way HERD-649b's own docstring once assumed.
             st.record_ci_conclusive_memo(branch, cand.sha, verdict, self.ci_health_detail)
+            if verdict == CV.CODEERROR:
+                _mark_ci_codeerror_rechecked(st.dir, branch, cand.sha)
         return verdict
+
+    def ci_verdict_recheck(self, cand):
+        """HERD-677: a CI-sourced CODEERROR is not immutable the way a CLEAN verdict is — `gh run
+        rerun` (ours, HERD-609's bounded infra retry, or a human's) can flip the SAME sha green
+        AFTER HERD-649b's conclusive memo already latched CODEERROR, and nothing in the memo's own
+        fast path (`_ci_health`, above) ever asks again. Grounded incident: PR #785's CI went red at
+        01:31, a rerun flipped the SAME sha green minutes later, but the refix rail bounced the
+        builder 4 rounds before a human noticed — no `ci_health_verdict` read ever happened again for
+        that (pr, sha), because the BLOCKED state treated the memo as gospel.
+
+        Called from `LiveTick._walk` right before ANY refix-bounce decision on a CODEERROR verdict,
+        so a healed red is caught before another round is spent on it. Throttled by
+        `_CI_CODEERROR_RECHECK_SECS` so a standing BLOCK — including one already refix-exhausted and
+        ESCALATEd, with no bounce ever pending again — still gets a periodic live re-read instead of
+        none at all, without re-polling gh every ~40s tick.
+
+        Returns ``CLEAN`` when the live conclusion has healed — the caller substitutes it for the
+        stale CODEERROR so the ordinary CLEAN path (`_refix_rail_reset`, merge-eligible) runs exactly
+        as it would for a fresh green read. Returns ``None`` in every other case (CI not the health
+        source, no matching CODEERROR memo, not due yet, CI unreadable, or still red) — the caller
+        keeps treating the candidate as CODEERROR, byte-identical to before this method existed."""
+        if self._health_source != "ci":
+            return None
+        branch = getattr(cand, "branch", "") or ""
+        if not branch:
+            return None
+        st = self.state
+        memo = st.ci_conclusive_memo(branch)
+        if not memo or memo["sha"] != cand.sha or memo["verdict"] != CV.CODEERROR:
+            return None                                   # not a CI-sourced BLOCKED red — nothing to heal
+        if not _ci_codeerror_recheck_due(st.dir, branch, cand.sha):
+            return None                                   # within the cadence window — trust the memo
+        if branch in self._ci_runs_cache:
+            runs = self._ci_runs_cache[branch]
+        else:
+            runs = _ci_runs(branch)
+            self._ci_poll_calls += 1
+            self._ci_branches_polled += 1
+            self._ci_runs_cache[branch] = runs
+        if runs is None:
+            return None                                   # CI unreadable this tick — leave the stale verdict standing
+        scan = CV.classify_runs(runs, cand.sha)
+        failure = None
+        if scan["bucket"] == "fail":
+            failure = CV.classify_failure_log(_ci_failed_log(scan["run_id"]))
+            self._ci_poll_calls += 1
+        verdict, reason, detail = CV.map_verdict(scan, failure)
+        if verdict not in (CV.CLEAN, CV.CODEERROR):
+            return None                                   # still pending/cancelled/infra — not terminal yet
+        _mark_ci_codeerror_rechecked(st.dir, branch, cand.sha)   # resets the throttle either way
+        if verdict != CV.CLEAN:
+            # Re-confirmed red — refresh the evidence (a rerun can name a DIFFERENT failing test) and
+            # let the ordinary refix path continue exactly as if this reverify never happened.
+            st.record_ci_conclusive_memo(branch, cand.sha, verdict, detail)
+            self.ci_health_detail = detail
+            return None
+        st.record_ci_conclusive_memo(branch, cand.sha, CV.CLEAN, "")
+        self.ci_health_detail = ""
+        self.reused_health = False
+        self.journal.append("ci_verdict_healed", "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                            "reason", "rerun", "workflow", scan["workflow"],
+                            "conclusion", scan["conclusion"], "run_id", scan["run_id"])
+        return CV.CLEAN
 
     def _ci_fallback(self, cand, reason):
         """LOUD fallback to the local suite: journal once per (pr, sha) and let the classic rail run.
@@ -6536,6 +6654,14 @@ class LiveTick:
             self._advance(cand, "merge_result_conflict")
             return HOLD
         health = health if health in ("CLEAN", "FLAKY", "CODEERROR", WAIT) else "CLEAN"
+        if health == "CODEERROR" and hasattr(self.gates, "ci_verdict_recheck"):
+            # HERD-677: a CI-sourced CODEERROR can heal on a live rerun after HERD-649b's memo
+            # already latched it — re-verify (throttled) BEFORE trusting it into a refix bounce or a
+            # standing BLOCK. A no-op under HEALTH_SOURCE=local or a locally-dispatched CODEERROR (no
+            # matching CI memo), so the classic rail is untouched.
+            healed = self.gates.ci_verdict_recheck(cand)
+            if healed is not None:
+                health = healed
         if health == WAIT:
             # HERD-459: "still waiting" is a PHASE, not an event — journal it once per (pr, sha, phase),
             # not once per poll tick. A suite can sit in flight for many minutes and the 100th identical
