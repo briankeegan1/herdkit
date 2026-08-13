@@ -11,8 +11,8 @@
 # nudge. Invariants asserted here:
 #   • OFF (default) is BYTE-IDENTICAL — even with an attribution ledger sitting on disk, every ungated
 #     row renders the pre-HERD-527 bytes, and the scan writes nothing at all.
-#   • ON + in-progress + assigned → 'ungated here · <assignee> building <id> on their machine', and the
-#     adopt nudge is GONE from that row.
+#   • ON + in-progress + assigned → the compact '👤 #<pr> <title> · <assignee> — building <id>' row
+#     (HERD-663), and the adopt nudge is GONE from that row.
 #   • ON but the item is not in progress, or is in progress and UNASSIGNED, or resolves to nothing →
 #     TODAY's row, unchanged.
 #   • The `Refs:` join is the SHARED HERD-522 parser (a `## Refs:` heading resolves); the branch
@@ -159,9 +159,9 @@ pass
 # ── 4. …and that is what the console actually renders ───────────────────────────────────────────────
 UNGATED_PR_SECTION_ROWS=""
 build_ungated_prs
-grep -q "🔓 #101 add widget feat/widget · ungated here · Ava Chen building HERD-500 on their machine" \
+grep -q "👤 #101 add widget · Ava Chen — building HERD-500" \
   <<< "$UNGATED_PR_SECTION_ROWS" || fail "row 101 not attributed: $UNGATED_PR_SECTION_ROWS"
-grep -q "🔓 #103 team view feat/herd-527-teammate · ungated here · Brian K building HERD-527 on their machine" \
+grep -q "👤 #103 team view · Brian K — building HERD-527" \
   <<< "$UNGATED_PR_SECTION_ROWS" || fail "row 103 not attributed: $UNGATED_PR_SECTION_ROWS"
 # The adopt nudge is gone from the attributed rows — but still present on the unattributed one.
 grep -q "#101.*enable ADOPT_REMOTE_PRS" <<< "$UNGATED_PR_SECTION_ROWS" \
@@ -170,6 +170,21 @@ grep -q "#102 fix leak feat/herd-52-x · ungated · no builder record · enable 
   <<< "$UNGATED_PR_SECTION_ROWS" || fail "an unattributed row must keep today's wording verbatim"
 grep -q "SENTINEL-NETWORK-LEAK" <<< "$UNGATED_PR_SECTION_ROWS" \
   && fail "the RENDER must never touch the network (the scan owns every fetch)"
+pass
+
+# ── 4b. HERD-663 TEAM_ALIASES overrides the attributed row's display name ──────────────────────────
+export TEAM_ALIASES="Ava Chen=Ava,someoneelse=Someone Else"
+UNGATED_PR_SECTION_ROWS=""
+build_ungated_prs
+grep -q "👤 #101 add widget · Ava — building HERD-500" <<< "$UNGATED_PR_SECTION_ROWS" \
+  || fail "TEAM_ALIASES must override the attributed row's display name: $UNGATED_PR_SECTION_ROWS"
+grep -q "👤 #103 team view · Brian K — building HERD-527" <<< "$UNGATED_PR_SECTION_ROWS" \
+  || fail "a name with no TEAM_ALIASES entry must render unchanged: $UNGATED_PR_SECTION_ROWS"
+unset TEAM_ALIASES
+UNGATED_PR_SECTION_ROWS=""
+build_ungated_prs
+grep -q "👤 #101 add widget · Ava Chen — building HERD-500" <<< "$UNGATED_PR_SECTION_ROWS" \
+  || fail "unsetting TEAM_ALIASES must revert to the tracker's own display name: $UNGATED_PR_SECTION_ROWS"
 pass
 
 # ── 5. In progress but UNASSIGNED attributes nothing ("someone" is not a name) ──────────────────────
