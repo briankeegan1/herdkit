@@ -18436,6 +18436,90 @@ _engine_tick_watchdog() {
   return 1
 }
 
+# ── HERD-671 leg 2: IDLE-CADENCE — widen the REMOTE gh legs while genuinely idle ────────────────────
+# See WATCHER_IDLE_CADENCE's own header in herd-config.sh for the full contract. Two globals persist
+# across ticks in this long-lived process: _WATCHER_IDLE_REMOTE_TICK (the countdown) and
+# _WATCHER_LAST_PRS_OPEN (the last successfully-OBSERVED open-PR count, learned as a side effect of
+# _prs_fetch_tick's own call — this leg never spends an extra gh round-trip just to LEARN idleness,
+# only to widen the cadence once idleness is already known from a call the render leg was making
+# anyway). "" (unknown, the pre-first-tick state) reads as NOT idle, so the very first tick always
+# polls at full speed — never a fabricated idle guess before this watcher has observed anything.
+_WATCHER_IDLE_REMOTE_TICK=0
+_WATCHER_LAST_PRS_OPEN=""
+
+_watcher_idle_cadence_enabled() {
+  case "${WATCHER_IDLE_CADENCE:-off}" in
+    on|ON|On|true|TRUE|1|yes|YES) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _watcher_idle_remote_interval — WATCHER_IDLE_REMOTE_SECS expressed as a TICK COUNT at this loop's
+# ~4s cadence (the same tick-count-interval convention as _TEAM_PRESENCE_SCAN_INTERVAL and siblings).
+# Non-numeric or sub-4s falls back to the built-in 60s (15 ticks).
+_watcher_idle_remote_interval() {
+  local _wiri_secs="${WATCHER_IDLE_REMOTE_SECS:-60}"
+  case "$_wiri_secs" in
+    ''|*[!0-9]*) printf '15'; return 0 ;;
+  esac
+  local _wiri=$(( _wiri_secs / 4 ))
+  [ "$_wiri" -ge 1 ] || _wiri=1
+  printf '%s' "$_wiri"
+}
+
+# _watcher_local_worktrees_present — true iff ANY builder worktree is currently checked out under
+# $WORKTREES_DIR/$TREES (excluding the $MAIN checkout itself). LOCAL-only (`git worktree list` —
+# never `gh`, never the network), so this is cheap enough to call every tick regardless of whether the
+# idle-cadence lever is even on. `$TREES` is realpath-normalized before the comparison (`cd -P && pwd`)
+# — the SAME HERD-182 fix `_discover_feature_worktrees` already applies — because git prints each
+# worktree's CANONICALIZED path (e.g. macOS's /tmp -> /private/tmp), so a symlinked pool dir would
+# otherwise never match and this would wrongly read "absent" forever on such a machine.
+_watcher_local_worktrees_present() {
+  local _wlp_dir="${TREES:-${WORKTREES_DIR:-}}" _wlp_list
+  [ -n "$_wlp_dir" ] && [ -d "$_wlp_dir" ] || return 1
+  _wlp_dir="$(cd -P "$_wlp_dir" 2>/dev/null && pwd)" || return 1
+  _wlp_list="$(git -C "$MAIN" worktree list --porcelain 2>/dev/null)"
+  grep -q "^worktree ${_wlp_dir}/" <<<"$_wlp_list"
+}
+
+# _watcher_prs_open_count <PRS_JSON> — the open-PR count from a `gh pr list` JSON array; -1 on any
+# unparseable input (never mistaken for a real, positive "zero" reading).
+_watcher_prs_open_count() {
+  python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read() or "[]")
+    print(len(d) if isinstance(d, list) else -1)
+except Exception:
+    print(-1)
+' <<<"$1" 2>/dev/null || printf -- '-1'
+}
+
+# _watcher_remote_tick_due — true (rc 0) iff THIS tick should pay the remote gh cost: the render leg's
+# `gh pr list` (_prs_fetch_tick) and the Python engine core's own pooled `gh api graphql` discovery
+# (_engine_tick_watchdog). Call EXACTLY ONCE per tick (it mutates the countdown) and reuse the result
+# at both call sites, so the two legs are throttled in lockstep rather than drifting apart. Byte-
+# identical "always due" with the lever off. Otherwise reconciled fresh every tick: any local
+# worktree, or the last known open-PR count being nonzero (or not yet known), resets the countdown to
+# zero and returns due immediately — the snap-back-on-activity half of the contract.
+_watcher_remote_tick_due() {
+  _watcher_idle_cadence_enabled || return 0
+  if _watcher_local_worktrees_present; then
+    _WATCHER_IDLE_REMOTE_TICK=0
+    return 0
+  fi
+  if [ "${_WATCHER_LAST_PRS_OPEN:-1}" != "0" ]; then
+    _WATCHER_IDLE_REMOTE_TICK=0
+    return 0
+  fi
+  _WATCHER_IDLE_REMOTE_TICK=$(( _WATCHER_IDLE_REMOTE_TICK + 1 ))
+  if [ "$_WATCHER_IDLE_REMOTE_TICK" -ge "$(_watcher_idle_remote_interval)" ]; then
+    _WATCHER_IDLE_REMOTE_TICK=0
+    return 0
+  fi
+  return 1
+}
+
 _tick_render_reconcile() {
   # HERD-496: tick cadence — the gap between consecutive INVOCATIONS of this function (this tick's
   # full work plus the caller's sleep), against its own rolling baseline. This is the ONE phase the
@@ -18533,7 +18617,24 @@ _tick_render_reconcile() {
   # wunit_list_open would either drop all of that (a real behavior change) or require wunit_list_open to
   # grow tick-specific side effects the spike's interface never gave it. Left calling _prs_fetch_tick
   # directly; noted via herd note rather than silently forced through a facade op that doesn't fit it.
-  _prs_fetch_tick
+  #
+  # HERD-671 leg 2: the due-check is computed ONCE here and reused verbatim at the engine watchdog call
+  # site below, so the render leg's `gh pr list` and the Python engine's own graphql discovery are
+  # throttled in lockstep, never drifting apart. Skipped ticks simply leave PRS_JSON/PRS_LOOKUP_OK at
+  # whatever the last real fetch set — every downstream reader this tick (retirement, FEATS, the view
+  # filter) sees that same last-known-good snapshot, exactly like the existing team-presence/inbox/
+  # adopt throttles already do for THEIR own ledgers.
+  if _watcher_remote_tick_due; then
+    _WATCHER_REMOTE_TICK_DUE=1
+    _prs_fetch_tick
+    if [ "${PRS_LOOKUP_OK:-0}" = "1" ]; then
+      _wrtd_count="$(_watcher_prs_open_count "$PRS_JSON")"
+      [ "$_wrtd_count" -ge 0 ] 2>/dev/null && _WATCHER_LAST_PRS_OPEN="$_wrtd_count"
+      unset _wrtd_count
+    fi
+  else
+    _WATCHER_REMOTE_TICK_DUE=""
+  fi
   # Builder liveness roster via the active driver: herdr-claude → `herdr agent list`; headless →
   # the detached-agent registry rendered in the same JSON shape. This is what dead-builder
   # reconciliation keys off, so it must reflect real liveness with OR without panes.
@@ -19084,7 +19185,15 @@ EOF
   # with backoff, and past a fault streak HOLDS loudly (engine-down banner + journal + notification)
   # while it keeps retrying. A fault means "no engine actions this tick" — never a half-run. The render
   # above and the reconcile/sweep legs below run every cycle regardless, against the state Python wrote.
-  _engine_tick_watchdog
+  #
+  # HERD-671 leg 2: reuses the SAME due-check _prs_fetch_tick already computed this tick (set once,
+  # above) rather than re-deciding independently — the render leg's `gh pr list` and this engine tick's
+  # own pooled `gh api graphql` discovery are throttled together. A skipped tick is a quiet no-op, not
+  # a fault: the fault streak, the engine-down banner and its notification are all left untouched, so
+  # deliberately widening the idle cadence never trips the "engine down" alarm.
+  if [ -n "$_WATCHER_REMOTE_TICK_DUE" ]; then
+    _engine_tick_watchdog
+  fi
   # Resolver-pane reconcile (HERD-280): retire the pane of every resolver whose DONE verdict has landed.
   # Runs OUTSIDE the conflict pass on purpose — a resolver that CLEARED its conflict leaves the pass's
   # scope entirely (the PR is CLEAN now), so only a registry-vs-verdict reconcile ever sees it finish.

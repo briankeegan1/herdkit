@@ -4292,6 +4292,60 @@ class TestSlugDerivation(unittest.TestCase):
         self.assertEqual(cands[0].slug, "unlock-supersession-cancel")     # not the full branch
         self.assertEqual(cands[0].worktree, os.path.join(pool, "unlock-supersession-cancel"))
 
+    def test_discovery_pools_the_pr_body(self):
+        # HERD-671 leg 1: the SAME graphql round-trip now carries `body`, so the hold layer's
+        # per-PR `gh pr view --json body` never has to run for a candidate this call discovered.
+        pool = tempfile.mkdtemp()
+        os.environ["TREES"] = pool
+        _make_worktree(pool, "pooled-body")
+        payload = {"data": {"repository": {"pullRequests": {"nodes": [
+            {"number": 451, "headRefName": "feat/pooled-body",
+             "headRefOid": "deadbeef", "baseRefName": "main", "mergeStateStatus": "CLEAN",
+             "reviewDecision": "", "body": "HUMAN-VERIFY:\n- smoke test\n",
+             "author": {"login": "brian"},
+             "assignees": {"nodes": []}, "labels": {"nodes": []}}]}}}}
+
+        class _Stub:
+            def run(self, *a, **k):
+                class R:
+                    stdout = json.dumps(payload)
+                return R()
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            cands = LR.discover_via_graphql(repo="owner/name")
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(len(cands), 1)
+        self.assertEqual(cands[0].hv_body, "HUMAN-VERIFY:\n- smoke test\n")
+        self.assertTrue(cands[0].hv_body_pooled)
+
+    def test_discovery_pools_an_absent_body_as_empty_string(self):
+        # A PR with no body at all: GraphQL returns `body: null`; the pool must still mark it
+        # POOLED (a real "no body" answer), not fall through to a live per-PR re-read.
+        pool = tempfile.mkdtemp()
+        os.environ["TREES"] = pool
+        _make_worktree(pool, "no-body")
+        payload = {"data": {"repository": {"pullRequests": {"nodes": [
+            {"number": 452, "headRefName": "feat/no-body", "headRefOid": "cafef00d",
+             "baseRefName": "main", "mergeStateStatus": "CLEAN", "reviewDecision": "",
+             "body": None, "author": {"login": "brian"},
+             "assignees": {"nodes": []}, "labels": {"nodes": []}}]}}}}
+
+        class _Stub:
+            def run(self, *a, **k):
+                class R:
+                    stdout = json.dumps(payload)
+                return R()
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            cands = LR.discover_via_graphql(repo="owner/name")
+        finally:
+            LR.subprocess = orig
+        self.assertEqual(cands[0].hv_body, "")
+        self.assertTrue(cands[0].hv_body_pooled)
+
 
 class TestDraftPRDiscovery(unittest.TestCase):
     """HERD-374: draft PRs must be skipped at discovery and never reach the merge actuator.
@@ -7068,6 +7122,35 @@ class TestHoldLayerRestored(LiveCase):
         res, ev = self.tick([self.one(1, review="PASS", health="CLEAN", hv_hold=True)])
         self.assertEqual(res["outcomes"]["1"], "HOLD")
         self.assertEqual([o for o in ev if o["event"] == "hold_applied"][0]["kind"], "human-verify")
+
+    # ── HERD-671 leg 1: a POOLED body (discovery already fetched it) skips the live read entirely ──
+    def test_pooled_body_never_spends_a_live_read(self):
+        src = _StubHoldSource(body="whatever the live read would have said")
+        out, ev = self.tick_live(src, review="PASS", health="CLEAN",
+                                  hv_body=_HV_BODY, hv_body_pooled=True)
+        self.assertEqual(out, "HOLD")
+        self.assertEqual(src.body_reads, 0, "a pooled body must not also spend a live gh call")
+        held = [o for o in ev if o["event"] == "hold_applied"]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0]["kind"], "human-verify")
+
+    def test_pooled_body_with_no_block_still_merges(self):
+        src = _StubHoldSource(body="whatever the live read would have said")
+        out, ev = self.tick_live(src, review="PASS", health="CLEAN",
+                                  hv_body="No manual steps here.\n", hv_body_pooled=True)
+        self.assertEqual(out, "MERGE")
+        self.assertEqual(src.body_reads, 0)
+        self.assertFalse([o for o in ev if o["event"] == "hold_applied"])
+
+    def test_pooled_empty_body_never_falls_back_to_a_live_unreadable_hold(self):
+        # A pooled "" (a real, successfully-fetched empty body) must merge — never mistaken for the
+        # unreadable-body fail-closed case, which only applies to the LIVE per-PR fallback read.
+        src = _StubHoldSource(body="", rc=124)
+        out, ev = self.tick_live(src, review="PASS", health="CLEAN",
+                                  hv_body="", hv_body_pooled=True)
+        self.assertEqual(out, "MERGE")
+        self.assertEqual(src.body_reads, 0)
+        self.assertFalse([o for o in ev if o["event"] == "hv_body_unreadable"])
 
 
 class _RecordingHoldActuator(DryRunActuator):
