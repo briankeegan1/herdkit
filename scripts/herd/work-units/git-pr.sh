@@ -445,17 +445,22 @@ do_merge() {
 }
 
 # The --json fields for the tick's `gh pr list`. In team mode we additionally need each PR's `author`
-# to enforce the ownership gate even when NO view lens is active; fold it in (deduped). HERD-369 needs
-# `isDraft` (never adopt a draft) ONLY when ADOPT_REMOTE_PRS is on. HERD-470 needs it too, ONLY when
-# FINISH_STALL_MIN is on: GitHub's `mergeStateStatus` enum has NO "DRAFT" case (it is DIRTY | UNKNOWN |
-# BLOCKED | BEHIND | UNSTABLE | HAS_HOOKS | CLEAN — a draft PR reports UNKNOWN, since branch-protection
-# computation never runs against a PR that cannot be merged yet) — `isDraft` is the only field that
-# actually says so, and the draft-stall leg (_discover_feature_worktrees / the tick loop) needs it to
-# detect a draft PR at all. In the default solo scope with adopt AND the finish-stall leg both off this
-# is exactly _watcher_view_fields — the base set — so the default gh call is unchanged.
+# to enforce the ownership gate even when NO view lens is active; fold it in (deduped). HERD-661's
+# TEAM_PRESENCE=live PUBLISH leg needs `author` too, even in SOLO scope: it is how
+# _team_presence_live_publish_tick tells "a PR I authored and am building" apart from "a PR I merely
+# adopted/gate for someone else" (FEATS' author field, threaded through from here) — without it every
+# FEATS record's author reads empty in solo scope and the leg would silently never publish. HERD-369
+# needs `isDraft` (never adopt a draft) ONLY when ADOPT_REMOTE_PRS is on. HERD-470 needs it too, ONLY
+# when FINISH_STALL_MIN is on: GitHub's `mergeStateStatus` enum has NO "DRAFT" case (it is DIRTY |
+# UNKNOWN | BLOCKED | BEHIND | UNSTABLE | HAS_HOOKS | CLEAN — a draft PR reports UNKNOWN, since
+# branch-protection computation never runs against a PR that cannot be merged yet) — `isDraft` is the
+# only field that actually says so, and the draft-stall leg (_discover_feature_worktrees / the tick
+# loop) needs it to detect a draft PR at all. In the default solo scope with adopt, finish-stall AND
+# TEAM_PRESENCE=live all off this is exactly _watcher_view_fields — the base set — so the default gh
+# call is unchanged.
 _watcher_tick_fields() {
   _wtf="$(_watcher_view_fields)"
-  if _watcher_team_mode; then
+  if _watcher_team_mode || _team_presence_live_enabled; then
     case ",$_wtf," in *,author,*) ;; *) _wtf="${_wtf},author" ;; esac
   fi
   if _adopt_remote_prs_enabled || _finish_stall_enabled; then
