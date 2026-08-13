@@ -1415,12 +1415,19 @@ class LiveState:
         except Exception:
             pass
 
-    # gh rate-limit backoff substrate (HERD-582) ──────────────────────────────────────────────────
-    # GLOBAL (not sha-keyed), like the breaker ledger above: one line, ``<until_epoch>``, the moment a
-    # tick may next attempt a REMOTE (gh) call. Written when a tick classifies a gh failure as a rate
-    # limit (never on a genuine fault, agent-watch.sh:epoch_to_hhmm renders the SAME file for the
-    # console's calm row) and read at the TOP of every tick so a still-active backoff window skips the
-    # gh round-trip entirely rather than re-drawing the same rejection tick after tick.
+    # gh rate-limit backoff substrate (HERD-582, resource-aware since HERD-670) ────────────────────
+    # GLOBAL (not sha-keyed), like the breaker ledger above: line 1 is ``<until_epoch>`` — the moment a
+    # tick may next attempt a REMOTE (gh) call — and line 2 is the EXHAUSTED RESOURCE name ("core" or
+    # "graphql"). Written when a tick classifies a gh failure as a rate limit (never on a genuine
+    # fault, agent-watch.sh:epoch_to_hhmm renders line 1 of the SAME file for the console's calm row)
+    # and read at the TOP of every tick so a still-active backoff window skips the gh round-trip
+    # entirely rather than re-drawing the same rejection tick after tick.
+    #
+    # HERD-670: bash's ``_gh_rate_limited_until`` (agent-watch.sh) reads ONLY ``head -n1`` and demands
+    # it be pure digits, so line 1 stays a bare epoch — the resource rides on line 2, a field bash
+    # never reads and so never breaks on. A pre-HERD-670 marker (epoch only, no line 2) reads back as
+    # resource "core" — the bucket every classification defaulted to before per-resource tracking
+    # existed, so an in-flight backoff surviving a deploy keeps behaving exactly as it did.
 
     def gh_rate_limit_path(self):
         return self._p(".agent-watch-gh-rate-limit")
@@ -1436,15 +1443,29 @@ class LiveState:
         except Exception:
             return 0
 
-    def set_gh_rate_limited_until(self, until):
-        """Persist the backoff window end. No-op w/o a state dir — a sim/dry-run tick carries no
-        cross-tick memory, same as every other ledger above."""
+    def gh_rate_limited_resource(self):
+        """The gh resource ("core"/"graphql") the active backoff window is for. Defaults to "core" —
+        both the pre-HERD-670 marker shape (no line 2 at all) and any unreadable/blank line 2."""
+        path = self.gh_rate_limit_path()
+        if not path or not os.path.exists(path):
+            return "core"
+        try:
+            with open(path, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            resource = lines[1].strip() if len(lines) > 1 else ""
+            return resource or "core"
+        except Exception:
+            return "core"
+
+    def set_gh_rate_limited_until(self, until, resource="core"):
+        """Persist the backoff window end + the exhausted resource. No-op w/o a state dir — a
+        sim/dry-run tick carries no cross-tick memory, same as every other ledger above."""
         path = self.gh_rate_limit_path()
         if not path:
             return
         try:
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write("%d\n" % int(until))
+                fh.write("%d\n%s\n" % (int(until), resource or "core"))
         except Exception:
             pass
 
@@ -2085,7 +2106,7 @@ def _pool_scoped(cands):
     return [c for c in cands if _is_worktree(c.worktree)]
 
 
-# ── gh rate-limit classification (HERD-582) ───────────────────────────────────────────────────────
+# ── gh rate-limit classification (HERD-582, resource-aware since HERD-670) ───────────────────────────
 # The live incident this fixes (2026-08-06 02:06): a GraphQL bucket exhausted after a 50-merge day made
 # discover_via_graphql's ``gh`` call exit non-zero. Before this, that CalledProcessError propagated
 # straight out of LiveTick.run() to `main`, which is exit-1/fault territory (engine-version.sh:
@@ -2097,6 +2118,17 @@ def _pool_scoped(cands):
 #   • GraphQL: the error text names the rate limit (gh's GraphQL client surfaces the API's "rate
 #     limit ... exceeded" message on 200-with-errors and on non-zero exits alike).
 #   • REST: an HTTP 403 whose response carries ``X-RateLimit-Remaining: 0``.
+#
+# HERD-670: GitHub tracks SEPARATE budgets per resource ("core" for REST, "graphql" for GraphQL, plus
+# search/etc this engine never calls) — ``gh api rate_limit``'s legacy top-level ``.rate`` field is
+# just an ALIAS for ``.resources.core``, never graphql. Grounded live 2026-08-13: the watcher's remote
+# legs are GraphQL under the hood, so a GraphQL exhaustion left ``.rate``/``.resources.core`` fully
+# populated the whole time — the refill-early re-probe (below) read core, saw budget, and cleared the
+# backoff immediately, which re-hit the still-empty GraphQL bucket and re-armed: a flapping loop. Each
+# gh wrapper below KNOWS which bucket its own call draws from (discover_via_graphql → "graphql";
+# _repo_owner_name's REST call → "core") and threads that resource through classification, the reset/
+# remaining probes (queried at ``.resources.<resource>.*``, never the ambiguous ``.rate`` alias), and
+# the persisted backoff marker, so every probe reads the SAME bucket that was actually exhausted.
 _RATE_LIMIT_TEXT_RE = re.compile(r"rate limit", re.IGNORECASE)
 _RATE_LIMIT_REST_RE = re.compile(r"x-ratelimit-remaining:\s*0", re.IGNORECASE)
 _RATE_LIMIT_403_RE = re.compile(r"\b403\b")
@@ -2117,19 +2149,25 @@ def _looks_gh_rate_limited(text):
 class GhRateLimited(Exception):
     """Raised by a gh wrapper in place of the underlying ``CalledProcessError`` once its failure is
     classified as a rate limit (HERD-582). ``reset_at`` is the epoch the budget resets (``None`` when
-    the cheap follow-up probe itself failed — fail-soft; the caller then applies a default cooldown)."""
+    the cheap follow-up probe itself failed — fail-soft; the caller then applies a default cooldown).
+    ``resource`` (HERD-670) is the gh bucket that was actually exhausted — "core" (REST) or "graphql"
+    — so the backoff arms and later re-probes against the SAME bucket, never the wrong one."""
 
-    def __init__(self, reset_at=None):
+    def __init__(self, reset_at=None, resource="core"):
         super().__init__("gh rate limit exceeded")
         self.reset_at = reset_at
+        self.resource = resource or "core"
 
 
-def _gh_rate_limit_reset():
-    """One cheap REST call (``gh api rate_limit``) for the epoch the exhausted budget resets.
+def _gh_rate_limit_reset(resource="core"):
+    """One cheap REST call (``gh api rate_limit``) for the epoch ``resource``'s budget resets.
     Best-effort: ANY failure (the probe itself rate-limited, network, parse) returns ``None`` rather
-    than raising — a reset-time lookup failing must never itself fault the tick."""
+    than raising — a reset-time lookup failing must never itself fault the tick.
+
+    HERD-670: reads ``.resources.<resource>.reset``, never the legacy ``.rate.reset`` alias (which is
+    ALWAYS the core bucket) — a graphql exhaustion must read graphql's own reset, not core's."""
     try:
-        out = subprocess.run(["gh", "api", "rate_limit", "-q", ".rate.reset"],
+        out = subprocess.run(["gh", "api", "rate_limit", "-q", ".resources.%s.reset" % resource],
                              capture_output=True, text=True, timeout=10)
         if out.returncode == 0 and out.stdout.strip():
             return int(out.stdout.strip())
@@ -2138,8 +2176,8 @@ def _gh_rate_limit_reset():
     return None
 
 
-def _gh_rate_limit_remaining():
-    """One cheap REST call (``gh api rate_limit``) for the CURRENT remaining core-budget count, or
+def _gh_rate_limit_remaining(resource="core"):
+    """One cheap REST call (``gh api rate_limit``) for the CURRENT remaining count on ``resource``, or
     ``None`` on any failure — the SAME fail-soft contract as :func:`_gh_rate_limit_reset` (a probe
     failure must never itself fault the tick, and must never be read as "refilled").
 
@@ -2147,9 +2185,13 @@ def _gh_rate_limit_remaining():
     (GitHub resets on a rolling hourly window, not exactly when a prior tick's exhausted-at snapshot
     said it would) shows up here as ``remaining > 0`` well before ``gh_rate_limited_until``'s recorded
     epoch — the 2026-08-11 22:08-22:13 incident this leg is grounded in, where an operator had to
-    hand-clear the marker ~20 minutes early because nothing re-checked."""
+    hand-clear the marker ~20 minutes early because nothing re-checked.
+
+    HERD-670: reads ``.resources.<resource>.remaining``, never the legacy ``.rate.remaining`` alias
+    (always core) — grounded live 2026-08-13, where core sat at 4709/5000 the entire time graphql was
+    0/5000 EXHAUSTED, so a core-only probe misread "refilled" every ~45s and flapped the backoff."""
     try:
-        out = subprocess.run(["gh", "api", "rate_limit", "-q", ".rate.remaining"],
+        out = subprocess.run(["gh", "api", "rate_limit", "-q", ".resources.%s.remaining" % resource],
                              capture_output=True, text=True, timeout=10)
         if out.returncode == 0 and out.stdout.strip():
             return int(out.stdout.strip())
@@ -2158,13 +2200,15 @@ def _gh_rate_limit_remaining():
     return None
 
 
-def _reraise_gh_failure(exc):
+def _reraise_gh_failure(exc, resource="core"):
     """Given a failed gh ``CalledProcessError``, raise :class:`GhRateLimited` when its output matches a
     known rate-limit shape, else re-raise ``exc`` unchanged — genuine failures keep the fault path.
-    Always raises; never returns."""
+    ``resource`` names the bucket THIS call draws from (the caller knows: a GraphQL call always draws
+    "graphql", a REST call always draws "core" — HERD-670), threaded into the reset probe and the
+    raised exception so arming/re-probing never reads the wrong bucket. Always raises; never returns."""
     text = "%s\n%s" % (getattr(exc, "stdout", "") or "", getattr(exc, "stderr", "") or "")
     if _looks_gh_rate_limited(text):
-        raise GhRateLimited(reset_at=_gh_rate_limit_reset())
+        raise GhRateLimited(reset_at=_gh_rate_limit_reset(resource), resource=resource)
     raise exc
 
 
@@ -2172,6 +2216,26 @@ def _reraise_gh_failure(exc):
 # the cheap reset probe itself failed (fail-soft — never block backoff on a second gh call succeeding).
 _GH_RATE_LIMIT_BUFFER_SECONDS = 30
 _GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS = 300
+
+# HERD-670: at a rate-limit window's reset, every watcher whose backoff armed against the SAME
+# exhaustion event would otherwise wake on the exact same epoch and re-drain the fresh window together
+# (thundering herd — grounded live 2026-08-13, all four of this machine's watchers resumed
+# simultaneously). A small, BOUNDED, DETERMINISTIC per-workspace offset spreads those resumes out
+# without needing wall-clock randomness (Date/random are unavailable to workflow-run code and would
+# make a resume time unreproducible in a test anyway).
+_GH_RATE_LIMIT_JITTER_MAX_SECONDS = 45
+
+
+def _resume_jitter_seconds(workspace):
+    """A stable [0, _GH_RATE_LIMIT_JITTER_MAX_SECONDS) offset derived from ``workspace`` (the watcher's
+    state dir — stable per project/pool, distinct across projects sharing a machine and a reset
+    window) via a fixed hash — NOT ``random``/``time``, so the SAME workspace always gets the SAME
+    offset and a test can assert an exact value. Empty/``None`` workspace (no state dir — a sim/dry-run
+    tick) contributes no jitter."""
+    if not workspace:
+        return 0
+    digest = hashlib.sha256(workspace.encode("utf-8")).digest()
+    return digest[0] % _GH_RATE_LIMIT_JITTER_MAX_SECONDS
 
 
 # ── discovery: where candidates come from ─────────────────────────────────────────────────────────
@@ -2205,7 +2269,7 @@ def discover_via_graphql(repo=None, limit=50):
             capture_output=True, text=True, check=True,
         )
     except subprocess.CalledProcessError as exc:
-        _reraise_gh_failure(exc)
+        _reraise_gh_failure(exc, resource="graphql")  # HERD-670: gh api graphql draws the graphql bucket
     data = json.loads(out.stdout)
     nodes = (((data.get("data") or {}).get("repository") or {})
              .get("pullRequests") or {}).get("nodes") or []
@@ -6892,13 +6956,14 @@ class LiveTick:
                 self.journal.append("hold_comment_superseded", "pr", cand.pr, "sha", cand.sha,
                                     "old_sha", cand.sha, "slug", cand.slug, "reason", reason)
 
-    def _rate_limited_summary(self, until):
+    def _rate_limited_summary(self, until, resource="core"):
         """The calm, non-faulting tick result for a gh rate-limit backoff window (HERD-582): no
         candidates walked, no gate/merge dispatch — REMOTE legs are skipped until ``until`` (an epoch).
         Never raises, so ``main`` exits 0 and the bash watchdog's fault streak is untouched, exactly as
-        a genuine outage must NOT be (that path still raises and still faults)."""
+        a genuine outage must NOT be (that path still raises and still faults). ``resource`` (HERD-670)
+        names the exhausted gh bucket ("core"/"graphql")."""
         return {"outcomes": {}, "merged": [], "held": [], "pending": [], "journal": self.journal.path,
-                "rate_limited": True, "rate_limited_until": until}
+                "rate_limited": True, "rate_limited_until": until, "rate_limited_resource": resource}
 
     def run(self):
         """Run one tick over all discovered candidates; return the summary."""
@@ -6919,21 +6984,30 @@ class LiveTick:
             # keep sleeping to the recorded epoch or clear it now and run this tick for real. A
             # genuinely-exhausted budget (remaining 0, or the probe itself fails) keeps the backoff
             # exactly as before this leg existed.
-            remaining = _gh_rate_limit_remaining()
+            #
+            # HERD-670: probe the SAME resource the marker was armed against — reading the wrong
+            # bucket (e.g. always core) misreads a graphql exhaustion as "refilled" every tick.
+            resource = self.state.gh_rate_limited_resource()
+            remaining = _gh_rate_limit_remaining(resource)
             if remaining is not None and remaining > 0:
                 self.journal.append("gh_rate_limit_refilled_early", "was_until", until,
-                                    "remaining", remaining, "now", now)
+                                    "remaining", remaining, "now", now, "resource", resource)
                 self.state.clear_gh_rate_limited()
             else:
-                return self._rate_limited_summary(until)
+                return self._rate_limited_summary(until, resource)
         try:
             candidates = self.discovery.discover()
         except GhRateLimited as exc:
             reset = exc.reset_at if exc.reset_at is not None else now + _GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
-            until = reset + _GH_RATE_LIMIT_BUFFER_SECONDS
-            self.state.set_gh_rate_limited_until(until)
-            self.journal.append("engine_rate_limited", "reset", reset, "until", until)
-            return self._rate_limited_summary(until)
+            # HERD-670: a bounded, deterministic per-workspace jitter on top of the buffer so several
+            # watchers armed by the same exhaustion event don't all wake on the exact same epoch and
+            # thundering-herd the freshly-reset window together.
+            jitter = _resume_jitter_seconds(self.state.dir)
+            until = reset + _GH_RATE_LIMIT_BUFFER_SECONDS + jitter
+            self.state.set_gh_rate_limited_until(until, exc.resource)
+            self.journal.append("engine_rate_limited", "reset", reset, "until", until,
+                                "resource", exc.resource, "jitter", jitter)
+            return self._rate_limited_summary(until, exc.resource)
         self.state.clear_gh_rate_limited()
         self.journal.append("live_tick_start", "candidates", len(candidates), "impl", "python",
                             "merge_policy", self._merge_policy)
