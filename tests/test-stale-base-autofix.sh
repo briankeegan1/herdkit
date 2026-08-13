@@ -112,6 +112,11 @@ reset_state() {
   : > "$STUB_PANE_RUN_LOG"; : > "$RESOLVE_LOG"; : > "$REFIX_STATE"; : > "$JOURNAL_FILE"
   DISPLAY=(); DRYRUN=""; STUB_AGENT_EMPTY=""; STUB_LIVENESS=alive
   export STUB_AGENT_NAME="slug-a" STUB_AGENT_STATUS="idle" STUB_PANE_ID="pane-a"
+  # HERD-655: the AUTOFIX_SCOPE identity memoizes ONCE per process (by design — never one gh probe
+  # per candidate); this whole suite is one process, so each check must reset the memo itself or an
+  # earlier check's resolved owner would silently survive into a later one.
+  unset AUTOFIX_SCOPE WATCHER_OWNER WATCHER_VIEW_AUTHOR
+  _WATCHER_OWNER_RESOLVED=""; _WATCHER_OWNER_CACHE=""
 }
 REASON='stale base: 1 touched file(s) were changed on origin/main after this branch merge-base (e.g. A.txt)'
 WT="$T/trees/slug-a"; mkdir -p "$WT"
@@ -417,5 +422,58 @@ _handle_stale_dup 95 slug-a shaDR 0 "$WT" feat/a stale-base "$REASON"
 grep -q 'fix in progress · builder working' <<< "$(row)" || fail "(21) dry-run must render the honest row (got: $(row))"
 [ "$(runs)" = "0" ] || fail "(21) dry-run must never bounce"
 ok "(21) dry-run + working builder → fix in progress, still no bounce"
+
+# ── AUTOFIX_SCOPE (HERD-655, GitHub issue #771) ─────────────────────────────────────────────────────
+# Never auto-heal another operator's stale-base hold — neither the live-builder merge-up bounce nor
+# the no-live-builder resolver dispatch may write to a PR that is not the seat's own.
+
+# ── (22) own (default) + foreign author: WITHHELD — no bounce, no resolver, journaled ──────────────
+reset_state
+export STALE_BASE_AUTOFIX=on WATCHER_OWNER=alice
+_handle_stale_dup 96 slug-a shaSC1 0 "$WT" feat/a stale-base "$REASON" bob
+[ "$(runs)" = "0" ] || fail "(22) a foreign author must never be bounced (got $(runs))"
+[ "$(rslv)" = "0" ] || fail "(22) a foreign author must never dispatch the resolver (got $(rslv))"
+grep -q 'autofix withheld' <<< "$(row)" || fail "(22) row must name the withhold (got: $(row))"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" || fail "(22) withhold must be journaled"
+grep -q '"rail":"stale"' "$JOURNAL_FILE" || fail "(22) withhold journal must carry rail=stale"
+ok "(22) AUTOFIX_SCOPE=own withholds a foreign PR's stale-base heal"
+
+# ── (23) own (default) + own author: PERMITTED — bounces exactly as before ─────────────────────────
+reset_state
+export STALE_BASE_AUTOFIX=on WATCHER_OWNER=alice
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_stale_dup 97 slug-a shaSC2 0 "$WT" feat/a stale-base "$REASON" alice
+[ "$(runs)" = "1" ] || fail "(23) the operator's own PR must still bounce (got $(runs))"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" && fail "(23) an owned PR must never journal a withhold"
+ok "(23) AUTOFIX_SCOPE=own permits the operator's own PR"
+
+# ── (24) all + foreign author: PERMITTED — explicit opt-in restores today's behavior ────────────────
+reset_state
+export STALE_BASE_AUTOFIX=on AUTOFIX_SCOPE=all WATCHER_OWNER=alice
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_stale_dup 98 slug-a shaSC3 0 "$WT" feat/a stale-base "$REASON" bob
+[ "$(runs)" = "1" ] || fail "(24) AUTOFIX_SCOPE=all must bounce regardless of author (got $(runs))"
+ok "(24) AUTOFIX_SCOPE=all bypasses the ownership gate"
+
+# ── (25) own + unresolvable operator identity: WITHHELD fail-closed ────────────────────────────────
+reset_state
+export STALE_BASE_AUTOFIX=on
+unset WATCHER_OWNER
+_handle_stale_dup 99 slug-a shaSC4 0 "$WT" feat/a stale-base "$REASON" alice
+[ "$(runs)" = "0" ] || fail "(25) an unresolvable identity must never bounce (got $(runs))"
+[ "$(rslv)" = "0" ] || fail "(25) an unresolvable identity must never dispatch the resolver (got $(rslv))"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" || fail "(25) unresolvable identity must journal a withhold"
+grep -q '"reason":"noowner"' "$JOURNAL_FILE" || fail "(25) withhold reason must be noowner"
+ok "(25) AUTOFIX_SCOPE=own fails closed when the operator identity is unresolvable"
+
+# ── (26) a call site predating AUTOFIX_SCOPE (no 9th arg) is never scoped — byte-identical ─────────
+reset_state
+export STALE_BASE_AUTOFIX=on
+unset WATCHER_OWNER
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_stale_dup 100 slug-a shaSC5 0 "$WT" feat/a stale-base "$REASON"
+[ "$(runs)" = "1" ] || fail "(26) an omitted author must stay unscoped (got $(runs))"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" && fail "(26) an omitted author must never journal a withhold"
+ok "(26) a pre-HERD-655 call site (no author arg) is unaffected"
 
 echo "ALL PASS ($pass checks) — STALE_BASE_AUTOFIX (HERD-199)"

@@ -2372,6 +2372,37 @@ def _resolve_owner(config):
         return ""
 
 
+# ── AUTOFIX_SCOPE — multi-operator ownership gate for AUTOFIX WRITE RAILS (HERD-655, GH issue #771) ──
+# Mirrors agent-watch.sh's ``_autofix_scope``/``_autofix_scope_permits`` EXACTLY (same default, same
+# fail-closed shape, same identity resolution via ``_resolve_owner``) so bash and python can never
+# disagree about who a PR belongs to. Consulted by the ONE rail that is actually LIVE in this ported
+# engine, STALE_BASE_AUTOFIX (:meth:`LiveTick._walk`'s stale-base branch) — REVIEW_AUTOFIX and
+# HEALTHCHECK_AUTOFIX have no python-side gate of their own to hook (their bash implementations have
+# been unreachable since the P5b port, HERD-556; see docs/multi-operator-ownership.md).
+def _autofix_scope(config):
+    v = str((config or {}).get("AUTOFIX_SCOPE", "") or "own")
+    return v if v in ("own", "all") else "own"                        # unknown → safe default
+
+
+def _autofix_scope_permits(config, author, rail, pr, journal=None, me=None):
+    """True iff AUTOFIX_SCOPE permits an autofix WRITE (a resolver dispatch, a builder-pane bounce)
+    against ``author``'s PR. ``all`` always permits. ``own`` (default) permits ONLY when ``author``
+    equals the resolved operator identity — FAIL-CLOSED: an empty/unknown author, or an unresolvable
+    identity, WITHHOLDS (never fires blind). Journals ``autofix_scope_withheld`` on every withhold, the
+    SAME event name the bash rails journal, so the coordinator sees one shape regardless of which
+    engine fired it. ``me``, when given, is the caller's already-resolved identity (memoized per tick,
+    mirroring ``_xseat_identity``) — avoids a second ``gh api user`` probe in the same tick."""
+    if _autofix_scope(config) == "all":
+        return True
+    me = me if me is not None else _resolve_owner(config or {})
+    if me and author and author == me:
+        return True
+    if journal is not None:
+        journal.append("autofix_scope_withheld", "pr", pr, "author", author or "-", "rail", rail,
+                       "reason", "noowner" if not me else "not-owner")
+    return False
+
+
 def _view_keeps(cand, config):
     """Port of the bash watcher-view ``keep(pr)`` predicate (agent-watch.sh:10731): lens narrowing
     (mine/deps/review-queue) AND'd with the author/assignee/label/status filters. An unknown lens
@@ -6362,6 +6393,13 @@ class LiveTick:
                 # verbatim for a third rail (agent-watch.sh's "stale" refix-ledger kind).
                 if not _stale_base_autofix_enabled(self.config):
                     return HOLD
+                # HERD-655: AUTOFIX_SCOPE — never auto-heal another operator's stale-base hold (both
+                # the live-builder bounce and the resolver-dispatch fallback write to THEIR branch).
+                # Checked BEFORE any round is consumed so a withheld PR keeps its plain stale_dup_hold
+                # row (never a bounce) and stays retryable the instant a human clears it.
+                if not _autofix_scope_permits(self.config, cand.author, "stale", cand.pr, self.journal,
+                                              me=self._xseat_identity()):
+                    return HOLD
                 _sd_round, _sd_budget_reason = self._refix_check_and_record(cand, "stale")
                 if _sd_round is None and _sd_budget_reason is None:
                     outcome = self._refix_completion_incomplete(cand, "stale")
@@ -7010,7 +7048,7 @@ _CORE_ENV_KEYS = (("MERGE_POLICY", "WATCHER_AUTOMERGE", "HUMAN_VERIFY_POLICY",
                     "MERGE_METHOD", "DELETE_BRANCH_ON_MERGE", "REFIX_MAX_ROUNDS", "REFIX_COMPLETE_MIN",
                     "HERD_REFIX_WAIT_TIMEOUT", "WORK_UNIT_KIND", "MERGE_RESULT_GATE", "MERGE_QUEUE",
                     "HEALTH_TRUST_BUILDER", "STALE_BASE_AUTOFIX", "HEALTH_SOURCE",
-                    "CORE_SURFACE_GLOB")
+                    "CORE_SURFACE_GLOB", "AUTOFIX_SCOPE")
                    + _CONCURRENCY_KEYS + _WATCHER_KEYS + _FAIRNESS_KEYS + _BREAKER_KEYS
                    + _REVIEW_FASTPATH_KEYS)
 

@@ -560,43 +560,53 @@ yet approved.
 ## How the engine acts on whose work
 
 A seat that cannot say "did that rail just touch my PR, or the other operator's?" cannot safely run
-write rails in a shared repo — the exact gap a live incident exposed (a seat unable to tell whether
-the conflict resolver had acted on its own PR or a teammate's). This section is ground truth, read
-from the rail sources, not the config-key prose. `docs/multi-operator-ownership.md` (forthcoming,
-HERD-655) will carry the fuller model; this is the compact version every seat needs today.
+write rails in a shared repo — the exact gap a live incident exposed (a seat's `RESOLVE_AUTOFIX` rail
+dispatched a conflict resolver against another operator's PR, mid-edit, under a standing do-not-touch
+rule). This section is ground truth, read from the rail sources, not the config-key prose.
+[`docs/multi-operator-ownership.md`](../docs/multi-operator-ownership.md) (HERD-655) carries the full
+audit — per-surface scoping, defaults, and named gaps; this is the compact version every seat needs
+today.
 
 ### Seat identity
 
 Every rail that needs to know "is this my PR" resolves ONE identity, memoized once per watcher
 process: `WATCHER_OWNER` (explicit) → `WATCHER_VIEW_AUTHOR` (reuse the console-lens identity) → a
 live `gh api user` lookup. Set `WATCHER_OWNER` explicitly in any shared repo — an unresolved identity
-under `WATCHER_SCOPE=all` FAILS CLOSED (withholds auto-merge from every candidate rather than guess).
+FAILS CLOSED: under `WATCHER_SCOPE=all` it withholds auto-merge from every candidate, and under
+`AUTOFIX_SCOPE=own` (the default) it withholds every autofix write rail below, rather than guess.
 
 ### Per-rail ownership — who acts on whose PR, and with what
 
 Two tiers. **Discovery-scoped** rails only ever see candidates `WATCHER_SCOPE`/`WATCHER_OWNER`
 already filtered — under `WATCHER_SCOPE=all` a PR authored by someone else is dropped before any of
-these rails runs. **Unscoped** rails run their own sweep outside discovery and act on any qualifying
-PR/worktree regardless of author — no config key closes this gap yet; it is tracked as **HERD-655**.
+these rails runs (under the DEFAULT `WATCHER_SCOPE=mine` this filter is a NO-OP — see the gap note
+below). **Autofix-scoped** rails are gated directly by `AUTOFIX_SCOPE` (own default | all), the ONE
+shared check HERD-655 added — an own-authored PR passes, a foreign one is withheld and journaled
+(`autofix_scope_withheld`). **Unscoped** rails run their own sweep outside both gates and act on any
+qualifying PR/worktree regardless of author.
 
 | Rail | Config key | Writes to | Whose PRs, today |
 |---|---|---|---|
-| Stale-base heal | `STALE_BASE_AUTOFIX` (off) | re-tasks the builder, or dispatches the resolver | Discovery-scoped |
-| Review / healthcheck bounce | `REVIEW_AUTOFIX`, `HEALTHCHECK_AUTOFIX` (off) | re-task prompt to the builder's agent pane | Discovery-scoped — but both keys are currently cosmetic no-ops on the live engine; the bounce fires on every BLOCK/CODEERROR regardless of either flag. Don't rely on `=false` to keep a red from bouncing. |
-| Auto-merge | `MERGE_POLICY=auto` (`HUMAN_VERIFY_POLICY=auto` treats a declared HUMAN-VERIFY block as informational rather than a hold) | `gh pr merge` | Discovery-scoped — the same gate as above |
-| **Conflict resolver** | `RESOLVE_AUTOFIX` (off) | merges `$DEFAULT_BRANCH` into the PR's branch and pushes | **Unscoped today — see HERD-655.** Fires on any CONFLICTING PR the tick finds; never reaches the discovery/scope path at all. |
-| Remote-PR adoption | `ADOPT_REMOTE_PRS` (off) | `git fetch` + `git worktree add` into this seat's local pool | **Unscoped today — see HERD-655.** Adopts any open, non-draft PR no worktree already owns — this is what feeds the other rails a foreign PR to act on. |
-| Merged-PR reaper | none (always on) | deletes THIS SEAT's local worktree/branch/tabs/ledger row | Unscoped by author, low blast-radius: it only tears down a local copy on a sha GitHub reports merged/closed — never touches the remote branch. |
-| Backlog / tracker-state reconcile | none (advisory) | prints candidates or files ONE scribe request; re-asserts tracker Done state | Unscoped by design — repo-wide bookkeeping, not a per-operator action; never edits `{{BACKLOG_FILE}}` directly. |
+| **Conflict resolver** | `RESOLVE_AUTOFIX` (off) + `AUTOFIX_SCOPE` (own) | merges `$DEFAULT_BRANCH` into the PR's branch and pushes | **Autofix-scoped (HERD-655).** Own-authored PRs only by default; `AUTOFIX_SCOPE=all` restores the old unscoped behavior. |
+| Stale-base heal | `STALE_BASE_AUTOFIX` (off) + `AUTOFIX_SCOPE` (own) | re-tasks the builder, or dispatches the resolver | Discovery-scoped AND autofix-scoped (both apply; own-authored by default either way) |
+| Review / healthcheck bounce | `REVIEW_AUTOFIX`, `HEALTHCHECK_AUTOFIX` (off) + `AUTOFIX_SCOPE` (own, in the bash spec) | re-task prompt to the builder's agent pane | Autofix-scoped in the bash spec — but on the LIVE engine both keys AND `AUTOFIX_SCOPE` are currently no-ops: the bounce fires on every BLOCK/CODEERROR regardless of author or either flag (see `docs/multi-operator-ownership.md`'s "Known gaps"). Don't rely on `=false` or `AUTOFIX_SCOPE=own` to keep a red from bouncing a teammate's PR. |
+| Auto-merge | `MERGE_POLICY=auto` (`HUMAN_VERIFY_POLICY=auto` treats a declared HUMAN-VERIFY block as informational rather than a hold) | `gh pr merge` | Discovery-scoped **only under `WATCHER_SCOPE=all`** — the DEFAULT `WATCHER_SCOPE=mine` is a no-op (no author comparison at all), so on the shipped default this is effectively unscoped over whatever this seat's local pool holds. Set `WATCHER_SCOPE=all` + `WATCHER_OWNER` explicitly in any shared repo. |
+| Remote-PR adoption | `ADOPT_REMOTE_PRS` (off) | `git fetch` + `git worktree add` into this seat's local pool | **Unscoped.** Adopts any open, non-draft PR no worktree already owns — this is what feeds the other rails a foreign PR to act on. |
+| Merged-PR reaper | none (always on) | deletes THIS SEAT's local worktree/branch/tabs/ledger row | Unscoped by author, low blast-radius: gated by a strict sha-anchor proof (local HEAD == the PR's merged/closed head, or an ancestor) and same-machine reach; never touches the remote branch. |
+| Backlog / tracker-state reconcile | none (advisory) | prints candidates or files ONE scribe request; re-asserts tracker Done state | Unscoped by design — repo-wide bookkeeping, not a per-operator action; never edits `{{BACKLOG_FILE}}` directly. No automated caller exists today (coordinator/human-invoked only). |
 
 ### Before enabling a write rail in a shared repo
 
-- Set `WATCHER_OWNER` explicitly — don't rely on `gh api user` resolving to the seat you expect.
+- Set `WATCHER_OWNER` explicitly — don't rely on `gh api user` resolving to the seat you expect. It is
+  the ONE identity both `WATCHER_SCOPE` and `AUTOFIX_SCOPE` resolve against.
+- Leave `AUTOFIX_SCOPE` at its default `own` on any repo more than one operator's automation might
+  touch — it costs nothing on a solo install (every PR is already the operator's own) and is exactly
+  the guard that would have prevented the grounding incident for `RESOLVE_AUTOFIX`/`STALE_BASE_AUTOFIX`.
+- Set `WATCHER_SCOPE=all` too — its default `mine` does NOT narrow auto-merge to your own PRs (see the
+  row above); `all` is what actually arms the ownership check.
 - Read the row above before flipping a lever: an "unscoped" rail acts on a teammate's PR the moment
-  `ADOPT_REMOTE_PRS` (or any stray local worktree) puts it in this seat's pool.
-- `RESOLVE_AUTOFIX=on` is the highest-blast-radius lever here — it pushes a merge commit to whatever
-  branch is conflicting, with no author check at all. Turn it on only where every PR in the pool is
-  genuinely this seat's own.
+  `ADOPT_REMOTE_PRS` (or any stray local worktree) puts it in this seat's pool — and REVIEW_AUTOFIX /
+  HEALTHCHECK_AUTOFIX bounce unconditionally on the live engine regardless of `AUTOFIX_SCOPE` today.
 - After changing scope config, confirm with `herd why <pr#>` on a foreign PR (if one exists) rather
   than trusting the config's word for what it scopes.
 

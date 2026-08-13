@@ -322,6 +322,11 @@ WATCHER_VIEW_STATUS	unit	tests/test-watcher-views.sh
 WATCHER_VIEW_DEPS_LABEL	unit	tests/test-watcher-views.sh
 WATCHER_SCOPE	unit	tests/test-team-mode.sh
 WATCHER_OWNER	unit	tests/test-team-mode.sh
+AUTOFIX_SCOPE	unit	tests/test-autofix-scope.sh
+AUTOFIX_SCOPE	unit	tests/test-stale-base-autofix.sh
+AUTOFIX_SCOPE	unit	tests/test-auto-refix.sh
+AUTOFIX_SCOPE	unit	tests/test-health-autofix.sh
+AUTOFIX_SCOPE	unit	tests/test_live_runtime.py
 REVIEW_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 REVIEW_CONCURRENCY	unit	tests/test-live-engine-concurrency.sh
 NATIVE_BURST	unit	tests/test-native-burst.sh
