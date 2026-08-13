@@ -37,6 +37,19 @@
 #       (4b) a live reviewer → 'review · in progress (<age>)'
 #       (4c) neither → the caller's fallback, verbatim
 #
+#   COUNT 5 — STALE-BASE-BLIND conflict row (HERD-678). GitHub's `mergeable` flips CONFLICTING for a PR
+#     the stale-dup gate is ALSO holding (kind=stale-base) the instant the base moves far enough that
+#     the branch's old diff no longer applies textually. Observed live twice (PR #788 ~01:20, PR #791
+#     ~02:49): a stale-base refix bounce landed (round recorded, agent woke, working) within a second of
+#     the console reading 'needs you · conflict' — the conflict row consulted the resolver roster only,
+#     never the SAME refix ledger a live stale-base bounce writes to (`$TREES/.agent-watch-refixed`,
+#     written by both the bash and the Python engine's `_bounce_and_wake`).
+#       (5a) a live stale refix round (agent woke, working), no resolver on the roster → the shared
+#            'rebasing · awaiting push (round k/N)' row, never needs-you; no respawn queued
+#       (5b) the agent dies (or never woke) after the bounce → falls back to the honest needs-you and
+#            the respawn re-arms — a stale ledger record alone is not proof anyone is on it
+#       (5c) a live resolver still takes priority over the stale fallback (COUNT 1's doctrine unchanged)
+#
 # Sources agent-watch.sh in lib mode and drives the real functions against a REAL local git repo and
 # REAL marker files. journal_append is overridden to a log. No network, no gh, no herdr.
 # Run:  bash tests/test-console-truth-pass.sh
@@ -420,4 +433,55 @@ ROW="$(_gate_phase_row "feat-x" " #565 ·" 565 abc123 "$FALLBACK")"
 [ "$ROW" = "$FALLBACK" ] || fail "4a: a dead marker still rendered a live phase: $ROW"
 ok
 
-echo "PASS — console truth pass (HERD-453 + HERD-455 / GH #569): $pass assertions"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# COUNT 5 — the conflict row consults the SAME refix ledger a live stale-base bounce writes (HERD-678)
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+for fn in refix_attempted record_refix refix_rail_count refix_rail_cap; do
+  type "$fn" >/dev/null 2>&1 || fail "$fn not defined"
+done
+REFIX_STATE="$TREES/.agent-watch-refixed"; : > "$REFIX_STATE"
+STUB5_STATUS="working"; STUB5_LIVE="alive"
+_agent_status()   { printf '%s' "$STUB5_STATUS"; }
+_agent_liveness() { printf '%s' "$STUB5_LIVE"; }
+
+# (5a) a live stale-base refix round (agent woke, working), no resolver on the roster at all → the row
+#      reads the SAME 'rebasing · awaiting push (round k/N)' text the stale row itself uses, never
+#      needs-you; no respawn queued (a second resolver would race the live builder on its own worktree).
+record_refix 565 newsha feat-x stale
+classify "$(roster "" "")"
+case "${DISPLAY[0]}" in
+  *"rebasing · awaiting push"*) ok ;;
+  *) fail "5a: a live stale refix round must render rebasing, got: ${DISPLAY[0]}" ;;
+esac
+case "${DISPLAY[0]}" in *"needs you"*) fail "5a: row still says needs you: ${DISPLAY[0]}" ;; esac
+[ "${FLAIR_STATE[0]}" = "busy" ] || fail "5a: flair not downgraded to busy (got ${FLAIR_STATE[0]})"
+[ "${#CONF_IDX[@]}" -eq 0 ] || fail "5a: a respawn was queued while a stale refix round is live"
+# …and the shared check agrees at its own seam.
+case "$(AGENTS_JSON="$(roster "" "")" _active_fix_note 565 newsha feat-x conflict)" in
+  *rebasing*) ok ;;
+  *) fail "5a: the shared row-truth check does not see the live stale refix round" ;;
+esac
+
+# (5b) the builder dies (or the wake never landed) after the bounce → the row falls BACK to the honest
+#      needs-you and the respawn re-arms — a stale ledger record alone is not proof anyone is on it.
+STUB5_LIVE="dead"; STUB5_STATUS="idle"
+classify "$(roster "" "")"
+case "${DISPLAY[0]}" in
+  *"needs you · conflict"*) ok ;;
+  *) fail "5b: a dead-after-bounce agent must fall back to needs-you, got: ${DISPLAY[0]}" ;;
+esac
+[ "${#CONF_IDX[@]}" -eq 1 ] || fail "5b: the respawn did not re-arm once nobody was genuinely on it"
+AGENTS_JSON="$(roster "" "")" _active_fix_note 565 newsha feat-x conflict >/dev/null \
+  && fail "5b: the shared row-truth check invented work-in-flight from a dead agent"
+
+# (5c) a live resolver still takes priority — the stale ledger is a FALLBACK, not a replacement for
+#      COUNT 1's resolver-awareness (the same pr+sha now carries both a resolver AND a stale record).
+STUB5_LIVE="alive"; STUB5_STATUS="working"
+classify "$(roster "$RESOLVER_NAME" working)"
+case "${DISPLAY[0]}" in
+  *"resolving · awaiting push"*) ok ;;
+  *) fail "5c: a live resolver must still take priority over the stale fallback, got: ${DISPLAY[0]}" ;;
+esac
+
+echo "PASS — console truth pass (HERD-453 + HERD-455 / GH #569, HERD-678): $pass assertions"
