@@ -85,3 +85,15 @@ DRIVER_AGENT_COST_USAGE_KEYS='@degrade:no-verified-codex-usage-token-schema'
 # 'agent' rather than falling through to 'busy'. Space-separated substrings, matched by plain `in`
 # (never a regex) — see driver.sh's herd_driver_agent_process_signature.
 DRIVER_AGENT_PROCESS_SIGNATURE='codex'
+
+# ── Specialist-agent ROSTER bindings (HERD-667, epic HERD-666) ────────────────────────────────────
+# PRE-AUDIT (2026-08-12, codex 0.147.0 on this machine): Codex has NO named-agent selection and no
+# agent-definition lookup directory — neither a `--agent <name>` flag nor a scanned `agents/` dir.
+# Both capabilities are therefore bound to the drivers' @degrade sentinel rather than a guessed flag
+# or an invented path, and DEFINITION_MODE is `inject`: scripts/herd/agents.sh prepends the
+# definition body to the builder's task spec. That fallback is FIRST-CLASS, not a consolation prize —
+# it is the one mechanism that works on ANY runtime, and it is what `herd agents verify` probes here
+# (positive: body injected → sentinel returns; negative control: nothing injected → it must not).
+DRIVER_AGENT_DEFINITION_DIR='@degrade:no-agent-definition-lookup-path-codex-0.147.0'
+DRIVER_AGENT_SELECT_FLAG='@degrade:no-named-agent-selection-codex-0.147.0'
+DRIVER_AGENT_DEFINITION_MODE='inject'

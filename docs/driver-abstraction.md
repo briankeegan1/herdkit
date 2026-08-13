@@ -804,3 +804,57 @@ rescue, the frozen-pane guardrail, the static-idle-prompt case, the kill switch 
 cases (e)–(h) (the nudge-sequence replay end to end through `herd_spawn_wake_verify`: corroborated
 `woke=1`/`retried=none` with `status_disagreement` journaled, the frozen-pane guardrail, the
 genuinely-idle fixture, and the kill switch).
+
+---
+
+## Specialist agent roster bindings (HERD-667, epic HERD-666)
+
+A **specialist agent** is a committed, per-project agent definition (`.herd/agents/<name>.md`:
+frontmatter `name` / `description` / `sentinel`, body = the system prompt) that a build can be spawned
+with — the engine version of "a trained agent per domain". Every runtime-specific fact about how a
+definition reaches a runtime is DATA in the `.driver` file, read by `scripts/herd/agents.sh`. Three
+sibling keys join the `DRIVER_AGENT_*` exec block:
+
+| key | contract |
+|---|---|
+| `DRIVER_AGENT_DEFINITION_DIR` | where the runtime LOOKS UP named definitions. A **relative** value is repo-scope (resolved against `PROJECT_ROOT`); an absolute / `$HOME`-rooted one is user-scope. |
+| `DRIVER_AGENT_SELECT_FLAG` | the **by-name** selection flag shape, with a `<name>` token substituted (e.g. `--agent <name>`). |
+| `DRIVER_AGENT_DEFINITION_MODE` | `native` (the runtime reads the repo-scope dir directly — nothing to publish) · `install` (it only reads a USER-scope dir, so the committed source must be published there) · `inject` (no lookup at all — the lane prepends the body to the task spec). |
+
+**`@degrade:` means "capability absent", and that is load-bearing.** A runtime with no by-name
+selector binds the drivers' existing `@degrade:<reason>` sentinel rather than a guessed flag;
+`herd_roster_binding` reads any `@degrade:` value as absent, so the consumer takes the portable
+**inject** fallback instead of composing a flag the runtime would reject. This is the same honesty
+rule `DRIVER_AGENT_LIMIT_PATTERN` and `DRIVER_AGENT_COST_USAGE_KEYS` already follow, applied to a
+capability that is genuinely missing from two of the three big runtimes.
+
+**Selection needs no new seam in the spawn composer.** The lanes append the composed select flag to
+the spawn's `<flags>` argument, which `herd_driver_agent_spawn_argv` already substitutes for the
+driver's permission-flag token and word-splits into the argv. So a by-name selection is expressed
+entirely in existing plumbing, and an unset `HERD_AGENT` leaves the argv byte-identical.
+
+**Probe kind is independent of definition mode.** A runtime can have a native repo-scope definition
+directory and still expose no by-name spawn selector — claude does exactly that (`--agents <json>`
+passes *inline* definitions, it does not name one from the directory). `herd_roster_probe_kind`
+therefore answers "which mechanism would the LANE use here" (`flag` vs `inject`), and that is what
+`herd agents verify` probes: proving the advertised mechanism rather than the used one would prove
+nothing about a real build.
+
+**Verification is empirical and two-sided, because an unknown name fails silently.** Verified on grok
+1.0.3: an unknown `--agent` name is ignored without error — the runtime just runs as a plain agent, and
+the only symptom is the agent making the mistakes its definition forbids. So `herd agents verify`
+spawns through the existing `DRIVER_AGENT_ONESHOT_EXEC` seam (`herd_driver_oneshot_exec_as` — no new
+exec surface) and asserts BOTH halves: the definition's `sentinel` comes back when it is selected, and
+does **not** when the same probe runs against a name that cannot exist. A probe with no negative
+control cannot fail, and a check that cannot fail is worthless. Verdicts cache by
+`(driver, definition sha)` in the worktree pool; `herd doctor` reads that cache, `herd doctor --probe`
+re-runs it live.
+
+Per-runtime state as shipped (pre-audit 2026-08-12; full matrix and evidence in
+`docs/spikes/specialist-agent-roster.md`): claude 2.1.229 → `.claude/agents` / `native` / no selector;
+codex 0.147.0 → no dir, no selector, `inject`; grok 1.0.3 → `~/.grok/agents` / `install` /
+`--agent <name>`, **verified by report** (grok is not installed on the authoring machine, so `verify`
+fail-softs to a clear `unverified — binary not present` note rather than a red row); `stub` binds the
+select-flag shape so the hermetic test can drive both halves of the probe against a fake runtime.
+
+Proof: `tests/test-agent-roster.sh`.

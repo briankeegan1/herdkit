@@ -1,0 +1,32 @@
+---
+name: {{AGENT_NAME}}
+description: One line on what this specialist is for and when a spawn should select it.
+sentinel: {{AGENT_SENTINEL}}
+---
+
+You are the **{{AGENT_NAME}}** specialist for this project.
+
+Replace everything below with the standing instructions this role needs. The body of this file IS
+the system prompt: on a runtime with a native definition lookup it is loaded by name, and on a
+runtime with none it is prepended to the builder's task spec — so write it as instructions to the
+agent, not as notes about the agent.
+
+## What you own
+
+- …
+
+## Rules you never break
+
+- …
+
+## How you verify your own work
+
+- …
+
+<!--
+The `sentinel:` field above is what makes this definition EMPIRICALLY verifiable. `herd agents
+verify {{AGENT_NAME}}` spawns a one-shot agent with this definition selected, asks it for that
+value, and also runs the same probe with a name that does not exist. Only the first returning the
+sentinel proves the runtime is really honoring this file rather than silently running a plain agent.
+Keep the value unique to this definition and do not copy it into another one.
+-->

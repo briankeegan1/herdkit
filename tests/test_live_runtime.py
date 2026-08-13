@@ -2522,8 +2522,10 @@ class TestStaleDupGate(LiveCase):
         feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
         os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
         res, ev = self._tick_live(
-            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS"),
-            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"})
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
+                 author="dev1"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on",
+             "WATCHER_OWNER": "dev1"})
         self.assertEqual(res["outcomes"]["7"], "BLOCK")
         bounce = [o for o in ev if o["event"] == "refix_bounce"]
         self.assertEqual(len(bounce), 1)
@@ -2541,8 +2543,9 @@ class TestStaleDupGate(LiveCase):
         os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
         res, ev = self._tick_live(
             dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
-                 agent_status="dead"),
-            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"})
+                 agent_status="dead", author="dev1"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on",
+             "WATCHER_OWNER": "dev1"})
         self.assertEqual(res["outcomes"]["7"], "BLOCK")
         self.assertFalse([o for o in ev if o["event"] == "refix_escalated_no_wake"])
         bounce = [o for o in ev if o["event"] == "stale_base_autofix_bounce"]
@@ -2570,9 +2573,11 @@ class TestStaleDupGate(LiveCase):
         journal = LiveJournal(self.jpath)
         state = LiveState(self.tmp)
         actuator = _NoResolverActuator(journal)
-        config = {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"}
+        config = {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on",
+                  "WATCHER_OWNER": "dev1"}
         scenario = {"candidates": [self.one(pr=7, sha=feat_sha, worktree=feat_dir, base="main",
-                                            health="CLEAN", review="PASS", agent_status="dead")],
+                                            health="CLEAN", review="PASS", agent_status="dead",
+                                            author="dev1")],
                    "config": config}
         t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
                      state=state, hold_source=_StaleDupHermeticHoldSource(state, config))
@@ -2599,13 +2604,16 @@ class TestStaleDupGate(LiveCase):
         self.addCleanup(os.environ.pop, "STALE_BASE_AUTOFIX", None)
         self.addCleanup(os.environ.pop, "MERGE_POLICY", None)
         self.addCleanup(os.environ.pop, "DEFAULT_BRANCH", None)
+        self.addCleanup(os.environ.pop, "WATCHER_OWNER", None)
         self.addCleanup(os.environ.pop, "WATCHER_SCOPE", None)
         os.environ["STALE_BASE_AUTOFIX"] = "on"
         os.environ["MERGE_POLICY"] = "auto"
         os.environ["DEFAULT_BRANCH"] = "main"
+        os.environ["WATCHER_OWNER"] = "dev1"
         # HERD-653: an intact (explicit) WATCHER_SCOPE stays byte-identical — this test is about
-        # STALE_BASE_AUTOFIX plumbing, not scope, so it declares the solo default itself rather than
-        # relying on the now fail-closed "never set" default the env genuinely has in this process.
+        # STALE_BASE_AUTOFIX/AUTOFIX_SCOPE plumbing, not WATCHER_SCOPE itself, so it declares the
+        # solo default explicitly rather than relying on the now fail-closed "never set" default the
+        # env genuinely has in this process.
         os.environ["WATCHER_SCOPE"] = "mine"
         config = LR._config_from_env()
         self.assertEqual(config.get("STALE_BASE_AUTOFIX"), "on",
@@ -2615,7 +2623,7 @@ class TestStaleDupGate(LiveCase):
         os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
         res, ev = self._tick_live(
             dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
-                 agent_status="dead"),
+                 agent_status="dead", author="dev1"),
             config)
         self.assertEqual(res["outcomes"]["7"], "BLOCK")
         bounce = [o for o in ev if o["event"] == "stale_base_autofix_bounce"]
@@ -2660,6 +2668,181 @@ class TestStaleDupGate(LiveCase):
         finally:
             LR.subprocess = orig
         self.assertEqual(res["outcomes"]["1"], "MERGE")
+
+
+class TestAutofixScope(LiveCase):
+    """HERD-655 (GitHub issue #771): AUTOFIX_SCOPE, the multi-operator ownership gate shared by every
+    autofix WRITE rail. GROUNDED (emberglen, two operators): a seat's RESOLVE_AUTOFIX rail adopted the
+    OTHER operator's conflicting PR and dispatched a resolver against his branch — no author/operator
+    filter existed on any autofix write rail.
+
+    Two halves:
+      (a) the shared pure functions (_autofix_scope / _autofix_scope_permits) — own (default) | all,
+          fail-closed on an empty/unknown author or an unresolvable identity, journals
+          autofix_scope_withheld on every withhold, mirrors agent-watch.sh's bash twin exactly.
+      (b) the ONE rail that is actually LIVE in this ported engine, STALE_BASE_AUTOFIX
+          (:meth:`LiveTick._walk`'s stale-base branch) — end-to-end proof that a foreign PR's
+          stale-base hold is withheld (never bounced, never resolver-dispatched) while an owned PR's
+          heal proceeds exactly as :class:`TestStaleDupGate` already proves. REVIEW_AUTOFIX and
+          HEALTHCHECK_AUTOFIX have no python-side gate of their own to hook — see
+          docs/multi-operator-ownership.md for why (unreachable bash since the P5b port, HERD-556) —
+          so their scope wiring is proved in agent-watch.sh's own suites instead
+          (tests/test-auto-refix.sh, tests/test-health-autofix.sh).
+    """
+
+    # ── (a) the shared pure functions ────────────────────────────────────────────────────────────
+
+    def test_default_is_own(self):
+        self.assertEqual(LR._autofix_scope({}), "own")
+
+    def test_unknown_value_falls_back_to_own(self):
+        self.assertEqual(LR._autofix_scope({"AUTOFIX_SCOPE": "bogus"}), "own")
+
+    def test_own_permits_the_resolved_owner(self):
+        journal = LiveJournal(self.jpath)
+        config = {"WATCHER_OWNER": "alice"}
+        self.assertTrue(LR._autofix_scope_permits(config, "alice", "resolve", 1, journal))
+        self.assertFalse(os.path.exists(self.jpath), "a permitted call must never journal a withhold")
+
+    def test_own_withholds_a_foreign_author_and_journals(self):
+        journal = LiveJournal(self.jpath)
+        config = {"WATCHER_OWNER": "alice"}
+        self.assertFalse(LR._autofix_scope_permits(config, "bob", "stale", 2, journal))
+        ev = events(self.jpath)
+        withheld = [o for o in ev if o["event"] == "autofix_scope_withheld"]
+        self.assertEqual(len(withheld), 1)
+        self.assertEqual(withheld[0]["pr"], 2)
+        self.assertEqual(withheld[0]["author"], "bob")
+        self.assertEqual(withheld[0]["rail"], "stale")
+        self.assertEqual(withheld[0]["reason"], "not-owner")
+
+    def test_own_withholds_an_empty_author_fail_closed(self):
+        journal = LiveJournal(self.jpath)
+        config = {"WATCHER_OWNER": "alice"}
+        self.assertFalse(LR._autofix_scope_permits(config, "", "review", 3, journal))
+
+    def test_own_withholds_on_unresolvable_identity_and_journals_noowner(self):
+        journal = LiveJournal(self.jpath)
+        self.assertFalse(LR._autofix_scope_permits({}, "alice", "health", 4, journal, me=""))
+        ev = events(self.jpath)
+        withheld = [o for o in ev if o["event"] == "autofix_scope_withheld"]
+        self.assertEqual(len(withheld), 1)
+        self.assertEqual(withheld[0]["reason"], "noowner")
+
+    def test_all_permits_every_author_including_empty(self):
+        journal = LiveJournal(self.jpath)
+        config = {"AUTOFIX_SCOPE": "all", "WATCHER_OWNER": "alice"}
+        self.assertTrue(LR._autofix_scope_permits(config, "bob", "resolve", 5, journal))
+        self.assertTrue(LR._autofix_scope_permits(config, "", "resolve", 6, journal))
+        self.assertFalse(os.path.exists(self.jpath), "'all' must never journal a withhold")
+
+    def test_all_never_resolves_the_identity(self):
+        # 'all' must short-circuit before _resolve_owner — proved by poisoning subprocess (the gh
+        # fallback _resolve_owner would otherwise reach with no WATCHER_OWNER configured).
+        orig = LR.subprocess
+        LR.subprocess = _Poison()
+        try:
+            self.assertTrue(LR._autofix_scope_permits({"AUTOFIX_SCOPE": "all"}, "bob", "resolve", 7))
+        finally:
+            LR.subprocess = orig
+
+    def test_me_precomputed_skips_a_second_resolve(self):
+        # The memoized-identity seam LiveTick._xseat_identity feeds in: passing `me` explicitly must
+        # be honored verbatim, never re-derived from config.
+        config = {"WATCHER_OWNER": "someone-else"}
+        self.assertTrue(LR._autofix_scope_permits(config, "alice", "resolve", 8, me="alice"))
+
+    # ── (b) end-to-end: the ONE live rail, STALE_BASE_AUTOFIX ───────────────────────────────────────
+
+    def _seam_file(self, name, content):
+        path = os.path.join(self.tmp, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return path
+
+    def _tick_live(self, cand_kwargs, config, actuator=None):
+        config = dict(config)
+        journal = LiveJournal(self.jpath)
+        state = LiveState(self.tmp)
+        actuator = actuator or DryRunActuator(journal)
+        scenario = {"candidates": [self.one(**cand_kwargs)], "config": config}
+        t = LiveTick(config, FixtureDiscovery(scenario), FixtureGates(scenario), actuator, journal,
+                     state=state, hold_source=_StaleDupHermeticHoldSource(state, config))
+        res = t.run()
+        return res, events(self.jpath)
+
+    def test_stale_base_autofix_withholds_a_foreign_prs_heal(self):
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+        self.addCleanup(os.environ.pop, "HERD_STALE_DUP_BODY_FILE", None)
+        res, ev = self._tick_live(
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
+                 author="bob"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on",
+             "WATCHER_OWNER": "alice"})
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+        self.assertFalse([o for o in ev if o["event"] == "refix_bounce"],
+                         "a foreign PR must never be bounced")
+        self.assertFalse([o for o in ev if o["event"] == "stale_base_autofix_bounce"],
+                         "a foreign PR must never get the resolver dispatched at it")
+        withheld = [o for o in ev if o["event"] == "autofix_scope_withheld"]
+        self.assertEqual(len(withheld), 1)
+        self.assertEqual(withheld[0]["rail"], "stale")
+
+    def test_stale_base_autofix_permits_the_owners_own_pr(self):
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+        self.addCleanup(os.environ.pop, "HERD_STALE_DUP_BODY_FILE", None)
+        res, ev = self._tick_live(
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
+                 author="alice"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on",
+             "WATCHER_OWNER": "alice"})
+        self.assertEqual(res["outcomes"]["7"], "BLOCK")
+        self.assertTrue([o for o in ev if o["event"] == "refix_bounce"])
+        self.assertFalse([o for o in ev if o["event"] == "autofix_scope_withheld"])
+
+    def test_autofix_scope_all_bypasses_the_ownership_gate(self):
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+        self.addCleanup(os.environ.pop, "HERD_STALE_DUP_BODY_FILE", None)
+        res, ev = self._tick_live(
+            dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
+                 author="bob"),
+            {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on",
+             "AUTOFIX_SCOPE": "all", "WATCHER_OWNER": "alice"})
+        self.assertEqual(res["outcomes"]["7"], "BLOCK")
+        self.assertTrue([o for o in ev if o["event"] == "refix_bounce"])
+
+    def test_stale_base_autofix_withholds_on_unresolvable_identity(self):
+        # No WATCHER_OWNER configured — force the gh-fallback leg of _resolve_owner to prove genuinely
+        # unresolvable (never dependent on whether this machine happens to have an authenticated gh).
+        feat_dir, feat_sha = _make_stale_base_repo(self.tmp)
+        os.environ["HERD_STALE_DUP_BODY_FILE"] = self._seam_file("body.txt", "no ref here\n")
+        self.addCleanup(os.environ.pop, "HERD_STALE_DUP_BODY_FILE", None)
+        orig = LR._resolve_owner
+        LR._resolve_owner = lambda cfg: ""
+        try:
+            res, ev = self._tick_live(
+                dict(pr=7, sha=feat_sha, worktree=feat_dir, base="main", health="CLEAN", review="PASS",
+                     author="alice"),
+                {"MERGE_POLICY": "auto", "DEFAULT_BRANCH": "main", "STALE_BASE_AUTOFIX": "on"})
+        finally:
+            LR._resolve_owner = orig
+        self.assertEqual(res["outcomes"]["7"], "HOLD")
+        withheld = [o for o in ev if o["event"] == "autofix_scope_withheld"]
+        self.assertEqual(len(withheld), 1)
+        self.assertEqual(withheld[0]["reason"], "noowner")
+
+    def test_autofix_scope_key_reaches_live_tick_via_config_from_env(self):
+        # HERD-601 lesson (see test_stale_base_autofix_reaches_live_tick_via_config_from_env above):
+        # a key missing from _CORE_ENV_KEYS/herd-config.sh's export sweep silently never arrives in a
+        # real --tick child even when .herd/config sets it. Prove AUTOFIX_SCOPE threads the SAME seam.
+        self.addCleanup(os.environ.pop, "AUTOFIX_SCOPE", None)
+        os.environ["AUTOFIX_SCOPE"] = "all"
+        config = LR._config_from_env()
+        self.assertEqual(config.get("AUTOFIX_SCOPE"), "all",
+                          "_config_from_env must thread an exported AUTOFIX_SCOPE through")
 
 
 class TestVerdictParser(unittest.TestCase):

@@ -92,3 +92,23 @@ DRIVER_AGENT_COST_USAGE_KEYS='@degrade:no-verified-grok-usage-token-schema'
 # 'agent' rather than falling through to 'busy'. Space-separated substrings, matched by plain `in`
 # (never a regex) — see driver.sh's herd_driver_agent_process_signature.
 DRIVER_AGENT_PROCESS_SIGNATURE='grok'
+
+# ── Specialist-agent ROSTER bindings (HERD-667, epic HERD-666) ────────────────────────────────────
+# VERIFIED-BY-REPORT, not on this machine. The grok binary is NOT installed here (HERD-666 pre-audit),
+# so these two bindings come from the operator's hand-prototype on grok 1.0.3 rather than a local
+# probe, and post-merge live verification is owned by the second operator. What was reported, and why
+# each binding is shaped this way:
+#   • ~/.grok/agents/ (USER scope) is honored; a repo-local ./.grok/agents/ is IGNORED. That is trap
+#     T1 of the epic and the reason DEFINITION_MODE is `install`: the committed source in
+#     .herd/agents/ must be PUBLISHED to the user-scope dir (`herd agents install`) or the runtime
+#     never sees it. $HERD_AGENT_DEFINITION_ROOT rebinds the root (the hermetic-test / non-standard
+#     -home knob), exactly as $HERD_TRANSCRIPT_ROOT rebinds DRIVER_AGENT_SESSION_ID above.
+#   • `--agent <name>` selects a definition by name, and an UNKNOWN name is SILENTLY IGNORED — the
+#     runtime just runs as a plain agent. That is trap T2, and it is why `herd agents verify` is
+#     empirical and carries a negative control: on this runtime a probe without one cannot fail.
+# Anything NOT reported stays @degrade rather than guessed (the same honesty rule the limit-pattern
+# and cost-schema bindings above follow). `herd agents verify` fail-softs to a clear
+# "grok binary not present — unverified on this machine" note, never a red row.
+DRIVER_AGENT_DEFINITION_DIR='${HERD_AGENT_DEFINITION_ROOT:-$HOME}/.grok/agents'
+DRIVER_AGENT_SELECT_FLAG='--agent <name>'
+DRIVER_AGENT_DEFINITION_MODE='install'

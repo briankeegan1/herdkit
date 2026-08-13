@@ -1444,7 +1444,7 @@ EOF
         ref "${ref:-}" reason "${reason:-escalated}" age "$age"
     fi
     rm -f "$q/$id.escalated" "$q/$id.cancelled" "$q/$id.ref" "$q/$id.after" "$q/$id.prio" \
-          "$q/$id.gen" 2>/dev/null || true
+          "$q/$id.gen" "$q/$id.agent" 2>/dev/null || true
   done < "$INTENT_ESCALATION_LEDGER"
   herd_console_trim "$INTENT_ESCALATION_ACK"
   return 0
@@ -7164,14 +7164,21 @@ _conflict_row() {
   return 1
 }
 
-# _classify_conflict <idx> <pr#> <slug> <branch> <headsha> — decide what to do with a CONFLICTING PR
-# (HERD-55). Sha-keyed like the review-once gate: first conflict → auto-spawn the resolver; a NEW
-# commit that reshapes the conflict, or a resolver that DIED without clearing it, → RE-spawn for the
-# new sha; an ESCALATE verdict is TERMINAL for that sha; respawns are capped at REFIX_MAX_ROUNDS then
-# surface needs-you. Sets DISPLAY[idx]; queues a (re)spawn by appending to the CONF_* arrays with the
-# sha + reason. Never spawns here — the resolve pass does that so it stays render-ordered + dry-runnable.
+# _classify_conflict <idx> <pr#> <slug> <branch> <headsha> [author] — decide what to do with a
+# CONFLICTING PR (HERD-55). Sha-keyed like the review-once gate: first conflict → auto-spawn the
+# resolver; a NEW commit that reshapes the conflict, or a resolver that DIED without clearing it, →
+# RE-spawn for the new sha; an ESCALATE verdict is TERMINAL for that sha; respawns are capped at
+# REFIX_MAX_ROUNDS then surface needs-you. Sets DISPLAY[idx]; queues a (re)spawn by appending to the
+# CONF_* arrays with the sha + reason + author (HERD-655: AUTOFIX_SCOPE reads CONF_AUTHOR at the
+# dispatch pass so a foreign PR's conflict is never auto-resolved). Never spawns here — the resolve
+# pass does that so it stays render-ordered + dry-runnable.
+#
+# [author] is read with the unset-vs-empty-distinguishing `${6-…}` form: a caller that omits the 6th
+# positional entirely predates AUTOFIX_SCOPE (tests/test-resolve-autofix.bats and every row-
+# classification/liveness test call site) and queues the bypass sentinel into CONF_AUTHOR, so
+# _dispatch_conflict_autofix never scopes it; a caller that passes one (including "") is enforced.
 _classify_conflict() {
-  local ci="$1" cpr="$2" cslug="$3" cbranch="$4" csha="$5"
+  local ci="$1" cpr="$2" cslug="$3" cbranch="$4" csha="$5" cauthor="${6-__autofix_scope_unset__}"
   local sl pn cap count
   # Normalize an absent head sha to "-" so it keys consistently across the ledger + result file.
   [ -n "$csha" ] || csha="-"
@@ -7231,7 +7238,7 @@ _classify_conflict() {
       return
     fi
     _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "conflict" && return
-    CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("dead-resolver")
+    CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("dead-resolver"); CONF_AUTHOR+=("$cauthor")
     return
   fi
 
@@ -7239,7 +7246,7 @@ _classify_conflict() {
   if [ "$count" -eq 0 ]; then
     # First-ever conflict on this PR — today's hands-off auto-resolve path.
     _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "conflict" && return
-    CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("first")
+    CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("first"); CONF_AUTHOR+=("$cauthor")
     return
   fi
   # A resolver ran on an OLDER sha and this PR got a NEW commit that reshaped the conflict surface.
@@ -7257,7 +7264,7 @@ _classify_conflict() {
     return
   fi
   _conflict_row "$ci" "$sl" "$pn" "$cslug" "$cpr" "$csha" "conflict" && return
-  CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("new-commit")
+  CONF_IDX+=("$ci"); CONF_SLUG+=("$cslug"); CONF_PR+=("$cpr"); CONF_BRANCH+=("$cbranch"); CONF_SHA+=("$csha"); CONF_REASON+=("new-commit"); CONF_AUTHOR+=("$cauthor")
 }
 
 # resolve_autofix_enabled — HERD-541 master lever for RESOLVE_AUTOFIX. Default OFF (ship-dormant).
@@ -7288,15 +7295,24 @@ _dispatch_conflict_autofix() {
   [ "${#CONF_IDX[@]}" -gt 0 ] || return 0
   resolve_autofix_enabled || return 0
   [ -z "${DRYRUN:-}" ] || return 0
-  local _dca_k=0 _dca_idx _dca_slug _dca_pr _dca_branch _dca_sha _dca_reason
+  local _dca_k=0 _dca_idx _dca_slug _dca_pr _dca_branch _dca_sha _dca_reason _dca_author
   local _dca_sl _dca_pn _dca_round _dca_cap
   for _dca_idx in "${CONF_IDX[@]}"; do
     _dca_slug="${CONF_SLUG[_dca_k]}"; _dca_pr="${CONF_PR[_dca_k]}"; _dca_branch="${CONF_BRANCH[_dca_k]}"
-    _dca_sha="${CONF_SHA[_dca_k]}"; _dca_reason="${CONF_REASON[_dca_k]}"
+    _dca_sha="${CONF_SHA[_dca_k]}"; _dca_reason="${CONF_REASON[_dca_k]}"; _dca_author="${CONF_AUTHOR[_dca_k]:-}"
     _dca_k=$((_dca_k + 1))
     # NEVER yank a working builder — leave today's needs-you row exactly as _classify_conflict painted it.
     [ "$(_agent_status "$_dca_slug")" = "working" ] && continue
     _dca_sl="$(_slug_cell "$_dca_slug")"; _dca_pn=" ${C_DIM}#${_dca_pr}${C_RESET} ·"
+    # HERD-655: AUTOFIX_SCOPE — never auto-dispatch a resolver against another operator's PR. Checked
+    # BEFORE the cross-seat claim hold so a withheld PR reads as "not your PR", never "held". Skipped
+    # entirely when the caller predates AUTOFIX_SCOPE (author position never passed to
+    # _classify_conflict — see that function's docstring); a caller that does pass one is enforced.
+    if [ "$_dca_author" != "__autofix_scope_unset__" ] && ! _autofix_scope_permits "$_dca_author" resolve "$_dca_pr"; then
+      DISPLAY[_dca_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_dca_sl}${C_RESET}${_dca_pn} ${C_RED}needs you · conflict (autofix withheld — not your PR)${C_RESET}"
+      FLAIR_STATE[_dca_idx]="attention"
+      continue
+    fi
     if _resolve_claim_should_hold "$_dca_pr" "$_dca_sha" "$_dca_slug"; then
       DISPLAY[_dca_idx]="    ${C_YELLOW}🔀${C_RESET} ${C_BOLD}${_dca_sl}${C_RESET}${_dca_pn} ${C_YELLOW}resolving · held — another seat is resolving${C_RESET}"
       FLAIR_STATE[_dca_idx]="busy"
@@ -12238,13 +12254,18 @@ _defer_for_suite() {
   return 0
 }
 
-# _handle_block_verdict <pr#> <slug> <headSha> <display-idx>
+# _handle_block_verdict <pr#> <slug> <headSha> <display-idx> [worktree-dir] [author]
 # Called when the review verdict for a PR is BLOCK (from the ledger or a fresh gate step). If
 # REVIEW_AUTOFIX=true, attempts to bounce the builder agent; otherwise shows the standard message.
 # Always updates DISPLAY[<idx>]; calls render internally before the blocking wait so the user sees
 # "refixing" while the bounce is in progress.
+#
+# [author] (HERD-655, AUTOFIX_SCOPE) is OPTIONAL, read with the unset-vs-empty-distinguishing `${6-…}`
+# form: a caller that omits it predates AUTOFIX_SCOPE and is never scoped (every pre-existing direct
+# unit-test call site stays byte-identical); a caller that passes one (including "") is enforced.
 _handle_block_verdict() {
   local _hbv_pr="$1" _hbv_slug="$2" _hbv_sha="$3" _hbv_idx="$4" _hbv_wt="${5:-}"
+  local _hbv_author="${6-__autofix_scope_unset__}"
   local _hbv_sl _hbv_pn _hbv_live
   _hbv_sl="$(_slug_cell "$_hbv_slug")"
   _hbv_pn=" ${C_DIM}#${_hbv_pr}${C_RESET} ·"
@@ -12257,6 +12278,15 @@ _handle_block_verdict() {
   # silently break the block/override/auto-refix paths this very function drives. See post_gate_status.
 
   if [ "${REVIEW_AUTOFIX:-false}" = "true" ] && [ -z "${DRYRUN:-}" ]; then
+    # HERD-655: AUTOFIX_SCOPE — never auto-bounce another operator's review BLOCK (the re-task prompt
+    # types into THEIR builder pane). Checked FIRST inside the enabled branch — off/dry-run must keep
+    # today's plain "review blocked" row untouched, never the scope-withheld wording. Skipped entirely
+    # when the caller predates AUTOFIX_SCOPE (author position never passed); a caller that does pass
+    # one is enforced for real, once-guard NOT burned.
+    if [ "$_hbv_author" != "__autofix_scope_unset__" ] && ! _autofix_scope_permits "$_hbv_author" review "$_hbv_pr"; then
+      DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · review blocked · autofix withheld (not your PR) · see PR #${_hbv_pr}${C_RESET}"
+      return 0
+    fi
     # HARDENING (HERD-155 F5): NEVER pane-run a re-task prompt into a LIMIT-PARKED builder. A builder
     # that hit the account usage limit AFTER opening its PR is parked at the limit arrow-menu (or a
     # frozen session); the bounce below types the fix prompt via `herdr pane run`, which would land in
@@ -12965,12 +12995,21 @@ _stale_needs_you_row() {
 }
 
 # _handle_stale_dup <pr#> <slug> <headSha> <display-idx> <worktree-dir> <branch> <kind> <reason>
+#   [author]
 # Called every tick the stale-dup gate HOLDS. Always sets DISPLAY[<idx>]; never merges. Side effects
 # (PR comment / notify / journal of the hold) are once-per-sha via the caller's stale_dup_held_noted
 # guard; this helper owns the autofix bounce / resolver dispatch / row truth.
+#
+# [author] (HERD-655, AUTOFIX_SCOPE) is OPTIONAL and read with the unset-vs-empty-distinguishing
+# `${9-…}` form (not `${9:-}`): a caller that omits the 9th positional entirely predates AUTOFIX_SCOPE
+# and is never scoped (every pre-existing direct unit-test call site in tests/test-stale-base-autofix.sh
+# and tests/test-watcher-self-restart.sh stays byte-identical); a caller that explicitly passes an
+# author (including "") opts in to real enforcement. The one live call path (via _stale_dup_gate_step)
+# always passes the PR's real author once wired.
 _handle_stale_dup() {
   local _hsd_pr="$1" _hsd_slug="$2" _hsd_sha="$3" _hsd_idx="$4" _hsd_wt="${5:-}" \
         _hsd_branch="${6:-}" _hsd_kind="${7:-}" _hsd_reason="${8:-}"
+  local _hsd_author="${9-__autofix_scope_unset__}"
   local _hsd_sl _hsd_pn _hsd_rounds _hsd_round_num _hsd_base _hsd_capmsg
   _hsd_sl="$(_slug_cell "$_hsd_slug")"
   _hsd_pn=" ${C_DIM}#${_hsd_pr}${C_RESET} ·"
@@ -13090,6 +13129,15 @@ _handle_stale_dup() {
     return 0
   fi
 
+  # HERD-655: AUTOFIX_SCOPE — never auto-heal another operator's stale-base hold (a merge-up bounce or
+  # a resolver dispatch both write to THEIR branch). Skipped entirely when the caller predates
+  # AUTOFIX_SCOPE (author position never passed — see the docstring above); a caller that does pass an
+  # author is enforced for real, once-guard NOT burned so the heal fires the moment a human clears it.
+  if [ "$_hsd_author" != "__autofix_scope_unset__" ] && ! _autofix_scope_permits "$_hsd_author" stale "$_hsd_pr"; then
+    DISPLAY[_hsd_idx]="    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hsd_sl}${C_RESET}${_hsd_pn} ${C_RED}needs you · stale/duplicate (${_hsd_kind}) — held · autofix withheld (not your PR)${C_RESET}"
+    return 0
+  fi
+
   _hsd_round_num="$((_hsd_rounds + 1))"
 
   # NO LIVE BUILDER (foreign / reaped / dead / missing pane) → conflict resolver. The resolver's
@@ -13195,7 +13243,9 @@ Why: ${_hsd_reason}"
     agent_status_after "${_hsd_after:-unknown}" woke "$_hsd_woke" escalated "$_hsd_escalated"
 }
 
-# _stale_dup_gate_step <pr#> <slug> <worktree-dir> <headSha> <branch> <display-idx>
+# _stale_dup_gate_step <pr#> <slug> <worktree-dir> <headSha> <branch> <display-idx> [author]
+# [author] (HERD-655) is OPTIONAL, forwarded verbatim to _handle_stale_dup — see that function's
+# docstring for the unset-vs-empty distinction that keeps every pre-existing 6-arg caller unaffected.
 # The whole PRE-MERGE STALE / DUPLICATE gate (HERD-188 + HERD-199) as ONE callable step: evaluate,
 # and on a proven hold fire the once-per-sha comment/notify/journal, run the autofix/needs-you row,
 # and re-render. Returns 0 → PROCEED, 1 → HOLD (caller `continue`s; it must dispatch NOTHING).
@@ -13226,6 +13276,7 @@ Why: ${_hsd_reason}"
 # our suite runs — so the merge decision must be re-established from current state, unconditionally.
 _stale_dup_gate_step() {
   local _sdg_pr="$1" _sdg_slug="$2" _sdg_dir="$3" _sdg_sha="$4" _sdg_branch="$5" _sdg_idx="$6"
+  local _sdg_author="${7-__autofix_scope_unset__}"
   [ -n "$_sdg_sha" ] || return 0
   [ -z "${DRYRUN:-}" ] || return 0
   if stale_dup_check "$_sdg_pr" "$_sdg_slug" "$_sdg_dir" "$_sdg_sha" "$DEFAULT_BRANCH"; then
@@ -13263,7 +13314,7 @@ This PR appears to re-implement already-shipped work, or sits on a base stale en
   # lap: nothing was thrown away. Observability only; nothing below reads the count.
   _restale_note "$_sdg_pr" "$_sdg_sha" "$_sdg_slug" "$_STALE_DUP_KIND"
   _handle_stale_dup "$_sdg_pr" "$_sdg_slug" "$_sdg_sha" "$_sdg_idx" "$_sdg_dir" "$_sdg_branch" \
-    "$_STALE_DUP_KIND" "$_STALE_DUP_REASON"
+    "$_STALE_DUP_KIND" "$_STALE_DUP_REASON" "$_sdg_author"
   _restale_decorate_row "$_sdg_idx" "$_sdg_pr"
   render
   return 1
@@ -13305,11 +13356,16 @@ _health_qualify_unprepared() {
   printf '%s' "$_hqu_detail"
 }
 
-# _handle_health_codeerror <pr#> <slug> <headSha> <display-idx> <worktree-dir> <detail>
+# _handle_health_codeerror <pr#> <slug> <headSha> <display-idx> <worktree-dir> <detail> [author]
 # Called for EVERY reproduced healthcheck CODE ERROR — fresh from the collector or replayed from the
 # sha-cache — so the row stays truthful on every tick. Always sets DISPLAY[<idx>]; returns 0.
+#
+# [author] (HERD-655, AUTOFIX_SCOPE) is OPTIONAL, read with the unset-vs-empty-distinguishing `${7-…}`
+# form: a caller that omits it predates AUTOFIX_SCOPE and is never scoped (every pre-existing direct
+# unit-test call site stays byte-identical); a caller that passes one (including "") is enforced.
 _handle_health_codeerror() {
   local _hhc_pr="$1" _hhc_slug="$2" _hhc_sha="$3" _hhc_idx="$4" _hhc_wt="${5:-}" _hhc_detail="${6:-}"
+  local _hhc_author="${7-__autofix_scope_unset__}"
   local _hhc_sl _hhc_pn _hhc_note _hhc_rounds _hhc_live _hhc_capmsg
   _hhc_sl="$(_slug_cell "$_hhc_slug")"
   _hhc_pn=" ${C_DIM}#${_hhc_pr}${C_RESET} ·"
@@ -13345,6 +13401,16 @@ _handle_health_codeerror() {
     else
       DISPLAY[_hhc_idx]="$(_health_needs_you_row "$_hhc_sl" "$_hhc_pn" "$_hhc_pr" "$_hhc_sha" "$_hhc_detail")"
     fi
+    return 0
+  fi
+
+  # HERD-655: AUTOFIX_SCOPE — never auto-bounce another operator's health CODE ERROR (the re-task
+  # prompt types into THEIR builder pane). Checked FIRST inside the enabled branch — off/dry-run above
+  # keeps today's plain needs-you row untouched, never the scope-withheld wording. Skipped entirely
+  # when the caller predates AUTOFIX_SCOPE (author position never passed); a caller that does pass
+  # one is enforced for real.
+  if [ "$_hhc_author" != "__autofix_scope_unset__" ] && ! _autofix_scope_permits "$_hhc_author" health "$_hhc_pr"; then
+    DISPLAY[_hhc_idx]="$(_health_needs_you_row "$_hhc_sl" "$_hhc_pn" "$_hhc_pr" "$_hhc_sha" "${_hhc_detail} · autofix withheld (not your PR)")"
     return 0
   fi
 
@@ -17311,6 +17377,63 @@ _scope_permits_automerge() {
   [ -n "$_spa_author" ] && [ "$_spa_author" = "$_WATCHER_OWNER_CACHE" ]
 }
 
+# ── Multi-operator ownership gate for AUTOFIX WRITE RAILS (HERD-655, GitHub issue #771) ─────────────
+# GROUNDED (emberglen, two operators, 2026-08-12): our seat's RESOLVE_AUTOFIX rail adopted the OTHER
+# operator's conflicting PR and dispatched a resolver against his branch — no author/operator filter
+# existed on resolve_autodispatch or any other write rail. AUTOFIX_SCOPE closes that: it is consulted
+# by EVERY rail that writes to a PR head branch or a builder pane on its behalf — RESOLVE_AUTOFIX
+# (_dispatch_conflict_autofix), STALE_BASE_AUTOFIX (_handle_stale_dup), REVIEW_AUTOFIX
+# (_handle_block_verdict), HEALTHCHECK_AUTOFIX (_handle_health_codeerror) — through this ONE shared
+# check (multi-seat doctrine rule 2), never a rail-local reimplementation.
+#   own (DEFAULT) — the rail fires ONLY on PRs whose author matches the seat's own identity, resolved
+#                   the SAME way WATCHER_OWNER already resolves it (WATCHER_OWNER → WATCHER_VIEW_AUTHOR
+#                   → `gh api user`, memoized via _resolve_watcher_owner/_WATCHER_OWNER_CACHE — ONE
+#                   probe per process, never one per candidate). SHIP SAFE: a single-operator repo's
+#                   PRs are ALL its own, so this is zero behavior change there — the identity always
+#                   matches. FAIL-CLOSED, unlike _scope_permits_automerge's dormant `mine`: an
+#                   unresolvable operator identity, or an author that does not match it, WITHHOLDS the
+#                   write rather than firing blind, because the whole point of this key is that a rail
+#                   must never assume a candidate is ours.
+#   all             — today's behavior, explicit opt-in: every rail fires on every PR regardless of
+#                     author, exactly as before this key existed.
+# Unrecognized value → the safe default 'own' (loud warning), mirroring _watcher_scope.
+# Read-only rails (gating, health verdicts, console display) are NEVER scoped by this key — only the
+# four WRITE rails named above.
+_autofix_scope() {
+  case "${AUTOFIX_SCOPE:-own}" in
+    own|all) printf '%s' "${AUTOFIX_SCOPE:-own}" ;;
+    *)
+      _watcher_view_warn_once "AUTOFIX_SCOPE: unknown value '${AUTOFIX_SCOPE:-}' — falling back to safe default 'own'" "autofixscope:${AUTOFIX_SCOPE:-}"
+      printf 'own' ;;
+  esac
+}
+
+# _autofix_scope_permits <pr_author_login> <rail> <pr#> — the ONE shared check every autofix write
+# rail consults before it dispatches a resolver, bounces a builder pane, or otherwise writes to a PR's
+# head branch on the operator's behalf. Returns 0 (permitted) / non-zero (WITHHELD — caller must paint
+# a needs-you row and take no write action). Called DIRECTLY (never in a subshell) so the owner
+# resolution memoizes into the parent shell across ticks, exactly like _scope_permits_automerge.
+#   • all: always permits (today's behavior).
+#   • own (default): permits ONLY when <pr_author_login> equals the resolved operator identity.
+#     FAIL-CLOSED — an empty/unknown author, or an unresolvable operator identity, WITHHOLDS the write:
+#     a foreign PR must never be autofixed just because we could not confirm ownership. Every withhold
+#     is journaled (autofix_scope_withheld) so the coordinator sees it without a human pasting a pane.
+_autofix_scope_permits() {
+  _asp_author="${1:-}"; _asp_rail="${2:-}"; _asp_pr="${3:-}"
+  [ "$(_autofix_scope)" = "all" ] && return 0
+  _resolve_watcher_owner
+  if [ -z "$_WATCHER_OWNER_CACHE" ]; then
+    _watcher_view_warn_once "AUTOFIX_SCOPE=own but the operator identity is unresolved (set WATCHER_OWNER) — autofix WITHHELD for safety" "autofixscope:noowner"
+    journal_append autofix_scope_withheld pr "$_asp_pr" author "${_asp_author:--}" rail "$_asp_rail" reason noowner
+    return 1
+  fi
+  if [ -n "$_asp_author" ] && [ "$_asp_author" = "$_WATCHER_OWNER_CACHE" ]; then
+    return 0
+  fi
+  journal_append autofix_scope_withheld pr "$_asp_pr" author "${_asp_author:--}" rail "$_asp_rail" reason "not-owner"
+  return 1
+}
+
 # _watcher_tick_fields / _prs_fetch_tick — moved to work-units/git-pr.sh (HERD-398, Phase 3 work-unit
 # extraction).
 
@@ -18289,7 +18412,7 @@ _tick_render_reconcile() {
   DISPLAY=()
   FLAIR_STATE=()   # HERD-147: parallel to DISPLAY — one state-token per row for the pasture header
   CAND_IDX=(); CAND_DIR=(); CAND_SLUG=(); CAND_PR=(); CAND_BRANCH=(); CAND_SHA=()
-  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
+  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=(); CONF_AUTHOR=()
   # HERD-402: this tick's finish-stall verdict tally, fed into the throttled finish_stall_scan summary
   # once the FEATS loop below finishes classifying every builder.
   _FSS_ELIGIBLE=0; _FSS_RETASKED=0; _FSS_ESCALATED=0
@@ -18615,7 +18738,7 @@ EOF
     elif [ "$mergeable" = "CONFLICTING" ]; then
       # HERD-55: sha-keyed resolver dispatch — first conflict spawns; a new commit or a dead resolver
       # RE-spawns (bounded); an ESCALATE is terminal for the sha. Decides + queues via CONF_* arrays.
-      _classify_conflict "$i" "$prnum" "$slug" "$branch" "$headsha"
+      _classify_conflict "$i" "$prnum" "$slug" "$branch" "$headsha" "$prauthor"
       # HERD-231: whichever row that painted, a starving PR says so underneath it.
       _restale_decorate_row "$i" "$prnum"
     elif [ "$mergeable" = "MERGEABLE" ]; then
@@ -19256,10 +19379,31 @@ _intent_reground_closed() {
   [ "${_irc_parsed%%$'\t'*}" = "closed" ]
 }
 
+# _drain_lane_agent <claimed-path> — the SPECIALIST AGENT (HERD-667) an intent asked to be built with:
+# the first line of its `.agent` sidecar, re-validated here against the same definition-name grammar
+# the enqueue applied (a queue file is on disk between two processes, so the drain never trusts it
+# unvalidated). Empty for every ordinary intent — which is what keeps the launch below byte-identical.
+_drain_lane_agent() {
+  local _dla_f="${1%.req.mine}.agent" _dla_v=""
+  [ -f "$_dla_f" ] || return 0
+  _dla_v="$(sed -n 1p "$_dla_f" 2>/dev/null || true)"
+  case "$_dla_v" in ''|.*|-*|*/*|*[!0-9A-Za-z._-]*) return 0 ;; esac
+  printf '%s' "$_dla_v"
+}
+
 _drain_lane_worker() {
   local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5" _dlw_leased="${6:-}"
   local _dlw_out="" _dlw_rc=0 _dlw_bin="$HERE/herd-quick.sh"
   [ "$_dlw_lane" = "feature" ] && _dlw_bin="$HERE/herd-feature.sh"
+  # HERD-667: re-export the intent's specialist-agent name as HERD_AGENT so a QUEUED spawn selects the
+  # same agent a direct lane invocation would. Exported inside the command substitution's own subshell
+  # (never on the lane's argv) so an intent WITHOUT one leaves both branches' argv AND environment
+  # byte-identical — the same discipline the lease-handoff branch below is spelled out for.
+  # The `command -v` guard is the same shape the lever reads below use, and for the same reason: a
+  # live watcher always has the helper, but the hermetic tests extract THIS function alone — a missing
+  # helper must read as "no specialist agent" (the byte-identical path), silently, never as an error.
+  local _dlw_agent=""
+  command -v _drain_lane_agent >/dev/null 2>&1 && _dlw_agent="$(_drain_lane_agent "$_dlw_claimed")"
   # (The claim is bound to this worker's pid by the drain, synchronously, before the tick continues —
   # see `spawn-step.sh own` at the launch site. $BASHPID would let the worker do it itself, but bash
   # 3.2 — still macOS's /bin/bash — has no BASHPID, and the parent already holds the pid as `$!`.)
@@ -19275,9 +19419,11 @@ _drain_lane_worker() {
   # path a watcher takes with CAPACITY_BUDGET off — keeps byte-identically the argv AND environment it
   # had before this change.
   if [ "$_dlw_leased" = "1" ]; then
-    _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" HERD_AGENT_LEASE_HELD=1 bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+    _dlw_out="$(if [ -n "$_dlw_agent" ]; then export HERD_AGENT="$_dlw_agent"; fi
+                HERD_ITEM_REF="$_dlw_ref" HERD_AGENT_LEASE_HELD=1 bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
   else
-    _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+    _dlw_out="$(if [ -n "$_dlw_agent" ]; then export HERD_AGENT="$_dlw_agent"; fi
+                HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
   fi
   # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
   # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
