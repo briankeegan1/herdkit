@@ -46,7 +46,8 @@ case "$(_journal_file)" in "$T"/*) : ;; *) fail "journal path escapes the sandbo
 for fn in _sweep_gate_corpses _marker_write _marker_live _inflight_verified_live _health_pid_live \
           _health_heartbeat_file _heartbeat_fresh _health_key_from_inflight _health_dispatch_count_file \
           _health_bump_dispatch_count _health_redispatch_loop_note _health_inflight_boot_reconcile \
-          _health_inflight_file _health_dispatch_file _health_log_file _health_terminate_worker; do
+          _health_inflight_file _health_dispatch_file _health_log_file _health_terminate_worker \
+          _health_adopted_file; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
 done
 ok
@@ -70,17 +71,31 @@ printf 'progress line\n' > "$HB1"          # fresh mtime (just written)
 _health_pid_live "$INF1" || fail "leg1: dead pid + fresh heartbeat must read as live (adopted)"
 ok
 
+ADOPTED1="$(_health_adopted_file "$KEY1")"
 _sweep_gate_corpses
 [ -f "$INF1" ] || fail "leg2: adopted marker must NOT be reaped by the corpse sweep"
-[ -f "${INF1}.adopted" ] || fail "leg2: adopted marker must gain a .adopted sidecar"
+[ -f "$ADOPTED1" ] || fail "leg2: adopted marker must gain a .health-adopted-<key> sidecar"
 [ "$(jgrep 'health_inflight_adopted')" -ge 1 ] || fail "leg2: health_inflight_adopted must be journaled"
 [ "$(jgrep 'health_died')" -eq 0 ] || fail "leg2: adopted key must never journal health_died"
 ok
 
-# a second sweep tick must not re-journal the adoption (once-only guard).
+# PR #808 round-1 review regression: the adopted sidecar must NOT share the .health-inflight- prefix —
+# every OTHER companion file lives under its own distinct prefix precisely so this glob only ever
+# matches real markers. A sidecar that collided here was itself mis-walked as a marker (empty pid ->
+# treated as a corpse -> rm'd + a phantom health_died, and the once-only guard defeated every sweep).
+case "$ADOPTED1" in
+  "$TREES"/.health-inflight-*) fail "leg2: the adopted sidecar must NOT match the .health-inflight-* glob (was: $ADOPTED1)" ;;
+esac
+ok
+
+# a second sweep tick must not re-journal the adoption (once-only guard) — this is the DIRECT proof the
+# sidecar naming fix restores: before it, the sidecar itself was reaped as a phantom corpse every sweep,
+# which recreated it and re-journaled the adoption note every ~2 ticks.
 _N_ADOPT_BEFORE="$(jgrep 'health_inflight_adopted')"
 _sweep_gate_corpses
+[ -f "$INF1" ] || fail "leg2: the real marker must still be standing after a second sweep tick"
 [ "$(jgrep 'health_inflight_adopted')" -eq "$_N_ADOPT_BEFORE" ] || fail "leg2: adoption note must be once-only, not re-journaled every sweep"
+[ "$(jgrep 'health_died')" -eq 0 ] || fail "leg2: a second sweep must never phantom-reap the sidecar itself as a dead marker"
 ok
 
 # ── (1)+(2) GENUINE CORPSE: dead pid, STALE/absent heartbeat → reaped, health_died journaled ───────

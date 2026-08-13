@@ -19,8 +19,10 @@
 #   suite_inflight        — a REAL background worker is dispatched; its inflight marker is live
 #   wrapper_pid_lost       — the tracked pid is killed outright (simulating the wrapper's own exit)
 #   adopted_not_reaped     — the corpse sweep, seeing a fresh heartbeat, ADOPTS the marker: it survives,
-#                            gains a .adopted sidecar, and journals health_inflight_adopted (never
-#                            health_died)
+#                            gains a .health-adopted-<key> sidecar, and journals health_inflight_adopted
+#                            (never health_died)
+#   adopted_sidecar_outside_glob — a SECOND sweep tick never phantom-reaps the sidecar itself (it lives
+#                            outside the .health-inflight- prefix its own glob walks — PR #808 round-1)
 #   never_double_dispatch  — re-entering the gate while adopted dispatches NO second worker (dispatch
 #                            count stays 1, no second healthcheck_started)
 #   adoption_not_forever   — once the heartbeat itself goes stale (the surrogate "real work" stops), the
@@ -148,10 +150,18 @@ sleep 0.3   # let at least one heartbeat land before the sweep runs
 
 # ═══ adopt, never reap, never double-dispatch ════════════════════════════════════════════════════
 step adopt "the corpse sweep must ADOPT the heartbeat-corroborated marker, not reap it"
+ADOPTED_SIDECAR="$(_health_adopted_file "$KEY")"
 _sweep_gate_corpses
 assert adopted_not_reaped \
-  $([ -f "$INF" ] && [ -f "${INF}.adopted" ] && jhas 'health_inflight_adopted' && ! jhas 'health_died' && echo 0 || echo 1) \
-  "marker survives · .adopted sidecar present · health_inflight_adopted journaled · no health_died"
+  $([ -f "$INF" ] && [ -f "$ADOPTED_SIDECAR" ] && jhas 'health_inflight_adopted' && ! jhas 'health_died' && echo 0 || echo 1) \
+  "marker survives · .health-adopted-<key> sidecar present · health_inflight_adopted journaled · no health_died"
+
+# PR #808 round-1 review regression: a SECOND sweep must not phantom-reap the sidecar itself (it must
+# never share the .health-inflight- prefix its own glob walks).
+_sweep_gate_corpses
+assert adopted_sidecar_outside_glob \
+  $([ -f "$INF" ] && ! jhas 'health_died' && echo 0 || echo 1) \
+  "a second sweep tick left the real marker standing and journaled no phantom health_died"
 
 DISPLAY=(); _HC_RESULT=""
 _healthcheck_gate "$PR" "$SLUG" "$WT" 0 "$SHA"

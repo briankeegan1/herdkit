@@ -10891,7 +10891,7 @@ _collect_main_health() {
     local _cm_elapsed; _cm_elapsed="$(_marker_age "$(_health_inflight_file "main-$_cm_sha")")"
     case "$_cm_elapsed" in ''|-1|*[!0-9]*) : ;; *) _phase_anomaly_observe main_health_suite "main-health suite" "$_cm_elapsed" ;; esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" \
-          "$(_main_health_retry_file "$_cm_sha")" "$(_health_inflight_file "main-$_cm_sha").adopted" \
+          "$(_main_health_retry_file "$_cm_sha")" "$(_health_adopted_file "main-$_cm_sha")" \
           "$(_health_dispatch_count_file "main-$_cm_sha")" 2>/dev/null || true
     lifecycle_retire health-worker "main-$_cm_sha" collected   # HERD-193 RETIRE: verdict routed
   done
@@ -10943,7 +10943,7 @@ _health_inflight_boot_reconcile() {
       continue
     fi
     if _health_terminate_worker "$f"; then
-      rm -f "$f" "$(_health_dispatch_file "$rest")" "${f}.adopted" \
+      rm -f "$f" "$(_health_dispatch_file "$rest")" "$(_health_adopted_file "$rest")" \
         "$(_health_dispatch_count_file "$rest")" 2>/dev/null || true
       journal_append infra_event component agent-watch reason health_inflight_boot_orphan_reaped key "$rest"
       declare -f lifecycle_retire >/dev/null 2>&1 && lifecycle_retire health-worker "$rest" boot-orphan
@@ -16439,6 +16439,18 @@ _health_key_from_inflight() { printf '%s' "${1##*/.health-inflight-}"; }
 # engines/seats.
 _health_dispatch_count_file() { printf '%s' "$TREES/.health-dispatch-count-$1"; }
 
+# _health_adopted_file <key> — the once-only guard sidecar for a HEARTBEAT-ADOPTED marker (HERD-736 leg
+# 2). Deliberately OUTSIDE the `.health-inflight-` prefix (review finding, PR #808 round 1): every OTHER
+# companion in this family already lives under its own distinct prefix (`.health-dispatch-`,
+# `.health-log-`, `.health-result-`, `.health-dispatch-count-`) precisely so `.health-inflight-*` keeps
+# matching ONLY real markers — a sidecar named `<inflight-file>.adopted` would have been the first one
+# to violate that, and both glob loops that walk `.health-inflight-*` with a MUTATING side effect
+# (_sweep_gate_corpses, _health_inflight_boot_reconcile) would then misread the empty sidecar itself as
+# a dead marker: rm it (defeating the once-only guard it exists to be — the adoption note would then
+# repeat every sweep) and journal a phantom `health_died`/`health_inflight_boot_orphan_reaped` for a
+# worker that never existed.
+_health_adopted_file() { printf '%s' "$TREES/.health-adopted-$1"; }
+
 # _health_bump_dispatch_count <key> — increment (or create at 1) the counter and print the NEW value.
 # Best-effort/fail-soft to "1" on any read fault: under-counting only costs one missed loud event, never
 # a false one.
@@ -17208,8 +17220,8 @@ _healthcheck_gate() {
       *) _health_duration_record "$_hg_elapsed"
          _phase_anomaly_observe healthcheck "health-check" "$_hg_elapsed" ;;   # HERD-496
     esac
-    rm -f "$_hg_disp" "$_hg_inflight" "${_hg_inflight}.adopted" "$(_health_dispatch_count_file "$_hg_key")" \
-      2>/dev/null || true
+    rm -f "$_hg_disp" "$_hg_inflight" "$(_health_adopted_file "$_hg_key")" \
+      "$(_health_dispatch_count_file "$_hg_key")" 2>/dev/null || true
     lifecycle_retire health-worker "$_hg_key" collected     # HERD-193 RETIRE: result consumed
     return 0
   fi
@@ -17375,7 +17387,7 @@ _sweep_gate_corpses() {
   # + idempotent); a CONCURRENT one corrupts the retry ledger and the infra breaker.
   _gate_corpse_claim || return 0
   trap '_gate_corpse_release' RETURN
-  local f base rest pr sha age pid _sw_margin _sw_timeout _sw_early _sw_log
+  local f base rest pr sha age pid _sw_margin _sw_timeout _sw_early _sw_log _sw_adopted_f
   # ── review family: .review-inflight-<pr>-<sha> ──
   for f in "$TREES"/.review-inflight-*; do
     [ -e "$f" ] || continue
@@ -17423,11 +17435,13 @@ _sweep_gate_corpses() {
         # own pid can legitimately exit while the suite subtree it started keeps running). There is no
         # pid left to signal, so leave the marker exactly as-is (a later tick re-checks it fresh, and
         # the collector still consumes its eventual nonce-matched result) — NEVER treat this as a
-        # corpse, and NEVER let a sibling dispatch start over it. Journal ONCE (a `.adopted` sidecar
-        # keys the once-only guard, cleared by the collector alongside the marker) so a standing
-        # adoption stays visible instead of silently repeating every tick.
-        if [ ! -f "${f}.adopted" ]; then
-          : > "${f}.adopted" 2>/dev/null || true
+        # corpse, and NEVER let a sibling dispatch start over it. Journal ONCE (a `.health-adopted-<key>`
+        # sidecar — DELIBERATELY outside the `.health-inflight-` prefix, see _health_adopted_file's own
+        # docstring — keys the once-only guard, cleared by the collector alongside the marker) so a
+        # standing adoption stays visible instead of silently repeating every tick.
+        _sw_adopted_f="$(_health_adopted_file "$rest")"
+        if [ ! -f "$_sw_adopted_f" ]; then
+          : > "$_sw_adopted_f" 2>/dev/null || true
           journal_append infra_event component agent-watch reason health_inflight_adopted key "$rest"
         fi
         _health_lifecycle_spawn_once "$f" "$rest"
@@ -17484,7 +17498,7 @@ _sweep_gate_corpses() {
         journal_append infra_event component agent-watch reason health_timeout key "$rest" age "$age"
       fi
     else
-      rm -f "$f" "$(_health_dispatch_file "$rest")" "${f}.adopted" 2>/dev/null || true
+      rm -f "$f" "$(_health_dispatch_file "$rest")" "$(_health_adopted_file "$rest")" 2>/dev/null || true
       journal_append infra_event component agent-watch reason health_died key "$rest"
       declare -f lifecycle_retire >/dev/null 2>&1 && lifecycle_retire health-worker "$rest" severed
     fi

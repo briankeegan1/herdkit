@@ -1226,6 +1226,12 @@ class LiveState:
         # actually launched a given worker.
         return self._p(".health-dispatch-count-%s" % self._health_key(cand))
 
+    def health_adopted_file(self, cand):
+        # HERD-736 leg 2: SAME filename agent-watch.sh's `_health_adopted_file` writes — see its
+        # docstring for why this lives OUTSIDE the `.health-inflight-` prefix (PR #808 round-1 review:
+        # a sidecar sharing that prefix was mis-walked as a marker by the corpse sweep's own glob).
+        return self._p(".health-adopted-%s" % self._health_key(cand))
+
     def health_cached_verdict(self, cand):
         """The TERMINAL health verdict cached for this exact head sha — reuse with no suite re-run
         (agent-watch.sh:10237). The cache line is ``<verdict>\\t<detail>``; verdict ∈ CLEAN|FLAKY|CODEERROR."""
@@ -3396,7 +3402,7 @@ class LiveGates:
                     # exact tick observed it under, so a later tick can tell whether the operator has
                     # since released a changed gate posture — see gate_config_generation's docstring.
                     st.record_health_generation(cand, D.gate_config_generation(self.config))
-                    st.rm(disp, inflight, (inflight + ".adopted") if inflight else None,
+                    st.rm(disp, inflight, st.health_adopted_file(cand),
                           st.health_dispatch_count_file(cand))
                     return verdict
                 # Nonce matched but the payload is unparseable / truncated → an infra death, NOT a verdict;
