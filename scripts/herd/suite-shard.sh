@@ -47,13 +47,18 @@
 #   order — and the last is the one that makes the other three safe:
 #     (1) PAIRING (the gate-coverage convention, HERD-292): a changed scripts/herd/<name>.sh selects
 #         its paired tests/test-<name>.sh. A changed tests/test-<name>.sh selects itself.
-#     (2) DOCS MAPPING (HERD-733): README.md, any docs/** path, and any other top-level *.md file
-#         (never one under tests/, which rule (1) already governs) selects the enumerated
-#         doc-drift/caps-sync/conformance lint tests (HERD_SUITE_DOCS_LINT_TESTS below) instead of
-#         falling through to FAIL-CLOSED. A documentation-only diff cannot break engine logic, but it
-#         CAN drift out of sync with the manifest those lints check docs against — this is the fix for
-#         the regression PR #800 exposed: a docs-only PR ran the full ~350-test suite (12.3m) because
-#         README.md/docs/*.md paths matched no PAIRING/DECLARED-DEPS rule and fell through to (4).
+#     (2) DOCS MAPPING (HERD-733): README.md, any docs/** path, and any other *.md file AT ANY DEPTH
+#         (never one under tests/, which rule (1) already governs — the case pattern below is NOT
+#         restricted to the repo root) selects the enumerated doc-drift/caps-sync/conformance lint
+#         tests (HERD_SUITE_DOCS_LINT_TESTS below) instead of falling through to FAIL-CLOSED. A
+#         documentation-only diff cannot break engine logic, but it CAN drift out of sync with the
+#         manifest those lints check docs against — this is the fix for the regression PR #800
+#         exposed: a docs-only PR ran the full ~350-test suite (12.3m) because README.md/docs/*.md
+#         paths matched no PAIRING/DECLARED-DEPS rule and fell through to (4). A curated test that
+#         asserts on a SPECIFIC doc's real content (test-driver-abstraction.sh on
+#         docs/driver-abstraction.md, test-map.sh on docs/control-room-map.md) is NOT covered by the
+#         three enumerated lints — those tests declare their own `# suite-deps:` header (rule (3)
+#         below) so a diff to the doc they assert on still unions them in.
 #     (3) DECLARED DEPS: a test may declare cross-file coverage with a
 #             # suite-deps: <path-or-glob> [<path-or-glob>…]
 #         header line. Any changed path matching a token selects that test. This is how a test that
@@ -278,7 +283,7 @@ herd_suite_tests_for_diff() {
         esac ;;
     esac
 
-    # (2) DOCS MAPPING (HERD-733): README.md, any docs/** path, and any other top-level *.md file
+    # (2) DOCS MAPPING (HERD-733): README.md, any docs/** path, and any other *.md file at any depth
     # select the enumerated doc-lint tests. A path under tests/ is excluded here — a *.md fixture or
     # helper living in tests/ is governed by rule (1)/(3), never reclassified as a doc.
     case "$_hsd_p" in

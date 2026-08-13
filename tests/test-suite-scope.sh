@@ -35,12 +35,18 @@
 #   (6)  FAIL-CLOSED, unmappable: a path no rule maps (a nested backend, a template, a Python module)
 #        selects the curated set EXACTLY — and it does so even when it is mixed in with a perfectly
 #        mappable path, so one unprovable file in a diff re-arms the whole suite.
-#   (6b) HERD-733 DOCS MAPPING: README.md / docs/** / a top-level *.md select the enumerated
-#        doc-drift/caps-sync/conformance lint tests + the always-run core — NOT the full curated set
-#        (the PR #800 regression this ships to fix: a docs-only diff used to fail closed to the whole
-#        ~350-test suite).
+#   (6b) HERD-733 DOCS MAPPING: README.md / docs/** / any other *.md (any depth, outside tests/)
+#        select the enumerated doc-drift/caps-sync/conformance lint tests + the always-run core — NOT
+#        the full curated set (the PR #800 regression this ships to fix: a docs-only diff used to fail
+#        closed to the whole ~350-test suite). A test that asserts on one specific doc's real content
+#        (test-driver-abstraction.sh, test-map.sh) instead declares its own `# suite-deps:` header, so
+#        it is unioned in on top of the enumerated lints rather than being covered by them.
 #   (6c) HERD-733 MIXED: a docs path beside a mapped code path selects the UNION — doc-lint + core +
 #        the paired test — never a fail-closed full run.
+#   (6d) HERD-733 DOC-CONTENT COVERAGE: a curated test that asserts on one SPECIFIC doc's real
+#        content (test-driver-abstraction.sh on docs/driver-abstraction.md, test-map.sh on
+#        docs/control-room-map.md) is not one of the enumerated doc-lint tests, so it must declare its
+#        own `# suite-deps:` header — a diff to the doc it asserts on still selects it.
 #   (7)  NO CHANGED PATHS AT ALL → the curated set (the same thorough-side default healthcheck.sh
 #        uses when it cannot tell what changed).
 #   (8)  A changed tests/test-<name>.sh selects ITSELF.
@@ -199,7 +205,7 @@ mixed="$(herd_suite_tests_for_diff "$ROOT/tests" scripts/herd/journal.sh pysrc/h
   || fail "(6) ONE unmappable path in a diff must re-arm the whole suite, even beside a mapped path"
 ok "(6) an unmappable path selects everything, and re-arms the whole suite when mixed with a mapped one"
 
-# ── (6b) DOCS MAPPING (HERD-733): README.md / docs/** / a top-level *.md select the doc-drift/
+# ── (6b) DOCS MAPPING (HERD-733): README.md / docs/** / any other *.md (any depth) select the doc-drift/
 # caps-sync/conformance lint tests + the always-run core — NOT the full curated set. This is the fix
 # for the PR #800 regression: a docs-only PR ran the full ~350-test suite because README.md/docs/*.md
 # paths matched no PAIRING/DECLARED-DEPS rule and fell through to FAIL-CLOSED.
@@ -219,7 +225,7 @@ $docs_expected"
   [ "$got" != "$CURATED" ] \
     || fail "(6b) docs path '$p' must NOT fail closed to the entire curated set (the HERD-733 regression)"
 done
-ok "(6b) a docs-only diff (README.md / docs/**/*.md / a top-level *.md) selects exactly the doc-lint tests + core, never the full suite"
+ok "(6b) a docs-only diff (README.md / docs/**/*.md / any other *.md at any depth) selects exactly the doc-lint tests + core, never the full suite"
 
 # ── (6c) MIXED docs + a mapped code path → UNION, never fail-closed ────────────────────────────────
 mixed_docs="$(herd_suite_tests_for_diff "$ROOT/tests" scripts/herd/journal.sh README.md)"
@@ -232,6 +238,25 @@ $mixed_expected"
 [ "$mixed_docs" != "$CURATED" ] \
   || fail "(6c) a mixed docs+code diff must not fail closed to the entire curated set"
 ok "(6c) a docs path mixed with a mapped code path selects the UNION (doc-lint + core + the paired test), not the full suite"
+
+# ── (6d) DOC-CONTENT COVERAGE (HERD-733 review fix): a curated test that asserts on one SPECIFIC
+# doc's real content must NOT be dropped by the docs-mapping narrowing. test-driver-abstraction.sh
+# greps the real docs/driver-abstraction.md and test-map.sh greps the real docs/control-room-map.md;
+# neither is one of the three enumerated doc-lint tests nor in the always-run core, so each declares
+# its own `# suite-deps:` header (rule (3)) — proving the union actually restores them, not just that
+# the header exists in the source.
+for pair in "docs/driver-abstraction.md:test-driver-abstraction.sh" "docs/control-room-map.md:test-map.sh"; do
+  doc="${pair%%:*}"; want_test="${pair##*:}"
+  has "$CURATED" "$want_test" || fail "(6d) fixture assumption broken: $want_test is not in the curated set"
+  got="$(herd_suite_tests_for_diff "$ROOT/tests" "$doc")"
+  has "$got" "$want_test" \
+    || fail "(6d) a diff to $doc did NOT select $want_test — a docs-scoped diff would let its real-content assertions silently stop running.
+--- got ---
+$got"
+  [ "$got" != "$CURATED" ] \
+    || fail "(6d) $doc must not fail closed to the entire curated set — it is docs-mapped + suite-deps-covered, not unmappable"
+done
+ok "(6d) a diff to a doc a curated test asserts on by real content still selects that test, via its own suite-deps header"
 
 # ── (7) no changed paths at all → the curated set ──────────────────────────────────────────────────
 [ "$(herd_suite_tests_for_diff "$ROOT/tests")" = "$CURATED" ] \
