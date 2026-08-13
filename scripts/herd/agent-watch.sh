@@ -12131,29 +12131,53 @@ _active_resolve_note() {
   printf 'resolving · awaiting push'
 }
 
+# _refix_ledger_note <pr#> <headSha> <slug> <kind> — the LEDGER-ONLY leg of the shared row-truth check:
+# print the in-progress phrase and return 0 iff a bounce was RECORDED for this exact (pr,sha,kind) and
+# not disproved by a stuck marker or a positively dead/missing agent afterward. Factored out of
+# _active_fix_note (below) so a caller can consult ONE rail's recorded evidence without also inheriting
+# that function's generic "agent happens to be working" RESCUE clause (b) — that clause is sound only
+# when the caller already knows THIS rail has a red (every existing caller checks a hold before ever
+# reaching it); a caller reusing it blind, like the conflict fallback below, would claim progress on a
+# rail that was never actually held, off nothing but an unrelated busy agent.
+_refix_ledger_note() {
+  local _rln_pr="$1" _rln_sha="$2" _rln_slug="$3" _rln_kind="$4" _rln_rounds
+  refix_attempted "$_rln_pr" "$_rln_sha" "$_rln_kind" \
+    && ! _refix_stuck_seen "$_rln_pr" "$_rln_sha" "$_rln_kind" || return 1
+  # A bounce was delivered and not disproved by a stuck marker. One more disproof: the agent may have
+  # DIED after the wake. Only a POSITIVE dead/missing overturns the record ('unknown' keeps the row).
+  case "$(_agent_liveness "$_rln_slug")" in
+    dead|missing) return 1 ;;
+  esac
+  # k/cap is THIS RAIL's budget (HERD-229) — the row names the rail's red, so the number beside it must
+  # be that rail's rounds, not the PR's lifetime total across every rail.
+  _rln_rounds="$(refix_rail_count "$_rln_pr" "$_rln_kind")"
+  printf 'fix in progress · awaiting push (round %s/%s)' "${_rln_rounds:-1}" "$(refix_rail_cap)"
+}
+
 # _active_fix_note <pr#> <headSha> <slug> <kind> — print the in-progress phrase and return 0 when an
 # agent is on this red; print nothing and return 1 when nobody is.
 _active_fix_note() {
-  local _afn_pr="$1" _afn_sha="$2" _afn_slug="$3" _afn_kind="$4" _afn_rounds _afn_live
-  # kind=conflict: the work-in-flight is a RESOLVER, and the refix ledger below knows nothing about it.
+  local _afn_pr="$1" _afn_sha="$2" _afn_slug="$3" _afn_kind="$4" _afn_note
+  # kind=conflict: the work-in-flight is usually a RESOLVER, and the refix ledger below (kind=conflict)
+  # knows nothing about it. But GitHub's `mergeable` flips to CONFLICTING for a PR the stale-dup gate is
+  # ALSO holding (kind=stale-base) the instant the base moves far enough that the old diff no longer
+  # applies textually — and the classifier below dispatches on `mergeable` alone, so it can land on this
+  # conflict branch while a stale-base refix bounce is still live (HERD-678: "needs you · conflict" was
+  # observed within a second of a stale bounce landing with woke=1, agent working). A resolver check
+  # alone is blind to that in-flight builder work, so fall back to the SAME shared ledger evidence the
+  # stale row itself trusts (via _refix_ledger_note, never the generic rescue clause below, which would
+  # false-claim progress from an unrelated busy agent) before painting needs-you.
   if [ "$_afn_kind" = "conflict" ]; then
-    _active_resolve_note "$_afn_slug"
-    return $?
+    _active_resolve_note "$_afn_slug" && return 0
+    if _afn_note="$(_refix_ledger_note "$_afn_pr" "$_afn_sha" "$_afn_slug" stale)"; then
+      printf '%s' "${_afn_note/fix in progress/rebasing}"
+      return 0
+    fi
+    return 1
   fi
-  if refix_attempted "$_afn_pr" "$_afn_sha" "$_afn_kind" \
-     && ! _refix_stuck_seen "$_afn_pr" "$_afn_sha" "$_afn_kind"; then
-    # A bounce was delivered and not disproved by a stuck marker. One more disproof: the agent may have
-    # DIED after the wake. Only a POSITIVE dead/missing overturns the record ('unknown' keeps the row).
-    _afn_live="$(_agent_liveness "$_afn_slug")"
-    case "$_afn_live" in
-      dead|missing) : ;;
-      *)
-        # k/cap is THIS RAIL's budget (HERD-229) — the row names the rail's red, so the number beside
-        # it must be that rail's rounds, not the PR's lifetime total across every rail.
-        _afn_rounds="$(refix_rail_count "$_afn_pr" "$_afn_kind")"
-        printf 'fix in progress · awaiting push (round %s/%s)' "${_afn_rounds:-1}" "$(refix_rail_cap)"
-        return 0 ;;
-    esac
+  if _afn_note="$(_refix_ledger_note "$_afn_pr" "$_afn_sha" "$_afn_slug" "$_afn_kind")"; then
+    printf '%s' "$_afn_note"
+    return 0
   fi
   # (b) — also the RESCUE path: a human who re-tasks a builder whose bounce got stuck flips it back to
   # "working", and the row must stop shouting "needs you" again.
