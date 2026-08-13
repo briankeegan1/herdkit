@@ -4347,6 +4347,144 @@ class TestSlugDerivation(unittest.TestCase):
         self.assertTrue(cands[0].hv_body_pooled)
 
 
+class TestPrFetchUnifyCache(unittest.TestCase):
+    """HERD-675: unify the per-tick PR-list fetch. Python is the FETCH OWNER — `discover_via_graphql`
+    writes its raw roster to a tick-scoped, seat-stamped cache the bash render leg's `_prs_fetch_tick`
+    (git-pr.sh) reads instead of paying its own `gh pr list` round-trip. Proves the lever both ways
+    (AGENTS.md): PR_FETCH_UNIFY off is a hard no-op (byte-identical — no file is ever written); on
+    writes an atomic, correctly-shaped cache a bash consumer can project fields out of."""
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in
+                        ("TREES", "WORKTREES_DIR", "PR_FETCH_UNIFY", "HERD_ENGINE_SEAT_ID")}
+        for k in self._saved:
+            os.environ.pop(k, None)
+        self.pool = tempfile.mkdtemp()
+        os.environ["TREES"] = self.pool
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    _PAYLOAD = {"data": {"repository": {"pullRequests": {"nodes": [
+        {"number": 500, "title": "unify the fetch", "headRefName": "feat/unify",
+         "headRefOid": "cafefeed", "baseRefName": "main", "mergeable": "MERGEABLE",
+         "mergeStateStatus": "CLEAN", "reviewDecision": "REVIEW_REQUIRED", "isDraft": False,
+         "body": "HUMAN-VERIFY:\n- nothing\n", "author": {"login": "brian"},
+         "assignees": {"nodes": [{"login": "sam"}]}, "labels": {"nodes": [{"name": "bug"}]}},
+        {"number": 501, "title": "wip draft", "headRefName": "feat/wip", "headRefOid": "deadc0de",
+         "baseRefName": "main", "mergeable": "UNKNOWN", "mergeStateStatus": "UNKNOWN",
+         "reviewDecision": "", "isDraft": True, "body": "", "author": {"login": "brian"},
+         "assignees": {"nodes": []}, "labels": {"nodes": []}},
+    ]}}}}
+
+    def _discover(self):
+        class _Stub:
+            def run(self, *a, **k):
+                class R:
+                    stdout = json.dumps(TestPrFetchUnifyCache._PAYLOAD)
+                return R()
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            return LR.discover_via_graphql(repo="owner/name")
+        finally:
+            LR.subprocess = orig
+
+    def test_gate_default_off(self):
+        self.assertFalse(LR._pr_fetch_unify_enabled())
+        for v in ("off", "OFF", "", "0", "no", "garbage"):
+            os.environ["PR_FETCH_UNIFY"] = v
+            self.assertFalse(LR._pr_fetch_unify_enabled(), v)
+
+    def test_gate_recognized_on_spellings(self):
+        for v in ("on", "ON", "true", "TRUE", "1", "yes", "YES"):
+            os.environ["PR_FETCH_UNIFY"] = v
+            self.assertTrue(LR._pr_fetch_unify_enabled(), v)
+
+    def test_off_never_writes_a_cache_file(self):
+        # SHIP-DORMANT: the default (unset) lever must leave the pool byte-identical — no new file.
+        self._discover()
+        self.assertEqual(os.listdir(self.pool), [])
+
+    def test_on_writes_an_atomic_cache_with_no_leftover_tmp_file(self):
+        os.environ["PR_FETCH_UNIFY"] = "on"
+        os.environ["HERD_ENGINE_SEAT_ID"] = "seat-alpha"
+        self._discover()
+        entries = os.listdir(self.pool)
+        self.assertEqual(entries, [".pr-list-cache-seat-alpha.json"])   # no ".NNNN.tmp" survivor
+
+    def test_cache_includes_drafts_unfiltered(self):
+        # Bash's own `gh pr list` fetch never filters drafts at fetch time either — only downstream —
+        # so the cache must carry BOTH PRs even though discover_via_graphql's own `cands` return value
+        # (LiveCandidate list) skips the draft.
+        os.environ["PR_FETCH_UNIFY"] = "on"
+        cands = self._discover()
+        self.assertEqual([c.pr for c in cands], ["500"])   # the draft never becomes a candidate
+
+        with open(LR._pr_fetch_cache_path(), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertEqual(sorted(p["number"] for p in doc["prs"]), [500, 501])
+
+    def test_cache_row_shapes_match_gh_pr_list_json(self):
+        # author/assignees/labels must be gh's OWN REST-json shapes (flat objects/lists), not
+        # GraphQL's {"nodes": [...]} connection wrapper — bash's login()/has_label() readers
+        # (agent-watch.sh) assume the flat shape.
+        os.environ["PR_FETCH_UNIFY"] = "on"
+        self._discover()
+        with open(LR._pr_fetch_cache_path(), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        row = next(p for p in doc["prs"] if p["number"] == 500)
+        self.assertEqual(row["title"], "unify the fetch")
+        self.assertEqual(row["headRefName"], "feat/unify")
+        self.assertEqual(row["headRefOid"], "cafefeed")
+        self.assertEqual(row["mergeable"], "MERGEABLE")
+        self.assertEqual(row["mergeStateStatus"], "CLEAN")
+        self.assertEqual(row["baseRefName"], "main")
+        self.assertEqual(row["reviewDecision"], "REVIEW_REQUIRED")
+        self.assertIs(row["isDraft"], False)
+        self.assertEqual(row["body"], "HUMAN-VERIFY:\n- nothing\n")
+        self.assertEqual(row["author"], {"login": "brian"})
+        self.assertEqual(row["assignees"], [{"login": "sam"}])
+        self.assertEqual(row["labels"], [{"name": "bug"}])
+
+    def test_written_at_is_current_epoch(self):
+        os.environ["PR_FETCH_UNIFY"] = "on"
+        before = int(time.time())
+        self._discover()
+        after = int(time.time())
+        with open(LR._pr_fetch_cache_path(), encoding="utf-8") as fh:
+            doc = json.load(fh)
+        self.assertTrue(before <= doc["written_at"] <= after, doc["written_at"])
+
+    def test_cache_path_is_seat_stamped_and_sanitized(self):
+        os.environ["HERD_ENGINE_SEAT_ID"] = "host.name:1234/weird chars"
+        path = LR._pr_fetch_cache_path()
+        self.assertTrue(path.startswith(self.pool))
+        self.assertNotIn("/", os.path.basename(path).replace(".json", "")[len(".pr-list-cache-"):])
+        self.assertNotIn(" ", path)
+
+    def test_cache_path_falls_back_to_solo_seat(self):
+        os.environ.pop("HERD_ENGINE_SEAT_ID", None)
+        self.assertEqual(os.path.basename(LR._pr_fetch_cache_path()), ".pr-list-cache-solo.json")
+
+    def test_cache_path_empty_without_a_pool(self):
+        os.environ.pop("TREES", None)
+        os.environ.pop("WORKTREES_DIR", None)
+        self.assertEqual(LR._pr_fetch_cache_path(), "")
+
+    def test_write_failure_is_fail_soft(self):
+        # An unwritable pool must never raise out of discover_via_graphql — the candidate walk this
+        # call produces is the load-bearing return value; a cache write is a pure side effect.
+        os.environ["PR_FETCH_UNIFY"] = "on"
+        os.environ["TREES"] = os.path.join(self.pool, "does", "not", "exist")
+        cands = self._discover()   # must not raise
+        self.assertEqual([c.pr for c in cands], ["500"])
+
+
 class TestDraftPRDiscovery(unittest.TestCase):
     """HERD-374: draft PRs must be skipped at discovery and never reach the merge actuator.
     Parity target: agent-watch.sh ~line 1805 `if pr.get("isDraft"): continue`."""

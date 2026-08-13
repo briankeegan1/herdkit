@@ -2249,6 +2249,114 @@ def _resume_jitter_seconds(workspace):
 
 # ── discovery: where candidates come from ─────────────────────────────────────────────────────────
 
+# HERD-675: unify the per-tick PR-list fetch. Before this, the bash render leg (`_prs_fetch_tick`,
+# `gh pr list --json ...`, scripts/herd/work-units/git-pr.sh) and this module's own `discover_via_graphql`
+# (`gh api graphql`) each independently fetched the full open-PR roster every tick — HERD-671 pooled and
+# throttled both, but deliberately left the two transports separate. This module is the richer schema
+# (GraphQL already carries body/baseRefName/reviewDecision/isDraft in one round-trip, and now title/
+# mergeable too — see the query in `discover_via_graphql`), so it is the FETCH OWNER: every successful
+# graphql discovery writes its raw roster to a tick-scoped, seat-stamped cache file in the worktree pool
+# (`_write_pr_fetch_cache`), and the bash leg reads a projected view of it instead of paying its own
+# `gh pr list` round-trip WHEN that cache is still fresh (`_pr_fetch_cache_read` in git-pr.sh) — falling
+# back to its own live fetch, byte-identical to before this task, whenever the cache is missing or stale.
+#
+# ORDERING CAVEAT (load-bearing finding, journaled via `herd note` at build time): within one bash
+# watcher tick, `_prs_fetch_tick` runs BEFORE this module is even invoked (`_tick_render_reconcile` calls
+# it, then later calls `_engine_tick_watchdog` → `herd_engine_live_tick` → `python3 -m herd.live_runtime
+# --tick` → here) — see `_watcher_remote_tick_due`'s docstring in agent-watch.sh. So bash can never
+# consume THIS tick's cache; it consumes the PREVIOUS tick's, and `_pr_fetch_cache_max_age_secs()`
+# (git-pr.sh) sizes the freshness bound to span that one-tick gap. The very first due tick after a
+# restart (no cache written yet) still pays two independent fetches, exactly as today; every steady-
+# state due tick after that pays exactly one.
+#
+# SHIP-DORMANT: PR_FETCH_UNIFY defaults off. Off, `_write_pr_fetch_cache` is a hard no-op — no file is
+# ever written — and bash's own reader never even attempts a cache read, so behavior (and the `gh`
+# round-trip count) is byte-identical to before this task on both legs.
+
+def _pr_fetch_unify_enabled():
+    """PR_FETCH_UNIFY: on | off (default off, ship-dormant) — mirrors git-pr.sh's own
+    ``_pr_fetch_unify_enabled`` EXACTLY (same key, same accepted spellings) so bash and python can never
+    disagree about whether the unified cache is active."""
+    return str(os.environ.get("PR_FETCH_UNIFY", "") or "off").strip().lower() in (
+        "1", "true", "on", "yes", "enable", "enabled")
+
+
+def _pr_fetch_cache_seat():
+    """This seat's id for the cache filename. ``HERD_ENGINE_SEAT_ID`` is what
+    ``herd_engine_live_tick`` (engine-version.sh) passes as an explicit env override on every real
+    tick — bash's own already-resolved ``herd_engine_seat_id`` (WATCHER_OWNER → WATCHER_VIEW_AUTHOR →
+    host:pid) — so the SAME seat computes the SAME cache path on both sides without this module needing
+    its own identity resolver. Falls back to ``"solo"`` for a standalone/test invocation with no seat
+    plumbed in (never crashes; a project that never sees more than one seat never notices). Sanitized to
+    filesystem-safe characters so a garbled/adversarial env value can never escape the pool directory."""
+    seat = os.environ.get("HERD_ENGINE_SEAT_ID") or "solo"
+    return "".join(c if (c.isalnum() or c in "_.-") else "_" for c in seat) or "solo"
+
+
+def _pr_fetch_cache_path():
+    """``$TREES/.pr-list-cache-<seat>.json`` — ``""`` (no cache, fail-soft) when the pool is
+    unresolved, mirroring every other pooled-file path in this module (``_pool_dir``)."""
+    pool = _pool_dir()
+    return os.path.join(pool, ".pr-list-cache-%s.json" % _pr_fetch_cache_seat()) if pool else ""
+
+
+def _pr_fetch_cache_row(node):
+    """Project one raw GraphQL PR node into the ``gh pr list --json ...``-shaped object bash's
+    ``_pr_fetch_cache_read`` (git-pr.sh) projects fields out of — ``author``/``assignees``/``labels``
+    as the SAME `{"login": ...}` / list-of-`{"login": ...}` / list-of-`{"name": ...}` shapes `gh`'s own
+    REST-ish JSON uses (not GraphQL's `{"nodes": [...]}` connection wrapper), so bash's existing
+    `.get("login")` / `.get("name")` reads (agent-watch.sh's `login()`/`has_label()`) work unchanged
+    against a cached row exactly as they do against a live `gh pr list` row."""
+    return {
+        "number": node.get("number"),
+        "title": node.get("title") or "",
+        "headRefName": node.get("headRefName") or "",
+        "headRefOid": node.get("headRefOid") or "",
+        "mergeable": node.get("mergeable") or "",
+        "mergeStateStatus": node.get("mergeStateStatus") or "",
+        "baseRefName": node.get("baseRefName") or "",
+        "reviewDecision": node.get("reviewDecision") or "",
+        "isDraft": bool(node.get("isDraft")),
+        "body": node.get("body") or "",
+        "author": {"login": ((node.get("author") or {}).get("login") or "")},
+        "assignees": [{"login": (a or {}).get("login", "")} for a in
+                      ((node.get("assignees") or {}).get("nodes") or [])],
+        "labels": [{"name": (l or {}).get("name", "")} for l in
+                   ((node.get("labels") or {}).get("nodes") or [])],
+    }
+
+
+def _write_pr_fetch_cache(nodes):
+    """Write THIS tick's freshly-discovered PR-list roster (raw GraphQL nodes, INCLUDING drafts — bash's
+    own `gh pr list` fetch never filters drafts at fetch time either, only downstream) to the tick-
+    scoped, seat-stamped cache file the bash render leg's `_pr_fetch_cache_read` (git-pr.sh) reads.
+
+    SHIP-DORMANT: a hard no-op with ``PR_FETCH_UNIFY`` off (the default) — no file is ever written, so
+    the pool directory sees zero new bytes and bash's reader (itself gated on the same key) never even
+    looks. FAIL-SOFT: any write failure (unwritable pool, no disk, no ``$TREES``) is swallowed — a cache
+    write can never fail the discovery call that produced it, and a missing/corrupt cache just means
+    bash's next tick falls back to its own live fetch, exactly as if this function did not exist.
+    Atomic (temp file + ``os.replace``), the SAME pattern this module's ledger writers use
+    (e.g. ``LiveState.purge_pr_approvals``), so a reader can never observe a half-written cache."""
+    if not _pr_fetch_unify_enabled():
+        return
+    path = _pr_fetch_cache_path()
+    if not path:
+        return
+    payload = {
+        "written_at": int(time.time()),
+        "seat": _pr_fetch_cache_seat(),
+        "prs": [_pr_fetch_cache_row(n) for n in nodes if isinstance(n, dict)],
+    }
+    try:
+        tmp = path + ".%d.tmp" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def discover_via_graphql(repo=None, limit=50):
     """Discover open-PR candidates in ONE batched GraphQL round-trip (contract §6, spike §0.3).
 
@@ -2268,10 +2376,15 @@ def discover_via_graphql(repo=None, limit=50):
     # parity: LiveHoldSource.hv_body / agent-watch.sh's per-PR `gh pr view --json body`) never has to
     # spend its own per-PR call — see `hv_body_pooled` on LiveCandidate and `_resolve_hold_inputs`. One
     # extra scalar field on an already-batched query costs nothing extra in request count.
+    # HERD-675: `title` and `mergeable` ride along the SAME way — LiveCandidate itself never reads
+    # either (this port has no use for them), but they are the two fields the bash render leg's
+    # `_watcher_tick_fields()` needs that this query did not previously carry, and closing that gap is
+    # what lets `_write_pr_fetch_cache` below serve a genuine superset of both legs' needs. Still one
+    # request; still nothing bash-observable changes unless PR_FETCH_UNIFY actually turns the cache on.
     query = (
         "query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){"
-        "pullRequests(states:OPEN,first:$n){nodes{number headRefName mergeStateStatus "
-        "headRefOid baseRefName reviewDecision isDraft body author{login} "
+        "pullRequests(states:OPEN,first:$n){nodes{number title headRefName mergeStateStatus "
+        "headRefOid baseRefName mergeable reviewDecision isDraft body author{login} "
         "assignees(first:10){nodes{login}} labels(first:20){nodes{name}}}}}}"
     )
     owner, name = _repo_owner_name(repo)
@@ -2286,6 +2399,7 @@ def discover_via_graphql(repo=None, limit=50):
     data = json.loads(out.stdout)
     nodes = (((data.get("data") or {}).get("repository") or {})
              .get("pullRequests") or {}).get("nodes") or []
+    _write_pr_fetch_cache(nodes)  # HERD-675: ship-dormant, no-op unless PR_FETCH_UNIFY=on
     cands = []
     for node in nodes:
         if node.get("isDraft"):
