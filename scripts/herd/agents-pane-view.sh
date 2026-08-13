@@ -19,7 +19,7 @@
 # It never spawns, mutates, gates, or merges anything — a crash here can only blank this one pane.
 #
 # RENDER DISCIPLINE: reconciled from observed state on a SLOW tick (default 10s, override
-# AGENTS_PANE_POLL_SECS), re-painting only when the observed state OR the pane's width changed
+# AGENTS_PANE_VIEW_POLL_SECS), re-painting only when the observed state OR the pane's width changed
 # (mirrors backlog-view.sh's frame-latch + HERD-288 resize-repaint discipline, at a fraction of the
 # cost — a roster listing + two file reads, no glow, no backend poll).
 set -u
@@ -36,6 +36,10 @@ REPO="$PROJECT_ROOT"
 . "$HERE/agents.sh"    # herd_roster_* — functions only, no side effects
 # shellcheck source=/dev/null
 . "$HERE/driver.sh"    # herd_driver_name — functions only, no side effects
+# shellcheck source=/dev/null
+. "$HERE/theme.sh"     # herd_theme_load_console — the C_* palette (seam-conformance B3: every
+                       # themed color routes through here, never a raw ANSI literal)
+herd_theme_load_console
 
 last_frame=""
 
@@ -77,13 +81,13 @@ if [ -r "$AGENTS_PANE_VIEW_TTY" ]; then
 fi
 restore_tty() {
   [ -n "$saved_tty" ] && stty "$saved_tty" <"$AGENTS_PANE_VIEW_TTY" 2>/dev/null
-  printf '\033[?25h'
+  printf '\033[?25h'  # seam-lint-ok: cursor visibility, not a themed color (mirrors backlog-view.sh/task-spec-view.sh)
 }
 trap 'restore_tty; exit 0' INT TERM
 trap restore_tty EXIT
 if [ -n "$saved_tty" ]; then
   stty -echo -icanon <"$AGENTS_PANE_VIEW_TTY" 2>/dev/null
-  printf '\033[?25l'
+  printf '\033[?25l'  # seam-lint-ok: cursor visibility, not a themed color (mirrors backlog-view.sh/task-spec-view.sh)
 fi
 
 # _truncate <text> <width> — hard-truncate with a trailing ellipsis; this pane is narrow by design
@@ -101,9 +105,9 @@ _truncate() {
 # unverified · missing, or empty when never verified).
 _verdict_glyph() {
   case "$1" in
-    ok)                 printf '\033[32m✓\033[0m' ;;
-    unresolved|missing)  printf '\033[31m✗\033[0m' ;;
-    *)                   printf '\033[2m?\033[0m' ;;
+    ok)                  printf '%s✓%s' "$C_GREEN" "$C_RESET" ;;
+    unresolved|missing)  printf '%s✗%s' "$C_RED" "$C_RESET" ;;
+    *)                   printf '%s?%s' "$C_DIM" "$C_RESET" ;;
   esac
 }
 
@@ -143,11 +147,12 @@ render_frame() {
   local w="$1" drv names n=0 name f sha desc cached verdict tab
   tab="$(printf '\t')"
   clear
-  printf '\033[1;36m\xf0\x9f\x91\xa4 agents\033[0m \033[2m· %s\033[0m\n\n' "$(_truncate "$WORKSPACE_NAME" $((w-10)))"
+  printf '%s%s\xf0\x9f\x91\xa4 agents%s %s· %s%s\n\n' \
+    "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$(_truncate "$WORKSPACE_NAME" $((w-10)))" "$C_RESET"
   drv="$(herd_driver_name 2>/dev/null || printf 'herdr-claude')"
   names="$(herd_roster_names 2>/dev/null || true)"
   if [ -z "$names" ]; then
-    printf '\033[2m(no roster —\033[0m\n\033[2m herd agents new)\033[0m\n'
+    printf '%s(no roster —%s\n%s herd agents new)%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$C_RESET"
   else
     while IFS= read -r name; do
       [ -n "$name" ] || continue
@@ -161,23 +166,23 @@ render_frame() {
 $names
 EOF
   fi
-  printf '\n\033[1;35mbuilders\033[0m\n'
+  printf '\n%s%sbuilders%s\n' "$C_BOLD" "$C_BLUE" "$C_RESET"
   local ib bn=0
   ib="$(_in_flight_builders)"
   if [ -n "$ib" ]; then
     while IFS="$tab" read -r slug agent; do
       [ -n "$slug" ] || continue
       bn=$((bn+1))
-      printf ' %s\n \033[2m%s\033[0m\n' "$(_truncate "$slug" "$w")" "$(_truncate "${agent:-general}" "$w")"
+      printf ' %s\n %s%s%s\n' "$(_truncate "$slug" "$w")" "$C_DIM" "$(_truncate "${agent:-general}" "$w")" "$C_RESET"
     done <<EOF
 $ib
 EOF
   fi
-  [ "$bn" -eq 0 ] && printf '\033[2m(none in flight)\033[0m\n'
+  [ "$bn" -eq 0 ] && printf '%s(none in flight)%s\n' "$C_DIM" "$C_RESET"
 }
 
 # ── the render loop ─────────────────────────────────────────────────────────
-poll="${AGENTS_PANE_POLL_SECS:-10}"
+poll="${AGENTS_PANE_VIEW_POLL_SECS:-10}"
 case "$poll" in ''|*[!0-9]*) poll=10 ;; esac
 
 polls=0

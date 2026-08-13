@@ -216,6 +216,9 @@ EXEMPT_PREFIX = (
     "EMIT_",            # backlog-reconcile-sweep.sh output-format seams
     "BACKLOG_VIEW_",    # backlog viewer pane internals
     "TASK_PANE_VIEW_",  # task-spec viewer pane internals
+    "AGENTS_PANE_VIEW_", # HERD-668: agents-pane-view.sh pane internals (poll interval + the
+                        # tty/cols/max-polls test seams, same shape as BACKLOG_VIEW_ above) — never
+                        # the AGENTS_PANE config knob itself, which IS declared
     "AGENT_WATCH_",     # agent-watch.sh dry-run / lib-mode test seams
     "IQ_",              # HERD-639: intent-queue.sh's TENANT knobs (IQ_LOG_PREFIX / IQ_ENGINE_DIR /
                         # IQ_SIDECARS / IQ_PRIO_DEFAULT / IQ_RECLAIM_MMIN). Plain shell variables a
