@@ -1078,6 +1078,8 @@ export ENV_SUSPECT_TIMEOUT HEALTH_LOAD_THRESHOLD  # HERD-567: reach the live Pyt
 : "${ANOMALY_BASELINES:="off"}"  # HERD-496: self-observation — PER-PHASE DURATION BASELINES + anomaly self-filing — on | off (default off, ship-dormant; yolo posture adopts on). on → the watcher records every completed phase's wall-clock duration (healthcheck start→verdict, review dispatch→verdict, the post-merge main-health suite, a refix bounce→wake, and its own tick cadence) into a rolling per-phase median/p95 baseline in the shared pool (pysrc/herd/store.py); once a phase has LEARNED enough samples, an instance that runs past 2x its own p95 journals a `phase_anomaly` event, paints a calm advisory row ('health-check 28m — p95 19m'), and FILES ONCE via the SAME shared-pool dedup marker MAIN_HEALTH_AUTOFIX's filing leg uses (HERD-371), keyed by phase+measurement+baseline so a re-observed identical reading dedups and a worse reading files fresh. GROUNDED: a 5h dead watcher (2026-08-02) was a tick-silence anomaly a learned baseline would have caught within minutes; a genuinely slow-but-typical suite never false-files because the threshold is LEARNED, not guessed. off (default) → byte-inert: no store write, no journal line, no row, no filing. Consumed by agent-watch.sh
 : "${ANOMALY_FILE_COOLDOWN_SECS:="1800"}"  # HERD-512: seconds a phase must wait after ACTUALLY FILING an anomaly item before that SAME phase may file another — default 1800 (30 min); 0 = off, i.e. the pre-HERD-512 behavior where every above-threshold reading may file. Only consulted while ANOMALY_BASELINES is on (off stays byte-inert). ANOMALY_BASELINES' honest-identity dedup only collapses an IDENTICAL re-reading (same phase+seconds+p95), so a phase that stays degraded files a FRESH item every tick it reads differently — GROUNDED 2026-08-04: one overnight window produced 4 separate tracker items telling the same tick-cadence story. Inside the window the anomaly is STILL journaled and STILL painted on the console ledger — the operator loses no visibility — only the tracker filing is withheld, journaled `phase_anomaly_filed result=cooldown`. A non-numeric value reads as the DEFAULT (not 0): a typo must not silently restore the filing storm this key exists to stop. Consumed by agent-watch.sh
 : "${RESOLVER_PANE:="off"}"      # HERD-280: the conflict resolver as a RETIRING PANE — on | off (default off, ship-dormant). on → herd-resolve.sh spawns the resolver as a bottom SPLIT PANE inside the builder's existing tab (label == slug) instead of a standalone resolve·<slug> tab, falling back to that tab in the control-room workspace when no builder tab exists; it records the pane in a sha-scoped dispatch registry ($TREES/.resolve-registry-<pr>-<sha>) and the watcher RECONCILES that registry against the OBSERVED verdict file each tick — a `RESOLVE: DONE` retires the pane immediately (guarded close + journal `resolver_pane_retired reason=result-consumed`), a `RESOLVE: ESCALATE` KEEPS the pane open for human inspection behind the existing needs-you row. The WORKTREE lifecycle is untouched: the retirement invariant still reaps at merge. off (default) → byte-identical to the pre-HERD-280 lane: a standalone tab, no registry file written, no reconcile, no retire. Consumed by agent-watch.sh + herd-resolve.sh
+: "${WATCHER_IDLE_CADENCE:="off"}"  # HERD-671 leg 2: IDLE-CADENCE — on | off (default off, ship-dormant). GROUNDED 2026-08-13: three of four watchers on one machine sit idle (zero open PRs, zero local builder worktrees) most of the night yet still pay a REMOTE gh round-trip every ~4s tick — the render leg's `gh pr list` and the Python engine core's own pooled `gh api graphql` discovery both run unconditionally regardless of whether there is anything to look at. on → each tick RECONCILES idleness fresh from two LOCAL, no-gh signals — any builder worktree currently checked out under $WORKTREES_DIR (a fresh `git worktree list`, always free) OR last tick's OWN successfully-fetched open-PR count being nonzero — and while BOTH read zero, widens the remote leg's cadence to WATCHER_IDLE_REMOTE_SECS instead of paying it every tick; the 4s LOCAL render/reconcile loop itself is untouched (it keeps repainting from whatever state the last remote fetch left behind, exactly like the existing TEAM_PRESENCE/adopt/inbox throttles). The countdown resets to zero — remote polling snaps back to full 4s cadence the very next tick — the instant either signal goes non-idle, so a freshly spawned builder or a newly opened PR is never left waiting out a stale window. off (default) → byte-identical: both remote legs run every tick exactly as before this key existed. Consumed by agent-watch.sh
+: "${WATCHER_IDLE_REMOTE_SECS:="60"}"  # HERD-671 leg 2: the widened remote-leg poll interval (seconds) WATCHER_IDLE_CADENCE steps up to while idle; only consulted while that lever is on. A non-numeric or sub-4s value falls back to the built-in 60. Consumed by agent-watch.sh
 : "${WATCHER_SCOPE:="mine"}"     # HERD-653 (GH #769, review follow-up): mine (default) | all — see the
 # team-mode block far below (§ Watcher lens + team mode / docs/capabilities-overview.md) for the full
 # on-behavior. Until this line, WATCHER_SCOPE carried NO `: "${KEY:=default}"` of its own (unlike its
@@ -1226,6 +1228,43 @@ export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
 # model id; this only moves the wire. See docs/sensitive-data.md.
 : "${ANTHROPIC_BASE_URL:=}"
 [ -n "${ANTHROPIC_BASE_URL}" ] && export ANTHROPIC_BASE_URL
+
+# ── Per-project GH_TOKEN passthrough (HERD-671 leg 3) ─────────────────────────
+# GitHub rate limits are PER USER, not per token: several projects/watchers on one machine sharing
+# the operator's plain `gh auth login` identity all draw from the SAME 5000/hr GraphQL bucket, so a
+# heavy evening on one project can starve every other watcher's gate/merge reads (GROUNDED 2026-08-13,
+# HERD-671: four watchers here exhausted it together). An optional GH_TOKEN in THIS project's
+# .herd/secrets partitions a project onto its OWN bucket — but only when it names a DIFFERENTLY-OWNED
+# identity (a machine account or a GitHub App installation token); a second personal PAT for the same
+# human account still shares that human's one bucket and partitions nothing. `gh` (and `gh api
+# graphql`) already prefers GH_TOKEN/GITHUB_TOKEN over stored `gh auth login` credentials the moment
+# it is present in the process environment, so exporting it here IS the whole integration — no other
+# seam needs to change to use it.
+#
+# Read directly (grep one line, never sourced) so this file stays ZERO-SECRET: no other line of
+# .herd/secrets, nor its execution, ever reaches this process — only the single value the caller
+# already opted into. FAIL-SOFT + byte-identical when absent: an already-exported GH_TOKEN (the
+# operator's own shell, or a CI runner) wins over the file so this is layered under any existing
+# call-site convention rather than fighting it; no file / unreadable / no GH_TOKEN line => nothing is
+# exported and `gh` falls back to its already-authenticated identity exactly as before this key
+# existed. See docs/sensitive-data.md (Part 3) for the machine-account requirement.
+if [ -z "${GH_TOKEN:-}" ] && [ -n "${PROJECT_ROOT:-}" ] && [ -r "${PROJECT_ROOT}/.herd/secrets" ]; then
+  # `|| true` is load-bearing under a caller's `set -e -o pipefail` (e.g. new-feature.sh): with
+  # pipefail on, grep's exit 1 on "no GH_TOKEN line" (the common case) propagates as the WHOLE
+  # pipeline's status even though tail/sed both succeed on empty input — without this guard, sourcing
+  # this file from any set -e caller aborted the caller entirely the moment a project's .herd/secrets
+  # had no GH_TOKEN line (GROUNDED: broke new-feature.sh for every worktree spawn, caught by CI on
+  # test-builder-secrets-isolation.sh / test-cli-backend-switch.sh / test-adopt-worktree-prep.sh).
+  _herd_gh_token_raw="$(grep -E '^[[:space:]]*(export[[:space:]]+)?GH_TOKEN[[:space:]]*=' \
+    "${PROJECT_ROOT}/.herd/secrets" 2>/dev/null | tail -n1 \
+    | sed -E 's/^[[:space:]]*(export[[:space:]]+)?GH_TOKEN[[:space:]]*=[[:space:]]*//; s/[[:space:]]*#.*$//')" || true
+  case "$_herd_gh_token_raw" in
+    \"*\") _herd_gh_token_raw="${_herd_gh_token_raw#\"}"; _herd_gh_token_raw="${_herd_gh_token_raw%\"}" ;;
+    \'*\') _herd_gh_token_raw="${_herd_gh_token_raw#\'}"; _herd_gh_token_raw="${_herd_gh_token_raw%\'}" ;;
+  esac
+  [ -n "$_herd_gh_token_raw" ] && export GH_TOKEN="$_herd_gh_token_raw"
+  unset _herd_gh_token_raw
+fi
 
 # ── Atomic work-item claiming (HERD-50) ──────────────────────────────────────
 # CLAIM_REQUIRED gates the synchronous pre-spawn CLAIM step the lanes (herd-quick.sh /

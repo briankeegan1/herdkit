@@ -323,6 +323,8 @@ WATCHER_VIEW_STATUS	unit	tests/test-watcher-views.sh
 WATCHER_VIEW_DEPS_LABEL	unit	tests/test-watcher-views.sh
 WATCHER_SCOPE	unit	tests/test-team-mode.sh
 WATCHER_OWNER	unit	tests/test-team-mode.sh
+WATCHER_IDLE_CADENCE	unit	tests/test-watcher-idle-cadence.sh
+WATCHER_IDLE_REMOTE_SECS	unit	tests/test-watcher-idle-cadence.sh
 AUTOFIX_SCOPE	unit	tests/test-autofix-scope.sh
 AUTOFIX_SCOPE	unit	tests/test-stale-base-autofix.sh
 AUTOFIX_SCOPE	unit	tests/test-auto-refix.sh
@@ -512,6 +514,7 @@ MCP_PROVISION	unit	tests/test-mcp-provision.sh
 GRAPHIFY_BIN	unit	tests/test-init-grounding-interview.sh
 GRAPHIFY_BIN	unit	tests/test-codemap-project.sh
 ANTHROPIC_BASE_URL	unit	tests/test-driver-launch-agent.sh
+GH_TOKEN	unit	tests/test-gh-token-passthrough.sh
 .herd/steps.tsv	sim	tests/test-sandbox-sim.sh
 triggers.sh	unit	tests/test-triggers.sh
 .herd/triggers.tsv	unit	tests/test-triggers.sh
