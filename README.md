@@ -99,7 +99,10 @@ set of panes: a **coordinator** pane (the LLM agent reading the tracker and disp
 pinned **watcher** console (the live gate/merge state machine — polls on a fixed tick, default
 10 seconds), and a **backlog** pane showing open work. `herd pane <watch|backlog|coordinator>`
 restarts one piece in place; `herd reload` rebuilds the whole room around a live coordinator without
-closing it. Everything the control room drives is generic engine + lane scripts — see
+closing it. With **`WATCH_HOTKEYS=on`** (default `off`, byte-inert, armed only on the watcher's own
+interactive tty) the console gains a `v: view` hint row and `v` flips the `WATCHER_VIEW` lens
+`mine` ↔ `all` **in memory for that watcher process only** — `herd config set` stays the durable
+path. Everything the control room drives is generic engine + lane scripts — see
 [`docs/COORDINATOR-SOP.md`](docs/COORDINATOR-SOP.md) for the full attended/unattended operating
 playbook, escalation paths, and the state-machine handshake between coordinator, builder, and
 watcher.
