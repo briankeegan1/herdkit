@@ -21,16 +21,31 @@ name: CI
 # SHARDING (HERD-463): ~350 curated tests ran serially per platform (macos 24m, ubuntu 13m on PR
 # #579) — the #1 operator pain after HERD-437/440/441 re-armed 168 previously-exempt tests.
 # `shard` fans each platform out across N machines via a stable filename hash
-# (scripts/herd/suite-shard.sh: HERD_CI_SHARD_INDEX of HERD_CI_SHARD_COUNT). PER-PLATFORM FAN-OUT
-# (HERD-493): macos gets 8 shards, ubuntu gets 6 — macOS's per-test time is ~1.8x ubuntu's (heavier
-# per-process fork/exec) so it still benefits from more shards before per-runner spin-up (checkout +
-# Python setup + brew install) eats the marginal wall-clock gain; ubuntu's suite is already short
-# enough that 6 sits at that knee. The `shard:` array below (1..8) MUST cover the largest per-platform
-# count, with `exclude:` trimming it back to each platform's own count, and each platform's
-# `shard_count` (used for HERD_CI_SHARD_COUNT) MUST match how many of its shard values survive the
-# exclude — mutation-proven membership (every test lands in exactly one shard, the union == the full
-# curated set, for BOTH counts) lives in tests/test-suite-shard.sh, not in this workflow. DOES NOT
-# REDUCE what runs — only wall-clock.
+# (scripts/herd/suite-shard.sh: HERD_CI_SHARD_INDEX of HERD_CI_SHARD_COUNT).
+#
+# RIGHT-SIZED TO THE RUNNER CAP (HERD-665, supersedes the HERD-493 8-shard call): this GitHub plan
+# caps macOS-hosted-runner concurrency at 5 jobs ACCOUNT-WIDE (shared across every workflow run in
+# every repo on the account, including a fleet PR burst racing this one) — confirmed against real
+# runs (`gh run list`/`gh run view` job timestamps on pushes to main): 8 macOS shards never actually
+# run 8-wide, they run a 5-then-3 DOUBLE WAVE, so shards 6-8 sit queued behind shards 1-5 regardless
+# of the array size. The HERD-493 comment ("macOS benefits from more shards before per-runner spin-up
+# eats the gain") predates that observation — it's true in isolation, but moot once the account cap
+# caps the wave at 5 concurrent no matter how many shards the matrix declares. macos now ships 5
+# shards (one wave, matching the cap exactly); ubuntu keeps 6 (its own concurrency tier is not the
+# constraint, and 6 already sat at its own per-runner-overhead knee). See the PR body for the
+# measured before/after wall-clock. The `shard:` array below (1..6) MUST cover the largest
+# per-platform count (ubuntu's 6), with `exclude:` trimming it back to each platform's own count, and
+# each platform's `shard_count` (used for HERD_CI_SHARD_COUNT) MUST match how many of its shard
+# values survive the exclude — mutation-proven membership (every test lands in exactly one shard, the
+# union == the full curated set, for every shard count this workflow ships) lives in
+# tests/test-suite-shard.sh, not in this workflow. DOES NOT REDUCE what runs — only wall-clock.
+#
+# FLEET-BURST INTERPLAY: right-sizing macos to 5 removes the SELF-inflicted double wave (this run's
+# own shards queuing behind each other), but the account-wide cap is still shared with every other
+# concurrent macOS job on the account — a burst of several PRs' CI (or another repo's workflow) can
+# still queue this run's 5 shards behind THEIR jobs the same way. Nothing in this workflow can fix
+# that; it is an account-plan ceiling, not a per-workflow one. If fleet bursts become the dominant
+# wait, the lever is the GitHub plan's concurrency tier, not this matrix.
 #
 # DIFF-SCOPING (HERD-664): sharding splits the SAME ~350 tests across boxes; scoping asks the
 # different question of which of them a PR's diff can actually break. `HERD_CI_SCOPE_BASE_REF` below
@@ -75,22 +90,21 @@ jobs:
       fail-fast: false
       matrix:
         platform: [ubuntu, macos]
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]   # superset; exclude below trims per-platform
+        shard: [1, 2, 3, 4, 5, 6]   # superset; exclude below trims per-platform
         exclude:
-          # ubuntu runs 6 shards — trim the 7/8 slots the macos-only fan-out needs.
-          - platform: ubuntu
-            shard: 7
-          - platform: ubuntu
-            shard: 8
+          # macos runs 5 shards (the account-wide macOS runner cap, HERD-665) — trim the 6th slot
+          # ubuntu's larger fan-out needs.
+          - platform: macos
+            shard: 6
         include:
           - platform: ubuntu   # doubles as the WSL2 coverage (WSL2 == Linux semantics)
             os: ubuntu-latest
             locale: C.UTF-8         # glibc ships C.UTF-8
-            shard_count: 6          # keep in sync with the `exclude:` block above
+            shard_count: 6          # keep in sync with the `shard:` array's full range above
           - platform: macos
             os: macos-latest
             locale: en_US.UTF-8     # BSD libc has no C.UTF-8 — use a real UTF-8 locale
-            shard_count: 8          # keep in sync with the `shard:` array's full range above
+            shard_count: 5          # keep in sync with the `exclude:` block above (HERD-665: == the account-wide macOS runner cap)
     env:
       HERD_CI_PLATFORM: ${{ matrix.platform }}
       HERD_CI_SHARD_INDEX: ${{ matrix.shard }}

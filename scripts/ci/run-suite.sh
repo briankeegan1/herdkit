@@ -69,6 +69,18 @@
 #                        an absent/empty ledger is byte-identical to the pre-HERD-478 uniform cap.
 #                        See scripts/herd/test-cap-ledger.sh for the ledger format + the stale-row
 #                        lint that keeps it honest.
+#   HERD_CI_SUITE_WORKERS (HERD-665): BOUNDED INTRA-SHARD PARALLELISM. Tests within one shard run
+#                        SERIALLY on a multi-core runner by default (1 = today's exact behavior,
+#                        byte-identical: launch, wait, classify, repeat — same order, same output).
+#                        A value > 1 runs up to that many tests concurrently (a FIFO job queue, not
+#                        `wait -n` — macOS's system bash is 3.2 and lacks it), still one process per
+#                        test with its own per-test timeout and log file. SHIP-DORMANT: the knob
+#                        defaults to 1 because ~4% of the curated suite (test-config-manifest.sh,
+#                        test-py-statemachine.sh, the test-sandbox-posture-matrix-*.sh family, …)
+#                        never mktemp's its own workspace, and the whole suite shares ONE JOURNAL_FILE
+#                        (see the HERD-363 per-run keying below) — an append-heavy test racing another
+#                        under concurrency has not been proven safe, only spot-checked. Measure before
+#                        raising it in CI; this env var is the only thing that changes when you do.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -87,6 +99,11 @@ SCOPE_REPO="${HERD_CI_SCOPE_REPO:-$ROOT}"
 case "$SHARD_INDEX" in ''|*[!0-9]*) SHARD_INDEX=1 ;; esac
 case "$SHARD_COUNT" in ''|*[!0-9]*) SHARD_COUNT=1 ;; esac
 [ "$SHARD_COUNT" -ge 1 ] 2>/dev/null || SHARD_COUNT=1
+# HERD-665 bounded intra-shard parallelism — see the header doc above. Garbage/unset falls back to 1
+# (serial), never to 0 (which would launch every test at once with no cap).
+SUITE_WORKERS="${HERD_CI_SUITE_WORKERS:-1}"
+case "$SUITE_WORKERS" in ''|*[!0-9]*) SUITE_WORKERS=1 ;; esac
+[ "$SUITE_WORKERS" -ge 1 ] 2>/dev/null || SUITE_WORKERS=1
 # shellcheck source=scripts/herd/suite-shard.sh
 if [ -f "$ROOT/scripts/herd/suite-shard.sh" ]; then
   . "$ROOT/scripts/herd/suite-shard.sh"
@@ -346,7 +363,57 @@ if [ -f "$CAP_LEDGER" ]; then
 fi
 timeout_note="default-timeout=none"
 [ -n "$TO_BIN" ] && timeout_note="default-timeout=${PER_TEST_TIMEOUT}s"
-echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, ${timeout_note}${cap_note}${shard_note}${scope_note}) on ${PLATFORM}"
+worker_note=""
+[ "$SUITE_WORKERS" -gt 1 ] && worker_note=", workers=$SUITE_WORKERS"
+echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, ${timeout_note}${cap_note}${shard_note}${scope_note}${worker_note}) on ${PLATFORM}"
+
+# classify_result <name> <log> <test_artdir> <extra_argc> <cap> <rc> — the HERD-478/HERD-436 pass/
+# XFAIL/FAIL bookkeeping, factored out so it runs identically whether the test just ran in the
+# foreground (SUITE_WORKERS=1) or was waited on out of the FIFO job queue below (SUITE_WORKERS>1).
+classify_result() {
+  local c_name="$1" c_log="$2" c_artdir="$3" c_extra_argc="$4" c_cap="$5" c_rc="$6" c_timedout c_reason
+  if [ "$c_rc" -eq 0 ]; then
+    pass=$((pass+1))
+    [ "$c_extra_argc" -eq 0 ] || rm -rf "$c_artdir"  # green: nothing worth keeping
+    return
+  fi
+  c_timedout=""; [ "$c_rc" -eq 124 ] && c_timedout=" (TIMEOUT after ${c_cap}s)"
+  if c_reason="$(allow_reason "$c_name")"; then
+    xfail=$((xfail+1)); xfail_names+=("$c_name — $c_reason")
+    echo "⚠️  XFAIL (env-sensitive) $c_name$c_timedout: $c_reason"
+    [ "$c_extra_argc" -eq 0 ] || rm -rf "$c_artdir"
+  else
+    real_fail=$((real_fail+1)); real_names+=("$c_name$c_timedout")
+    echo "❌ FAIL $c_name$c_timedout"
+    # HERD-436: a wrapper test that runs many checkpoints (e.g. multiple chaos-sim reps) can scroll
+    # its own failing assertion off the top of a plain tail long before the wrapper's final summary
+    # line — print every checkpoint the test itself reported as failed, not just the last 6 lines.
+    if grep -qE '^FAIL[: ]' "$c_log"; then
+      echo "   failing checkpoints:"
+      grep -E '^FAIL[: ]' "$c_log" | sed 's/^/      │ /'
+    fi
+    echo "   last lines:"
+    tail -n 10 "$c_log" | sed 's/^/      │ /'
+    if [ -d "$c_artdir" ]; then
+      echo "   artifacts kept: $c_artdir"
+    fi
+  fi
+}
+
+# HERD-665: a FIFO queue of up to $SUITE_WORKERS in-flight tests. At SUITE_WORKERS=1 this backgrounds
+# one test and immediately waits on it before launching the next — same order, same output, same
+# process-per-test-with-its-own-timeout shape as the old inline `bash "$t"` foreground call. `wait -n`
+# (which would let the FIRST-TO-FINISH job drain, not necessarily the oldest) is unavailable on
+# macOS's bash 3.2, so this waits on the oldest queued pid specifically — deterministic draining, just
+# not necessarily in completion order once SUITE_WORKERS>1.
+q_pids=(); q_names=(); q_logs=(); q_artdirs=(); q_extra_argc=(); q_caps=()
+drain_one() {
+  local d_pid="${q_pids[0]}" d_rc
+  wait "$d_pid"; d_rc=$?
+  classify_result "${q_names[0]}" "${q_logs[0]}" "${q_artdirs[0]}" "${q_extra_argc[0]}" "${q_caps[0]}" "$d_rc"
+  q_pids=("${q_pids[@]:1}"); q_names=("${q_names[@]:1}"); q_logs=("${q_logs[@]:1}")
+  q_artdirs=("${q_artdirs[@]:1}"); q_extra_argc=("${q_extra_argc[@]:1}"); q_caps=("${q_caps[@]:1}")
+}
 for t in "${tests[@]}"; do
   name="$(basename "$t")"
   log="$LOGDIR/$name.log"
@@ -364,34 +431,13 @@ for t in "${tests[@]}"; do
   # extra_args[@] is expanded via the +"…" guard because macOS's system bash (3.2 — the default on
   # both the maintainer's box and the CI macos runner) treats "${arr[@]}" on an EMPTY array as an
   # unbound-variable error under `set -u`, unlike bash >= 4.4.
-  HERMETIC_TEST="$name" $TO bash "$t" "${extra_args[@]+"${extra_args[@]}"}" </dev/null >"$log" 2>&1
-  rc=$?
-  if [ "$rc" -eq 0 ]; then
-    pass=$((pass+1))
-    [ ${#extra_args[@]} -eq 0 ] || rm -rf "$test_artdir"  # green: nothing worth keeping
-    continue
-  fi
-  timedout=""; [ "$rc" -eq 124 ] && timedout=" (TIMEOUT after ${cap}s)"
-  if reason="$(allow_reason "$name")"; then
-    xfail=$((xfail+1)); xfail_names+=("$name — $reason")
-    echo "⚠️  XFAIL (env-sensitive) $name$timedout: $reason"
-    [ ${#extra_args[@]} -eq 0 ] || rm -rf "$test_artdir"
-  else
-    real_fail=$((real_fail+1)); real_names+=("$name$timedout")
-    echo "❌ FAIL $name$timedout"
-    # HERD-436: a wrapper test that runs many checkpoints (e.g. multiple chaos-sim reps) can scroll
-    # its own failing assertion off the top of a plain tail long before the wrapper's final summary
-    # line — print every checkpoint the test itself reported as failed, not just the last 6 lines.
-    if grep -qE '^FAIL[: ]' "$log"; then
-      echo "   failing checkpoints:"
-      grep -E '^FAIL[: ]' "$log" | sed 's/^/      │ /'
-    fi
-    echo "   last lines:"
-    tail -n 10 "$log" | sed 's/^/      │ /'
-    if [ -d "$test_artdir" ]; then
-      echo "   artifacts kept: $test_artdir"
-    fi
-  fi
+  HERMETIC_TEST="$name" $TO bash "$t" "${extra_args[@]+"${extra_args[@]}"}" </dev/null >"$log" 2>&1 &
+  q_pids+=("$!"); q_names+=("$name"); q_logs+=("$log")
+  q_artdirs+=("$test_artdir"); q_extra_argc+=("${#extra_args[@]}"); q_caps+=("$cap")
+  [ "${#q_pids[@]}" -ge "$SUITE_WORKERS" ] && drain_one
+done
+while [ "${#q_pids[@]}" -gt 0 ]; do
+  drain_one
 done
 
 echo

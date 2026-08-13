@@ -8,11 +8,12 @@
 # can never read as green."
 #
 # Proves:
-#   (1) MEMBERSHIP (real tree): for shard_count in {1,3,4,6,7,8}, the UNION of shards 1..shard_count
+#   (1) MEMBERSHIP (real tree): for shard_count in {1,3,4,5,6}, the UNION of shards 1..shard_count
 #       reconstructs herd_suite_curated_tests EXACTLY — no drop, no duplicate — against the REAL
 #       tests/ dir this file lives in (so a future test addition/removal stays covered for free).
-#       6 and 8 are the live HERD-493 CI counts (ubuntu and macos respectively) — every shard_count
-#       the workflow actually sets is covered here, not just illustrative values.
+#       5 and 6 are the live HERD-665 CI counts (macos and ubuntu respectively — HERD-665 right-sized
+#       macos from 8 down to 5, matching the account-wide macOS runner concurrency cap) — every
+#       shard_count the workflow actually sets is covered here, not just illustrative values.
 #   (2) shard_count=1 → the single shard IS the full curated set (byte-identical to unsharded).
 #   (3) DETERMINISM: the same (name, count) always yields the same shard — across repeated calls
 #       and across a fresh subshell (no hidden process-local state).
@@ -54,7 +55,7 @@ pass() { PASS=$((PASS+1)); }
 curated="$(herd_suite_curated_tests "$ROOT/tests")"
 curated_n="$(printf '%s' "$curated" | grep -c .)"
 [ "$curated_n" -gt 0 ] || fail "(1) curated set is empty — glob/exempt-file wiring is broken"
-for n in 1 3 4 6 7 8; do
+for n in 1 3 4 5 6; do
   union="$(
     i=1
     while [ "$i" -le "$n" ]; do
@@ -69,7 +70,7 @@ for n in 1 3 4 6 7 8; do
     || fail "(1) shard_count=$n: union of all shards does not exactly reconstruct the curated set"
   pass
 done
-echo "PASS (1) membership: union of shards {1,3,4,6,7,8} reconstructs the curated set exactly ($curated_n tests) — no drop, no duplicate"
+echo "PASS (1) membership: union of shards {1,3,4,5,6} reconstructs the curated set exactly ($curated_n tests) — no drop, no duplicate"
 
 # ── 2. shard_count=1 → the single shard is the full curated set ──────────────────────────────────
 one="$(herd_suite_tests_for_shard "$ROOT/tests" 1 1)"
@@ -180,7 +181,7 @@ scoped_n="$(printf '%s\n' "$scoped" | grep -c .)"
 [ "$scoped_n" -gt 0 ] || fail "(9) the scoped selection is empty — the premise of this check is broken"
 [ "$scoped_n" -lt "$curated_n" ] \
   || fail "(9) the scoped selection ($scoped_n) is not narrower than the curated set ($curated_n) — this check would be vacuous"
-for n in 1 2 6 8; do
+for n in 1 2 5 6; do
   s_union="$(
     i=1
     while [ "$i" -le "$n" ]; do
