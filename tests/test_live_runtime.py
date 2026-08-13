@@ -8482,6 +8482,9 @@ class TestGhRateLimitClassification(unittest.TestCase):
             with self.assertRaises(LR.GhRateLimited) as ctx:
                 LR.discover_via_graphql(repo="owner/name")
             self.assertEqual(ctx.exception.reset_at, reset_epoch)
+            # HERD-670: a GraphQL call's failure must classify against the "graphql" bucket, never
+            # the default "core" — the exact mix-up that caused the flapping loop.
+            self.assertEqual(ctx.exception.resource, "graphql")
         finally:
             LR.subprocess = orig
 
@@ -8516,8 +8519,10 @@ class TestGhRateLimitClassification(unittest.TestCase):
         orig = LR.subprocess
         LR.subprocess = _Stub()
         try:
-            with self.assertRaises(LR.GhRateLimited):
+            with self.assertRaises(LR.GhRateLimited) as ctx:
                 LR._repo_owner_name(None)
+            # HERD-670: a REST call's failure classifies against "core" — the resource it actually draws.
+            self.assertEqual(ctx.exception.resource, "core")
         finally:
             LR.subprocess = orig
 
@@ -8534,6 +8539,151 @@ class TestGhRateLimitClassification(unittest.TestCase):
             self.assertIsNone(LR._gh_rate_limit_reset())
         finally:
             LR.subprocess = orig
+
+    def test_reset_and_remaining_probes_query_the_named_resource_not_the_core_alias(self):
+        # HERD-670: the legacy `.rate` field is an ALIAS for `.resources.core` — a probe must ask for
+        # `.resources.<resource>.*` explicitly so a graphql probe never silently reads core's numbers.
+        calls = []
+
+        class _Stub:
+            def run(self, argv, **k):
+                calls.append(argv)
+                q = argv[argv.index("-q") + 1]
+
+                class R:
+                    returncode = 0
+                    stdout = "42\n"
+                return R()
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            self.assertEqual(LR._gh_rate_limit_reset("graphql"), 42)
+            self.assertEqual(LR._gh_rate_limit_remaining("graphql"), 42)
+            self.assertEqual(LR._gh_rate_limit_reset("core"), 42)
+            self.assertEqual(LR._gh_rate_limit_remaining("core"), 42)
+        finally:
+            LR.subprocess = orig
+        queried = [argv[argv.index("-q") + 1] for argv in calls]
+        self.assertIn(".resources.graphql.reset", queried)
+        self.assertIn(".resources.graphql.remaining", queried)
+        self.assertIn(".resources.core.reset", queried)
+        self.assertIn(".resources.core.remaining", queried)
+        self.assertFalse(any(q in (".rate.reset", ".rate.remaining") for q in queried),
+                          "must never read the ambiguous .rate alias (always core)")
+
+    def test_bucket_selection_core_full_graphql_empty(self):
+        # Direct simulation of a `gh api rate_limit` snapshot where core is comfortably full and
+        # graphql is fully exhausted — the exact shape from the grounding incident (2026-08-13
+        # 00:43-00:45Z: core 4709/5000, graphql 0/5000). Each probe must read its OWN named resource.
+        snapshot = {"core": {"remaining": 4709, "reset": 1735689600},
+                    "graphql": {"remaining": 0, "reset": 1735689900}}
+
+        class _Stub:
+            def run(self, argv, **k):
+                q = argv[argv.index("-q") + 1]
+                resource, field = q.split(".")[2], q.split(".")[3]
+
+                class R:
+                    returncode = 0
+                    stdout = "%s\n" % snapshot[resource][field]
+                return R()
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            self.assertEqual(LR._gh_rate_limit_remaining("core"), 4709)
+            self.assertEqual(LR._gh_rate_limit_remaining("graphql"), 0)
+            self.assertEqual(LR._gh_rate_limit_reset("core"), 1735689600)
+            self.assertEqual(LR._gh_rate_limit_reset("graphql"), 1735689900)
+        finally:
+            LR.subprocess = orig
+
+    def test_bucket_selection_inverse_core_empty_graphql_full(self):
+        # Inverse of the above: core exhausted (a REST-heavy leg like _repo_owner_name), graphql full.
+        snapshot = {"core": {"remaining": 0, "reset": 1735690200},
+                    "graphql": {"remaining": 4988, "reset": 1735690800}}
+
+        class _Stub:
+            def run(self, argv, **k):
+                q = argv[argv.index("-q") + 1]
+                resource, field = q.split(".")[2], q.split(".")[3]
+
+                class R:
+                    returncode = 0
+                    stdout = "%s\n" % snapshot[resource][field]
+                return R()
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            self.assertEqual(LR._gh_rate_limit_remaining("core"), 0)
+            self.assertEqual(LR._gh_rate_limit_remaining("graphql"), 4988)
+            self.assertEqual(LR._gh_rate_limit_reset("core"), 1735690200)
+            self.assertEqual(LR._gh_rate_limit_reset("graphql"), 1735690800)
+        finally:
+            LR.subprocess = orig
+
+
+class TestResumeJitter(unittest.TestCase):
+    """HERD-670: the resume offset must be bounded, DETERMINISTIC (no random/Date — a rerun of the
+    same tick must reproduce the same wakeup), and spread distinct workspaces apart so several
+    watchers armed by the same exhaustion event don't all wake on the exact same epoch."""
+
+    def test_deterministic_and_bounded(self):
+        v1 = LR._resume_jitter_seconds("/trees/projA")
+        v2 = LR._resume_jitter_seconds("/trees/projA")
+        self.assertEqual(v1, v2)
+        self.assertGreaterEqual(v1, 0)
+        self.assertLess(v1, LR._GH_RATE_LIMIT_JITTER_MAX_SECONDS)
+
+    def test_empty_or_missing_workspace_contributes_no_jitter(self):
+        self.assertEqual(LR._resume_jitter_seconds(""), 0)
+        self.assertEqual(LR._resume_jitter_seconds(None), 0)
+
+    def test_distinct_workspaces_are_not_all_collapsed_to_one_offset(self):
+        vals = {LR._resume_jitter_seconds("/trees/ws-%d" % i) for i in range(20)}
+        self.assertGreater(len(vals), 1, "20 distinct workspaces should not all hash to one offset")
+
+
+class TestGhRateLimitResourceMarker(unittest.TestCase):
+    """HERD-670: the persisted backoff marker must round-trip the exhausted resource alongside the
+    epoch, while staying byte-compatible with bash's `_gh_rate_limited_until` (agent-watch.sh), which
+    reads ONLY `head -n1` and demands it be pure digits."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_round_trips_resource(self):
+        state = LiveState(self.tmp)
+        state.set_gh_rate_limited_until(123456, "graphql")
+        self.assertEqual(state.gh_rate_limited_until(), 123456)
+        self.assertEqual(state.gh_rate_limited_resource(), "graphql")
+
+    def test_default_resource_is_core(self):
+        state = LiveState(self.tmp)
+        state.set_gh_rate_limited_until(123456)
+        self.assertEqual(state.gh_rate_limited_resource(), "core")
+
+    def test_first_line_stays_a_bare_epoch_for_bash_compat(self):
+        state = LiveState(self.tmp)
+        state.set_gh_rate_limited_until(123456, "graphql")
+        with open(state.gh_rate_limit_path(), encoding="utf-8") as fh:
+            first_line = fh.readline().strip()
+        self.assertEqual(first_line, "123456")
+        self.assertTrue(first_line.isdigit())
+
+    def test_pre_herd670_marker_shape_reads_back_as_core(self):
+        state = LiveState(self.tmp)
+        with open(state.gh_rate_limit_path(), "w", encoding="utf-8") as fh:
+            fh.write("123456\n")  # old shape: epoch only, no resource line
+        self.assertEqual(state.gh_rate_limited_until(), 123456)
+        self.assertEqual(state.gh_rate_limited_resource(), "core")
+
+    def test_no_state_dir_defaults_core(self):
+        state = LiveState(self.tmp)
+        state.dir = None
+        self.assertEqual(state.gh_rate_limited_resource(), "core")
 
 
 class TestLiveTickRateLimitBackoff(LiveCase):
@@ -8555,18 +8705,47 @@ class TestLiveTickRateLimitBackoff(LiveCase):
             result = t.run()  # must NOT raise
         finally:
             os.environ.pop("HERD_FAKE_NOW", None)
-        want_until = 1735689600 + LR._GH_RATE_LIMIT_BUFFER_SECONDS
+        # HERD-670: the armed deadline now carries a deterministic per-workspace jitter on top of
+        # the buffer (same seed the production code uses — self.tmp is this test's state dir).
+        jitter = LR._resume_jitter_seconds(self.tmp)
+        want_until = 1735689600 + LR._GH_RATE_LIMIT_BUFFER_SECONDS + jitter
         self.assertTrue(result.get("rate_limited"))
         self.assertEqual(result.get("rate_limited_until"), want_until)
+        # GhRateLimited(reset_at=...) with no explicit resource defaults to "core".
+        self.assertEqual(result.get("rate_limited_resource"), "core")
         evs = events(self.jpath)
         rl = [e for e in evs if e["event"] == "engine_rate_limited"]
         self.assertEqual(len(rl), 1)
         self.assertEqual(int(rl[0]["reset"]), 1735689600)
         self.assertEqual(int(rl[0]["until"]), want_until)
+        self.assertEqual(rl[0]["resource"], "core")
+        self.assertEqual(int(rl[0]["jitter"]), jitter)
         # no ordinary tick bookkeeping ran — this tick did no candidate walk at all
         self.assertEqual([e["event"] for e in evs if e["event"] in ("live_tick_start", "live_tick_end")], [])
         # the marker persisted so the NEXT tick can skip the gh round-trip outright
         self.assertEqual(state.gh_rate_limited_until(), want_until)
+        self.assertEqual(state.gh_rate_limited_resource(), "core")
+
+    def test_journals_resource_from_the_raised_exception(self):
+        # HERD-670: a discovery leg that classified against "graphql" must arm the marker and journal
+        # against "graphql" — never silently default to "core".
+        os.environ["HERD_FAKE_NOW"] = "1735689000"
+        try:
+            class _RLDiscovery:
+                def discover(self):
+                    raise LR.GhRateLimited(reset_at=1735689600, resource="graphql")
+
+            journal = LiveJournal(self.jpath)
+            state = LiveState(self.tmp)
+            t = LiveTick({}, _RLDiscovery(), FixtureGates({}), DryRunActuator(journal), journal,
+                         state=state)
+            result = t.run()
+        finally:
+            os.environ.pop("HERD_FAKE_NOW", None)
+        self.assertEqual(result.get("rate_limited_resource"), "graphql")
+        self.assertEqual(state.gh_rate_limited_resource(), "graphql")
+        rl = [e for e in events(self.jpath) if e["event"] == "engine_rate_limited"]
+        self.assertEqual(rl[0]["resource"], "graphql")
 
     def test_falls_back_to_the_default_cooldown_when_the_reset_probe_itself_failed(self):
         # reset_at=None (the cheap follow-up probe failed too) must never block the calm path —
@@ -8584,7 +8763,9 @@ class TestLiveTickRateLimitBackoff(LiveCase):
             result = t.run()
         finally:
             os.environ.pop("HERD_FAKE_NOW", None)
-        want_until = 1735689000 + LR._GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS + LR._GH_RATE_LIMIT_BUFFER_SECONDS
+        jitter = LR._resume_jitter_seconds(self.tmp)
+        want_until = (1735689000 + LR._GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS
+                      + LR._GH_RATE_LIMIT_BUFFER_SECONDS + jitter)
         self.assertTrue(result.get("rate_limited"))
         self.assertEqual(result.get("rate_limited_until"), want_until)
         rl = [e for e in events(self.jpath) if e["event"] == "engine_rate_limited"]
@@ -9093,6 +9274,8 @@ class TestGhRateLimitStaleDeadlineReprobe(unittest.TestCase):
         with mock.patch.object(LR, "_gh_rate_limit_remaining", return_value=500) as probe:
             res = tick.run()
             self.assertEqual(probe.call_count, 1)
+            # HERD-670: the default-shape marker (no resource line) re-probes "core".
+            probe.assert_called_once_with("core")
         self.assertNotIn("rate_limited", res)
         self.assertEqual(state.gh_rate_limited_until(), 0, "a refilled budget must clear the marker")
         self.assertTrue(any(e.get("event") == "gh_rate_limit_refilled_early"
@@ -9124,6 +9307,49 @@ class TestGhRateLimitStaleDeadlineReprobe(unittest.TestCase):
         with mock.patch.object(LR, "_gh_rate_limit_remaining") as probe:
             tick.run()
             self.assertEqual(probe.call_count, 0)
+
+    def test_reprobe_reads_the_armed_resource_not_always_core(self):
+        # HERD-670: a marker armed against "graphql" must re-probe "graphql", never default to "core".
+        tick, state = self._tick()
+        future = int(LR._now_epoch()) + 1200
+        state.set_gh_rate_limited_until(future, "graphql")
+        with mock.patch.object(LR, "_gh_rate_limit_remaining", return_value=0) as probe:
+            tick.run()
+        probe.assert_called_once_with("graphql")
+
+    def test_graphql_exhaustion_does_not_refill_early_off_a_full_core_bucket(self):
+        """HERD-670 regression: the exact grounding incident (2026-08-13 00:43-00:45Z) — core sat at
+        4709/5000 the entire time graphql was 0/5000 exhausted. A core-only refill probe misread this
+        as refilled every ~45s and flapped the backoff (engine_rate_limited / gh_rate_limit_refilled_
+        early alternating). The probe must read graphql's own remaining count, not core's."""
+        tick, state = self._tick()
+        future = int(LR._now_epoch()) + 1200
+        state.set_gh_rate_limited_until(future, "graphql")
+
+        def _remaining(resource="core"):
+            return {"core": 4709, "graphql": 0}.get(resource)
+
+        with mock.patch.object(LR, "_gh_rate_limit_remaining", side_effect=_remaining):
+            res = tick.run()
+        self.assertTrue(res.get("rate_limited"), "a full core bucket must not clear a graphql backoff")
+        self.assertEqual(state.gh_rate_limited_until(), future)
+        evs = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertFalse(any(e.get("event") == "gh_rate_limit_refilled_early" for e in evs))
+
+    def test_core_exhaustion_does_not_refill_early_off_a_full_graphql_bucket(self):
+        """Inverse of the above: a core exhaustion (e.g. _repo_owner_name's REST call) must not be
+        cleared by a full graphql bucket either — each resource's backoff is independent."""
+        tick, state = self._tick()
+        future = int(LR._now_epoch()) + 1200
+        state.set_gh_rate_limited_until(future, "core")
+
+        def _remaining(resource="core"):
+            return {"core": 0, "graphql": 4988}.get(resource)
+
+        with mock.patch.object(LR, "_gh_rate_limit_remaining", side_effect=_remaining):
+            res = tick.run()
+        self.assertTrue(res.get("rate_limited"))
+        self.assertEqual(state.gh_rate_limited_until(), future)
 
 
 if __name__ == "__main__":

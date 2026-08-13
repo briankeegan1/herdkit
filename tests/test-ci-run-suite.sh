@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # test-ci-run-suite.sh — hermetic test of scripts/ci/run-suite.sh, the cross-platform
 # CI suite runner. Covers the ONE thing it adds over the healthcheck's plain loop: the
-# per-platform env-sensitive ALLOWLIST classification.
+# per-platform env-sensitive ALLOWLIST classification. Also covers HERD-664 diff-scoped selection
+# and HERD-665 bounded intra-shard parallelism (HERD_CI_SUITE_WORKERS): OFF (unset/0/garbage) is
+# byte-identical to serial, ON preserves the same pass/fail/XFAIL bookkeeping and print order (the
+# FIFO drain queue waits on launch order, not completion order), and actually overlaps in wall-clock.
 #
 # Fully hermetic: it points the runner at a TEMP tests dir of fake pass/fail scripts and a
 # TEMP allowlist via the runner's env knobs, and forces the direct (non-bats) path. No real
@@ -242,6 +245,92 @@ scope_run 1 1
 [ "$RC" -eq 0 ] || fail "(10) unscoped run: expected rc 0, got $RC.  Out:\n$OUT"
 [ "$RAN" = "$ALL_SIX" ] || fail "(10) an unscoped run must execute the entire curated set, ran:\n$RAN"
 grep -q "scoped" <<< "$OUT" && fail "(10) the lever is OFF — the runner must not print a scope line.  Got:\n$OUT"
+pass
+
+
+# ══ HERD-665: BOUNDED INTRA-SHARD PARALLELISM (HERD_CI_SUITE_WORKERS) ═════════════════════════════
+# Ship-dormant: the default (unset, or any non-numeric/zero garbage) must run exactly as before — same
+# order, same pass/fail/XFAIL bookkeeping, same output modulo the one added ", workers=N" banner
+# fragment once the knob is actually raised. A value > 1 must both (a) preserve that output and (b)
+# actually overlap tests in wall-clock, or the knob is a no-op wearing a lever.
+WD="$T/workers"; mkdir -p "$WD"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WD/test-green-a.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WD/test-green-b.sh"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$WD/test-red-c.sh"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$WD/test-flaky-env-d.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$WD/test-green-e.sh"
+chmod +x "$WD"/*.sh
+WAL="$T/workers-allow.tsv"
+printf 'name\tplatforms\treason\ntest-flaky-env-d.sh\tall\tflaky by design\n' > "$WAL"
+
+run_workers() {  # run_workers(<workers-or-empty>) -> sets RC + OUT
+  OUT="$(HERD_CI_FORCE_DIRECT=1 HERD_CI_PLATFORM=ubuntu HERD_CI_TESTS_DIR="$WD" HERD_CI_ALLOWLIST="$WAL" \
+         HERD_CI_SUITE_WORKERS="${1:-}" bash "$RUNNER" 2>&1)"; RC=$?
+}
+
+# (11) DEFAULT (unset) is unaffected: no "workers=" fragment appears anywhere in the output.
+run_workers ""
+DEFAULT_RC=$RC
+[ "$DEFAULT_RC" -eq 1 ] || fail "(11) default workers: expected rc 1 (test-red-c real failure), got $RC.  Out:\n$OUT"
+grep -q "workers=" <<< "$OUT" && fail "(11) the lever is OFF by default — the banner must not mention workers.  Got:\n$OUT"
+DEFAULT_OUT="$OUT"
+pass
+
+# (12) HERD_CI_SUITE_WORKERS=1 explicitly is BYTE-IDENTICAL to the unset default (still serial).
+run_workers "1"
+[ "$OUT" = "$DEFAULT_OUT" ] || fail "(12) HERD_CI_SUITE_WORKERS=1 must be byte-identical to unset.
+--- unset ---
+$DEFAULT_OUT
+--- workers=1 ---
+$OUT"
+pass
+
+# (13) HERD_CI_SUITE_WORKERS=3: same pass/fail/XFAIL bookkeeping as serial, banner gains ONLY the
+# ", workers=3" fragment — strip it and the two outputs must match line-for-line (the FIFO drain queue
+# waits on the OLDEST-LAUNCHED pid, not the first-to-finish, so launch order — and therefore print
+# order — never depends on how many run concurrently).
+run_workers "3"
+[ "$RC" -eq "$DEFAULT_RC" ] || fail "(13) workers=3: expected the same rc ($DEFAULT_RC) as serial, got $RC.  Out:\n$OUT"
+STRIPPED="$(sed 's/, workers=3//' <<< "$OUT")"
+[ "$STRIPPED" = "$DEFAULT_OUT" ] || fail "(13) workers=3 output (banner fragment aside) must match serial output.
+--- serial ---
+$DEFAULT_OUT
+--- workers=3 (stripped) ---
+$STRIPPED"
+pass
+
+# (14) Garbage / zero falls back to serial (1), never to an unbounded or zero-width queue.
+run_workers "0"
+[ "$OUT" = "$DEFAULT_OUT" ] || fail "(14) HERD_CI_SUITE_WORKERS=0 must fall back to serial (byte-identical).  Got:\n$OUT"
+run_workers "banana"
+[ "$OUT" = "$DEFAULT_OUT" ] || fail "(14) a non-numeric HERD_CI_SUITE_WORKERS must fall back to serial (byte-identical).  Got:\n$OUT"
+pass
+
+# (15) The knob actually overlaps tests in wall-clock — proof it is not a no-op. 6 tests that each
+# sleep 1s: serial must take >=6s; workers=6 must take comfortably under that (a generous <4s bound
+# leaves headroom for a loaded CI box while still proving real overlap, not 1.0x).
+SD="$T/slow"; mkdir -p "$SD"
+i=1
+while [ "$i" -le 6 ]; do
+  printf '#!/usr/bin/env bash\nsleep 1\nexit 0\n' > "$SD/test-slow-$i.sh"
+  i=$((i + 1))
+done
+chmod +x "$SD"/*.sh
+time_workers() {  # time_workers(<workers-or-empty>) -> prints elapsed whole seconds
+  local t0 t1
+  t0=$(date +%s)
+  HERD_CI_FORCE_DIRECT=1 HERD_CI_PLATFORM=ubuntu HERD_CI_TESTS_DIR="$SD" \
+    HERD_CI_SUITE_WORKERS="${1:-}" bash "$RUNNER" >/dev/null 2>&1
+  t1=$(date +%s)
+  printf '%s' "$((t1 - t0))"
+}
+SERIAL_SECS="$(time_workers "")"
+PARALLEL_SECS="$(time_workers "6")"
+[ "$SERIAL_SECS" -ge 6 ] || fail "(15) 6x 1s tests serial should take >=6s, took ${SERIAL_SECS}s"
+[ "$PARALLEL_SECS" -lt "$SERIAL_SECS" ] \
+  || fail "(15) workers=6 (${PARALLEL_SECS}s) should be faster than serial (${SERIAL_SECS}s) — the knob did not overlap anything"
+[ "$PARALLEL_SECS" -lt 4 ] \
+  || fail "(15) workers=6 took ${PARALLEL_SECS}s for 6x 1s tests — expected comfortably under 4s of real overlap"
 pass
 
 echo "PASS: test-ci-run-suite ($PASS checks)"

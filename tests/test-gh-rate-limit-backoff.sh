@@ -53,12 +53,15 @@ case "$*" in
     exit 0
     ;;
   *"rate_limit"*)
-    # HERD-649c: the live tick also probes `-q .rate.remaining` (the stale-deadline re-probe) once a
-    # backoff marker is already in force. This suite models a budget that is STILL exhausted across
-    # every tick it drives — 0 keeps that re-probe honoring the backoff exactly as before HERD-649c,
-    # which is what lets the "second tick makes ZERO further graphql calls" assertion below hold.
+    # HERD-649c: the live tick also probes the stale-deadline re-probe's "remaining" query once a
+    # backoff marker is already in force. HERD-670: that query now reads a NAMED resource —
+    # `.resources.<core|graphql>.remaining`, never the ambiguous `.rate.remaining` alias — so match on
+    # the "remaining" suffix generically rather than the old literal `.rate.remaining` field. This
+    # suite models a budget that is STILL exhausted across every tick it drives — 0 keeps that
+    # re-probe honoring the backoff exactly as before HERD-649c, which is what lets the "second tick
+    # makes ZERO further graphql calls" assertion below hold.
     case "$*" in
-      *".rate.remaining"*) printf '0\n' ;;
+      *".remaining"*) printf '0\n' ;;
       *) printf '%s\n' "$GH_STUB_RESET_EPOCH" ;;
     esac
     exit 0
@@ -94,7 +97,10 @@ export DRYRUN=1 AGENT_WATCH_DRYRUN=1
 export HERDKIT_HOME="$REPO"
 
 set_mode() { printf '%s' "$1" > "$GH_STUB_MODE_FILE"; }
-graphql_calls() { grep -c 'graphql' "$GH_STUB_CALLS" 2>/dev/null || true; }
+# HERD-670: matches only the discovery leg's OWN call ("api graphql ..."), never the rate_limit
+# probe — that probe's `-q .resources.graphql.remaining/.reset` argument also contains the substring
+# "graphql" now that the probe reads a NAMED resource, which would otherwise double-count it.
+graphql_calls() { grep -c '^api graphql ' "$GH_STUB_CALLS" 2>/dev/null || true; }
 
 # ── (1) herd_engine_live_tick directly: a rate-limited tick returns 0 (not a fault) and the real
 #        python journals engine_rate_limited with the reset stamp ────────────────────────────────
