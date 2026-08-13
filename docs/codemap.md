@@ -114,6 +114,7 @@ Role summarized from each file's top-of-file comment.
 - `tab-create-lint.sh` — THE shared TAB-DISCIPLINE CREATION guard (HERD-569): engine code may open a
 - `tab-discipline.sh` — THE RECONCILED TAB-DISCIPLINE SWEEP (HERD-569): the workspace's tab bar is
 - `task-spec-view.sh` — task-spec-view.sh <spec-file> — live, styled viewer for a BUILDER tab's otherwise-idle root pane.
+- `team-presence-live.sh` — HERD-661 (GitHub issue #639 phase 2): the LIVE half of teammate builder
 - `test-cap-ledger.sh` — THE shared PER-TEST TIMEOUT LEDGER library (HERD-478): scripts/ci/run-suite.sh
 - `theme.sh` — pluggable theming (HERD_THEME) for every herd color surface.
 - `tracker-state-sweep.sh` — periodic, ADVISORY tracker-state SELF-HEAL sweep (HERD-86).
@@ -159,7 +160,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 
 - `bin/herd` → `agent-update.sh`, `agents.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `intent-queue.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
-- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `capacity-ledger.sh`, `ci-repair.sh`, `console-section.sh`, `core-surface.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `intent-queue.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
+- `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `capacity-ledger.sh`, `ci-repair.sh`, `console-section.sh`, `core-surface.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `intent-queue.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `team-presence-live.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `agents.sh` → `driver.sh`, `herd-config.sh`
 - `app-monitor.sh` → `herd-config.sh`
 - `backlog-reconcile-sweep.sh` → `herd-config.sh`, `journal.sh`
@@ -407,7 +408,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
 - `WATCHER_CRASHLOOP_GUARD` → `herd-watch.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
-- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`, `spawn.sh`, `tracker-state-sweep.sh`
+- `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`, `spawn.sh`, `team-presence-live.sh`, `tracker-state-sweep.sh`
 - `WATCHER_RESURRECT` → `bin/herd`, `watcher-resurrect.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`, `resolver-claim.sh`
 - `WATCHER_SELF_RESTART` → `agent-watch.sh`
@@ -415,7 +416,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_STOP_REAP_MAIN_HEALTH` → `bin/herd`
 - `WATCHER_VIEW` → `agent-watch.sh`
 - `WATCHER_VIEW_ASSIGNEE` → `agent-watch.sh`
-- `WATCHER_VIEW_AUTHOR` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `resolver-claim.sh`
+- `WATCHER_VIEW_AUTHOR` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `resolver-claim.sh`, `team-presence-live.sh`
 - `WATCHER_VIEW_DEPS_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_LABEL` → `agent-watch.sh`
 - `WATCHER_VIEW_STATUS` → `agent-watch.sh`
