@@ -405,4 +405,44 @@ out="$(env -u HERD_AGENT HERD_AGENTS_DIR="$T/empty-roster" PROJECT_ROOT="$T/proj
 [ -z "$out" ] || fail "(15) doctor roster leg is not byte-inert without a roster: [$out]"
 pass; echo "PASS (15) list/show/new behave; the doctor leg is advisory, cache-only and byte-inert when empty"
 
+# ── 16. documentation .md files in the roster dir are SKIPPED, never mistaken for agents ──────────
+# (HERD-732, GH #801): a README.md with no frontmatter, and a stray .md whose frontmatter never sets
+# `name:`, both landed as bogus roster rows before this fix. Fixed ONCE in the shared scan
+# (herd_roster_names) rather than per-surface, so list/pane/install/verify all skip them together.
+cat > "$ROSTER/README.md" <<'EOF'
+# Agent roster
+
+This directory holds specialist agent definitions. See `herd agents new <name>`.
+EOF
+cat > "$ROSTER/noname.md" <<'EOF'
+---
+description: frontmatter present but no name: field
+---
+
+body
+EOF
+got="$(roster_sh 'herd_roster_names')"
+[ "$got" = "testing" ] || fail "(16) roster names leaked a documentation file: [$got]"
+got="$(roster_sh 'herd_roster_skipped_names')"
+[ "$got" = "$(printf 'README\nnoname')" ] || fail "(16) skipped names = [$got], expected README + noname"
+got="$(roster_sh 'herd_roster_field "$HERD_AGENTS_DIR/noname.md" name')"
+[ -z "$got" ] || fail "(16) noname.md unexpectedly parsed a name: [$got]"
+out="$(HERD_DRIVER=stub roster_sh 'herd_roster_list')"
+case "$out" in *"skipped: README.md (no frontmatter)"*) : ;; *) fail "(16) list did not report README as skipped (no frontmatter): $out" ;; esac
+case "$out" in *"skipped: noname.md (no name: field)"*) : ;; *) fail "(16) list did not report noname.md as skipped (no name: field): $out" ;; esac
+case "$out" in *$'\nREADME '*|*$'\nnoname '*) fail "(16) list rendered a documentation file as a roster row: $out" ;; esac
+# install (mode=install for the stub driver) publishes only the real definition — never the skipped ones.
+_ROSTER_ENV=(HERD_AGENT_DEFINITION_ROOT="$T/home2")
+out="$(HERD_DRIVER=stub roster_sh 'herd_roster_install stub')" || fail "(16) install exited non-zero: $out"
+_ROSTER_ENV=()
+[ -f "$T/home2/.stub-agent/agents/testing.md" ] || fail "(16) install did not publish the real definition"
+[ -e "$T/home2/.stub-agent/agents/README.md" ] && fail "(16) install published README.md as a definition"
+[ -e "$T/home2/.stub-agent/agents/noname.md" ] && fail "(16) install published noname.md as a definition"
+# the `verify` (no-name) loop iterates herd_roster_names — it would never even attempt the skipped ones.
+out="$(roster_sh 'for n in $(herd_roster_names); do printf "would-verify:%s\n" "$n"; done')"
+case "$out" in *"would-verify:README"*|*"would-verify:noname"*) fail "(16) the verify-all loop would probe a skipped file: $out" ;; esac
+case "$out" in *"would-verify:testing"*) : ;; *) fail "(16) the verify-all loop skipped the real definition: $out" ;; esac
+rm -f "$ROSTER/README.md" "$ROSTER/noname.md"
+pass; echo "PASS (16) documentation .md files (no frontmatter / no name:) are skipped by the shared scan, with a reported skip line"
+
 echo "ALL PASS ($PASS checks)"

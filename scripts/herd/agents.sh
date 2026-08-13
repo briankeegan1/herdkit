@@ -95,8 +95,22 @@ herd_roster_path() {
   printf '%s' "$f"
 }
 
-# herd_roster_names — every definition name in the roster, one per line, LC_ALL=C sorted. Empty (and
-# exit 0) when the roster dir is absent or holds no definitions — an unused feature is not an error.
+# herd_roster_is_definition <file> — success iff <file> is a REAL roster definition rather than
+# documentation that happens to sit in the roster dir (HERD-732, GH #801: a README.md alongside the
+# real definitions rendered as a roster row with name "README", description "—", unverified). Reuses
+# herd_roster_field, which already returns empty both for a file with NO frontmatter block at all and
+# for a frontmatter block that never sets `name:` — so both shapes of "this is not a definition" are
+# one check. This is the single classification every scan below builds on.
+herd_roster_is_definition() {
+  local f="${1:-}"
+  [ -f "$f" ] || return 1
+  [ -n "$(herd_roster_field "$f" name)" ]
+}
+
+# herd_roster_names — every REAL definition name in the roster, one per line, LC_ALL=C sorted. Empty
+# (and exit 0) when the roster dir is absent or holds no definitions — an unused feature is not an
+# error. This is the ONE roster-scan helper `list`, the pane, `install` and `verify` all consume, so a
+# classification fix lands here once rather than being re-derived per surface.
 herd_roster_names() {
   local d f b out=""
   d="$(herd_roster_dir)"
@@ -105,10 +119,42 @@ herd_roster_names() {
     [ -f "$f" ] || continue                       # nullglob-off guard: no match → literal → skip
     b="$(basename "$f" .md)"
     herd_roster_name_ok "$b" || continue
+    herd_roster_is_definition "$f" || continue    # documentation (no frontmatter / no name:) — skip
     out="$out$b"$'\n'
   done
   [ -n "$out" ] || return 0
   printf '%s' "$out" | LC_ALL=C sort              # pipe-ok: a bounded roster, far under a pipe buffer
+}
+
+# herd_roster_skipped_names — every *.md in the roster dir that herd_roster_names skipped as
+# documentation (a safe basename that fails herd_roster_is_definition), one per line, LC_ALL=C sorted.
+# Lets `herd agents list` SAY what it skipped instead of just silently shrinking the roster.
+herd_roster_skipped_names() {
+  local d f b out=""
+  d="$(herd_roster_dir)"
+  [ -d "$d" ] || return 0
+  for f in "$d"/*.md; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f" .md)"
+    herd_roster_name_ok "$b" || continue
+    herd_roster_is_definition "$f" && continue
+    out="$out$b"$'\n'
+  done
+  [ -n "$out" ] || return 0
+  printf '%s' "$out" | LC_ALL=C sort
+}
+
+# _herd_roster_skip_reason <file> — the human-readable reason herd_roster_list shows next to a
+# skipped .md: no frontmatter block at all, or a frontmatter block missing `name:`. Message-only — the
+# actual skip decision is herd_roster_is_definition; this never gates anything.
+_herd_roster_skip_reason() {
+  local f="${1:-}" first
+  first="$(head -n1 "$f" 2>/dev/null | tr -d '[:space:]')"
+  if [ "$first" = "---" ]; then
+    printf 'no name: field'
+  else
+    printf 'no frontmatter'
+  fi
 }
 
 # herd_roster_field <file> <key> — a FRONTMATTER value from a definition. The frontmatter is the
@@ -587,7 +633,7 @@ herd_roster_lane_warn() {
 # herd_roster_list — the roster plus, per entry, the ACTIVE driver's resolution state read from the
 # CACHE (never a live probe — `herd agents verify` owns the spawning). Always exits 0.
 herd_roster_list() {
-  local drv mode kind dir n f sha cached verdict desc reason
+  local drv mode kind dir n f sha cached verdict desc reason skipped
   drv="$(herd_driver_name 2>/dev/null || printf 'herdr-claude')"
   mode="$(herd_roster_mode "$drv")"
   kind="$(herd_roster_probe_kind "$drv")"
@@ -597,8 +643,15 @@ herd_roster_list() {
     "$drv" "$mode" "$kind" "${dir:-<none>}"
   reason="$(herd_roster_degrade_reason DRIVER_AGENT_SELECT_FLAG "$drv")"
   [ -n "$reason" ] && printf '        no by-name selector on this runtime (%s) — definitions are INJECTED into the task spec\n' "$reason"
+  skipped="$(herd_roster_skipped_names)"
   if [ -z "$(herd_roster_names)" ]; then
     printf '\n(no definitions yet — scaffold one with: herd agents new <name>)\n'
+    if [ -n "$skipped" ]; then
+      while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        printf '  skipped: %s.md (%s)\n' "$n" "$(_herd_roster_skip_reason "$(herd_roster_dir)/$n.md")"
+      done <<< "$skipped"
+    fi
     return 0
   fi
   printf '\n%-24s %-14s %s\n' "NAME" "STATE" "DESCRIPTION"
@@ -616,6 +669,12 @@ herd_roster_list() {
     [ "${#desc}" -gt 72 ] && desc="${desc:0:69}..."
     printf '%-24s %-14s %s\n' "$n" "$verdict" "$desc"
   done <<< "$(herd_roster_names)"
+  if [ -n "$skipped" ]; then
+    while IFS= read -r n; do
+      [ -n "$n" ] || continue
+      printf '  skipped: %s.md (%s)\n' "$n" "$(_herd_roster_skip_reason "$(herd_roster_dir)/$n.md")"
+    done <<< "$skipped"
+  fi
   printf '\nstate is the CACHED verdict for (driver=%s, definition sha) — re-probe with: herd agents verify\n' "$drv"
   return 0
 }
