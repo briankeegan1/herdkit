@@ -205,6 +205,15 @@ if [ -n "${HERD_ITEM_REF:-}" ]; then
   printf '%s\n' "$HERD_ITEM_REF" > "$WORKTREES_DIR/.herd-ref-$SLUG" 2>/dev/null || true
 fi
 
+# HERD-668: mirror the marker above for the specialist agent this builder was spawned under, so the
+# AGENTS_PANE control-room pane (scripts/herd/agents-pane-view.sh) can render "<slug> — <agent>"
+# without a live probe or a re-derivation of HERD_AGENT from anywhere else. Written only when
+# HERD_AGENT names a definition (an untracked/plain spawn leaves no marker → the pane renders
+# "general"). Fail-soft: a write error never blocks the spawn.
+if [ -n "${HERD_AGENT:-}" ]; then
+  printf '%s\n' "$HERD_AGENT" > "$WORKTREES_DIR/.herd-agent-$SLUG" 2>/dev/null || true
+fi
+
 # 2. New herdr tab rooted in the worktree; grab tab id + root pane id. If herdr is unavailable
 #    the parse yields empty ids — bail loudly instead of failing cryptically.
 #    SKIPPED under the headless driver: no tabs/panes (the agent is launched detached below).

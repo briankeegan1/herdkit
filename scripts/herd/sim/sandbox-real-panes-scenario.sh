@@ -215,7 +215,7 @@ else
   command -v herdr >/dev/null 2>&1 || reason="herdr not installed"
   checkpoint herdr_available skip "$reason — skipping the real-pane path (headless CI is clean, not red)"
   # Skip every downstream pane checkpoint LOUDLY (each recorded skip), then emit a skip scorecard.
-  for cp in workspace_created control_room reload_pane_verify_timeout builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
+  for cp in workspace_created control_room agents_pane_off_byte_identical agents_pane_on_present reload_pane_verify_timeout builder_tab pane_labels_on_spawn agent_idle agent_working agent_done \
             pane_captured notify_stubbed reviewer_pane_retired_on_verdict reviewer_pane_close_refused_on_mismatch \
             context_guard_refuses_real_teardown \
             resolver_pane_retired_on_done resolver_pane_kept_on_escalate \
@@ -271,6 +271,51 @@ except Exception as e:
       checkpoint control_room pass "control-room tab $CTRL_TAB has labelled watcher + backlog panes"
     else
       checkpoint control_room fail "watcher/backlog panes not both present+labelled ($CTRL_OK)"
+    fi
+  fi
+
+  # ── AGENTS_PANE (HERD-668): off is byte-identical, on splits + labels a pane off the WATCH pane ──
+  # coordinator.sh / bin/herd (cmd_reload, `herd pane agents`) only ever call
+  # `herdr pane split <watch-pane> --direction right --ratio 0.72 …` when AGENTS_PANE=on — the exact
+  # call reproduced here. off (the default, and the control room stood up just above) never makes
+  # this call, so the FIRST assertion proves the byte-identical claim on the SAME control room the
+  # `control_room` checkpoint already built, before this scenario ever arms the lever.
+  if [ -n "$WSID" ]; then
+    step agentspane "AGENTS_PANE off is byte-identical (no split); on splits + labels a pane off the watch pane"
+    AGP_OFF="$(pane_json "$WSID" | python3 -c '
+import sys,json
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    print("yes" if any(str(p.get("label",""))=="agents" for p in panes) else "no")
+except Exception:
+    print("err")
+' 2>/dev/null)"
+    if [ "$AGP_OFF" = no ]; then
+      checkpoint agents_pane_off_byte_identical pass "no 'agents'-labelled pane exists — AGENTS_PANE=off never split one (byte-identical control room)"
+    else
+      checkpoint agents_pane_off_byte_identical fail "an 'agents' pane exists despite AGENTS_PANE never being armed ($AGP_OFF)"
+    fi
+
+    AG_SPLIT="$(herdr pane split "$WATCH_PANE" --direction right --ratio 0.72 --cwd "$REPO" --no-focus 2>/dev/null || true)"
+    AGENTS_PANE_ID="$(printf '%s' "$AG_SPLIT" | hj 'd["result"]["pane"]["pane_id"]')"
+    if [ -n "$AGENTS_PANE_ID" ]; then
+      PANES_CREATED=$((PANES_CREATED+1))
+      herdr pane rename "$AGENTS_PANE_ID" "agents" >/dev/null 2>&1 || true
+    fi
+    AGP_ON="$(pane_json "$WSID" | python3 -c '
+import sys,json
+tab=sys.argv[1]
+try:
+    panes=(json.load(sys.stdin).get("result") or {}).get("panes") or []
+    mine={str(p.get("label","")) for p in panes if str(p.get("tab_id",""))==tab}
+    print("yes" if "agents" in mine and "watcher" in mine else "no:"+",".join(sorted(mine)))
+except Exception as e:
+    print("err:"+str(e))
+' "$CTRL_TAB" 2>/dev/null)"
+    if [ "$AGP_ON" = yes ] && [ -n "$AGENTS_PANE_ID" ]; then
+      checkpoint agents_pane_on_present pass "AGENTS_PANE=on split + labelled a pane ($AGENTS_PANE_ID) off the watch pane; watcher pane still present"
+    else
+      checkpoint agents_pane_on_present fail "agents pane not created/labelled as expected ($AGP_ON, id=$AGENTS_PANE_ID)"
     fi
   fi
 
