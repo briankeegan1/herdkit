@@ -46,6 +46,23 @@
 #                        (mutation-proven by tests/test-suite-shard.sh). "all" mode
 #                        (HERD_CI_FORCE_DIRECT=1) ignores sharding — it is a debug/full-glob mode,
 #                        not the gate.
+#   HERD_CI_SCOPE_BASE_REF / HERD_CI_SCOPE_REPO (HERD-664): DIFF-SCOPED selection. When
+#                        HERD_CI_SCOPE_BASE_REF names a base ref (the CI workflow passes
+#                        `origin/<pr base branch>` for a pull_request, and NOTHING for a push to
+#                        main), the runner diffs HEAD against its merge-base with that ref and runs
+#                        only the curated tests that diff can affect — scoping FIRST, then sharding
+#                        the SCOPED set, so a shard whose scoped slice is empty exits green fast.
+#                        The selection itself (name-pairing + `# suite-deps:` headers + the
+#                        always-run core + FAIL-CLOSED on any wide-blast or unmappable path) is
+#                        scripts/herd/suite-shard.sh's herd_suite_tests_for_diff — ONE
+#                        implementation shared with the local heavy gate, mutation-proven by
+#                        tests/test-suite-scope.sh. UNSET (the default, and what a main push gets) is
+#                        byte-identical to the pre-HERD-664 full sharded run, and so is every
+#                        fail-closed path: a wide-blast/unmappable diff, or a diff that cannot be
+#                        obtained at all, runs the ENTIRE curated sharded set. Whatever it selects is
+#                        announced loudly ("scoped N of M curated tests (reason)") — never a silent
+#                        cap. HERD_CI_SCOPE_REPO is the git repo the diff is computed in (default:
+#                        this checkout, $ROOT); tests point it at a fixture.
 #   HERD_CI_TEST_CAP_LEDGER (HERD-478): tsv path naming PER-TEST timeout overrides (default:
 #                        <tests-dir>/test-caps.tsv). A test named there runs under its own row's
 #                        cap-secs instead of HERD_CI_TEST_TIMEOUT; every other test is unaffected —
@@ -65,6 +82,8 @@ PER_TEST_TIMEOUT="${HERD_CI_TEST_TIMEOUT:-120}"
 CAP_LEDGER="${HERD_CI_TEST_CAP_LEDGER:-$TESTS_DIR/test-caps.tsv}"
 SHARD_INDEX="${HERD_CI_SHARD_INDEX:-1}"
 SHARD_COUNT="${HERD_CI_SHARD_COUNT:-1}"
+SCOPE_BASE_REF="${HERD_CI_SCOPE_BASE_REF:-}"
+SCOPE_REPO="${HERD_CI_SCOPE_REPO:-$ROOT}"
 case "$SHARD_INDEX" in ''|*[!0-9]*) SHARD_INDEX=1 ;; esac
 case "$SHARD_COUNT" in ''|*[!0-9]*) SHARD_COUNT=1 ;; esac
 [ "$SHARD_COUNT" -ge 1 ] 2>/dev/null || SHARD_COUNT=1
@@ -165,7 +184,33 @@ allow_reason() {
   return 1
 }
 
+# ── HERD-664 DIFF-SCOPED SELECTION: the changed paths this run is scoped to ──────
+# Prints the paths changed between HEAD and its merge-base with <base-ref>, one per line; returns 1
+# when the diff CANNOT be obtained (no git, not a repo, an unresolvable base ref, a shallow clone
+# with no common ancestor). Every one of those is answered by the caller with the FULL curated set —
+# "we could not tell what changed" must never read as "nothing changed".
+scope_changed_paths() {
+  local _scp_base="$1" _scp_mb _scp_out
+  [ -n "$_scp_base" ] || return 1
+  command -v git >/dev/null 2>&1 || return 1
+  git -C "$SCOPE_REPO" rev-parse --git-dir >/dev/null 2>&1 || return 1
+  _scp_mb="$(git -C "$SCOPE_REPO" merge-base "$_scp_base" HEAD 2>/dev/null)" || return 1
+  [ -n "$_scp_mb" ] || return 1
+  # --no-renames on purpose: with rename detection ON, a moved file is reported ONLY under its NEW
+  # path, so the OLD path — whose paired test may be the one that actually covers the move — never
+  # reaches the selection rules. Listing both halves keeps the mapping (and its fail-closed fallback)
+  # working on a rename.
+  _scp_out="$(git -C "$SCOPE_REPO" diff --no-renames --name-only "$_scp_mb" HEAD 2>/dev/null)" || return 1
+  printf '%s\n' "$_scp_out"
+  return 0
+}
+
 # ── select the test files: curated (the exact set the bats gate runs) by default, else the glob ──
+SCOPE_MODE="full"     # "diff" only once a NARROWER-than-curated selection has actually been proven
+SCOPE_REASON=""
+SCOPE_SEL=""
+SCOPE_N=0
+SCOPE_TOTAL=0
 tests=()
 if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] && [ -f "$CURATED_SRC" ]; then
   MODE="curated"
@@ -193,10 +238,67 @@ if [ "${HERD_CI_FORCE_DIRECT:-0}" != "1" ] && [ -f "$CURATED_SRC" ]; then
   # curated glob-minus-exempt logic can never drift between the two. SHARD_COUNT=1 (the default) selects
   # every curated test — byte-identical to the pre-shard unsharded selection.
   EXEMPT_FILE="$TESTS_DIR/gate-coverage-exempt.tsv"
-  while IFS= read -r base; do
-    [ -n "$base" ] || continue
-    tests+=("$TESTS_DIR/$base")
-  done < <(herd_suite_tests_for_shard "$TESTS_DIR" "$SHARD_INDEX" "$SHARD_COUNT" "$EXEMPT_FILE")
+  # HERD-664: SCOPE FIRST, THEN SHARD. Sharding splits the same work across boxes; scoping asks which
+  # of the curated tests this diff can actually break. Doing it in this order is what lets a shard
+  # whose scoped slice is empty exit green immediately instead of paying for a runner that had
+  # nothing to run. The selection is herd_suite_tests_for_diff's (ONE implementation, shared with the
+  # local heavy gate and mutation-proven by tests/test-suite-scope.sh); this file only decides
+  # WHETHER to scope and then applies the SAME herd_suite_shard_of partition to whatever came back —
+  # so the scoped-then-sharded union across a full matrix row is exactly the scoped selection
+  # (mutation-proven by tests/test-suite-shard.sh check 9).
+  #
+  # FAIL-CLOSED, three ways, each announced: no base ref (a push to main, or any caller that never
+  # opts in) → full; the diff cannot be obtained → full; the selection comes back AS the whole curated
+  # set (a wide-blast or unmappable path) → full, reached by the SAME herd_suite_tests_for_shard call
+  # as before so the run is byte-identical to a pre-HERD-664 one.
+  if [ -n "$SCOPE_BASE_REF" ] && command -v herd_suite_tests_for_diff >/dev/null 2>&1; then
+    scope_curated="$(herd_suite_curated_tests "$TESTS_DIR" "$EXEMPT_FILE")"
+    SCOPE_TOTAL="$(printf '%s\n' "$scope_curated" | grep -c .)"
+    SCOPE_N="$SCOPE_TOTAL"
+    if scope_raw="$(scope_changed_paths "$SCOPE_BASE_REF")"; then
+      scope_paths=()
+      while IFS= read -r scope_p; do
+        [ -n "$scope_p" ] && scope_paths+=("$scope_p")
+      done <<EOF
+$scope_raw
+EOF
+      if [ "${#scope_paths[@]}" -eq 0 ]; then
+        SCOPE_REASON="fail-closed: the diff vs '$SCOPE_BASE_REF' named no changed path"
+      else
+        scope_try="$(herd_suite_tests_for_diff "$TESTS_DIR" "${scope_paths[@]}")"
+        if [ -z "$scope_try" ] || [ "$scope_try" = "$scope_curated" ]; then
+          SCOPE_REASON="fail-closed: a wide-blast or unmappable path among ${#scope_paths[@]} changed path(s) vs '$SCOPE_BASE_REF'"
+        else
+          SCOPE_MODE="diff"
+          SCOPE_SEL="$scope_try"
+          SCOPE_N="$(printf '%s\n' "$SCOPE_SEL" | grep -c .)"
+          SCOPE_REASON="${#scope_paths[@]} changed path(s) vs merge-base with '$SCOPE_BASE_REF'"
+        fi
+      fi
+    else
+      SCOPE_REASON="fail-closed: cannot diff HEAD against '$SCOPE_BASE_REF' in $SCOPE_REPO"
+    fi
+    echo "🔎 scoped $SCOPE_N of $SCOPE_TOTAL curated tests ($SCOPE_REASON)"
+  elif [ -n "$SCOPE_BASE_REF" ]; then
+    # A partially-upgraded tree: a base ref was passed, but this checkout's suite-shard.sh predates
+    # diff-scoped selection. Fall back to the full curated set — loudly, never silently.
+    echo "⚠️  HERD_CI_SCOPE_BASE_REF='$SCOPE_BASE_REF' but this tree's scripts/herd/suite-shard.sh has no diff-scoped selection — running the FULL curated set"
+  fi
+  if [ "$SCOPE_MODE" = "diff" ]; then
+    # The scoped set, partitioned by the SAME stable filename hash the unscoped path uses.
+    while IFS= read -r base; do
+      [ -n "$base" ] || continue
+      [ "$(herd_suite_shard_of "$base" "$SHARD_COUNT")" = "$SHARD_INDEX" ] || continue
+      tests+=("$TESTS_DIR/$base")
+    done <<EOF
+$SCOPE_SEL
+EOF
+  else
+    while IFS= read -r base; do
+      [ -n "$base" ] || continue
+      tests+=("$TESTS_DIR/$base")
+    done < <(herd_suite_tests_for_shard "$TESTS_DIR" "$SHARD_INDEX" "$SHARD_COUNT" "$EXEMPT_FILE")
+  fi
 else
   MODE="all"
   shopt -s nullglob
@@ -204,6 +306,14 @@ else
   shopt -u nullglob
 fi
 if [ "${#tests[@]}" -eq 0 ]; then
+  # HERD-664: under a PROVEN diff-scoped selection an empty slice is the point, not a misconfiguration
+  # — none of the tests this diff can break hashed into this shard, so this runner is done. Loud and
+  # green, never silent. Every other empty selection (a bad shard index, an empty tests dir, a scoped
+  # selection that somehow came back empty) is still the setup error it always was.
+  if [ "$SCOPE_MODE" = "diff" ] && [ "$SCOPE_N" -gt 0 ]; then
+    echo "✅ shard $SHARD_INDEX/$SHARD_COUNT has NO scoped tests — none of the $SCOPE_N scoped (of $SCOPE_TOTAL curated) tests hash to this shard"
+    exit 0
+  fi
   echo "❌ no tests selected (mode=$MODE, dir=$TESTS_DIR)" >&2
   exit 2
 fi
@@ -225,6 +335,10 @@ fi
 [ -n "$TO_BIN" ] || echo "⚠️  no timeout binary found — running tests without a per-test cap"
 shard_note=""
 [ "$SHARD_COUNT" -gt 1 ] && shard_note=", shard=$SHARD_INDEX/$SHARD_COUNT"
+# HERD-664: carried into the run header AND the summary banner, so a log read from either end says
+# what this leg actually covered. Empty (byte-identical) whenever the run was not narrowed.
+scope_note=""
+[ "$SCOPE_MODE" = "diff" ] && scope_note=", scoped=$SCOPE_N/$SCOPE_TOTAL"
 cap_note=""
 if [ -f "$CAP_LEDGER" ]; then
   cap_rows="$(grep -vE '^[[:space:]]*(#|test[[:space:]])' "$CAP_LEDGER" 2>/dev/null | grep -c .)" || cap_rows=0
@@ -232,7 +346,7 @@ if [ -f "$CAP_LEDGER" ]; then
 fi
 timeout_note="default-timeout=none"
 [ -n "$TO_BIN" ] && timeout_note="default-timeout=${PER_TEST_TIMEOUT}s"
-echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, ${timeout_note}${cap_note}${shard_note}) on ${PLATFORM}"
+echo "▶ running ${#tests[@]} hermetic tests (mode=$MODE, ${timeout_note}${cap_note}${shard_note}${scope_note}) on ${PLATFORM}"
 for t in "${tests[@]}"; do
   name="$(basename "$t")"
   log="$LOGDIR/$name.log"
@@ -281,7 +395,7 @@ for t in "${tests[@]}"; do
 done
 
 echo
-echo "── CI suite summary (${PLATFORM}, mode=$MODE${shard_note}) ─────────────────"
+echo "── CI suite summary (${PLATFORM}, mode=$MODE${shard_note}${scope_note}) ─────────────────"
 echo "   passed:                $pass"
 echo "   XFAIL (env-sensitive): $xfail"
 echo "   real failures:         $real_fail"
@@ -291,8 +405,8 @@ fi
 if [ "$real_fail" -gt 0 ]; then
   echo "   real-failed tests:"
   printf '     ✗ %s\n' "${real_names[@]}"
-  echo "❌ CI SUITE FAILED on ${PLATFORM}${shard_note} ($real_fail real failure(s))"
+  echo "❌ CI SUITE FAILED on ${PLATFORM}${shard_note}${scope_note} ($real_fail real failure(s))"
   exit 1
 fi
-echo "✅ CI SUITE CLEAN on ${PLATFORM}${shard_note} ($pass passed, $xfail env-sensitive XFAIL)"
+echo "✅ CI SUITE CLEAN on ${PLATFORM}${shard_note}${scope_note} ($pass passed, $xfail env-sensitive XFAIL)"
 exit 0
