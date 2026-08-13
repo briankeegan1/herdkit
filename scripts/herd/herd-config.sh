@@ -1217,6 +1217,16 @@ export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
 # A small value like 5 is a conservative arm for unattended runs.
 : "${WATCH_CLAUDE_PROBE_TIMEOUT:="0"}"  # 0/unset = off (byte-inert); N>=1 = `claude --version` probe timeout (seconds)
 
+# ── In-console hotkey (HERD-674) ──────────────────────────────────────────────
+# WATCH_HOTKEYS arms a bounded, fail-soft keypress listener on the watcher's OWN tick loop: pressing
+# 'v' flips WATCHER_VIEW mine<->all IN-MEMORY, for this process only (never writes .herd/config or
+# config.local — `herd config set` remains the durable path). off (default) => byte-inert: no stty
+# call, no stdin read, no listener process, no rendered hint. on => armed ONLY when the watcher's own
+# stdin is a real interactive tty (never headless/sim/lib-mode/a piped stdin, which degrade silently).
+# Machine-scoped (routes to .herd/config.local): whether THIS seat's pane has an attached keyboard is
+# per-machine state, exactly like WATCHER_VIEW* and HERD_DRIVER. Consumed by agent-watch.sh.
+: "${WATCH_HOTKEYS:="off"}"
+
 # ── Claude Code custom endpoint (HERD-171) ───────────────────────────────────
 # ANTHROPIC_BASE_URL relocates the endpoint the claude runtime talks to (enterprise/BAA gateway or
 # a local model server). Empty/unset => Claude Code default Anthropic endpoint (byte-identical). The

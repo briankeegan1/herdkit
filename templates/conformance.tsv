@@ -363,6 +363,7 @@ DELTA_REVIEW	unit	tests/test-delta-review.sh
 DELTA_REVIEW	unit	tests/test_live_runtime.py
 WATCH_CLAUDE_PROBE_TIMEOUT	unit	tests/test-watcher-claude-hang.sh
 WATCH_CLAUDE_PROBE_TIMEOUT	unit	tests/test_live_runtime.py
+WATCH_HOTKEYS	unit	tests/test-watch-hotkeys.sh
 REVIEW_MODEL_ESCALATED	unit	tests/test-review-escalation.sh
 REVIEW_MODEL_ESCALATED	unit	tests/test_live_runtime.py
 REVIEW_EVIDENCE_ESCALATE_ROUNDS	unit	tests/test-review-escalation.sh
