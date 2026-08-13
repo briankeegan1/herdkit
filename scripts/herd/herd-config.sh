@@ -1248,9 +1248,15 @@ export MERGE_POLICY WATCHER_AUTOMERGE HUMAN_VERIFY_POLICY MERGE_METHOD \
 # exported and `gh` falls back to its already-authenticated identity exactly as before this key
 # existed. See docs/sensitive-data.md (Part 3) for the machine-account requirement.
 if [ -z "${GH_TOKEN:-}" ] && [ -n "${PROJECT_ROOT:-}" ] && [ -r "${PROJECT_ROOT}/.herd/secrets" ]; then
+  # `|| true` is load-bearing under a caller's `set -e -o pipefail` (e.g. new-feature.sh): with
+  # pipefail on, grep's exit 1 on "no GH_TOKEN line" (the common case) propagates as the WHOLE
+  # pipeline's status even though tail/sed both succeed on empty input — without this guard, sourcing
+  # this file from any set -e caller aborted the caller entirely the moment a project's .herd/secrets
+  # had no GH_TOKEN line (GROUNDED: broke new-feature.sh for every worktree spawn, caught by CI on
+  # test-builder-secrets-isolation.sh / test-cli-backend-switch.sh / test-adopt-worktree-prep.sh).
   _herd_gh_token_raw="$(grep -E '^[[:space:]]*(export[[:space:]]+)?GH_TOKEN[[:space:]]*=' \
     "${PROJECT_ROOT}/.herd/secrets" 2>/dev/null | tail -n1 \
-    | sed -E 's/^[[:space:]]*(export[[:space:]]+)?GH_TOKEN[[:space:]]*=[[:space:]]*//; s/[[:space:]]*#.*$//')"
+    | sed -E 's/^[[:space:]]*(export[[:space:]]+)?GH_TOKEN[[:space:]]*=[[:space:]]*//; s/[[:space:]]*#.*$//')" || true
   case "$_herd_gh_token_raw" in
     \"*\") _herd_gh_token_raw="${_herd_gh_token_raw#\"}"; _herd_gh_token_raw="${_herd_gh_token_raw%\"}" ;;
     \'*\') _herd_gh_token_raw="${_herd_gh_token_raw#\'}"; _herd_gh_token_raw="${_herd_gh_token_raw%\'}" ;;

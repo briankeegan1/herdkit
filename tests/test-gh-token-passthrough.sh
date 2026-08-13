@@ -32,15 +32,36 @@ pass(){ PASS=$((PASS+1)); }
 
 # load_gh_token <project_root> [extra env assignments...] — sources the loader in a clean subshell
 # from a cwd with no .herd/config above it, and prints GH_TOKEN's resolved value (empty if unset).
+# Sourced under `set -euo pipefail` DELIBERATELY: every real caller (new-feature.sh, herd-quick.sh,
+# herd-feature.sh) sources herd-config.sh under exactly this strictness, so any pipeline in the
+# passthrough that trips `set -e` on the common "no GH_TOKEN line" case would abort the caller
+# entirely — a bug the loader-sourcing itself must catch, not just the resolved value.
 load_gh_token() {
   local proj="$1"; shift
   ( cd "$T" && env -i PATH="$PATH" HOME="$HOME" PROJECT_ROOT="$proj" HERD_CONFIG_FILE="$proj/.nonexistent-config" "$@" \
-      bash -c "unset MODEL_COORDINATOR MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH MODEL_RESOLVER MODEL_REVIEW TOKEN_MODE
+      bash -c "set -euo pipefail
+unset MODEL_COORDINATOR MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH MODEL_RESOLVER MODEL_REVIEW TOKEN_MODE
 . '$LOADER' >/dev/null 2>&1
 printf '%s' \"\${GH_TOKEN:-}\"" )
 }
 
 PROJ="$T/proj"; mkdir -p "$PROJ/.herd"
+
+# ── 0. THE regression this class of bug produces: sourcing under a real caller's `set -e -o
+# pipefail` must NEVER abort mid-source on the common "no GH_TOKEN line" case (grep's exit 1 on no
+# match propagating through `| tail | sed` under pipefail is exactly the trap). Assert the MARKER
+# after the source line is actually reached and the whole invocation exits 0 — not just that the
+# resolved value looks empty, which a mid-source abort would also (mis)produce.
+printf '# .herd/secrets\nLINEAR_API_KEY=unrelated\n' > "$PROJ/.herd/secrets"
+abort_out="$( cd "$T" && env -i PATH="$PATH" HOME="$HOME" PROJECT_ROOT="$PROJ" \
+  HERD_CONFIG_FILE="$PROJ/.nonexistent-config" bash -c "set -euo pipefail
+unset MODEL_COORDINATOR MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH MODEL_RESOLVER MODEL_REVIEW TOKEN_MODE
+. '$LOADER' >/dev/null 2>&1
+printf 'SOURCED_OK'" 2>&1 )"
+abort_rc=$?
+[ "$abort_rc" -eq 0 ] || fail "sourcing under set -e -o pipefail must exit 0 with no GH_TOKEN line (rc=$abort_rc, out='$abort_out')"
+[ "$abort_out" = "SOURCED_OK" ] || fail "sourcing aborted mid-file under set -e -o pipefail (got '$abort_out') — a real caller (new-feature.sh) would die here"
+pass
 
 # ── 1. No .herd/secrets at all: byte-identical, nothing exported ───────────────────────────────────
 rm -f "$PROJ/.herd/secrets"
