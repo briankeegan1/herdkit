@@ -16,7 +16,8 @@
 # WHAT COUNTS AS A VIOLATION
 # A key is checked ONLY if it is actually SET (has a value) after herd-config.sh finishes sourcing —
 # either from its own `: "${KEY:=default}"` line, or from a project's .herd/config. A key that stays
-# completely UNSET (e.g. WATCHER_SCOPE with no default anywhere) is NOT a violation: os.environ.get()
+# completely UNSET (e.g. WATCHER_OWNER, which — unlike WATCHER_SCOPE post-HERD-653 — genuinely carries
+# no default anywhere) is NOT a violation: os.environ.get()
 # returns the identical None whether or not an unset shell var carries the export attribute, so there
 # is nothing for the python core to miss. The violation is narrowly: SET in this shell, but not
 # exported — the exact shape that stranded HEALTH_CONCURRENCY.
