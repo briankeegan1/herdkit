@@ -10301,6 +10301,9 @@ _main_health_dispatch() {
   printf '%s\n' "$_mh_pr" > "$(_main_health_pr_file "$_mh_sha")" 2>/dev/null || true
   journal_append main_health pr "$_mh_pr" sha "$_mh_sha" result dispatched pid "$_mh_wpid" \
     log_path "$_mh_log" provenance "$_mh_prov"
+  # HERD-736 leg 3: loud, distinct visibility the moment a SECOND dispatch lands on this exact sha.
+  local _mh_n; _mh_n="$(_health_bump_dispatch_count "$_mh_key")"
+  _health_redispatch_loop_note "$_mh_key" "$_mh_n" "$_mh_pr" "$_mh_sha" main
   # HERD-193 SPAWN: the main-health suite is a health worker like any other — same key space
   # (main-<sha>), same slot cap, same corpse-sweep deadline. Lever-gated; retired by _collect_main_health.
   lifecycle_spawn health-worker "$_mh_key" "pid:$_mh_wpid" agent-watch
@@ -10888,7 +10891,8 @@ _collect_main_health() {
     local _cm_elapsed; _cm_elapsed="$(_marker_age "$(_health_inflight_file "main-$_cm_sha")")"
     case "$_cm_elapsed" in ''|-1|*[!0-9]*) : ;; *) _phase_anomaly_observe main_health_suite "main-health suite" "$_cm_elapsed" ;; esac
     rm -f "$_cm_f" "$(_health_inflight_file "main-$_cm_sha")" "$(_main_health_pr_file "$_cm_sha")" \
-          "$(_main_health_retry_file "$_cm_sha")" 2>/dev/null || true
+          "$(_main_health_retry_file "$_cm_sha")" "$(_health_inflight_file "main-$_cm_sha").adopted" \
+          "$(_health_dispatch_count_file "main-$_cm_sha")" 2>/dev/null || true
     lifecycle_retire health-worker "main-$_cm_sha" collected   # HERD-193 RETIRE: verdict routed
   done
 }
@@ -10901,6 +10905,52 @@ _collect_main_health() {
 _srs_gh_view() {
   _gh_timeout startup_reap_view pr view "$1" --json state,number,headRefOid \
     -q '.state+"\t"+((.headRefOid)//"")+"\t"+(((.number)//0)|tostring)' 2>/dev/null || true
+}
+
+# _health_inflight_boot_reconcile — ONE-SHOT, at watcher STARTUP, over every `.health-inflight-*`
+# marker already on disk (HERD-736 leg 4 / HERD-734, "the orphan half"). A watcher restart — crashed,
+# `herd reload`, or a self-restart with WATCHER_STOP_REAP_MAIN_HEALTH off (the PR-gate family's default:
+# a per-PR health worker is deliberately left running across a stop, see _stop_reap_main_health's own
+# docstring, because the NEXT watcher is expected to collect its result) — otherwise inherits every
+# in-flight marker with ZERO visibility: the first ordinary tick's corpse sweep eventually reconciles
+# it, but silently, on whatever cadence the tick loop happens to reach it. This makes the inheritance
+# LOUD the instant the new process exists, and — extending _stop_reap_main_health's verified-kill
+# pattern from the STOP side to the BOOT side — actively cleans up a worker that is provably gone
+# instead of leaving its process tree to linger as an unaccounted orphan (HERD-734's "recurring orphan
+# hc-wrapper processes"):
+#   • live (or HERD-736 heartbeat-ADOPTED) → nothing to reap; journal `health_inflight_boot_adopted`
+#     once so an operator sees exactly what this boot inherited, then leave it for the ordinary tick
+#     machinery (dispatch/collect/sweep) to keep supervising.
+#   • not live and not heartbeat-corroborated → reuse the SAME shared, verified kill primitive the
+#     ordinary corpse sweep's timeout branch uses (_health_terminate_worker: TERM → grace → KILL by
+#     session/group, never a bare single-pid kill) before dropping the marker, so a genuinely-abandoned
+#     suite subtree cannot outlive this reconcile the way an unreaped orphan does today. A worker that
+#     survives the kill attempt KEEPS its marker (nothing removed, nothing lost) and is retried by the
+#     ordinary corpse sweep on the very next tick — never re-terminated blind.
+# Idempotent (an already-collected/already-gone marker is simply absent) and fully fail-soft; touches
+# nothing outside `.health-inflight-*` + its sibling scratch files. Byte-quiet when there is nothing to
+# reconcile — the common, healthy restart.
+_health_inflight_boot_reconcile() {
+  [ -n "${TREES:-}" ] && [ -d "$TREES" ] || return 0
+  local f base rest
+  for f in "$TREES"/.health-inflight-*; do
+    [ -e "$f" ] || continue
+    base="${f##*/}"; rest="${base#.health-inflight-}"
+    [ -n "$rest" ] || continue
+    if _health_pid_live "$f"; then
+      journal_append infra_event component agent-watch reason health_inflight_boot_adopted key "$rest"
+      _health_lifecycle_spawn_once "$f" "$rest"
+      continue
+    fi
+    if _health_terminate_worker "$f"; then
+      rm -f "$f" "$(_health_dispatch_file "$rest")" "${f}.adopted" \
+        "$(_health_dispatch_count_file "$rest")" 2>/dev/null || true
+      journal_append infra_event component agent-watch reason health_inflight_boot_orphan_reaped key "$rest"
+      declare -f lifecycle_retire >/dev/null 2>&1 && lifecycle_retire health-worker "$rest" boot-orphan
+    else
+      journal_append infra_event component agent-watch reason health_inflight_boot_orphan_reap_failed key "$rest"
+    fi
+  done
 }
 
 # _startup_reap_sweep — RESUME teardown for a merged-but-unreaped worktree (HERD-91). Reaps are
@@ -16361,46 +16411,126 @@ _marker_age_or_mtime() {
   printf '%s' "$(( $(_now_epoch) - m ))"
 }
 
-# _inflight_verified_live <file> <timeout> — THE shared "does this in-flight marker still legitimately
-# hold a health/merge-result slot" check (HERD-451 — mirrored verbatim by pysrc/herd/live_runtime.py's
-# ``_inflight_verified_live``, cross-referenced; Rule 2, one notion of liveness, never two divergent
-# copies). Recycling-safe IDENTITY, not bare existence:
-#   • pid dead → not live (a crashed worker never wedges a slot).
+# _HEALTH_HEARTBEAT_GRACE — how fresh a health worker's progress-log heartbeat must be to corroborate
+# liveness when the tracked pid itself cannot prove it (HERD-736). A literal, not a config key — same
+# rationale as lifecycle.sh's _LC_EXIT_GRACE: the suite already tees per-test progress lines into
+# "<log>.progress" as it runs (HEALTHCHECK_PROGRESS_LOG, HERD-494/533), so a worker that is still
+# legitimately testing something writes there at least every few tests. Generous enough to survive one
+# slow test without a false negative, tight enough that a truly wedged/gone worker is still caught
+# promptly (well under HEALTH_INFLIGHT_TIMEOUT's own many-minute horizon).
+_HEALTH_HEARTBEAT_GRACE=180
+
+# _health_heartbeat_file <key> — the progress-log heartbeat companion for a health worker's <key>
+# (mirrors _health_log_file's own naming; "<log>.progress" is HEALTHCHECK_PROGRESS_LOG's convention,
+# HERD-494/533). This is the ONLY channel that can corroborate liveness when the tracked pid itself
+# cannot: a dispatch's tracked wrapper pid can legitimately exit — or its identity become unprovable —
+# while the detached suite subtree it started keeps running and keeps teeing progress here (HERD-736:
+# "the wrapper forks; the tracked pid exiting is normal").
+_health_heartbeat_file() { printf '%s' "$TREES/.health-log-$1.progress"; }
+
+# _health_key_from_inflight <inflight-file> — the <key> a `.health-inflight-<key>` path was built from
+# (inverse of _health_inflight_file). Every caller of _health_pid_live passes exactly this family.
+_health_key_from_inflight() { printf '%s' "${1##*/.health-inflight-}"; }
+
+# _health_dispatch_count_file <key> — a small counter ledger: how many times a health worker has been
+# DISPATCHED for this exact (pr,sha)/main-<sha> key (HERD-736 leg 3). The SAME file naming is written by
+# pysrc/herd/live_runtime.py's dispatch leg, so the count is the true global tally regardless of which
+# engine actually launched a given worker — a re-dispatch loop must stay visible even if it alternates
+# engines/seats.
+_health_dispatch_count_file() { printf '%s' "$TREES/.health-dispatch-count-$1"; }
+
+# _health_bump_dispatch_count <key> — increment (or create at 1) the counter and print the NEW value.
+# Best-effort/fail-soft to "1" on any read fault: under-counting only costs one missed loud event, never
+# a false one.
+_health_bump_dispatch_count() {
+  local _f _n
+  _f="$(_health_dispatch_count_file "$1")"
+  _n="$(cat "$_f" 2>/dev/null | tr -cd '0-9')"
+  case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
+  _n=$((_n + 1))
+  printf '%s\n' "$_n" > "$_f" 2>/dev/null || true
+  printf '%s' "$_n"
+}
+
+# _health_redispatch_loop_note <key> <n> <pr> <sha> <slug> — LOUD, UNDEDUPED visibility for a redispatch
+# loop (HERD-736 leg 3): a first dispatch for a key is routine (`healthcheck_started` already covers it)
+# — a SECOND OR LATER dispatch for the exact same (pr,sha)/main-<sha> key is never routine (a genuine new
+# commit gets a new key, so this can only mean something upstream keeps treating a live/adopted suite as
+# gone) and must be its own distinct, always-emitted journal line, never folded into the ordinary stream.
+_health_redispatch_loop_note() {
+  local _k="$1" _n="$2" _pr="$3" _sha="$4" _slug="$5"
+  [ "${_n:-0}" -ge 2 ] 2>/dev/null || return 0
+  journal_append health_redispatch_loop key "$_k" count "$_n" pr "$_pr" sha "$_sha" slug "$_slug"
+}
+
+# _heartbeat_fresh <file> [grace] — true iff <file> exists and was written within the last <grace>
+# seconds (default _HEALTH_HEARTBEAT_GRACE). Fail-soft: an absent/unreadable/zero-mtime file is NEVER
+# fresh — a heartbeat must be POSITIVELY observed, never assumed.
+_heartbeat_fresh() {
+  local f="${1:-}" grace="${2:-$_HEALTH_HEARTBEAT_GRACE}" mt
+  [ -n "$f" ] && [ -e "$f" ] || return 1
+  mt="$(file_mtime "$f" 2>/dev/null || printf 0)"
+  case "$mt" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$mt" -gt 0 ] || return 1
+  [ "$(( $(_now_epoch) - mt ))" -lt "$grace" ]
+}
+
+# _inflight_verified_live <file> <timeout> [heartbeat-file] — THE shared "does this in-flight marker
+# still legitimately hold a health/merge-result slot" check (HERD-451 — mirrored verbatim by
+# pysrc/herd/live_runtime.py's ``_inflight_verified_live``, cross-referenced; Rule 2, one notion of
+# liveness, never two divergent copies). Recycling-safe IDENTITY, not bare existence:
+#   • pid dead → NOT live UNLESS a <heartbeat-file> is given and still FRESH (HERD-736: the tracked pid
+#     is sometimes a wrapper — "bash -c <script>" running a suite it itself launched as a foreground
+#     child — whose own exit is not proof the suite subtree is gone; a still-fresh progress-log
+#     heartbeat is independent, positive evidence real work is ongoing under an identity the marker
+#     never named). No heartbeat file given (every non-health caller) → byte-identical to before.
 #   • pid alive AND the marker's recorded start-time matches the pid's CURRENT one → live, UNBOUNDED (a
 #     verified-same-process worker is trusted for as long as it legitimately runs — the separate
 #     inflight-TIMEOUT check in the corpse sweep decides whether to TERM a long-running one, not this).
 #   • pid alive but the recorded start-time does NOT match → NOT live (the classic PID-RECYCLING case;
-#     already handled by ``_marker_live`` and unchanged here).
+#     already handled by ``_marker_live`` and unchanged here). A heartbeat NEVER overrides this: pid
+#     recycling is positive evidence of a DIFFERENT process, and trusting a heartbeat over it would
+#     resurrect the exact recycled-pid failure HERD-451 closed.
 #   • pid alive but NO start-time was ever recorded (a legacy pre-restart-safe marker, or any writer that
 #     bypassed ``_marker_write``) → identity CANNOT be proven from the marker alone. A bare `kill -0`
 #     success is trusted ONLY within <timeout> seconds of the marker's age (dispatch-ts, else file
-#     mtime); past that it reads as NOT live. An unverifiable marker no longer gets an indefinite pass
-#     just because *some* process now happens to hold that recycled pid — the EXACT GROUNDED 2026-07-31
-#     failure: a stale ``.health-inflight-*`` marker's recorded pid had been recycled by the OS onto the
-#     watcher itself / an unrelated `sleep`, and the old bare-existence check trusted it forever, wedging
-#     the HEALTH_CONCURRENCY slot with zero suites actually running. 23 such markers had silently
+#     mtime), OR for as long as the heartbeat stays fresh past that bound; past both it reads as NOT
+#     live. An unverifiable marker no longer gets an indefinite pass just because *some* process now
+#     happens to hold that recycled pid — the EXACT GROUNDED 2026-07-31 failure: a stale
+#     ``.health-inflight-*`` marker's recorded pid had been recycled by the OS onto the watcher itself /
+#     an unrelated `sleep`, and the old bare-existence check trusted it forever, wedging the
+#     HEALTH_CONCURRENCY slot with zero suites actually running. 23 such markers had silently
 #     accumulated since 2026-07-08 with no code error ever raised.
 _inflight_verified_live() {
-  local f="$1" timeout="${2:-1800}" pid st cur age
+  local f="$1" timeout="${2:-1800}" hb="${3:-}" pid st cur age
   pid="$(_marker_pid "$f")"; [ -n "$pid" ] || return 1
-  kill -0 "$pid" 2>/dev/null || return 1
+  if ! kill -0 "$pid" 2>/dev/null; then
+    [ -n "$hb" ] && _heartbeat_fresh "$hb" && return 0
+    return 1
+  fi
   st="$(_marker_starttime "$f")"
   if [ -n "$st" ]; then
     cur="$(_pid_starttime "$pid")"
     [ -n "$cur" ] || return 0        # transient ps hiccup — trust the recorded identity, unchanged
-    [ "$cur" = "$st" ]
-    return $?
+    [ "$cur" = "$st" ] && return 0
+    return 1                          # recycled pid — never trusted, heartbeat or not
   fi
   age="$(_marker_age_or_mtime "$f")"
   case "$age" in ''|-1|*[!0-9]*) return 0 ;; esac   # no signal at all — fail toward not reaping
-  [ "$age" -lt "$timeout" ]
+  [ "$age" -lt "$timeout" ] && return 0
+  [ -n "$hb" ] && _heartbeat_fresh "$hb" && return 0
+  return 1
 }
 
 # _health_pid_live <inflight-file> — true if the marker records a still-running holder (pid alive AND,
 # via the recycling guard, still the SAME process — bounded by HEALTH_INFLIGHT_TIMEOUT when the marker
-# carries no provable identity at all, see _inflight_verified_live). Shares the restart-safe substrate
-# with the review side.
-_health_pid_live() { _inflight_verified_live "$1" "${HEALTH_INFLIGHT_TIMEOUT:-1800}"; }
+# carries no provable identity at all — see _inflight_verified_live), OR the worker's progress-log
+# heartbeat is still fresh even when the tracked pid itself cannot prove it (HERD-736). Shares the
+# restart-safe substrate with the review side.
+_health_pid_live() {
+  _inflight_verified_live "$1" "${HEALTH_INFLIGHT_TIMEOUT:-1800}" \
+    "$(_health_heartbeat_file "$(_health_key_from_inflight "$1")")"
+}
 
 # _count_live_healthchecks — number of inflight markers (across ALL PRs) whose holder pid is VERIFIED
 # live (see _health_pid_live / _inflight_verified_live — identity, not bare existence). Dead OR
@@ -17078,7 +17208,8 @@ _healthcheck_gate() {
       *) _health_duration_record "$_hg_elapsed"
          _phase_anomaly_observe healthcheck "health-check" "$_hg_elapsed" ;;   # HERD-496
     esac
-    rm -f "$_hg_disp" "$_hg_inflight" 2>/dev/null || true
+    rm -f "$_hg_disp" "$_hg_inflight" "${_hg_inflight}.adopted" "$(_health_dispatch_count_file "$_hg_key")" \
+      2>/dev/null || true
     lifecycle_retire health-worker "$_hg_key" collected     # HERD-193 RETIRE: result consumed
     return 0
   fi
@@ -17166,6 +17297,9 @@ _healthcheck_gate() {
   # healthcheck_started (not just a later 'outcome'): the record shows runs IN FLIGHT — so a suite that
   # never finishes (killed, restart) is visible in the journal, and log_path points at the tailable log.
   journal_append healthcheck_started pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" pid "$_hg_wpid" log_path "$_hg_log"
+  # HERD-736 leg 3: loud, distinct visibility the moment a SECOND dispatch lands on this exact (pr,sha).
+  local _hg_dn; _hg_dn="$(_health_bump_dispatch_count "$_hg_key")"
+  _health_redispatch_loop_note "$_hg_key" "$_hg_dn" "$_hg_pr" "$_hg_sha" "$_hg_slug"
   # HERD-193 SPAWN: owner=agent-watch, liveness=worker pid, deadline=HEALTH_INFLIGHT_TIMEOUT (the very
   # timeout the corpse sweep already enforces), retire=the collect/severed paths above. Lever-gated.
   lifecycle_spawn health-worker "$_hg_key" "pid:$_hg_wpid" agent-watch
@@ -17215,6 +17349,26 @@ _gate_corpse_claim() {
 }
 _gate_corpse_release() { rmdir "$_GATE_CORPSE_MTX" 2>/dev/null || true; }
 
+# _health_lifecycle_spawn_once <marker-file> <key> — register a live/adopted health worker with the
+# HERD-193 supervised-process contract (lifecycle.sh) the FIRST time the sweep observes it — idempotent
+# (a record already on disk is left alone, so its spawn epoch never resets tick after tick, which would
+# otherwise make it look perpetually fresh and never EXPIRE). This is the live rail's own wiring: the
+# dispatcher itself (bash's now-retired _healthcheck_gate, or live_runtime.py — neither of which can
+# call this bash-only library directly) never spawns a record, so the corpse sweep — which walks every
+# marker regardless of which engine wrote it — is the one place both engines' health workers actually
+# get supervised. Byte-inert with LIFECYCLE_CONTRACTS=off (lifecycle_spawn's own ship-dormant gate) or
+# when lifecycle.sh was never sourced (declare -f guard, mirroring every other optional-lib check here).
+_health_lifecycle_spawn_once() {
+  declare -f lifecycle_spawn >/dev/null 2>&1 || return 0
+  declare -f lifecycle_enabled >/dev/null 2>&1 && { lifecycle_enabled || return 0; }
+  local _f="$1" _k="$2" _rf
+  if declare -f _lc_record_file >/dev/null 2>&1; then
+    _rf="$(_lc_record_file health-worker "$_k" 2>/dev/null)" || return 0
+    [ -n "$_rf" ] && [ -f "$_rf" ] && return 0
+  fi
+  lifecycle_spawn health-worker "$_k" "pid:$(_marker_pid "$_f")" agent-watch
+}
+
 _sweep_gate_corpses() {
   [ -z "${DRYRUN:-}" ] || return 0
   # Serialize against a concurrent `herd sweep` / watcher tick. A skipped sweep is harmless (periodic
@@ -17258,7 +17412,28 @@ _sweep_gate_corpses() {
     # HERD-451: _health_pid_live (not bare _marker_live) so an identity-unverifiable marker past
     # HEALTH_INFLIGHT_TIMEOUT falls straight to the corpse branch below — removed + journaled, NEVER
     # signaled (we cannot prove it is our worker, so we never risk TERMing an unrelated recycled pid).
+    # HERD-736: _health_pid_live now ALSO trusts a fresh progress-log heartbeat when the tracked pid
+    # itself cannot prove liveness — so this branch covers BOTH a verified-real holder AND an ADOPTED
+    # one (heartbeat-only). Disambiguate with bare _marker_live immediately below: only a real,
+    # signalable pid may ever be TERMed/KILLed.
     if _health_pid_live "$f"; then
+      if ! _marker_live "$f"; then
+        # ADOPTED (HERD-736): the tracked pid is gone or unprovable, but the heartbeat is fresh — real
+        # work is still happening under an identity this marker never named (a dispatch wrapper whose
+        # own pid can legitimately exit while the suite subtree it started keeps running). There is no
+        # pid left to signal, so leave the marker exactly as-is (a later tick re-checks it fresh, and
+        # the collector still consumes its eventual nonce-matched result) — NEVER treat this as a
+        # corpse, and NEVER let a sibling dispatch start over it. Journal ONCE (a `.adopted` sidecar
+        # keys the once-only guard, cleared by the collector alongside the marker) so a standing
+        # adoption stays visible instead of silently repeating every tick.
+        if [ ! -f "${f}.adopted" ]; then
+          : > "${f}.adopted" 2>/dev/null || true
+          journal_append infra_event component agent-watch reason health_inflight_adopted key "$rest"
+        fi
+        _health_lifecycle_spawn_once "$f" "$rest"
+        continue
+      fi
+      _health_lifecycle_spawn_once "$f" "$rest"
       age="$(_marker_age "$f")"
       case "$age" in ''|-1|*[!0-9]*) continue ;; esac
       # HERD-494(b) EARLY-REAP PROBE: a worker whose tailable log is STILL 0 bytes after
@@ -17309,8 +17484,9 @@ _sweep_gate_corpses() {
         journal_append infra_event component agent-watch reason health_timeout key "$rest" age "$age"
       fi
     else
-      rm -f "$f" "$(_health_dispatch_file "$rest")" 2>/dev/null || true
+      rm -f "$f" "$(_health_dispatch_file "$rest")" "${f}.adopted" 2>/dev/null || true
       journal_append infra_event component agent-watch reason health_died key "$rest"
+      declare -f lifecycle_retire >/dev/null 2>&1 && lifecycle_retire health-worker "$rest" severed
     fi
   done
 }
@@ -20514,6 +20690,12 @@ _ENGINE_PAUSE_DECLARED=""   # HERD-347: set while the operator ENGINE_PAUSE bann
 # (HERD-91 — the crash-between-merge-and-reap window). Runs once here, BEFORE the live loop, so a
 # stranded worktree + idle builder tab is cleaned up on restart rather than lingering forever.
 _startup_reap_sweep
+
+# One-shot at STARTUP: reconcile every health-inflight marker this process just inherited — adopt what
+# is genuinely still running (or heartbeat-corroborated), verified-kill + clean up what is not
+# (HERD-736 leg 4 / HERD-734). Runs once here, BEFORE the live loop, so a restart's inheritance is
+# never silent.
+_health_inflight_boot_reconcile
 
 # One-shot at STARTUP: this process just loaded the engine code that is on disk NOW, so any pending
 # "main pulled new engine code — restart recommended" note (HERD-233) has been satisfied by the very
