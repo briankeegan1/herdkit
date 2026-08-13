@@ -1,22 +1,33 @@
 # .herd/triggers.tsv — declarative SCHEDULED / TRIGGERED RUNS (HERD-169). Commit this (code-shaped
-# config, zero-secret). A cron-style trigger spawns a defined workflow (a named backlog-item template
-# or a steps.tsv pipeline — whatever the task text names) on schedule by ENQUEUEING spawn intents onto
-# the SAME durable spawn queue the coordinator uses (scripts/herd/spawn.sh). It never bypasses a gate:
-# every spawned intent runs the normal builder → healthcheck → review → merge pipeline.
+# config, zero-secret). A cron-style trigger either ENQUEUEs a defined workflow (a named backlog-item
+# template or a steps.tsv pipeline — whatever the task text names) onto the SAME durable spawn queue
+# the coordinator uses (scripts/herd/spawn.sh — every spawned intent still runs the normal builder →
+# healthcheck → review → merge pipeline, never bypassing a gate), or, lane=mechanical (HERD-673), runs
+# the task text DIRECTLY as a shell command — no worktree, no agent, no PR — for cheap, deterministic
+# maintenance that would waste a whole builder spawn.
 #
 # Format — one TAB-SEPARATED row per trigger (columns separated by a literal tab, NOT spaces):
-#     name <TAB> schedule <TAB> lane <TAB> task <TAB> input
+#     name <TAB> schedule <TAB> lane <TAB> task <TAB> input [<TAB> agent]
 #
 #   name      kebab-ish label; the snapshot key, the journal key, and the spawn slug prefix.
 #   schedule  the cadence a tick fires this trigger on — one of:
 #               @hourly | @daily | @weekly | every:<N>[smhd] (e.g. every:30m, every:6h, every:2d) | manual
 #             'manual' NEVER auto-fires on a tick; fire it explicitly with 'triggers.sh fire <name>'.
-#   lane      quick | feature — the durable-queue lane each spawned intent runs in.
-#   task      the task text handed to each spawned builder (its "workflow"). Tokens substituted PER
-#             spawn:  {item} → the delta input line that triggered it · {name} → the trigger name.
+#   lane      quick | feature | mechanical — quick/feature are the durable-queue lane each spawned
+#             intent runs in; mechanical (HERD-673) runs the rendered task text directly, once per
+#             delta item, with no spawn at all.
+#   task      quick/feature: the task text handed to each spawned builder (its "workflow"). mechanical:
+#             the literal shell command to run. Tokens substituted PER fire either way:
+#               {item} → the delta input line that triggered it · {name} → the trigger name.
 #   input     a shell command whose STDOUT lines are the INPUT SET (one item per line). Each fire diffs
-#             this set against the previous run's snapshot and spawns work ONLY for the DELTA (new
-#             lines). An empty input set spawns nothing.
+#             this set against the previous run's snapshot and spawns/runs work ONLY for the DELTA (new
+#             lines). An empty input set does nothing. A periodic (not per-item) row typically uses a
+#             date-based input (e.g. `date +%Y-%m-%d` or `date +%G-W%V`) so exactly one delta line
+#             appears per period.
+#   agent     OPTIONAL 6th column, quick/feature only (HERD-673): a .herd/agents/<name>.md roster
+#             definition (HERD-667) to build this spawn with, threaded via HERD_AGENT. Blank or the
+#             column absent (a 5-field row parses identically to before this column existed) ⇒ no
+#             override.
 #
 # ── DIFF-AGAINST-LAST-RUN ──────────────────────────────────────────────────────────────────────────
 # A per-trigger last-run input snapshot is stored under .herd/trigger-state/<name>.snapshot (runtime
@@ -43,3 +54,9 @@
 #
 # Manual: re-run the release-notes pipeline on demand (never auto-fires).
 # release-notes<TAB>manual<TAB>quick<TAB>Regenerate release notes for {item}.<TAB>git tag --points-at HEAD
+#
+# Daily, no agent: a cheap mechanical refresh — never spawns a builder.
+# cache-refresh<TAB>@daily<TAB>mechanical<TAB>bash scripts/some-cache-refresh.sh<TAB>date +%Y-%m-%d
+#
+# Weekly, with a specialist: build with a named .herd/agents/<name>.md roster definition (optional 6th column).
+# weekly-audit<TAB>@weekly<TAB>quick<TAB>Audit {item} for drift.<TAB>date +%G-W%V<TAB>my-specialist
