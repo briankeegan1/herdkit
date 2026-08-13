@@ -65,7 +65,7 @@ pass; echo "PASS (2) empty roster renders an explicit hint"
 # ── (3) roster entry + CACHED verdict, no live probe ──────────────────────────────────────────────
 P3="$T/p3"; _project "$P3"
 mkdir -p "$P3/.herd/agents"
-printf '%s\n' '---' 'description: a test agent' 'sentinel: TEST-SENTINEL-1' '---' 'body' \
+printf '%s\n' '---' 'name: tester' 'description: a test agent' 'sentinel: TEST-SENTINEL-1' '---' 'body' \
   > "$P3/.herd/agents/tester.md"
 out="$(_render "$P3")"
 case "$out" in *tester*) : ;; *) fail "(3a) roster entry 'tester' not rendered: [$out]" ;; esac
