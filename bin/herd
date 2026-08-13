@@ -6732,6 +6732,54 @@ except Exception: pass
 ' 2>/dev/null || true
 }
 
+# _agents_pane_on — success iff AGENTS_PANE reads on (tolerant of the usual on/true/yes/1 spellings,
+# mirroring HEALTH_PANE's parse); an unrecognized value (including unset) reads off.
+_agents_pane_on() {
+  case "${AGENTS_PANE:-off}" in on|true|yes|1) return 0 ;; *) return 1 ;; esac
+}
+
+# _reload_agents_pane_resolve <watch_pane> <anchor_pane> <root> <reg_agents_pane> — HERD-668: the
+# shared adopt-or-create logic for the AGENTS_PANE control-room pane, used by BOTH cmd_reload and
+# `herd pane agents` so the resolution rules live in exactly one place. Mirrors the watch/backlog
+# resolve order (registry hint, validated → RIGHT neighbor of the watch pane, validated → split
+# fresh), scoped to the watch pane rather than the coordinator anchor since this pane's home is
+# beside the watcher, not beside the coordinator. Prints "<pane_id>,<created 0|1>" — pane_id empty
+# when AGENTS_PANE is off, <watch_pane> is empty, or the split itself fails; <created> is 1 only when
+# a fresh split ran (so the caller knows whether a width-sensitive REPAINT is owed).
+#
+# COMMA-DELIMITED ON PURPOSE (review finding, PR #791): a SPACE-joined "<pane_id> <created>" sentinel
+# is ambiguous under `read`'s DEFAULT IFS the instant pane_id is empty — bash's whitespace-class IFS
+# splitting collapses/strips LEADING separators (this holds for space, tab, AND newline, even when one
+# is set as the SOLE IFS char), so "read -r aPane created <<< ' 0'" silently reads aPane="0" (the
+# 'created' flag, not a pane id) and created="" instead of aPane="" created="0" — exactly the "off is
+# byte-identical" guarantee this feature promises, broken on every default `herd reload`. A comma is
+# NOT in IFS's whitespace class, so callers MUST `IFS=',' read -r aPane created <<< "$(…)"` — a plain
+# `read` (default IFS) on a comma-joined string leaves the whole thing in the first variable, an
+# immediately obvious break rather than the silent one above. Every caller below is fixed to match.
+_reload_agents_pane_resolve() {
+  local wpane="$1" anchor="$2" root="$3" reg="$4" aPane="" created=0
+  _agents_pane_on || { printf ',0'; return 0; }
+  [ -n "$wpane" ] || { printf ',0'; return 0; }
+  if [ -n "$reg" ] && [ "$reg" != "$wpane" ] && [ "$reg" != "$anchor" ] && _reg_role_ok "$reg" agents; then
+    case "$(_reload_pane_state "$reg" "agents-pane-view.sh")" in
+      BARE|RUN*) aPane="$reg" ;;
+    esac
+  fi
+  if [ -z "$aPane" ]; then
+    local nb; nb="$(_reload_neighbor "$wpane" right)"
+    if [ -n "$nb" ] && [ "$nb" != "$anchor" ]; then
+      case "$(_reload_pane_state "$nb" "agents-pane-view.sh")" in
+        BARE|RUN*) aPane="$nb" ;;
+      esac
+    fi
+  fi
+  if [ -z "$aPane" ]; then
+    aPane="$(_reload_split_pane "$wpane" right 0.72 "$root")"
+    [ -n "$aPane" ] && created=1
+  fi
+  printf '%s,%s' "$aPane" "$created"
+}
+
 # _reload_tab_by_label lives in layout-reconcile.sh (sourced above) — shared with coordinator.sh.
 
 # _reload_tab_create <workspace_id> <cwd> <label> → "tab_id pane_id", or empty.
@@ -7241,10 +7289,12 @@ cmd_reload() {
   #                                     exercise the herdr path without spawning a real watcher
   local watch_script="$SCRIPTS_DIR/herd-watch.sh"
   local backlog_script="$SCRIPTS_DIR/backlog-view.sh"
+  local agents_script="$SCRIPTS_DIR/agents-pane-view.sh"
   local watch_match="agent-watch.sh|herd-watch.sh"   # herd-watch.sh execs agent-watch.sh
   local launch_desc="background" watch_pid="" watch_pane=""
   local backlog_desc="not managed (herdr unavailable)"
   local coordinator_desc=""
+  local aPane=""   # HERD-668: the AGENTS_PANE pane, resolved/created below; stays empty when off
   local herdr_attempted=0
   # rebuild_desc — the ALWAYS-printed verdict distinguishing a full control-room rebuild from a
   # skill-only + headless-watcher fallback, so `herd reload`'s outcome is never ambiguous (issue #60,
@@ -7313,11 +7363,12 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
       # Registry rows (coordinator.sh / prior reloads) — hints, validated below. Each pane_id is
       # taken ONLY when the row's recorded workspace_id matches this workspace (or the row is a legacy
       # untagged one); a row stamped with a DIFFERENT workspace is dropped here (issue #60).
-      local reg_apane="" reg_wpane="" reg_bpane=""
+      local reg_apane="" reg_wpane="" reg_bpane="" reg_agentspane=""
       if [ -f "$WORKTREES_DIR/.herd-panes" ]; then
         reg_apane="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" coordinator-agent "$ws")"
         reg_wpane="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" watch "$ws")"
         reg_bpane="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" backlog "$ws")"
+        reg_agentspane="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" agents "$ws")"
       fi
 
       local coord_tab="" agent_pane="" agent_live=0 bPane="" wPane="" geom_changed=0
@@ -7354,6 +7405,16 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
                   sleep 0.2; _kk=$((_kk+1))
                 done
                 [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
+              fi
+              # HERD-668: AGENTS_PANE=on → split it off the watch pane's RIGHT (see
+              # _reload_agents_pane_resolve). Off (default) is a hard no-op — $aPane stays empty.
+              local _arp _a_created=0
+              _arp="$(_reload_agents_pane_resolve "$wPane" "$agent_pane" "$root" "$reg_agentspane")"
+              IFS=',' read -r aPane _a_created <<< "$_arp"
+              if [ -n "$aPane" ]; then
+                [ "$_a_created" -eq 1 ] && geom_changed=1
+                _reload_pane_run_verified "$aPane" "bash $agents_script" "agents-pane-view.sh" >/dev/null || \
+                  warn "agents-pane-view did not appear in pane $aPane"
               fi
             fi
           fi
@@ -7517,6 +7578,19 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
               [ -f "$HERD_WATCHER_LOCK" ] && watch_pid="$(cat "$HERD_WATCHER_LOCK" 2>/dev/null || true)"
             fi
           fi
+
+          # HERD-668: AGENTS_PANE=on → resolve/adopt/create the agents pane off the watch pane's
+          # RIGHT (see _reload_agents_pane_resolve). Off (default) is a hard no-op — $aPane stays empty.
+          if [ -n "$wPane" ]; then
+            local _arp2 _a_created2=0
+            _arp2="$(_reload_agents_pane_resolve "$wPane" "$agent_pane" "$root" "$reg_agentspane")"
+            IFS=',' read -r aPane _a_created2 <<< "$_arp2"
+            if [ -n "$aPane" ]; then
+              [ "$_a_created2" -eq 1 ] && geom_changed=1
+              _reload_pane_run_verified "$aPane" "bash $agents_script" "agents-pane-view.sh" >/dev/null || \
+                warn "agents-pane-view did not appear in pane $aPane"
+            fi
+          fi
         else
           warn "coordinator tab ${coord_tab} has no resolvable coordinator pane — skipping layout"
         fi
@@ -7576,7 +7650,7 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
       # that names a foreign workspace (issue #60). The writer mkdir -p's — WORKTREES_DIR may not
       # exist yet on a control room that predates the first feature build.
       layout_write_registry "$WORKTREES_DIR/.herd-panes" "$ws" "$coord_tab" \
-        "${agent_pane:-}" "${bPane:-}" "${wPane:-}" "$WORKSPACE_NAME"
+        "${agent_pane:-}" "${bPane:-}" "${wPane:-}" "$WORKSPACE_NAME" "${aPane:-}"
     fi
   fi
 
@@ -7731,19 +7805,21 @@ except Exception: pass
 ' 2>/dev/null || true
 }
 
-# _pane_write_registry <agent> <backlog> <watch> — rewrite $WORKTREES_DIR/.herd-panes from the
-# OBSERVED final pane IDs (empty rows omitted) via the shared writer. All three rows carry the
+# _pane_write_registry <agent> <backlog> <watch> [agents] — rewrite $WORKTREES_DIR/.herd-panes from
+# the OBSERVED final pane IDs (empty rows omitted) via the shared writer. All rows carry the
 # coordinator tab id and the resolved workspace_id (4th column) so a later reader can drop a hint
-# naming a foreign workspace.
+# naming a foreign workspace. The optional 4th arg (HERD-668) is the AGENTS_PANE pane; every
+# subcommand that does not touch it passes $PANE_REG_AG through unchanged so a `herd pane
+# watch`/`backlog`/`coordinator` restart never drops the agents row this subcommand did not touch.
 _pane_write_registry() {
-  layout_write_registry "$WORKTREES_DIR/.herd-panes" "$PANE_WS" "$PANE_COORD_TAB" "$1" "$2" "$3" "$WORKSPACE_NAME"
+  layout_write_registry "$WORKTREES_DIR/.herd-panes" "$PANE_WS" "$PANE_COORD_TAB" "$1" "$2" "$3" "$WORKSPACE_NAME" "${4:-}"
 }
 
 # _pane_init — shared preamble for the pane subcommands. Resolves and PINS this project's
 # .herd/config (refusing the dogfood fallback), requires herdr, resolves the workspace +
 # coordinator tab + anchor (coordinator) pane, and reads the .herd-panes registry rows. Dies with a
 # clear message when the control room is not up. Sets PANE_* globals for the caller:
-#   PANE_ROOT PANE_CFG PANE_WS PANE_COORD_TAB PANE_AGENT PANE_AGENT_LIVE PANE_REG_A/W/B
+#   PANE_ROOT PANE_CFG PANE_WS PANE_COORD_TAB PANE_AGENT PANE_AGENT_LIVE PANE_REG_A/W/B/AG
 #
 # HERD-405: `pwd` alone refused to dogfood from a subdirectory (e.g. scripts/herd) even though the
 # project's config sits one or more levels up. Delegates to _herd_resolve_project_config (shared with
@@ -7794,11 +7870,12 @@ print(", ".join(str(w.get("label","?")) for w in ws) or "none")
   # Registry rows (coordinator.sh / prior reloads) — hints, validated against the live roster below.
   # Each pane_id is taken ONLY when the row's recorded workspace_id matches this workspace (or the
   # row is a legacy untagged one); a row stamped with a DIFFERENT workspace is dropped (issue #60).
-  PANE_REG_A=""; PANE_REG_W=""; PANE_REG_B=""
+  PANE_REG_A=""; PANE_REG_W=""; PANE_REG_B=""; PANE_REG_AG=""
   if [ -f "$WORKTREES_DIR/.herd-panes" ]; then
     PANE_REG_A="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" coordinator-agent "$PANE_WS")"
     PANE_REG_W="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" watch "$PANE_WS")"
     PANE_REG_B="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" backlog "$PANE_WS")"
+    PANE_REG_AG="$(_reg_pane_validated "$WORKTREES_DIR/.herd-panes" agents "$PANE_WS")"
   fi
 
   # ANCHOR: resolve the coordinator pane — a live agent in the tab (authoritative; also catches
@@ -7931,7 +8008,7 @@ cmd_pane_watch() {
 
   # 4. Registry from the observed final state (backlog row preserved from the registry).
   # Write unconditionally — even a blocked restart must not leak an unregistered pane.
-  _pane_write_registry "$PANE_AGENT" "$PANE_REG_B" "$wPane"
+  _pane_write_registry "$PANE_AGENT" "$PANE_REG_B" "$wPane" "$PANE_REG_AG"
 
   # HERD-342 leg (a): verify a NEW LIVE watcher is running after the restart attempt.
   _watcher_restart_verify "$watch_pid" "$_wpw_pre_pid" "$_wpw_cmd_ticks" "herd pane watch" || return 1
@@ -8015,12 +8092,78 @@ cmd_pane_backlog() {
   fi
 
   # Registry from the observed final state (watch row preserved from the registry).
-  _pane_write_registry "$PANE_AGENT" "$bPane" "$PANE_REG_W"
+  _pane_write_registry "$PANE_AGENT" "$bPane" "$PANE_REG_W" "$PANE_REG_AG"
 
   say ""
   ok "pane backlog complete"
   say "  workspace:  $WORKSPACE_NAME"
   say "  backlog:    $bsum"
+  return 0
+}
+
+# cmd_pane_agents — HERD-668: restart the AGENTS_PANE control-room pane in place. Unlike watch/
+# backlog this pane is entirely OPT-IN (AGENTS_PANE=off by default) and STRICTLY read-only, so there
+# is nothing destructive to confirm and no singleton/lock to fight — it is a rerun of one harmless
+# viewer script. When the lever is off this is a clean, loud no-op (never creates a pane the operator
+# did not ask for).
+cmd_pane_agents() {
+  _pane_init
+  say "${c_bold}herd pane agents${c_rst} — restarting the agents pane in place"
+  say ""
+
+  if ! _agents_pane_on; then
+    warn "AGENTS_PANE is off — nothing to do (set AGENTS_PANE=on in .herd/config, then 'herd reload' to build the pane)"
+    return 0
+  fi
+
+  local agents_script="$SCRIPTS_DIR/agents-pane-view.sh"
+
+  # Resolve the WATCH pane first — the agents pane's home is beside it, not beside the coordinator.
+  local wPane="$PANE_REG_W"
+  if [ -z "$wPane" ]; then
+    local p
+    for p in $(_reload_tab_panes "$PANE_WS" "$PANE_COORD_TAB"); do
+      [ "$(_reload_pane_role "$p")" = "watch" ] && { wPane="$p"; break; }
+    done
+  fi
+  if [ -z "$wPane" ]; then
+    warn "no watch pane found in tab $PANE_COORD_TAB — run 'herd pane watch' or 'herd reload' first"
+    return 1
+  fi
+
+  local aPane="" created=0 geom_changed=0
+  local _arp; _arp="$(_reload_agents_pane_resolve "$wPane" "$PANE_AGENT" "$PANE_ROOT" "$PANE_REG_AG")"
+  IFS=',' read -r aPane created <<< "$_arp"
+
+  local asum="FAILED ✗"
+  if [ -n "$aPane" ]; then
+    [ "$created" -eq 1 ] && geom_changed=1
+    if _reload_pane_run_verified "$aPane" "bash $agents_script" "agents-pane-view.sh" >/dev/null; then
+      asum="pane $aPane · visible ✓"
+      [ "$created" -eq 1 ] && asum="pane $aPane · recreated ✓"
+    else
+      asum="pane $aPane · NOT visible ✗"
+      warn "agents-pane-view did not appear in pane $aPane"
+    fi
+  else
+    warn "could not resolve or create an agents pane beside the watch pane"
+  fi
+
+  # REPAINT: mirrors cmd_pane_watch/backlog — a fresh split narrows the watch pane, so its own
+  # width-sensitive render (agent-watch.sh reads columns per tick) is nudged the same way a geometry
+  # change already nudges the backlog viewer.
+  if [ "$geom_changed" -eq 1 ] && [ -n "${BACKLOG_FILE:-}" ] && [ -f "$PANE_ROOT/$BACKLOG_FILE" ]; then
+    touch "$PANE_ROOT/$BACKLOG_FILE" 2>/dev/null || true
+  fi
+
+  # Registry from the observed final state (agent/backlog rows preserved from the registry).
+  _pane_write_registry "$PANE_AGENT" "$PANE_REG_B" "$wPane" "$aPane"
+
+  say ""
+  ok "pane agents complete"
+  say "  workspace:  $WORKSPACE_NAME"
+  say "  agents:     $asum"
+  case "$asum" in *"FAILED"*) return 1 ;; esac
   return 0
 }
 
@@ -8068,7 +8211,7 @@ cmd_pane_coordinator() {
   fi
 
   # Registry from the observed final state (new coordinator pane; backlog/watch preserved).
-  _pane_write_registry "$new_pane" "$PANE_REG_B" "$watch_before"
+  _pane_write_registry "$new_pane" "$PANE_REG_B" "$watch_before" "$PANE_REG_AG"
 
   say ""
   ok "pane coordinator complete"
@@ -8088,6 +8231,8 @@ herd pane <target> — restart ONE control-room pane in place (no full reload)
   herd pane coordinator    relaunch the coordinator agent pane — KILLS the live coordinator claude
                            session, so it requires a typed 'yes' or --yes
     [--yes|-y]             skip the confirmation prompt (still destructive)
+  herd pane agents         rerun the read-only agents pane (AGENTS_PANE=on only; a clean no-op when
+                           off), recreated beside the watch pane if gone — never destructive
 EOF
 }
 
@@ -8098,8 +8243,9 @@ cmd_pane() {
     watch)        cmd_pane_watch "$@" ;;
     backlog)      cmd_pane_backlog "$@" ;;
     coordinator)  cmd_pane_coordinator "$@" ;;
+    agents)       cmd_pane_agents "$@" ;;
     ''|help|-h|--help) _pane_usage ;;
-    *) die "unknown 'herd pane' target '$sub' — expected: watch | backlog | coordinator" ;;
+    *) die "unknown 'herd pane' target '$sub' — expected: watch | backlog | coordinator | agents" ;;
   esac
 }
 
@@ -9271,6 +9417,8 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                         backlog      rerun the backlog viewer in its pane
                                         coordinator  relaunch the coordinator agent (KILLS the
                                                      live session; needs a typed yes or --yes)
+                                        agents       rerun the read-only agents pane (AGENTS_PANE=on
+                                                     only; a clean no-op when off)
   herd update [--force]               pull the herdkit engine (git pull --ff-only), upgrade the
                                       coordinator skill, and reload the workspace in one step;
                                       refuses if the engine checkout is dirty or builders are

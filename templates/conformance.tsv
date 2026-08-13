@@ -88,7 +88,7 @@ herd notes [list|ack <n|all>]	unit	tests/test-note-full-sidecar.sh
 herd tracker-heals [list|ack <n|all>]	unit	tests/test-tracker-heals-ack.sh
 herd intents [list|ack <n|all>]	unit	tests/test-spawn-queue-priority.sh
 herd reload	unit	tests/test-cli-reload.sh
-herd pane <watch|backlog|coordinator>	unit	tests/test-cli-pane.sh
+herd pane <watch|backlog|coordinator|agents>	unit	tests/test-cli-pane.sh
 herd watcher-resurrect	unit	tests/test-watcher-resurrect.sh
 herd update [--force]	unit	tests/test-cli-update.sh
 herd log [--pr N] [--tail]	unit	tests/test-journal.sh
@@ -409,6 +409,10 @@ RESOLVER_PANE	unit	tests/test-resolver-pane-lifecycle.sh
 RESOLVER_PANE	sim	tests/test-sandbox-real-panes.sh
 HEALTH_PANE	unit	tests/test-health-pane-lifecycle.sh
 HEALTH_PANE	sim	tests/test-sandbox-real-panes.sh
+AGENTS_PANE	unit	tests/test-layout-reconcile.sh
+AGENTS_PANE	unit	tests/test-cli-pane.sh
+AGENTS_PANE	unit	tests/test-agents-pane-view.sh
+AGENTS_PANE	sim	tests/test-sandbox-real-panes.sh
 GATE_STATUS	sim	tests/test-sandbox-multiseat.sh
 WATCHER_SCOPE	sim	tests/test-sandbox-multiseat.sh
 HEALTHCHECK_AUTOFIX	unit	tests/test-health-autofix.sh

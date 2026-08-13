@@ -276,4 +276,34 @@ layout_write_registry "$reg" w1 tC pA pL pW wsX
 [ "$(cat "$S/panes/pW/label" 2>/dev/null)" = "watch·wsX" ]       || fail "label: default driver (via herd_driver_pane_rename) did not label the watch pane"
 ok
 
+# ── 10. HERD-668: _reload_pane_role classifies an agents-pane-view.sh pane as 'agents' ───────────
+S="$T/s10"; mkdir -p "$S"; export HERDR_STATE="$S"
+_pane "$S" pAg tC 'bash /x/agents-pane-view.sh'
+[ "$(_reload_pane_role pAg)" = "agents" ] || fail "agents-pane: pane running agents-pane-view.sh not classified 'agents'"
+ok
+
+# ── 11. HERD-668: layout_write_registry's optional 8th 'agents' arg ──────────────────────────────
+# BYTE-IDENTICAL WHEN OMITTED: every pre-existing call site (coordinator.sh/cmd_reload/herd pane *
+# before this lever existed, and AGENTS_PANE=off today) never passes an 8th arg — the registry must
+# carry no 'agents' row and the label pass must touch no extra pane, exactly like test 6's baseline.
+S="$T/s11"; mkdir -p "$S"; export HERDR_STATE="$S"
+_pane "$S" pA tC 'claude /coordinator'
+_pane "$S" pL tC 'bash /x/backlog-view.sh'
+_pane "$S" pW tC 'bash /x/herd-watch.sh'
+reg="$S/.herd-panes"
+layout_write_registry "$reg" w1 tC pA pL pW wsX
+grep -q '^agents ' "$reg" && fail "registry: an 'agents' row appeared despite no 8th arg (AGENTS_PANE=off must be byte-identical)" || true
+[ "$(wc -l < "$reg")" -eq 3 ] || fail "registry: expected exactly 3 rows when the 8th (agents) arg is omitted"
+
+# ON: an 8th arg writes the 4th role row and labels it agents·<ws_name>, alongside the other three.
+_pane "$S" pAg tC ''
+layout_write_registry "$reg" w1 tC pA pL pW wsX pAg
+grep -qx 'agents pAg tC w1' "$reg" || fail "registry: agents row wrong/missing when the 8th arg is supplied"
+[ "$(wc -l < "$reg")" -eq 4 ] || fail "registry: expected exactly 4 rows when the agents pane is supplied"
+[ "$(cat "$S/panes/pAg/label" 2>/dev/null)" = "agents·wsX" ] || fail "label: agents pane not labelled 'agents·wsX'"
+# Empty 8th arg again → row/label drop back out (never leaves a stale 'agents' row lying around).
+layout_write_registry "$reg" w1 tC pA pL pW wsX
+grep -q '^agents ' "$reg" && fail "registry: stale 'agents' row survived a write with no 8th arg" || true
+ok
+
 echo "ALL PASS ($pass checks)"

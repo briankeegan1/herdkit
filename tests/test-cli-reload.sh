@@ -1254,4 +1254,43 @@ grep -q "DETACHED" <<< "$out" \
 kill "$ZPID43" 2>/dev/null || true
 ok
 
+# ── 44. HERD-668 review finding (PR #791): AGENTS_PANE off (default) is a HARD no-op on reload ────
+# _reload_agents_pane_resolve's off-path sentinel used to be SPACE-joined ("<pane_id> <created>");
+# `read`'s default IFS collapses/strips a LEADING separator, so an empty pane_id + "0" silently
+# became aPane="0" (the flag, misread as a pane id) instead of aPane="". That fabricated a PHANTOM
+# `agents 0 <tab> <ws>` registry row and a spurious `pane run 0 …` on EVERY default reload — exactly
+# the "off is byte-identical" guarantee this lever promises. Comma-delimited now; this proves it.
+P="$T/p44"; mkdir "$P"
+_make_project "$P" "reloadtest"
+S="$T/state44"; _rich_coord_state "$S"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (AGENTS_PANE off/default)"
+P44_REAL="$(cd "$P" && pwd -P)"
+grep -q "^agents " "$P44_REAL/trees/.herd-panes" \
+  && fail "registry carries an 'agents' row despite AGENTS_PANE never being set (got: $(grep '^agents ' "$P44_REAL/trees/.herd-panes"))" \
+  || true
+grep -qE "pane run 0[[:space:]]" "$S/log" \
+  && fail "reload ran a command in phantom pane '0' — the space-sentinel collapse bug" || true
+grep -q "agents-pane-view.sh" "$S/log" \
+  && fail "agents-pane-view.sh was launched despite AGENTS_PANE off" || true
+grep -q "pane rename .* agents·reloadtest" "$S/log" \
+  && fail "an agents pane was labelled despite AGENTS_PANE off" || true
+grep -qi "did not appear in pane" <<< "$out" \
+  && fail "spurious agents-pane-view visibility warning printed despite AGENTS_PANE off: $out" || true
+ok
+
+# ── 45. AGENTS_PANE=on: reload splits + labels a REAL pane off the watch pane, registry row correct ─
+P="$T/p45"; mkdir "$P"
+_make_project "$P" "reloadtest" 'AGENTS_PANE="on"'
+S="$T/state45"; _rich_coord_state "$S"
+out="$(_rich_reload "$P" "$S")" || fail "reload failed (AGENTS_PANE on)"
+P45_REAL="$(cd "$P" && pwd -P)"
+new_ag="$(awk '$1=="agents" {print $2}' "$P45_REAL/trees/.herd-panes")"
+[ -n "$new_ag" ] || fail "AGENTS_PANE=on: no 'agents' registry row written"
+[ "$new_ag" != "0" ] || fail "AGENTS_PANE=on: registry 'agents' row is the phantom pane id '0'"
+grep -rl "agents-pane-view.sh" "$S/panes" >/dev/null || fail "AGENTS_PANE=on: no pane received agents-pane-view.sh"
+grep -q "pane rename $new_ag agents·reloadtest" "$S/log" || fail "AGENTS_PANE=on: agents pane not labelled 'agents·reloadtest'"
+grep -q "pane split pW --direction right --ratio 0.72" "$S/log" \
+  || fail "AGENTS_PANE=on: agents pane not split off the watch pane at ratio 0.72"
+ok
+
 echo "ALL PASS ($pass checks)"
