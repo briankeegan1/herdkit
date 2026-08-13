@@ -31,6 +31,20 @@ name: CI
 # exclude — mutation-proven membership (every test lands in exactly one shard, the union == the full
 # curated set, for BOTH counts) lives in tests/test-suite-shard.sh, not in this workflow. DOES NOT
 # REDUCE what runs — only wall-clock.
+#
+# DIFF-SCOPING (HERD-664): sharding splits the SAME ~350 tests across boxes; scoping asks the
+# different question of which of them a PR's diff can actually break. `HERD_CI_SCOPE_BASE_REF` below
+# hands scripts/ci/run-suite.sh the PR's base branch; the runner diffs HEAD against its merge-base
+# with that ref and scopes the curated set FIRST (scripts/herd/suite-shard.sh's
+# herd_suite_tests_for_diff — name-pairing + `# suite-deps:` headers + the always-run
+# tests/scope-core.tsv, and FAIL-CLOSED to the ENTIRE curated set on any wide-blast or unmappable
+# path), then shards the SCOPED set, so a shard with no scoped tests exits green in seconds. The ref
+# is passed ONLY for a pull_request: a push to main leaves it empty, which is byte-identical to the
+# pre-HERD-664 full sharded run — as is every fail-closed path, including a diff this runner cannot
+# obtain at all. `fetch-depth: 0` on a PR is what makes the merge base resolvable (the default
+# shallow checkout has no common ancestor to find); if it were ever unavailable the runner falls back
+# to the full set rather than guessing. Every run prints "scoped N of M curated tests (reason)" —
+# there is no silent cap.
 
 on:
   push:
@@ -81,10 +95,25 @@ jobs:
       HERD_CI_PLATFORM: ${{ matrix.platform }}
       HERD_CI_SHARD_INDEX: ${{ matrix.shard }}
       HERD_CI_SHARD_COUNT: ${{ matrix.shard_count }}
+      # HERD-664 diff-scoped selection: the PR's base branch, or EMPTY on a push to main (which runs
+      # the full curated sharded set, exactly as before). Quoted string literals on purpose — an
+      # unquoted `&& 0 || 1` would evaluate to 1, since 0 is falsy in a GitHub expression.
+      HERD_CI_SCOPE_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
       LANG: ${{ matrix.locale }}
       LC_ALL: ${{ matrix.locale }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history on a PR so `git merge-base <base> HEAD` resolves (HERD-664); a push to main
+          # is not scoped, so it keeps the fast shallow checkout.
+          fetch-depth: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+      - name: Fetch the PR base branch (diff-scoped selection, HERD-664)
+        if: github.event_name == 'pull_request'
+        run: |
+          # Give the merge-base a NAMED ref to resolve. Best-effort: if this fetch fails, the runner
+          # cannot obtain a diff and falls back to the FULL curated set — never to a guess.
+          git fetch --no-tags origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}" || true
       - name: Set up Python 3.12
         # The suite is tested against a mature Python; the runner default (3.14) regresses the
         # codemap + rich-render tests. Pin a stable version that matches the maintainer's engine.
