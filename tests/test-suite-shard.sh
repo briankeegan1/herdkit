@@ -27,6 +27,13 @@
 #   (8) herd_suite_curated_tests still honors gate-coverage-exempt.tsv on a fixture tree (the same
 #       selection scripts/ci/run-suite.sh has always used), so the shard library and the CI runner
 #       can never disagree about what "curated" means.
+#   (9) SCOPE-THEN-SHARD MEMBERSHIP (HERD-664): scripts/ci/run-suite.sh now scopes the curated set to
+#       the PR's diff FIRST and shards the SCOPED set, so check (1)'s invariant has to hold for that
+#       set too — the union of shards 1..N over a scoped selection reconstructs the scoped selection
+#       EXACTLY, at every shard count. Mutation-proven in both directions (a dropped name and a
+#       duplicated name each break the reconstruction, so the comparison is not vacuous), plus the
+#       fail-closed composition: when the diff selects the whole curated set, sharding it is
+#       identical to the unscoped herd_suite_tests_for_shard partition CI has always run.
 #
 # Run:  bash tests/test-suite-shard.sh
 set -uo pipefail
@@ -153,5 +160,63 @@ grep -qx 'test-quarantined.sh' <<< "$sel" && fail "(8) test-quarantined.sh must 
 pass
 echo "PASS (8) curated selection excludes exempt-listed tests, same convention as scripts/ci/run-suite.sh"
 
+# ── 9. SCOPE-THEN-SHARD (HERD-664): the union of a SCOPED selection's shards IS that selection ─────
+# scripts/ci/run-suite.sh scopes the curated set to the PR's diff FIRST, then shards the SCOPED set —
+# so check (1)'s membership invariant must hold over that smaller set as well. It is the same
+# false-green shape: a shard that silently drops a scoped test just finishes faster and stays green,
+# and now with FEWER tests in flight there is even less noise to notice it in.
+shard_filter() {   # shard_filter <shard_index> <shard_count> — reads test names on stdin
+  local _sf_idx="$1" _sf_cnt="$2" _sf_nm
+  while IFS= read -r _sf_nm; do
+    [ -n "$_sf_nm" ] || continue
+    [ "$(herd_suite_shard_of "$_sf_nm" "$_sf_cnt")" = "$_sf_idx" ] && printf '%s\n' "$_sf_nm"
+  done
+  return 0
+}
+# A real, genuinely NARROWER selection: scripts/herd/journal.sh is name-paired, is not wide-blast and
+# declares no exotic deps (the same probe tests/test-suite-scope.sh's narrowness check uses).
+scoped="$(herd_suite_tests_for_diff "$ROOT/tests" scripts/herd/journal.sh)"
+scoped_n="$(printf '%s\n' "$scoped" | grep -c .)"
+[ "$scoped_n" -gt 0 ] || fail "(9) the scoped selection is empty — the premise of this check is broken"
+[ "$scoped_n" -lt "$curated_n" ] \
+  || fail "(9) the scoped selection ($scoped_n) is not narrower than the curated set ($curated_n) — this check would be vacuous"
+for n in 1 2 6 8; do
+  s_union="$(
+    i=1
+    while [ "$i" -le "$n" ]; do
+      printf '%s\n' "$scoped" | shard_filter "$i" "$n"
+      i=$((i + 1))
+    done | LC_ALL=C sort
+  )"
+  s_union_n="$(printf '%s\n' "$s_union" | grep -c .)"
+  [ "$s_union_n" -eq "$scoped_n" ] \
+    || fail "(9) shard_count=$n: the scoped union has $s_union_n tests, the scoped selection has $scoped_n (a drop or a duplicate)"
+  diff <(printf '%s\n' "$scoped") <(printf '%s\n' "$s_union") >/dev/null \
+    || fail "(9) shard_count=$n: the union of shards over the SCOPED set does not reconstruct it exactly"
+  pass
+done
+# MUTATION, both directions: the comparison above must actually catch a broken partition. A dropped
+# name and a duplicated name are the two ways a shard partition goes wrong, and neither may compare
+# equal to the intact selection.
+mut_drop="$(printf '%s\n' "$scoped" | sed '$d')"
+diff <(printf '%s\n' "$scoped") <(printf '%s\n' "$mut_drop") >/dev/null \
+  && fail "(9) a DROPPED test compares equal to the intact scoped selection — the union check is vacuous"
+mut_dup="$(printf '%s\n%s\n' "$scoped" "$(printf '%s\n' "$scoped" | head -1)" | LC_ALL=C sort)"  # pipe-ok: a one-line printf producer, far under any pipe buffer, and the status is not gated
+diff <(printf '%s\n' "$scoped") <(printf '%s\n' "$mut_dup") >/dev/null \
+  && fail "(9) a DUPLICATED test compares equal to the intact scoped selection — the union check is vacuous"
+pass
+# FAIL-CLOSED COMPOSITION: a wide-blast diff selects the entire curated set, and sharding THAT is
+# byte-identical to the unscoped partition CI has always run — the guarantee that scoping never
+# changes what a fail-closed run covers. One shard index is enough: both sides shard the same list
+# through the same function, so a wiring bug shows up on any of them.
+wide="$(herd_suite_tests_for_diff "$ROOT/tests" bin/herd)"
+[ "$wide" = "$curated" ] || fail "(9) a wide-blast diff must select the entire curated set"
+wide_shard="$(printf '%s\n' "$wide" | shard_filter 2 6)"
+plain_shard="$(herd_suite_tests_for_shard "$ROOT/tests" 2 6)"
+[ "$wide_shard" = "$plain_shard" ] \
+  || fail "(9) sharding a fail-closed (full-curated) scoped selection differs from the unscoped shard partition"
+pass
+echo "PASS (9) scope-then-shard: the union of shards over a scoped selection ($scoped_n of $curated_n tests) reconstructs it exactly at every shard count, a dropped/duplicated name is caught, and a fail-closed selection shards identically to the unscoped partition"
+
 echo
-echo "ALL PASS ($PASS checks) — HERD-463 shard library: membership is exact, deterministic, stable under insertion, and exempt-aware; a dropped/duplicated shard can never read as green."
+echo "ALL PASS ($PASS checks) — HERD-463 shard library: membership is exact, deterministic, stable under insertion, and exempt-aware; a dropped/duplicated shard can never read as green. HERD-664: the same holds after diff-scoping, and a fail-closed selection shards exactly as before."

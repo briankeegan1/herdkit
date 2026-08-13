@@ -93,13 +93,16 @@ pass
 echo "PASS (2b) the sibling key (still exported) is not flagged — a real diff, not a blanket red"
 
 # ── 3. A key with no default anywhere stays clean when genuinely unset ──────────────────────────────
+# WATCHER_OWNER (unlike WATCHER_SCOPE post-HERD-653, which now carries a real `mine` default so
+# "absent from the child's environment" can only ever mean a genuine wiring gap) still carries no
+# `: "${KEY:=default}"` line at all — the still-valid example of a key that stays genuinely unset.
 TU="$T/unset-key"
 make_tree "$TU"
 out="$(herd_env_export_lint "$TU")"; rc=$?
-[ "$rc" -eq 0 ] || fail "(3) an untouched tree with WATCHER_SCOPE genuinely unset must be clean (exit 0, got $rc): $out"
-grep -qx "WATCHER_SCOPE" <<< "$out" && fail "(3) WATCHER_SCOPE has no default anywhere — must never be flagged when unset (got: $out)"
+[ "$rc" -eq 0 ] || fail "(3) an untouched tree with WATCHER_OWNER genuinely unset must be clean (exit 0, got $rc): $out"
+grep -qx "WATCHER_OWNER" <<< "$out" && fail "(3) WATCHER_OWNER has no default anywhere — must never be flagged when unset (got: $out)"
 pass
-echo "PASS (3) a core key with no herd-config.sh default (WATCHER_SCOPE) is not flagged merely for being unset"
+echo "PASS (3) a core key with no herd-config.sh default (WATCHER_OWNER) is not flagged merely for being unset"
 
 # ── 4. A project .herd/config override with no 'export' also reds ───────────────────────────────────
 # WATCHER_SCOPE carries no `: "${KEY:=default}"` line in herd-config.sh — only a bare `export
