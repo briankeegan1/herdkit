@@ -7953,6 +7953,14 @@ _self_restart_exec() {
   [ -n "${HERD_HERMETIC_GUARD:-}" ] && return 1
   [ -r "$HERE/agent-watch.sh" ] || return 1
   _self_restart_journal "$_se_trigger" "$_se_workers" "$_se_waited"
+  # HERD-674 (review finding): `exec` never runs the EXIT/TERM trap _watcher_lock_cleanup fires from,
+  # so the in-console hotkey listener — a background child holding the pane's tty in raw mode, unlike
+  # every OTHER in-flight fork this handoff intentionally lets outlive the exec (those are
+  # marker-owned and reaped by the inflight-marker sweeps below; this one is neither) — would
+  # otherwise survive as an orphan still blocking in `read -n 1` with echo off, and the re-loaded
+  # image would then arm a SECOND listener on top of it. Stop it explicitly before the exec; the
+  # incoming image re-arms its own via the ordinary one-shot startup spawn.
+  _watch_hotkeys_listener_stop
   # GENERATION HANDOFF (HERD-266). exec keeps our pid, but the outgoing image's still-running forks
   # are momentarily neither marker-owned nor children of a settled lock, so a `herd status` sampling
   # inside this window can see more than one tagged main. Record the window (TTL-bounded, cleared by
@@ -17468,6 +17476,10 @@ _watch_hotkeys_active() {
 
 # The marker file the background listener writes and the tick loop polls: a bare counter, one line,
 # under $TREES (or $WORKTREES_DIR/$TMPDIR fail-soft chain — mirrors _watcher_view_warn_once's path).
+# Single-writer by construction, not by any locking here: the watcher singleton (HERD_WATCHER_LOCK)
+# guarantees at most one live watcher process per pool, and _watch_hotkeys_listener_spawn is called
+# exactly once per process (the startup one-shot, plus the re-armed listener after a self-restart
+# exec, which _watch_hotkeys_listener_stop always retires first) — never two concurrent writers.
 _watch_hotkeys_marker_file() {
   printf '%s' "${TREES:-${WORKTREES_DIR:-${TMPDIR:-/tmp}}}/.agent-watch-hotkeys-view"
 }
@@ -17536,7 +17548,10 @@ _watch_hotkeys_listener_stop() {
 # blocking — so its cost is a constant few milliseconds whether or not a key was ever pressed (this is
 # the NON-BLOCKING proof: see the timing assertion in tests/test-watch-hotkeys.sh). A changed marker
 # (a real keystroke landed since the last tick) flips WATCHER_VIEW mine<->all in memory; anything else
-# — not active, marker absent/unchanged, a corrupt read — is a silent no-op.
+# — not active, marker absent/unchanged, a corrupt read — is a silent no-op. KNOWN COALESCING: this
+# detects the marker CHANGED, not how many times — two (or any even count of) 'v' presses inside one
+# ~4s tick interval net a single flip rather than a no-op/full round trip. A cosmetic quirk on a
+# human-paced keypress, not a correctness issue (the flip is always a well-defined mine<->all toggle).
 _watch_hotkeys_poll_tick() {
   _watch_hotkeys_active || return 0
   local _whp_marker _whp_cur

@@ -196,4 +196,23 @@ python3 -c "import sys; sys.exit(0 if $_whs_dt < 3.0 else 1)" \
   || fail "listener_stop must terminate the tracked PID (stand-in ran its full natural duration: ${_whs_dt}s)"
 ok
 
+# ── 9. self-restart exec never orphans the listener (review finding, HERD-674) ─────────────────────
+# `exec` replaces the process image without running any EXIT/TERM trap, so the ONLY way
+# _self_restart_exec can retire the background listener before handing off is an EXPLICIT call —
+# and it must run BEFORE the `exec -a` line, or the outgoing image's raw-mode reader survives the
+# handoff as an orphan (and the incoming image then arms a second one on top of it). This can't be
+# proven by actually invoking _self_restart_exec (exec would replace this test's own shell), so it is
+# proven structurally: the function body must call _watch_hotkeys_listener_stop, strictly before its
+# own `exec -a` line.
+body="$(declare -f _self_restart_exec)"
+case "$body" in
+  *_watch_hotkeys_listener_stop*) ok ;;
+  *) fail "_self_restart_exec must call _watch_hotkeys_listener_stop — exec drops EXIT/TERM traps, so this is the only place that can retire the listener before a self-restart handoff" ;;
+esac
+stop_line="$(grep -n -m1 '_watch_hotkeys_listener_stop' <<<"$body" | cut -d: -f1)"
+exec_line="$(grep -n -m1 'exec -a' <<<"$body" | cut -d: -f1)"
+[ -n "$stop_line" ] && [ -n "$exec_line" ] && [ "$stop_line" -lt "$exec_line" ] \
+  || fail "_watch_hotkeys_listener_stop must run BEFORE the 'exec -a' line in _self_restart_exec (stop@$stop_line exec@$exec_line)"
+ok
+
 echo "PASS ($pass assertions) — tests/test-watch-hotkeys.sh"
