@@ -72,8 +72,8 @@ PRS_LOOKUP_OK=1 _ungated_prs_scan "$PRS" "102"
 [ -s "$UNGATED_PR_LEDGER" ] || fail "the ungated-PR scan must fire with no config key set at all"
 n=$(wc -l < "$UNGATED_PR_LEDGER" | tr -cd '0-9')
 [ "$n" = "2" ] || fail "expected 2 ungated rows (101,103; 102 is claimed), got $n"
-grep -q "^${HERD_FAKE_NOW}	101	add widget	feat/widget$" "$UNGATED_PR_LEDGER" || fail "PR 101 row missing/misshaped"
-grep -q "^${HERD_FAKE_NOW}	103	tidy docs	feat/docs$"  "$UNGATED_PR_LEDGER" || fail "PR 103 row missing/misshaped"
+grep -q "^${HERD_FAKE_NOW}	101	add widget	feat/widget	$" "$UNGATED_PR_LEDGER" || fail "PR 101 row missing/misshaped"
+grep -q "^${HERD_FAKE_NOW}	103	tidy docs	feat/docs	$"  "$UNGATED_PR_LEDGER" || fail "PR 103 row missing/misshaped"
 grep -q "	102	" "$UNGATED_PR_LEDGER" && fail "claimed PR 102 must NOT be an ungated row"
 pass
 
@@ -127,6 +127,60 @@ UNGATED_PR_SECTION_ROWS=$'    🔓 #101 add widget feat/widget · x\n'
 last_frame=""
 render >/dev/null 2>&1 || true
 case "${frame:-}" in *"ungated PRs"*) : ;; *) fail "a non-empty section must render the ungated PRs header, with NO config key set" ;; esac
+pass
+
+# ── 8. HERD-663 AUTHOR FALLBACK: a PR authored by someone other than this seat (WATCHER_OWNER=
+#      me-operator, set at the top of this file) renders the compact '👤 ... authored by <author>
+#      (no tracker claim)' row with the adopt nudge suppressed; a PR this seat authored itself keeps
+#      today's adopt-nudge row verbatim ──────────────────────────────────────────────────────────────
+rm -f "$UNGATED_PR_LEDGER" "$ADOPT_PR_LEDGER"
+PRS_AUTHORED='[
+  {"number":201,"title":"teammate work","headRefName":"feat/teammate","headRefOid":"ddd444","author":{"login":"teammate-x"}},
+  {"number":202,"title":"my own PR","headRefName":"feat/mine","headRefOid":"eee555","author":{"login":"me-operator"}}
+]'
+PRS_LOOKUP_OK=1 _ungated_prs_scan "$PRS_AUTHORED" ""
+grep -q "^${HERD_FAKE_NOW}	201	teammate work	feat/teammate	teammate-x$" "$UNGATED_PR_LEDGER" \
+  || fail "PR 201's author must be recorded in the ledger: $(cat "$UNGATED_PR_LEDGER")"
+UNGATED_PR_SECTION_ROWS=""
+build_ungated_prs
+grep -q "👤 #201 teammate work · authored by teammate-x (no tracker claim)" <<< "$UNGATED_PR_SECTION_ROWS" \
+  || fail "PR 201 must render the author-fallback row: $UNGATED_PR_SECTION_ROWS"
+grep -q "#201.*enable ADOPT_REMOTE_PRS" <<< "$UNGATED_PR_SECTION_ROWS" \
+  && fail "the adopt nudge must be suppressed on an author-fallback row"
+grep -q "🔓 #202 my own PR feat/mine · ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree add to adopt" \
+  <<< "$UNGATED_PR_SECTION_ROWS" || fail "PR 202 (this seat's own PR) must keep today's adopt-nudge row: $UNGATED_PR_SECTION_ROWS"
+pass
+
+# ── 9. Explicitly OFF ADOPT_REMOTE_PRS drops the "enable ADOPT_REMOTE_PRS" clause from the base row —
+#      unset (default) keeps it, since flipping it on there is still live advice. herd-config.sh's
+#      `: "${ADOPT_REMOTE_PRS:="off"}"` default-ASSIGNS the runtime var the moment it loads, so "left
+#      unset" and "the operator wrote off" are indistinguishable via $ADOPT_REMOTE_PRS itself — this
+#      writes/removes the KEY IN THE CONFIG FILE (what _adopt_remote_prs_config_value actually reads)
+#      to prove the two really are told apart ────────────────────────────────────────────────────────
+_adopt_remote_prs_enabled && fail "precondition: ADOPT_REMOTE_PRS must already read off (unset==default==off)"
+printf 'ADOPT_REMOTE_PRS=off\n' > "$T/no-such-config"
+UNGATED_PR_SECTION_ROWS=""
+build_ungated_prs
+grep -q "🔓 #202 my own PR feat/mine · ungated · no builder record · git worktree add to adopt" \
+  <<< "$UNGATED_PR_SECTION_ROWS" || fail "an explicit ADOPT_REMOTE_PRS=off in the config file must drop the enable-it suggestion: $UNGATED_PR_SECTION_ROWS"
+grep -q "enable ADOPT_REMOTE_PRS" <<< "$UNGATED_PR_SECTION_ROWS" \
+  && fail "no row may suggest enabling ADOPT_REMOTE_PRS once it is explicitly off"
+rm -f "$T/no-such-config"
+UNGATED_PR_SECTION_ROWS=""
+build_ungated_prs
+grep -q "🔓 #202 my own PR feat/mine · ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree add to adopt" \
+  <<< "$UNGATED_PR_SECTION_ROWS" || fail "no config file at all (implicit default) must keep the enable-it suggestion: $UNGATED_PR_SECTION_ROWS"
+pass
+
+# ── 10. TEAM_ALIASES overrides the author-fallback row's display name too (HERD-663 shares the same
+#       lookup with the TEAM_PRESENCE attributed row, tested in test-team-presence.sh) ────────────────
+export TEAM_ALIASES="teammate-x=Teammate X"
+UNGATED_PR_SECTION_ROWS=""
+build_ungated_prs
+grep -q "👤 #201 teammate work · authored by Teammate X (no tracker claim)" <<< "$UNGATED_PR_SECTION_ROWS" \
+  || fail "TEAM_ALIASES must override the author-fallback display name: $UNGATED_PR_SECTION_ROWS"
+unset TEAM_ALIASES
+rm -f "$UNGATED_PR_LEDGER" "$ADOPT_PR_LEDGER"
 pass
 
 echo "ok — $PASS ungated-PR-rows assertions passed"

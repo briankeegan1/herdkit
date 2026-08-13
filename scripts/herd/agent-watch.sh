@@ -2522,28 +2522,118 @@ EOF
   printf '%s\tcalm' "${_ug_epoch:-}"
 }
 
-# _ungated_pr_row <line>  ("<epoch>\t<pr>\t<title>\t<branch>") → one themed console row. Fail-soft: a
-# row missing its PR number renders nothing (drops out of the section).
+# ── Team aliases (HERD-663) ──────────────────────────────────────────────────────────────────────
+# TEAM_ALIASES — an optional, machine-scoped display-name override shared by BOTH person-emoji row
+# forms below (the TEAM_PRESENCE-attributed row and the author-fallback row): comma-separated
+# handle=Name pairs, e.g. "nouvertnec84=Chase,anotherhandle=Other Name". A resolved identity (tracker
+# assignee or PR author login) is looked up case-insensitively; a hit substitutes <Name>, a miss falls
+# straight back to whatever was already resolved — a tracker's own display name when the backend
+# provides one, else the raw handle. Empty/unset (default) is a pure passthrough: byte-inert.
+_team_alias_lookup() {
+  local _tal_handle="${1:-}" _tal_k _tal_v _tal_handle_lc
+  [ -n "$_tal_handle" ] || return 0
+  [ -n "${TEAM_ALIASES:-}" ] || return 0
+  _tal_handle_lc="$(printf '%s' "$_tal_handle" | tr '[:upper:]' '[:lower:]')"
+  while IFS='=' read -r _tal_k _tal_v; do
+    _tal_k="$(printf '%s' "$_tal_k" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+    [ -n "$_tal_k" ] && [ "$_tal_k" = "$_tal_handle_lc" ] || continue
+    _tal_v="$(printf '%s' "$_tal_v" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$_tal_v" ] || continue
+    printf '%s' "$_tal_v"
+    return 0
+  done <<EOF
+$(printf '%s' "$TEAM_ALIASES" | tr ',' '\n')
+EOF
+  return 0
+}
+
+# _team_alias_display <raw> — <raw> resolved through TEAM_ALIASES when a pair matches it, else <raw>
+# itself unchanged. Fail-soft by construction: never errors, never empties a non-empty input.
+_team_alias_display() {
+  local _tad_raw="${1:-}" _tad_hit
+  _tad_hit="$(_team_alias_lookup "$_tad_raw")"
+  printf '%s' "${_tad_hit:-$_tad_raw}"
+}
+
+# _adopt_remote_prs_config_value — read ADOPT_REMOTE_PRS FRESH from the config FILE(s), never the
+# resolved $ADOPT_REMOTE_PRS: herd-config.sh's `: "${ADOPT_REMOTE_PRS:="off"}"` default-ASSIGNS the
+# runtime variable the instant it loads (unlike a plain `:-` substitution), so by the time this row
+# renders, "left unset" and "the operator wrote off" are BOTH just $ADOPT_REMOTE_PRS=off — the file is
+# the only place that distinction still lives. Mirrors _engine_pause_config_value's file-read shape
+# exactly (HERD-347): config.local (when present) wins over the committed baseline. Fail-soft: an
+# absent/unreadable file or key yields "".
+_adopt_remote_prs_config_value() {
+  local _arc_base _arc_dir _arc_f _arc_line _arc_val=""
+  _arc_base="${HERD_CONFIG_FILE:-}"
+  [ -n "$_arc_base" ] || { [ -n "${PROJECT_ROOT:-}" ] && _arc_base="${PROJECT_ROOT}/.herd/config"; }
+  [ -n "$_arc_base" ] || return 0
+  _arc_dir="$(dirname "$_arc_base" 2>/dev/null)" || return 0
+  for _arc_f in "$_arc_dir/config.local" "$_arc_base"; do
+    [ -n "$_arc_f" ] && [ -r "$_arc_f" ] || continue
+    _arc_line="$(grep -E '^[[:space:]]*ADOPT_REMOTE_PRS[[:space:]]*=' "$_arc_f" 2>/dev/null | tail -n1)" || _arc_line=""
+    [ -n "$_arc_line" ] || continue
+    _arc_val="$(printf '%s\n' "$_arc_line" \
+      | sed -E 's/^[[:space:]]*ADOPT_REMOTE_PRS[[:space:]]*=[[:space:]]*//; s/[[:space:]]*#.*$//; s/^"//; s/"$//; s/^'\''//; s/'\''$//; s/[[:space:]]*$//')"
+    break
+  done
+  printf '%s' "$_arc_val"
+}
+
+# _adopt_remote_prs_explicitly_off — true iff the config FILE itself sets ADOPT_REMOTE_PRS to a value
+# that does not read as enabled — i.e. an operator deliberately turned it off (or mistyped it), as
+# opposed to leaving the key out of the file entirely (today's implicit default off). Distinguishing
+# the two lets the base ungated row (below) drop the "enable ADOPT_REMOTE_PRS" suggestion only when it
+# would be actively wrong advice to give.
+_adopt_remote_prs_explicitly_off() {
+  local _aro_val
+  _aro_val="$(_adopt_remote_prs_config_value)"
+  [ -n "$_aro_val" ] || return 1
+  case "$(printf '%s' "$_aro_val" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# _ungated_pr_row <line>  ("<epoch>\t<pr>\t<title>\t<branch>\t<author>") → one themed console row.
+# Fail-soft: a row missing its PR number renders nothing (drops out of the section).
 #
-# HERD-527: when the TEAM_PRESENCE cache attributes this PR to a teammate who is mid-build on their own
-# machine, the row says so and the adopt nudge is SUPPRESSED — "adopt this" is exactly the wrong advice
-# for a PR someone else is actively building. With TEAM_PRESENCE off (default) the cache is always
-# empty, the lookup returns nothing, and this prints the pre-HERD-527 bytes verbatim.
+# THREE forms, first match wins:
+#   1. HERD-527/HERD-663/HERD-661 ATTRIBUTED — the TEAM_PRESENCE cache attributes this PR to a
+#      teammate mid-build on their own machine: '👤 #<pr> <title> · <name> — building <id>' (a compact
+#      form replacing the older, wordier 'ungated here · <handle> building <id> on their machine';
+#      <name> goes through TEAM_ALIASES). Under TEAM_PRESENCE=live ONLY, a trailing freshness clause
+#      is appended when the live channel (team-presence-live.sh) has a marker for this PR: ' · active
+#      2m ago' (fresh) or ' · last active 3h ago (stale?)' (past _TEAM_PRESENCE_LIVE_STALE_SECS) — a
+#      plain TEAM_PRESENCE=on row, or a live row with no reachable marker, appends nothing and is
+#      BYTE-IDENTICAL to the on-only row. "adopt this" is exactly the wrong advice for a PR someone
+#      else is actively building, so the adopt nudge never appears on this row.
+#   2. HERD-663 AUTHOR FALLBACK — no tracker attribution, but the PR's `author` (present in team mode,
+#      HERD-401's _watcher_tick_fields) is known and is NOT this seat's own identity (_watcher_owner_
+#      login, memoized — see build_ungated_prs, which resolves it once per render BEFORE the row
+#      subshells run so this never triggers a fresh `gh api user` per row): '👤 #<pr> <title> ·
+#      authored by <author> (no tracker claim)', again through TEAM_ALIASES. Reserves the adopt nudge
+#      for PRs this seat itself authored.
+#   3. TODAY'S ROW — unresolved (TEAM_PRESENCE off/unattributed, author unknown, or author IS this
+#      seat): the original '🔓 ... ungated · no builder record · enable ADOPT_REMOTE_PRS or git
+#      worktree add to adopt', minus the ADOPT_REMOTE_PRS clause when that key is explicitly off (see
+#      _adopt_remote_prs_explicitly_off) — suggesting a lever the operator deliberately disabled is
+#      wrong advice too. With TEAM_PRESENCE off and no author field in this tick's PRS_JSON (solo
+#      scope), this is the ONLY reachable branch and prints the pre-HERD-663 bytes verbatim.
 _ungated_pr_row() {
-  local _ug_epoch _ug_pr _ug_title _ug_branch _ug_who
-  IFS=$'\t' read -r _ug_epoch _ug_pr _ug_title _ug_branch <<EOF
+  local _ug_epoch _ug_pr _ug_title _ug_branch _ug_author _ug_who
+  IFS=$'\t' read -r _ug_epoch _ug_pr _ug_title _ug_branch _ug_author <<EOF
 $1
 EOF
   [ -n "${_ug_pr:-}" ] || return 0
   _ug_who="$(_team_presence_lookup "$_ug_pr")"
   if [ -n "$_ug_who" ]; then
-    local _ug_id _ug_assignee _ug_status _ug_live_epoch _ug_live=""
+    local _ug_id _ug_assignee _ug_status _ug_live_epoch _ug_live="" _ug_display
     IFS=$'\t' read -r _ug_id _ug_assignee _ug_status _ug_live_epoch <<EOF
 $_ug_who
 EOF
     # HERD-661 (GH #639 phase 2): TEAM_PRESENCE=live only — when the consume leg found a fresh live
     # marker for this PR, append the freshness clause. Absent/unparseable epoch (TEAM_PRESENCE=on, or
-    # live with no reachable channel) leaves _ug_live empty, so the row is BYTE-IDENTICAL to phase 1.
+    # live with no reachable channel) leaves _ug_live empty, so the row is BYTE-IDENTICAL to on/HERD-663.
     case "${_ug_live_epoch:-}" in
       ''|*[!0-9]*) ;;
       *)
@@ -2556,9 +2646,24 @@ EOF
         fi
         ;;
     esac
-    printf '    %s🔓%s %s#%s%s %s %s%s · ungated here · %s building %s on their machine%s%s' \
+    _ug_display="$(_team_alias_display "$_ug_assignee")"
+    printf '    %s👤%s %s#%s%s %s · %s — building %s%s%s' \
       "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
-      "$C_DIM" "${_ug_branch:-}" "$_ug_assignee" "$_ug_id" "$_ug_live" "$C_RESET"
+      "$_ug_display" "$_ug_id" "$_ug_live" "$C_RESET"
+    return 0
+  fi
+  if [ -n "${_ug_author:-}" ] && [ "$_ug_author" != "$(_watcher_owner_login)" ]; then
+    local _ug_author_display
+    _ug_author_display="$(_team_alias_display "$_ug_author")"
+    printf '    %s👤%s %s#%s%s %s · authored by %s (no tracker claim)%s' \
+      "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
+      "$_ug_author_display" "$C_RESET"
+    return 0
+  fi
+  if [ "${_UG_ADOPT_HINT_OFF:-0}" = "1" ]; then
+    printf '    %s🔓%s %s#%s%s %s %s%s · ungated · no builder record · git worktree add to adopt%s' \
+      "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
+      "$C_DIM" "${_ug_branch:-}" "$C_RESET"
     return 0
   fi
   printf '    %s🔓%s %s#%s%s %s %s%s · ungated · no builder record · enable ADOPT_REMOTE_PRS or git worktree add to adopt%s' \
@@ -2599,6 +2704,8 @@ for line in (os.environ.get("ADOPTED") or "").splitlines():
 epoch = os.environ.get("EPOCH", "")
 def flat(s):
     return " ".join(str(s or "").split())
+def login(d):
+    return d.get("login", "") if isinstance(d, dict) else ""
 for pr in prs:
     if not isinstance(pr, dict):
         continue
@@ -2615,7 +2722,8 @@ for pr in prs:
     if len(title) > 80:
         title = title[:79].rstrip() + "…"
     branch = flat(pr.get("headRefName"))
-    print("%s\t%s\t%s\t%s" % (epoch, num, title, branch))
+    author = flat(login(pr.get("author")))
+    print("%s\t%s\t%s\t%s\t%s" % (epoch, num, title, branch, author))
 ' 2>/dev/null)" || _ug_out=""
   if [ -n "$_ug_out" ]; then
     printf '%s\n' "$_ug_out" > "$UNGATED_PR_LEDGER" 2>/dev/null || true
@@ -2638,6 +2746,14 @@ build_ungated_prs() {
   # no-op) whenever TEAM_PRESENCE is off — that is what keeps the off-path byte-identical.
   _team_presence_load
   [ -s "$UNGATED_PR_LEDGER" ] || return 0
+  # HERD-663: resolve the seat's own identity ONCE per render, called DIRECTLY (never via `$()`) so the
+  # memo lands in THIS shell — every row's `$(_watcher_owner_login)` (herd_console_section runs
+  # _ungated_pr_row in a subshell) then inherits an already-resolved cache instead of each independently
+  # racing a fresh `gh api user`. Resolved AT MOST ONCE per process regardless of how many renders follow.
+  _resolve_watcher_owner
+  # HERD-663: same ONCE-per-render treatment for the ADOPT_REMOTE_PRS-explicitly-off config-FILE read —
+  # a filesystem read, not a network call, but still wasteful to repeat per row.
+  if _adopt_remote_prs_explicitly_off; then _UG_ADOPT_HINT_OFF=1; else _UG_ADOPT_HINT_OFF=0; fi
   local rows
   rows="$(herd_console_section "$UNGATED_PR_LEDGER" "$UNGATED_PR_ROWS_LIMIT" \
     _ungated_pr_classify _ungated_pr_row)"

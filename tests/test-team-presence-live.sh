@@ -334,9 +334,9 @@ grep -q "^103	HERD-527	Brian K	idle	${STALE_EPOCH}\$" "$TEAM_PRESENCE_LEDGER" \
   || fail "PR 103's ledger row must carry the live status+epoch: $(cat "$TEAM_PRESENCE_LEDGER")"
 UNGATED_PR_SECTION_ROWS=""
 build_ungated_prs
-grep -q "🔓 #101 add widget feat/widget · ungated here · Ava Chen building HERD-500 on their machine · active " \
+grep -q "👤 #101 add widget · Ava Chen — building HERD-500 · active " \
   <<< "$UNGATED_PR_SECTION_ROWS" || fail "row 101 must render the FRESH freshness clause: $UNGATED_PR_SECTION_ROWS"
-grep -q "🔓 #103 team view feat/herd-527-teammate · ungated here · Brian K building HERD-527 on their machine · last active " \
+grep -q "👤 #103 team view · Brian K — building HERD-527 · last active " \
   <<< "$UNGATED_PR_SECTION_ROWS" || fail "row 103 must render the STALE freshness clause: $UNGATED_PR_SECTION_ROWS"
 grep -q "(stale?)" <<< "$UNGATED_PR_SECTION_ROWS" || fail "row 103 must be flagged (stale?)"
 ROW101="$(grep '#101' <<< "$UNGATED_PR_SECTION_ROWS")"
@@ -354,7 +354,7 @@ grep -q "^103	HERD-527	Brian K\$" "$TEAM_PRESENCE_LEDGER" \
   || fail "PR 103 with no live marker must fall back to the plain 3-field on-style row: $(cat "$TEAM_PRESENCE_LEDGER")"
 UNGATED_PR_SECTION_ROWS=""
 build_ungated_prs
-grep -q "🔓 #103 team view feat/herd-527-teammate · ungated here · Brian K building HERD-527 on their machine$" \
+grep -q "👤 #103 team view · Brian K — building HERD-527$" \
   <<< "$UNGATED_PR_SECTION_ROWS" || fail "row 103 must render byte-identically to TEAM_PRESENCE=on: $UNGATED_PR_SECTION_ROWS"
 ok
 
