@@ -1,0 +1,13 @@
+# .herd/triggers.tsv — SCHEDULED / TRIGGERED RUNS (HERD-169). Format + full semantics documented in
+# templates/triggers.example and scripts/herd/triggers.sh's header comment. Validate with:
+#   bash scripts/herd/triggers.sh validate
+#
+# THE HERD-673 MAINTENANCE-GARDENER TRIGGER PACK — dormant unless MAINTENANCE_GARDENER=on (the
+# gardener's own gate; these rows still fire on schedule either way, but gardener.sh run itself is a
+# byte-inert no-op while the key is off, and the two mechanical rows below are independently harmless
+# to run with the gardener off).
+#
+# name<TAB>schedule<TAB>lane<TAB>task<TAB>input[<TAB>agent]
+maintenance-gardener	@weekly	quick	Run the maintenance gardener: `bash scripts/herd/gardener.sh run`. You are the docs-gardener specialist -- read .herd/agents/docs-gardener.md for your full brief before you start. Review what it filed (or why it filed zero findings) with the judgment a fixed heuristic cannot have; file anything it structurally could not see the same way it does (scripts/herd/scribe.sh, never a direct edit to README.md/docs/**/templates/*.tmpl). No PR needed -- this is a review-and-file turn, not a code change.	date +%G-W%V	docs-gardener
+gardener-graphify-refresh	@daily	mechanical	command -v "${GRAPHIFY_BIN:-graphify}" >/dev/null 2>&1 && "${GRAPHIFY_BIN:-graphify}" update --no-cluster >/dev/null 2>&1 || true	date +%Y-%m-%d
+gardener-conformance-report	@daily	mechanical	herd conformance report || true	date +%Y-%m-%d
