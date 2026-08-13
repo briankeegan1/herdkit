@@ -58,10 +58,22 @@ DRIVER_AGENT_PROCESS_SIGNATURE='claude'
 #   SELECT_FLAG      the by-name selection flag shape ('<name>' is substituted), or an @degrade
 #                    sentinel when the runtime exposes no by-name selector.
 #   DEFINITION_MODE  native | install | inject — see agents.sh's herd_roster_mode.
-# VERIFIED on this machine (claude 2.1.229): repo-scope `.claude/agents/*.md` is read natively, so
-# NOTHING has to be published anywhere for a definition to be visible — mode=native.
+# CORRECTED 2026-08-13 (HERD-729 — read scripts/herd/agents.sh's T3 trap note before touching this
+# again). Repo-scope `.claude/agents/*.md` IS read natively by claude 2.1.229, but as SUBAGENT
+# definitions for the harness's own Agent/Task tool — delegated to at the ORCHESTRATOR's discretion,
+# never loaded as the MAIN session's persona a top-level `claude -p` oneshot runs the whole build as.
+# `herd agents verify docs-gardener` was grounded live against exactly this: `herd agents install`
+# published the definition to `.claude/agents/`, mode said `native` ("nothing to publish needed"),
+# yet the definition never governed a oneshot's behavior — because nothing about a bare `-p` prompt
+# ever invokes that subagent. mode=inject is the HONEST claim: injecting the body into the task spec
+# is the one mechanism that provably reaches a claude oneshot's whole session, and it is also what
+# `herd_roster_probe_kind` already resolves to below (claude has no by-name selector) — so mode now
+# AGREES with the mechanism the lane actually uses instead of contradicting it. DEFINITION_DIR stays
+# bound: it is still a true fact about where claude's native subagent feature looks, useful if a
+# future capability wants Task-tool delegation — `herd agents install` just no longer publishes
+# there for mode=inject (nothing would read it for HERD_AGENT's purpose).
 DRIVER_AGENT_DEFINITION_DIR='.claude/agents'
-DRIVER_AGENT_DEFINITION_MODE='native'
+DRIVER_AGENT_DEFINITION_MODE='inject'
 # No BY-NAME agent selector exists on the spawn/exec surface: claude 2.1.229 has `--agents <json>`,
 # which passes INLINE definitions rather than naming one from the definition dir, and subagents are
 # otherwise dispatched by the model itself. Bound to the drivers' honest @degrade sentinel rather than

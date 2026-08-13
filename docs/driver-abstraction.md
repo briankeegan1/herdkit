@@ -850,11 +850,16 @@ control cannot fail, and a check that cannot fail is worthless. Verdicts cache b
 `(driver, definition sha)` in the worktree pool; `herd doctor` reads that cache, `herd doctor --probe`
 re-runs it live.
 
-Per-runtime state as shipped (pre-audit 2026-08-12; full matrix and evidence in
-`docs/spikes/specialist-agent-roster.md`): claude 2.1.229 → `.claude/agents` / `native` / no selector;
-codex 0.147.0 → no dir, no selector, `inject`; grok 1.0.3 → `~/.grok/agents` / `install` /
-`--agent <name>`, **verified by report** (grok is not installed on the authoring machine, so `verify`
-fail-softs to a clear `unverified — binary not present` note rather than a red row); `stub` binds the
-select-flag shape so the hermetic test can drive both halves of the probe against a fake runtime.
+Per-runtime state (corrected 2026-08-13, HERD-729; full matrix and evidence in
+`docs/spikes/specialist-agent-roster.md`): claude 2.1.229 → `.claude/agents` / **`inject`** / no
+selector (the 2026-08-12 pre-audit called this `native`, on the true-but-misleading fact that claude
+reads that directory — it does, but only for Agent/Task-tool SUBAGENTS, never as the top-level
+session's own persona; a live `herd agents verify` grounded the gap and the binding was corrected —
+`inject` is the mechanism that actually governs a oneshot's whole session, and it is what
+`herd_roster_probe_kind` already resolved to independent of this field); codex 0.147.0 → no dir, no
+selector, `inject`; grok 1.0.3 → `~/.grok/agents` / `install` / `--agent <name>`, **verified by
+report** (grok is not installed on the authoring machine, so `verify` fail-softs to a clear
+`unverified — binary not present` note rather than a red row); `stub` binds the select-flag shape so
+the hermetic test can drive both halves of the probe against a fake runtime.
 
 Proof: `tests/test-agent-roster.sh`.
