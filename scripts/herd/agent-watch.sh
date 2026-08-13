@@ -15033,6 +15033,12 @@ _respawn_builder_in_worktree() {
   local _rw_res _rw_driver
   _rw_res="$(herd_model_resolve "$_rw_model")" || return 1
   _rw_driver="${_rw_res%%$'\t'*}"; _rw_model="${_rw_res#*$'\t'}"
+  # HERD-735: persist the RE-resolved spawn driver for this respawn — herd_driver_agent_liveness
+  # fingerprints a builder by ITS OWN spawn driver, never the coordinator's active one, and a respawn
+  # onto a different runtime (a re-tasked model ref) must overwrite the prior record, not leave it
+  # stale (this non-headless branch bypasses herd_driver_start_agent/launch_agent, which write it for
+  # every other spawn/respawn path).
+  herd_driver_agent_spawn_driver_write "$_rw_slug" "$_rw_driver"
   local -a _rw_rt=(); local _rw_t
   while IFS= read -r -d '' _rw_t; do _rw_rt+=("$_rw_t"); done < <(herd_driver_agent_spawn_argv "$_rw_driver" "$_rw_model" "$_rw_flags" "$_rw_ptr")
   # Launch through the shared herdr CLI bridge (issue #514): the attach CLI splits the fresh tab's
