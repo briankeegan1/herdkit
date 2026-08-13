@@ -31,7 +31,7 @@ SPAWNLOG="$T/spawn.log"
 STUB="$T/spawn-stub.sh"
 cat > "$STUB" <<'STUB'
 #!/usr/bin/env bash
-printf '%s|%s|%s\n' "$1" "$2" "$3" >> "$SPAWNLOG"
+printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "${HERD_AGENT:-}" >> "$SPAWNLOG"
 exit 0
 STUB
 chmod +x "$STUB"
@@ -104,9 +104,9 @@ printf 'watch-b\t@hourly\tfeature\tBuild {item}.\tcat %s\n'        "$INPUT_B" >>
 T1="$(run tick --now "$NOW" 2>&1)"
 grep -q "watch-a': FIRST RUN" <<< "$T1" || fail "(3) tick1 must announce watch-a FIRST RUN ($T1)"
 grep -q "watch-b': FIRST RUN" <<< "$T1" || fail "(3) tick1 must announce watch-b FIRST RUN"
-grep -q '^watch-a-x|quick|Fix x for watch-a.$'  "$SPAWNLOG" || fail "(3) tick1 must spawn watch-a-x with rendered task ($(cat "$SPAWNLOG"))"
-grep -q '^watch-a-y|quick|Fix y for watch-a.$'  "$SPAWNLOG" || fail "(3) tick1 must spawn watch-a-y"
-grep -q '^watch-b-one|feature|Build one.$'      "$SPAWNLOG" || fail "(3) tick1 must spawn watch-b-one with the feature lane"
+grep -q '^watch-a-x|quick|Fix x for watch-a.|$'  "$SPAWNLOG" || fail "(3) tick1 must spawn watch-a-x with rendered task ($(cat "$SPAWNLOG"))"
+grep -q '^watch-a-y|quick|Fix y for watch-a.|$'  "$SPAWNLOG" || fail "(3) tick1 must spawn watch-a-y"
+grep -q '^watch-b-one|feature|Build one.|$'      "$SPAWNLOG" || fail "(3) tick1 must spawn watch-b-one with the feature lane"
 [ "$(wc -l < "$SPAWNLOG")" -eq 3 ] || fail "(3) tick1 must spawn exactly 3 (got $(wc -l < "$SPAWNLOG"): $(cat "$SPAWNLOG"))"
 [ -f "$STATE/watch-a.snapshot" ] && [ -f "$STATE/watch-b.snapshot" ] || fail "(3) tick1 must persist per-trigger snapshots"
 
@@ -123,7 +123,7 @@ run tick --now "$((NOW + 60))" >/dev/null 2>&1
 T2="$(run tick --now "$((NOW + 7200))" 2>&1)"
 grep -q "watch-a': input unchanged" <<< "$T2" || fail "(3) tick2 watch-a must report 'input unchanged' ($T2)"
 grep -q "watch-b': input changed" <<< "$T2" || fail "(3) tick2 watch-b must report 'input changed'"
-grep -q '^watch-b-two|feature|Build two.$' "$SPAWNLOG" || fail "(3) tick2 must spawn the delta watch-b-two ($(cat "$SPAWNLOG"))"
+grep -q '^watch-b-two|feature|Build two.|$' "$SPAWNLOG" || fail "(3) tick2 must spawn the delta watch-b-two ($(cat "$SPAWNLOG"))"
 grep -q 'watch-a' "$SPAWNLOG" && fail "(3) tick2 must NOT re-spawn unchanged watch-a"
 grep -q 'watch-b-one' "$SPAWNLOG" && fail "(3) tick2 must NOT re-spawn the already-seen watch-b-one"
 [ "$(wc -l < "$SPAWNLOG")" -eq 1 ] || fail "(3) tick2 must spawn exactly 1 delta (got $(wc -l < "$SPAWNLOG"): $(cat "$SPAWNLOG"))"
@@ -149,8 +149,8 @@ printf 'on-demand\tmanual\tquick\tGo {item}\tprintf "a\\nb\\n"\n' > "$FIX"
 run tick --now "$NOW" >/dev/null 2>&1
 [ ! -s "$SPAWNLOG" ] || fail "(5) a manual trigger must NOT fire on a tick ($(cat "$SPAWNLOG"))"
 run fire on-demand "$NOW" >/dev/null 2>&1 || fail "(5) 'fire' on a manual trigger must run"
-grep -q '^on-demand-a|quick|Go a$' "$SPAWNLOG" || fail "(5) fire must spawn on-demand-a"
-grep -q '^on-demand-b|quick|Go b$' "$SPAWNLOG" || fail "(5) fire must spawn on-demand-b"
+grep -q '^on-demand-a|quick|Go a|$' "$SPAWNLOG" || fail "(5) fire must spawn on-demand-a"
+grep -q '^on-demand-b|quick|Go b|$' "$SPAWNLOG" || fail "(5) fire must spawn on-demand-b"
 run fire no-such-trigger "$NOW" >/dev/null 2>&1 && fail "(5) firing an unknown trigger must exit non-zero"
 pass
 echo "PASS (5) manual triggers: silent on tick, fire-on-demand spawns; unknown name errors"
@@ -192,6 +192,59 @@ req="$(ls "$QTREES/spawn-queue"/*.req 2>/dev/null | sed -n 1p)"
 [ "$(sed -n '3p' "$req")" = "Ship alpha" ]  || fail "(7) queued intent task wrong ($(sed -n '3p' "$req"))"
 pass
 echo "PASS (7) real spawn.sh: a trigger delta enqueues a well-formed intent onto the durable queue"
+export HERD_TRIGGERS_SPAWN_CMD="$STUB"   # restore the stub for the remaining cases
+
+# ── Case 8: HERD-673 mechanical lane — a delta runs the command DIRECTLY, never through spawn.sh ─────
+: > "$SPAWNLOG"; rm -rf "$STATE"
+MARK="$T/mech.mark"; rm -f "$MARK"
+printf 'refresh\t@daily\tmechanical\techo hit-{item} >> %s\tprintf "one\\n"\n' "$MARK" > "$FIX"
+M1="$(run tick --now "$NOW" 2>&1)"
+[ ! -s "$SPAWNLOG" ] || fail "(8) a mechanical row must NEVER enqueue onto the spawn queue ($(cat "$SPAWNLOG"))"
+[ -f "$MARK" ] || fail "(8) a mechanical row's rendered command must actually run"
+[ "$(cat "$MARK")" = "hit-one" ] || fail "(8) a mechanical row must render {item} into its command ($(cat "$MARK" 2>/dev/null))"
+grep -q "mechanical run OK for 'one'" <<< "$M1" || fail "(8) a successful mechanical run must report OK ($M1)"
+# Fail-soft: a mechanical command's own non-zero exit is reported but never wedges the tick.
+: > "$MARK"
+printf 'broken\t@daily\tmechanical\tsh -c "exit 9"\tprintf "x\\n"\n' >> "$FIX"
+M2="$(run tick --now "$((NOW + 86400))" --force 2>&1)"
+grep -q "mechanical run FAILED (rc=9)" <<< "$M2" || fail "(8) a failing mechanical command must be reported loudly ($M2)"
+[ ! -s "$SPAWNLOG" ] || fail "(8) a mechanical row must never touch the spawn queue even on failure"
+pass
+echo "PASS (8) mechanical lane: runs the command directly (never spawns), renders {item}, fails soft on a non-zero exit"
+
+# ── Case 9: HERD-673 agent column — threaded to HERD_AGENT for exactly the row that names one ────────
+: > "$SPAWNLOG"; rm -rf "$STATE"
+printf 'no-agent\t@hourly\tquick\tPlain {item}\tprintf "a\\n"\n\ttry-agent\t@hourly\tfeature\tSpecial {item}\tprintf "b\\n"\tdocs-gardener\n' > "$FIX"
+run tick --now "$NOW" >/dev/null 2>&1
+grep -q '^no-agent-a|quick|Plain a|$' "$SPAWNLOG" || fail "(9) a 5-column-shaped row must spawn with NO agent override ($(cat "$SPAWNLOG"))"
+grep -q '^try-agent-b|feature|Special b|docs-gardener$' "$SPAWNLOG" || fail "(9) a 6-column row's agent must reach the spawn as HERD_AGENT ($(cat "$SPAWNLOG"))"
+pass
+echo "PASS (9) agent column: threaded to HERD_AGENT only for the row that names one; absent ⇒ untouched"
+
+# ── Case 10: agent column over the REAL spawn.sh path — lands in the queue's .agent sidecar ──────────
+unset HERD_TRIGGERS_SPAWN_CMD
+QTREES2="$T/qtrees2"; mkdir -p "$QTREES2"
+PROJ3="$T/proj3"; mkdir -p "$PROJ3/.herd"
+cat > "$PROJ3/.herd/config" <<EOF
+PROJECT_ROOT="$PROJ3"
+WORKSPACE_NAME="trigtest3"
+SCRIBE_BACKEND="file"
+BACKLOG_FILE="BACKLOG.md"
+WORKTREES_DIR="$QTREES2"
+EOF
+REALIN3="$T/realin3"; printf 'gamma\n' > "$REALIN3"
+printf 'realagent\t@hourly\tquick\tGrow {item}\tcat %s\tdocs-gardener\n' "$REALIN3" > "$FIX"
+( cd "$PROJ3" && HERD_CONFIG_FILE="$PROJ3/.herd/config" HERD_TRIGGERS_FILE="$FIX" \
+    HERD_TRIGGERS_STATE_DIR="$T/rstate3" HERD_TRIGGERS_INPUT_DIR="$T" \
+    bash "$TRIG" tick --now "$NOW" >/dev/null 2>&1 )
+req3="$(ls "$QTREES2/spawn-queue"/*.req 2>/dev/null | sed -n 1p)"
+[ -n "$req3" ] || fail "(10) the real spawn.sh must land a .req intent for an agent-carrying row"
+agentfile="${req3%.req}.agent"
+[ -f "$agentfile" ] || fail "(10) an agent-carrying trigger row must write the queue's .agent sidecar"
+[ "$(cat "$agentfile")" = "docs-gardener" ] || fail "(10) the .agent sidecar must carry the row's agent name ($(cat "$agentfile" 2>/dev/null))"
+pass
+echo "PASS (10) agent column + real spawn.sh: the queued intent carries a .agent sidecar naming the roster definition"
+export HERD_TRIGGERS_SPAWN_CMD="$STUB"
 
 echo
-echo "ALL PASS ($PASS checks) — scheduled/triggered runs: validate, schedule due-ness, two-tick diff sim, fail-soft, manual, dormancy, real-queue enqueue."
+echo "ALL PASS ($PASS checks) — scheduled/triggered runs: validate, schedule due-ness, two-tick diff sim, fail-soft, manual, dormancy, real-queue enqueue, mechanical lane, agent column (stub + real queue sidecar)."
