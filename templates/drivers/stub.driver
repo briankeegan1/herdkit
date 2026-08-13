@@ -45,3 +45,14 @@ DRIVER_AGENT_COST_USAGE_KEYS='prompt_tokens completion_tokens'
 # process-signature (HERD-428) — names the NON-CLAUDE stub-agent runtime, proving the pane-role probe
 # is portable, not claude-wired. See driver.sh's herd_driver_agent_process_signature.
 DRIVER_AGENT_PROCESS_SIGNATURE='stub-agent'
+
+# ── Specialist-agent ROSTER bindings (HERD-667, epic HERD-666) ────────────────────────────────────
+# The stub driver's job is to be the COMPLETE non-Claude driver the seams can prove themselves
+# against, so it binds the roster surface too — and binds it to the SELECT-FLAG shape (mode=install,
+# user-scope lookup dir, `--agent <name>`), the harder of the two paths. That is what lets
+# tests/test-agent-roster.sh drive the empirical verify — positive AND the negative control — against
+# a fake `stub-agent` runtime with no real vendor CLI installed, including a fake that IGNORES
+# --agent, which is trap T2 (grok's silent fallback) reproduced hermetically.
+DRIVER_AGENT_DEFINITION_DIR='${HERD_AGENT_DEFINITION_ROOT:-$HOME}/.stub-agent/agents'
+DRIVER_AGENT_SELECT_FLAG='--agent <name>'
+DRIVER_AGENT_DEFINITION_MODE='install'

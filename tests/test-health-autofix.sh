@@ -521,4 +521,64 @@ _sink="$(sim_notify_sink "$WORKTREES_DIR")"
   || fail "the refix-stall escalation must still NOTIFY (into the sink, not the desktop)"
 ok
 
+# ── HERD-655 (GitHub issue #771): AUTOFIX_SCOPE -- never auto-bounce another operator's health red ──
+reset_scope_owner() {
+  unset AUTOFIX_SCOPE WATCHER_OWNER WATCHER_VIEW_AUTHOR
+  _WATCHER_OWNER_RESOLVED=""; _WATCHER_OWNER_CACHE=""
+  : > "$JOURNAL_FILE"
+}
+
+# ── (12) own (default) + foreign author: WITHHELD -- no bounce, journaled ────────────────────────
+reset_state; reset_scope_owner
+export HEALTHCHECK_AUTOFIX=true WATCHER_OWNER="alice"
+_handle_health_codeerror 60 slug-a shaSC1 0 "$T/wt" "$NOTOK" "bob"
+[ "$(runs)" = "0" ] || fail "(12) a foreign author must never be bounced (got $(runs))"
+grep -q 'autofix withheld' <<< "$(row)" || fail "(12) row must name the withhold (got: $(row))"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" || fail "(12) withhold must be journaled"
+grep -q '"rail":"health"' "$JOURNAL_FILE" || fail "(12) withhold journal must carry rail=health"
+ok
+
+# ── (13) own (default) + own author: PERMITTED -- bounces exactly as before ──────────────────────
+reset_state; reset_scope_owner
+export HEALTHCHECK_AUTOFIX=true WATCHER_OWNER="alice"
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_health_codeerror 61 slug-a shaSC2 0 "$T/wt" "$NOTOK" "alice"
+[ "$(runs)" = "1" ] || fail "(13) the operator's own PR must still bounce (got $(runs))"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" && fail "(13) an owned PR must never journal a withhold"
+ok
+
+# ── (14) all + foreign author: PERMITTED -- explicit opt-in restores today's behavior ────────────
+reset_state; reset_scope_owner
+export HEALTHCHECK_AUTOFIX=true AUTOFIX_SCOPE=all WATCHER_OWNER="alice"
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_health_codeerror 62 slug-a shaSC3 0 "$T/wt" "$NOTOK" "bob"
+[ "$(runs)" = "1" ] || fail "(14) AUTOFIX_SCOPE=all must bounce regardless of author (got $(runs))"
+ok
+
+# ── (15) own + unresolvable operator identity: WITHHELD fail-closed ──────────────────────────────
+reset_state; reset_scope_owner
+export HEALTHCHECK_AUTOFIX=true
+_handle_health_codeerror 63 slug-a shaSC4 0 "$T/wt" "$NOTOK" "alice"
+[ "$(runs)" = "0" ] || fail "(15) an unresolvable identity must never bounce (got $(runs))"
+grep -q '"reason":"noowner"' "$JOURNAL_FILE" || fail "(15) withhold reason must be noowner"
+ok
+
+# ── (16) a call site predating AUTOFIX_SCOPE (no author arg) is never scoped -- byte-identical ───
+reset_state; reset_scope_owner
+export HEALTHCHECK_AUTOFIX=true
+printf '0\n' > "$STUB_WAIT_FILE"
+_handle_health_codeerror 64 slug-a shaSC5 0 "$T/wt" "$NOTOK"
+[ "$(runs)" = "1" ] || fail "(16) an omitted author must stay unscoped (got $(runs))"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" && fail "(16) an omitted author must never journal a withhold"
+ok
+# HEALTHCHECK_AUTOFIX=false must never journal a scope withhold either -- off must stay plain needs-you.
+reset_state; reset_scope_owner
+export HEALTHCHECK_AUTOFIX=false WATCHER_OWNER="alice"
+_handle_health_codeerror 65 slug-a shaSC6 0 "$T/wt" "$NOTOK" "bob"
+grep -q 'needs you' <<< "$(row)" || fail "(16b) HEALTHCHECK_AUTOFIX=false must show the plain needs-you row (got: $(row))"
+grep -q 'autofix withheld' <<< "$(row)" && fail "(16b) HEALTHCHECK_AUTOFIX=false must NOT mention autofix withheld"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" && fail "(16b) HEALTHCHECK_AUTOFIX=false must never journal a scope withhold"
+ok
+reset_scope_owner
+
 echo "ALL PASS ($pass checks)"

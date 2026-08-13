@@ -75,6 +75,7 @@ herd render	unit	tests/test-cli.sh
 herd map	unit	tests/test-map.sh
 herd codemap	unit	tests/test-codemap.sh
 herd symbol-index	unit	tests/test-symbol-index.sh
+herd agents <list|new|show|install|verify>	unit	tests/test-agent-roster.sh
 herd ledger <set|get|list|rm|compact|path>	unit	tests/test-ledger.sh
 herd ledger <set|get|list|rm|compact|path>	unit	tests/test-cli-note-context.sh
 herd advise "<question>" [context…]	unit	tests/test-advise.sh
@@ -322,6 +323,11 @@ WATCHER_VIEW_STATUS	unit	tests/test-watcher-views.sh
 WATCHER_VIEW_DEPS_LABEL	unit	tests/test-watcher-views.sh
 WATCHER_SCOPE	unit	tests/test-team-mode.sh
 WATCHER_OWNER	unit	tests/test-team-mode.sh
+AUTOFIX_SCOPE	unit	tests/test-autofix-scope.sh
+AUTOFIX_SCOPE	unit	tests/test-stale-base-autofix.sh
+AUTOFIX_SCOPE	unit	tests/test-auto-refix.sh
+AUTOFIX_SCOPE	unit	tests/test-health-autofix.sh
+AUTOFIX_SCOPE	unit	tests/test_live_runtime.py
 REVIEW_CONCURRENCY	sim	tests/test-sandbox-concurrency.sh
 REVIEW_CONCURRENCY	unit	tests/test-live-engine-concurrency.sh
 NATIVE_BURST	unit	tests/test-native-burst.sh
@@ -473,6 +479,7 @@ HERD_LIMIT_DETECT	unit	tests/test-limit-resume.sh
 HERD_LIMIT_DETECT	sim	tests/test-sandbox-limit-resume.sh
 HERD_FORCE_SPAWN	unit	tests/test-spawn-rate-match.sh
 HERD_FORCE_SPAWN	unit	tests/test-tracked-spawns.sh
+HERD_AGENT	unit	tests/test-agent-roster.sh
 HERD_LIMIT_RESUME_BUFFER	unit	tests/test-limit-resume.sh
 HERD_LIMIT_RESUME_BUFFER	sim	tests/test-sandbox-limit-resume.sh
 HERD_LIMIT_UNKNOWN_WAIT	unit	tests/test-limit-resume.sh
@@ -589,6 +596,7 @@ agent-watch.sh	unit	tests/test-intent-queue-evidence-tenant.sh
 agent-watch.sh	unit	tests/test-intent-queue-note-ack-tenant.sh
 herd queue [list|plan]	unit	tests/test-queue-plan-surface.sh
 intent-queue.sh	unit	tests/test-queue-plan-surface.sh
+scripts/herd/agents.sh	unit	tests/test-agent-roster.sh
 agent-watch.sh	unit	tests/test-queue-plan-surface.sh
 spawn.sh	unit	tests/test-queue-plan-surface.sh
 console-section.sh	unit	tests/test-queue-plan-surface.sh

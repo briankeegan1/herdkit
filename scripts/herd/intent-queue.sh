@@ -64,7 +64,7 @@ IQ_PRIO_DEFAULT="${IQ_PRIO_DEFAULT:-50}"
 #   prio     HERD-630 priority band
 #   attempts HERD-639 transient-failure counter (doc §4.3), used by the M3 tenant
 #   gen      HERD-642 the published GENERATION this intent belongs to (doc §4.4 supersede-over-delete)
-IQ_SIDECARS="${IQ_SIDECARS:-ref after owner prio attempts gen}"
+IQ_SIDECARS="${IQ_SIDECARS:-ref after owner prio attempts gen agent}"
 
 # Abandoned-claim threshold in MINUTES. Staleness is the CLAIM age, not the enqueue age: iq_claim and
 # iq_release deliberately touch the file whenever it changes hands (see below), so this measures

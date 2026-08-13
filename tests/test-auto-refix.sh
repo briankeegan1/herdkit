@@ -405,4 +405,81 @@ REFIX_MAX_ROUNDS=2
 REFIX_MAX_ROUNDS=3
 ok
 
+# HERD-655 (GitHub issue #771): AUTOFIX_SCOPE -- never auto-bounce another operator's review BLOCK.
+export JOURNAL_FILE="$T/journal.jsonl"; : > "$JOURNAL_FILE"
+reset_scope_owner() {
+  unset AUTOFIX_SCOPE WATCHER_OWNER WATCHER_VIEW_AUTHOR
+  _WATCHER_OWNER_RESOLVED=""; _WATCHER_OWNER_CACHE=""
+  : > "$JOURNAL_FILE"
+}
+
+# ── (10) own (default) + foreign author: WITHHELD -- no bounce, journaled ────────────────────────
+rm -f "$REFIX_STATE"; : > "$PANE_LOG"; reset_scope_owner
+export WATCHER_OWNER="alice"
+DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""
+_handle_block_verdict "110" "slug-scope" "sha-scope1" "0" "" "bob"
+[ ! -s "$PANE_LOG" ] || fail "(10) a foreign author must never be bounced (log has $(wc -l < "$PANE_LOG") lines)"
+ok
+d="${DISPLAY[0]:-}"
+grep -q "autofix withheld" <<< "$d" || fail "(10) row must name the withhold (got: $d)"
+ok
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" || fail "(10) withhold must be journaled"
+grep -q '"rail":"review"' "$JOURNAL_FILE" || fail "(10) withhold journal must carry rail=review"
+ok
+
+# ── (11) own (default) + own author: PERMITTED -- bounces exactly as before ──────────────────────
+rm -f "$REFIX_STATE"; : > "$PANE_LOG"; reset_scope_owner
+export WATCHER_OWNER="alice"
+export STUB_AGENT_NAME="slug-scope" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-scope-1"
+printf '0
+' > "$STUB_WAIT_FILE"
+DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""
+_handle_block_verdict "111" "slug-scope" "sha-scope2" "0" "" "alice"
+[ "$(wc -l < "$PANE_LOG")" -eq 1 ] || fail "(11) the operator's own PR must still bounce (got $(wc -l < "$PANE_LOG"))"
+ok
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" && fail "(11) an owned PR must never journal a withhold"
+ok
+
+# ── (12) all + foreign author: PERMITTED -- explicit opt-in restores today's behavior ────────────
+rm -f "$REFIX_STATE"; : > "$PANE_LOG"; reset_scope_owner
+export AUTOFIX_SCOPE=all WATCHER_OWNER="alice"
+export STUB_AGENT_NAME="slug-scope" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-scope-2"
+printf '0
+' > "$STUB_WAIT_FILE"
+DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""
+_handle_block_verdict "112" "slug-scope" "sha-scope3" "0" "" "bob"
+[ "$(wc -l < "$PANE_LOG")" -eq 1 ] || fail "(12) AUTOFIX_SCOPE=all must bounce regardless of author (got $(wc -l < "$PANE_LOG"))"
+ok
+
+# ── (13) own + unresolvable operator identity: WITHHELD fail-closed ──────────────────────────────
+rm -f "$REFIX_STATE"; : > "$PANE_LOG"; reset_scope_owner
+DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""
+_handle_block_verdict "113" "slug-scope" "sha-scope4" "0" "" "alice"
+[ ! -s "$PANE_LOG" ] || fail "(13) an unresolvable identity must never bounce"
+ok
+grep -q '"reason":"noowner"' "$JOURNAL_FILE" || fail "(13) withhold reason must be noowner"
+ok
+
+# ── (14) a call site predating AUTOFIX_SCOPE (no author arg) is never scoped -- byte-identical ───
+rm -f "$REFIX_STATE"; : > "$PANE_LOG"; reset_scope_owner
+export STUB_AGENT_NAME="slug-scope" STUB_AGENT_STATUS="idle" STUB_AGENT_PANE_ID="pane-scope-3"
+printf '0
+' > "$STUB_WAIT_FILE"
+DISPLAY=(); REVIEW_AUTOFIX=true; DRYRUN=""
+_handle_block_verdict "114" "slug-scope" "sha-scope5" "0"
+[ "$(wc -l < "$PANE_LOG")" -eq 1 ] || fail "(14) an omitted author must stay unscoped (got $(wc -l < "$PANE_LOG"))"
+ok
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" && fail "(14) an omitted author must never journal a withhold"
+ok
+# REVIEW_AUTOFIX=false must never journal a scope withhold either -- off must stay plain "review blocked".
+rm -f "$REFIX_STATE"; : > "$PANE_LOG"; reset_scope_owner
+export WATCHER_OWNER="alice"
+DISPLAY=(); REVIEW_AUTOFIX=false; DRYRUN=""
+_handle_block_verdict "115" "slug-scope" "sha-scope6" "0" "" "bob"
+d="${DISPLAY[0]:-}"
+grep -q "review blocked" <<< "$d" || fail "(14b) REVIEW_AUTOFIX=false must show the plain review-blocked row (got: $d)"
+grep -q "autofix withheld" <<< "$d" && fail "(14b) REVIEW_AUTOFIX=false must NOT mention autofix withheld"
+grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE" && fail "(14b) REVIEW_AUTOFIX=false must never journal a scope withhold"
+ok
+
 echo "ALL PASS ($pass checks)"
