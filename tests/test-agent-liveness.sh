@@ -8,7 +8,12 @@
 # `claude` foreground to a BARE shell (the killed-process signature), and asserts:
 #   (A) herd_driver_agent_liveness — herdr-claude (claude→alive, bare→dead, delisted-but-labelled-pane
 #       →dead via the label fallback, no agent + no labelled pane→MISSING, unreadable pane→unknown) AND
-#       headless (live pid→alive, dead pid→dead, no record→unknown).
+#       headless (live pid→alive, dead pid→dead, no record→unknown). HERD-735/GH#805: the fingerprint
+#       resolves against the builder's PERSISTED PER-SPAWN driver, never the coordinator's own ACTIVE
+#       one — a mixed-runtime room (spawn=grok, active=herdr-claude) still reads a live grok pane alive
+#       and degrades a signature miss to unknown (never a fabricated dead); an UNRECOVERABLE record (no
+#       persisted driver at all) degrades the same way, conservatively, while still matching a live
+#       pane via the union of every known driver's signature.
 #   (B) _status_classify_builder — liveness='dead' ⇒ 'agentdead' (even with an open PR), never over a
 #       WORKING agent, and byte-identical (unchanged bucket) when liveness is empty/unknown/alive.
 #   (C) _handle_block_verdict — a review bounce PREFLIGHTS liveness: a dead agent escalates to
@@ -135,15 +140,19 @@ render() { :; }
 # ════════════════════════════════════════════════════════════════════════════
 # (A) herd_driver_agent_liveness — the probe itself
 # ════════════════════════════════════════════════════════════════════════════
-# herdr-claude: a live claude foreground ⇒ alive
+# herdr-claude: a live claude foreground ⇒ alive. HERD-735: a real spawn ALWAYS persists a spawn-
+# driver record (herd_driver_start_agent / herd_driver_launch_agent both call
+# herd_driver_agent_spawn_driver_write); write one here too so this fixture matches what a shipped
+# agent actually has on disk, rather than exercising only the no-record fallback path.
 reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
 mk_pane pane-live "claude --model x --dangerously-skip-permissions" tab-b
 set_agent bob pane-live done
+herd_driver_agent_spawn_driver_write bob herdr-claude
 [ "$(herd_driver_agent_liveness bob)" = "alive" ] || fail "A1: claude foreground ⇒ alive"
 ok
 # herdr-claude: a bare shell (process killed) ⇒ dead
 mk_pane pane-live "" tab-b            # flip the same pane to bare
-[ "$(herd_driver_agent_liveness bob)" = "dead" ] || fail "A2: bare pane (claude gone) ⇒ dead"
+[ "$(herd_driver_agent_liveness bob)" = "dead" ] || fail "A2: bare pane (claude gone), known native spawn record ⇒ dead"
 ok
 # herdr-claude: claude launched AS the pane ROOT (shell_pid == the claude pid — the lane runs claude
 # with NO wrapping shell). The pane-shell exclusion must NOT drop this entry: it is POSITIVE alive
@@ -166,6 +175,7 @@ ok
 # dead via the label fallback (found even though the roster dropped it), never mis-read as missing.
 reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
 mk_pane pane-ghost "" tab-g ghost      # bare pane (claude gone), labelled 'ghost', no agent record
+herd_driver_agent_spawn_driver_write ghost herdr-claude
 [ "$(herd_driver_agent_liveness ghost)" = "dead" ] || fail "A4b: delisted agent, labelled pane present (bare) ⇒ dead"
 ok
 # _agent_liveness wrapper mirrors the driver seam
@@ -185,29 +195,60 @@ ok
 ) || fail "A6: headless pid liveness"
 ok
 
-# ── HERD-654: driver-aware fingerprint + non-native dead→unknown degrade ──────
-# templates/drivers/grok.driver ships DRIVER_AGENT_PROCESS_SIGNATURE='grok' — the pane-fingerprint the
-# probe must now match instead of the hardcoded 'claude' literal (which used to blind it to every
-# foreign runtime, see HERD-654's driver.sh header). A live grok pane ⇒ alive.
+# ── HERD-654: driver-aware fingerprint (templates/drivers/grok.driver ships
+# DRIVER_AGENT_PROCESS_SIGNATURE='grok' — the pane-fingerprint the probe must match instead of the
+# hardcoded 'claude' literal that used to blind it to every foreign runtime). ──────────────────────
+# ── HERD-735 / GH #805: resolve the fingerprint against the builder's PER-SPAWN driver, never the
+# coordinator's ACTIVE one. Mixed-runtime rooms (grok builders + a claude-active resolver) are the
+# NORMAL case; the pre-fix bug called herd_driver_agent_process_signature / herd_driver_agent_
+# runtime_native with NO argument, so they silently defaulted to the ACTIVE driver and a claude-active
+# check on a grok-spawned builder fingerprinted it against 'claude', missed, and read a LIVE agent as
+# DEAD. Every scenario below keeps the coordinator's OWN HERD_DRIVER at the default (herdr-claude) —
+# unlike the old A7-A9 which toggled HERD_DRIVER=grok around the call, which only proved
+# ACTIVE-driver-awareness, not per-spawn resolution — and instead drives the persisted spawn record.
 reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
 mk_pane pane-grok "grok --model x --always-approve" tab-g
 set_agent grokbob pane-grok working
-( export HERD_DRIVER=grok
-  [ "$(herd_driver_agent_liveness grokbob)" = "alive" ] || { echo "A7 FAIL"; exit 1; }
-) || fail "A7: a live grok pane fingerprints as alive under HERD_DRIVER=grok"
+herd_driver_agent_spawn_driver_write grokbob grok
+[ "$(herd_driver_agent_liveness grokbob)" = "alive" ] || fail "A7: spawn-record=grok, active=herdr-claude, live grok pane ⇒ alive"
 ok
-# same pane gone bare (grok process killed) under the NON-native driver ⇒ DEGRADES to unknown, never a
-# positive 'dead' — the conservative non-native safety net (a foreign runtime's process tree shape is
-# far less battle-tested than claude's, so a fingerprint miss stays probe-blind, not a fabricated death).
+# same grok-spawned builder goes bare (its grok process killed): the SPAWN record says grok, which is
+# non-native, so a fingerprint miss degrades to 'unknown', never a fabricated 'dead' — even though the
+# coordinator's own ACTIVE driver (herdr-claude) IS native. This is the exact HERD-735 regression
+# guard: if the probe ever again resolved against the active driver, this would misread 'dead'.
 mk_pane pane-grok "" tab-g
-( export HERD_DRIVER=grok
-  [ "$(herd_driver_agent_liveness grokbob)" = "unknown" ] || { echo "A8 FAIL"; exit 1; }
-) || fail "A8: a bare pane under a NON-native driver degrades to unknown, never dead"
+[ "$(herd_driver_agent_liveness grokbob)" = "unknown" ] || fail "A8: spawn-record=grok, active=herdr-claude, bare pane ⇒ unknown (never dead)"
 ok
-# the SAME bare pane under the NATIVE (default) driver is unaffected — still reads dead.
+# explicitly re-confirm under an unset/default HERD_DRIVER too (the common coordinator posture) —
+# byte-identical to A8; the active driver must never leak into this decision either way.
 ( unset HERD_DRIVER
-  [ "$(herd_driver_agent_liveness grokbob)" = "dead" ] || { echo "A9 FAIL"; exit 1; }
-) || fail "A9: a bare pane under the native driver still reads dead (byte-identical)"
+  [ "$(herd_driver_agent_liveness grokbob)" = "unknown" ] || { echo "A9 FAIL"; exit 1; }
+) || fail "A9: an unset (default herdr-claude) ACTIVE driver must not override a grok spawn record"
+ok
+# UNRECOVERABLE spawn record (no herd_driver_agent_spawn_driver_write call at all — an agent started
+# before this seam existed, or whose record write failed) + a bare pane ⇒ degrades to 'unknown', never
+# 'dead'. We cannot safely ASSUME nativeness for an agent with no record — that assumption is exactly
+# the bug — so this stays conservative during the fleet's transition onto the new seam.
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+mk_pane pane-legacy "" tab-l
+set_agent legacybob pane-legacy done
+[ "$(herd_driver_agent_liveness legacybob)" = "unknown" ] || fail "A10: unrecoverable spawn record + bare pane ⇒ unknown, never dead"
+ok
+# the SAME unrecoverable-record agent with a LIVE claude pane still resolves alive — the union-of-
+# every-known-driver fingerprint fallback still finds it, so a pre-existing agent is never misread as
+# dead OR unknown just because it predates the persisted record.
+mk_pane pane-legacy "claude --model x --dangerously-skip-permissions" tab-l
+[ "$(herd_driver_agent_liveness legacybob)" = "alive" ] || fail "A11: unrecoverable spawn record + live claude pane ⇒ alive (union fingerprint still matches)"
+ok
+# a real spawn seam persists the record BEFORE handing off the argv — proven against the ACTUAL
+# function (not just the raw write helper) so a future refactor that drops the call is caught. The
+# write happens before herd_driver_start_agent's headless dispatch even reaches its `claude` PATH
+# gate, so a stub runtime binary is not needed here — only the resolve+persist step is under test.
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+( export HERD_DRIVER=headless
+  herd_driver_start_agent grokstart "$T" grok:some-model --dangerously-skip-permissions PTR >/dev/null 2>&1 || true
+  [ "$(herd_driver_agent_spawn_driver grokstart)" = "grok" ] || { echo "A12 FAIL: $(herd_driver_agent_spawn_driver grokstart)"; exit 1; }
+) || fail "A12: herd_driver_start_agent persists the resolved spawn driver for a later liveness check"
 ok
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -239,6 +280,7 @@ REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
 rm -rf "$S/panes"; mkdir -p "$S/panes"; reset_agents
 mk_pane pane-dead "" tab-d                 # bare pane ⇒ dead
 set_agent deadbob pane-dead done
+herd_driver_agent_spawn_driver_write deadbob herdr-claude   # HERD-735: a real spawn always has one
 DISPLAY=()
 _handle_block_verdict "220" "deadbob" "sha-220" "0"
 d="${DISPLAY[0]:-}"
