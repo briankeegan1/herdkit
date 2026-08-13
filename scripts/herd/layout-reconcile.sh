@@ -87,7 +87,7 @@ for p in panes:
 ' 2>/dev/null || true
 }
 
-# _reload_pane_role <pane_id> → backlog|watch|agent|bare|busy|gone. Classifies a pane by the
+# _reload_pane_role <pane_id> → backlog|watch|agents|agent|bare|busy|gone. Classifies a pane by the
 # process in its foreground (process-info) — the ground truth the canonical roles map onto: the
 # backlog viewer, the watcher (herd-watch execs agent-watch), a live agent of the ACTIVE driver's
 # runtime, an idle shell (BARE, safe to reuse), or something else the human is running (BUSY — never
@@ -119,6 +119,7 @@ def has(*subs): return any(any(s in (p.get("cmdline") or "") for s in subs) for 
 agent_sigs=os.environ.get("SIG","claude").split() or ["claude"]
 if has("backlog-view.sh"): print("backlog")
 elif has("agent-watch.sh","herd-watch.sh"): print("watch")
+elif has("agents-pane-view.sh"): print("agents")
 elif has(*agent_sigs): print("agent")
 elif fg: print("busy")
 else: print("bare")
@@ -129,7 +130,7 @@ else: print("bare")
 
 # layout_snapshot <workspace_id> <tab_id> — THE shared eyes-on-layout scan. Emits one
 # TAB-separated "<role>\t<pane_id>" line per pane in <tab>, classifying each by its live foreground
-# process (backlog|watch|agent|bare|busy|gone). Empty when the tab has no panes / herdr is absent.
+# process (backlog|watch|agents|agent|bare|busy|gone). Empty when the tab has no panes / herdr is absent.
 # The live roster — not the registry — is ground truth; callers reconcile against this output.
 layout_snapshot() {
   local ws="$1" tab="$2" p role
@@ -231,39 +232,47 @@ _layout_label_pane() {
   return 0
 }
 
-# layout_label_roles <agent> <backlog> <watch> <ws_name> — reconcile the three control-room panes'
-# role labels to coordinator·<ws_name> / backlog·<ws_name> / watch·<ws_name> (empty pane ids are
-# skipped). Without a ws_name (a caller that cannot supply one) falls back to the bare role word —
-# still readable/non-empty, just not workspace-disambiguated. Display-only, fail-soft, no config key:
-# always runs, never gates anything.
+# layout_label_roles <agent> <backlog> <watch> <ws_name> [agents] — reconcile the control-room panes'
+# role labels to coordinator·<ws_name> / backlog·<ws_name> / watch·<ws_name> / agents·<ws_name>
+# (empty pane ids are skipped). Without a ws_name (a caller that cannot supply one) falls back to the
+# bare role word — still readable/non-empty, just not workspace-disambiguated. Display-only,
+# fail-soft, no config key: always runs, never gates anything. The optional 5th arg (HERD-668, the
+# AGENTS_PANE control-room pane) is simply skipped by every caller that never resolves one — an empty
+# 5th arg is a no-op, so this stays byte-identical for every caller predating it.
 layout_label_roles() {
-  local agent="${1:-}" backlog="${2:-}" watch="${3:-}" wsn="${4:-}"
-  local lc=coordinator lb=backlog lw=watch
-  if [ -n "$wsn" ]; then lc="coordinator·$wsn"; lb="backlog·$wsn"; lw="watch·$wsn"; fi
+  local agent="${1:-}" backlog="${2:-}" watch="${3:-}" wsn="${4:-}" agents="${5:-}"
+  local lc=coordinator lb=backlog lw=watch la=agents
+  if [ -n "$wsn" ]; then lc="coordinator·$wsn"; lb="backlog·$wsn"; lw="watch·$wsn"; la="agents·$wsn"; fi
   _layout_label_pane "$agent"   "$lc"
   _layout_label_pane "$backlog" "$lb"
   _layout_label_pane "$watch"   "$lw"
+  _layout_label_pane "$agents"  "$la"
   return 0
 }
 
-# layout_write_registry <file> <workspace_id> <tab_id> <agent> <backlog> <watch> [ws_name] — rewrite
-# the .herd-panes role registry from the OBSERVED final pane-ids (empty rows omitted). Every row
-# carries the tab id and the resolved workspace_id as a 4th column so a later reader can drop a hint
-# that names a foreign workspace (issue #60). The single writer shared by cmd_reload, the herd pane
-# subcommands, and coordinator.sh — so "rewrite from what we observed" is enforced in one place, and
-# (HERD-650) so is the role-label reconcile: every pass that writes the registry also re-asserts each
-# resolved pane's label. ws_name (the human-readable WORKSPACE_NAME, distinct from the workspace_id
-# 2nd arg) is optional — omitted, layout_label_roles falls back to unqualified labels.
+# layout_write_registry <file> <workspace_id> <tab_id> <agent> <backlog> <watch> [ws_name] [agents] —
+# rewrite the .herd-panes role registry from the OBSERVED final pane-ids (empty rows omitted). Every
+# row carries the tab id and the resolved workspace_id as a 4th column so a later reader can drop a
+# hint that names a foreign workspace (issue #60). The single writer shared by cmd_reload, the herd
+# pane subcommands, and coordinator.sh — so "rewrite from what we observed" is enforced in one place,
+# and (HERD-650) so is the role-label reconcile: every pass that writes the registry also re-asserts
+# each resolved pane's label. ws_name (the human-readable WORKSPACE_NAME, distinct from the
+# workspace_id 2nd arg) is optional — omitted, layout_label_roles falls back to unqualified labels.
+# The optional 8th arg `agents` (HERD-668) is the AGENTS_PANE control-room pane; every caller that
+# never resolves one (the overwhelming default, AGENTS_PANE=off) omits it, which writes no `agents`
+# row at all — byte-identical to before this arg existed. A registry with no `agents` row loads fine
+# (each role row is independently optional; a reader that looks for one simply finds none).
 layout_write_registry() {
-  local file="$1" ws="$2" tab="$3" agent="$4" backlog="$5" watch="$6" wsn="${7:-}"
+  local file="$1" ws="$2" tab="$3" agent="$4" backlog="$5" watch="$6" wsn="${7:-}" agents="${8:-}"
   mkdir -p "$(dirname "$file")"
   {
     [ -n "$agent" ]   && printf 'coordinator-agent %s %s %s\n' "$agent" "$tab" "$ws"
     [ -n "$backlog" ] && printf 'backlog %s %s %s\n' "$backlog" "$tab" "$ws"
     [ -n "$watch" ]   && printf 'watch %s %s %s\n' "$watch" "$tab" "$ws"
+    [ -n "$agents" ]  && printf 'agents %s %s %s\n' "$agents" "$tab" "$ws"
     :   # never let an omitted trailing row make the group (and the caller, under set -e) fail
   } > "$file"
-  layout_label_roles "$agent" "$backlog" "$watch" "$wsn"
+  layout_label_roles "$agent" "$backlog" "$watch" "$wsn" "$agents"
 }
 
 # ── stale single-pane drainer/reviewer tab flagging (HERD-114 crash sweep) ────

@@ -473,6 +473,47 @@ out="$(_pane_run "$P" "$S" coordinator -- -y)" || fail "coordinator relaunch fai
 grep -q "agent start coordinator-panetest" "$S/log" || fail "-y did not start a fresh coordinator agent"
 ok
 
+# ═══ herd pane agents (HERD-668) ═════════════════════════════════════════════════════════════════
+
+# ── 7c. AGENTS_PANE off (default): a clean, loud no-op — no split, no rename, no registry row ─────
+P="$T/p7c"; mkdir "$P"; _make_project "$P" "panetest"; R7C="$(cd "$P" && pwd -P)"
+S="$T/s7c"; _coord_state "$S" "$R7C"
+out="$(_pane_run "$P" "$S" agents)" || fail "pane agents (off) should exit 0"
+grep -qi "AGENTS_PANE is off" <<< "$out" || fail "pane agents (off) did not explain why it did nothing"
+grep -q "pane split" "$S/log" && fail "pane agents split a pane despite AGENTS_PANE=off" || true
+grep -q "^agents " "$R7C/trees/.herd-panes" && fail "pane agents wrote a registry row despite AGENTS_PANE=off" || true
+ok
+
+# ── 7d. AGENTS_PANE=on, no agents pane yet → split off the WATCH pane's right, labelled + registered ─
+P="$T/p7d"; mkdir "$P"; _make_project "$P" "panetest" 'AGENTS_PANE="on"'; R7D="$(cd "$P" && pwd -P)"
+S="$T/s7d"; _coord_state "$S" "$R7D"
+out="$(_pane_run "$P" "$S" agents)" || fail "pane agents (on, fresh) failed"
+grep -q "pane split pW --direction right --ratio 0.72" "$S/log" \
+  || fail "agents pane not split off the watch pane at ratio 0.72"
+grep -rl "agents-pane-view.sh" "$S/panes" >/dev/null || fail "new agents pane did not receive agents-pane-view.sh"
+grep -q "visible ✓\|recreated ✓" <<< "$out" || fail "agents summary missing a visible/recreated verdict"
+new_ag="$(awk '$1=="agents" {print $2}' "$R7D/trees/.herd-panes")"
+[ -n "$new_ag" ] || fail "registry agents row not written"
+grep -q "pane rename $new_ag agents·panetest" "$S/log" || fail "new agents pane not labelled 'agents·panetest'"
+# Every OTHER role row survives untouched.
+grep -q "^coordinator-agent pA" "$R7D/trees/.herd-panes" || fail "registry coordinator-agent row dropped by pane agents"
+grep -q "^backlog pL"           "$R7D/trees/.herd-panes" || fail "registry backlog row dropped by pane agents"
+grep -q "^watch pW"             "$R7D/trees/.herd-panes" || fail "registry watch row dropped by pane agents"
+ok
+
+# ── 7e. AGENTS_PANE=on, a BARE registered agents pane already exists → reused, never re-split ─────
+P="$T/p7e"; mkdir "$P"; _make_project "$P" "panetest" 'AGENTS_PANE="on"'; R7E="$(cd "$P" && pwd -P)"
+S="$T/s7e"; _coord_state "$S" "$R7E"
+mkdir -p "$S/panes/pAg"; printf 'tC' > "$S/panes/pAg/tab"
+cat >> "$R7E/trees/.herd-panes" <<REG
+agents pAg tC
+REG
+out="$(_pane_run "$P" "$S" agents)" || fail "pane agents (on, reuse) failed"
+grep -q "pane split" "$S/log" && fail "pane agents split a NEW pane despite a reusable registered one" || true
+grep -q "pane run pAg" "$S/log" || fail "agents-pane-view not rerun in the registered pane pAg"
+grep -q "^agents pAg tC" "$R7E/trees/.herd-panes" || fail "registry agents row not preserved on reuse"
+ok
+
 # ═══ refusal / guard tests ═══════════════════════════════════════════════════════════════════════
 
 # ── 8. refuses when no .herd/config resolves (no dogfood fallback) ────────────────────────────────
