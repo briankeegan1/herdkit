@@ -98,6 +98,13 @@ REPO="$ART/repo"
 SHOTS="$ART/screenshots"
 mkdir -p "$SHOTS"
 
+# HERD-735: a real lane always persists the resolved spawn driver (herd_driver_agent_spawn_driver_write,
+# called from herd_driver_start_agent / herd_driver_launch_agent) for herd_driver_agent_liveness to read
+# back later — the "rp-builder" stub spawned below via raw herdr calls (not the lane seam) needs its own
+# worktree root so that write has somewhere real to land, mirroring what herd-config.sh sets up in
+# production. Isolated from $REPO; never touches the real repo tree.
+WORKTREES_DIR="$ART/trees"; mkdir -p "$WORKTREES_DIR"
+
 # A workspace label unique enough to never collide with a real project's WORKSPACE_NAME. $$ keeps it
 # per-run; the label is a runtime handle, not part of the deterministic fixture, so this is fine.
 WS_LABEL="$LABEL_PREFIX-$$"
@@ -392,6 +399,12 @@ except Exception:
     else
       checkpoint builder_tab fail "builder tab not created as expected (tab='$BUILD_TAB' pane='$BUILD_PANE' ok=$BUILD_OK)"
     fi
+    # HERD-735: a real lane persists the RESOLVED spawn driver right after it resolves one
+    # (herd_driver_start_agent / herd_driver_launch_agent both call this) so herd_driver_agent_liveness
+    # can fingerprint THIS builder's own runtime later instead of guessing the active one. rp-builder is
+    # a herdr-claude-shaped stub (its 'live session' below is a literal `claude`-named binary), so record
+    # it as such — mirroring what the real lane would have written for it.
+    [ -n "$BUILD_PANE" ] && herd_driver_agent_spawn_driver_write rp-builder herdr-claude
   fi
 
   # ── PANE ROLE LABELS AT SPAWN (HERD-135): the lane names each pane by role via the driver so the
@@ -1410,6 +1423,11 @@ print(pi.get("foreground_process_group_id") or "")
         . "$HERE/../agent-watch.sh" >/dev/null 2>&1 || exit 3
         render() { :; }
         REVIEW_AUTOFIX=true; DRYRUN=""; REFIX_MAX_ROUNDS=3
+        # HERD-735: this subshell's own isolated WORKTREES_DIR ($BVT) is a fresh tree, distinct from the
+        # outer scope's — the spawn-driver record written there at builder creation is not visible here.
+        # Re-persist it so herd_driver_agent_liveness (called inside _handle_block_verdict) can resolve
+        # rp-builder's fingerprint the same way a real re-tick against a real worktree would.
+        herd_driver_agent_spawn_driver_write rp-builder herdr-claude
         DISPLAY=()
         _handle_block_verdict "600" "rp-builder" "deadsha600" "0" || true
         printf '%s' "${DISPLAY[0]:-}" > "$BV_DISPLAY"
