@@ -152,6 +152,29 @@ herd_driver_agent_process_signature() {
   herd_driver_agent_value DRIVER_AGENT_PROCESS_SIGNATURE claude "$drv"
 }
 
+# herd_driver_agent_process_signature_all — space-separated UNION of every SHIPPED driver's
+# DRIVER_AGENT_PROCESS_SIGNATURE token(s), deduped (HERD-735). The fingerprint
+# herd_driver_agent_liveness falls back to when it cannot recover a builder's per-spawn driver AT ALL
+# (no persisted record — see herd_driver_agent_spawn_driver): it still gives a live foreign-runtime
+# pane a real chance to fingerprint as alive, but a HIT here can no longer be attributed to one
+# specific driver, so a caller must not infer nativeness from it. FAIL-SOFT: an unreadable drivers dir
+# yields the 'claude' literal alone, same as any other unreadable-binding fallback in this file.
+herd_driver_agent_process_signature_all() {
+  local dir f name sig tok out=""
+  dir="$(_herd_drivers_dir)"
+  if [ -d "$dir" ]; then
+    for f in "$dir"/*.driver; do
+      [ -e "$f" ] || continue
+      name="${f##*/}"; name="${name%.driver}"
+      sig="$(herd_driver_agent_process_signature "$name" 2>/dev/null || true)"
+      for tok in $sig; do
+        case " $out " in *" $tok "*) ;; *) out="${out:+$out }$tok" ;; esac
+      done
+    done
+  fi
+  printf '%s' "${out:-claude}"
+}
+
 # herd_model_resolve <ref> — resolve an optionally runtime-qualified MODEL_* value into its concrete
 # driver + model. On success echoes two TAB-separated tokens "<driver>\t<model>" and returns 0:
 #   • BARE (no colon)                → "<default-driver>\t<ref>"  (herd_driver_name; byte-identical)
@@ -401,6 +424,42 @@ _herd_agents_dir() {
   printf '%s' "$base/.herd/agents"
 }
 _herd_agent_dir() { printf '%s/%s' "$(_herd_agents_dir)" "$1"; }
+
+# herd_driver_agent_spawn_driver_write <slug> <driver> — persist <slug>'s RESOLVED spawn driver
+# (HERD-735, GH #805): the runtime-qualified MODEL ref the lane (or a respawn) resolved AT SPAWN, so a
+# later liveness/fingerprint probe can recover WHICH runtime this agent actually is instead of
+# defaulting to the coordinator's own ACTIVE driver — the exact miss that made a claude-active room
+# fingerprint a grok-spawned builder against 'claude' and read it falsely DEAD. Every spawn/respawn
+# path (herd_driver_start_agent, herd_driver_launch_agent, agent-watch.sh's
+# _respawn_builder_in_worktree) calls this once it has resolved the driver. FAIL-SOFT: an unwritable
+# agents dir is a silent no-op — a later probe just falls through to its unrecoverable-record path.
+herd_driver_agent_spawn_driver_write() {
+  local slug="${1:-}" drv="${2:-}"
+  [ -n "$slug" ] && [ -n "$drv" ] || return 0
+  # No configured worktree root at all (WORKTREES_DIR/TREES both unset) — _herd_agents_dir would
+  # otherwise fall back to the CURRENT DIRECTORY (its existing contract for the headless pid/log/status
+  # registry), which is fine for a real spawn (herd-config.sh always sets one) but would litter an
+  # unrelated cwd for a caller that sourced driver.sh standalone (a unit test exercising only the argv
+  # composition, never a real worktree). Skip rather than write outside any known tree.
+  [ -n "${WORKTREES_DIR:-}${TREES:-}" ] || return 0
+  local adir; adir="$(_herd_agent_dir "$slug")"
+  mkdir -p "$adir" 2>/dev/null || return 0
+  printf '%s' "$drv" > "$adir/driver" 2>/dev/null || true
+  return 0
+}
+
+# herd_driver_agent_spawn_driver <slug> — echo <slug>'s persisted spawn driver (HERD-735), or EMPTY
+# when unrecoverable: no record at all (an agent spawned before this feature shipped, or whose write
+# failed). FAIL-SOFT, never fails; a caller (herd_driver_agent_liveness) treats empty as "cannot
+# safely assume nativeness" and degrades its fingerprint accordingly — it never guesses the active
+# driver in its place, which is the bug this whole seam exists to close.
+herd_driver_agent_spawn_driver() {
+  local slug="${1:-}" f
+  [ -n "$slug" ] || return 0
+  f="$(_herd_agent_dir "$slug")/driver"
+  [ -f "$f" ] && cat "$f" 2>/dev/null || true
+  return 0
+}
 
 # ── notify ───────────────────────────────────────────────────────────────────────────────────────
 # herd_driver_notify <title> <body> [sound] — surface a desktop-style notification. Load-bearing:
@@ -814,10 +873,27 @@ except Exception:
   # Blindly dropping the shell_pid entry then filters the live runtime out and fabricates a death (a
   # live idle builder read '💀 AGENT DEAD'). So we exclude the shell_pid entry ONLY when it is a real
   # shell WRAPPER (no runtime signature in its cmdline): a runtime-as-root pane keeps its own entry.
-  local sig native
-  sig="$(herd_driver_agent_process_signature 2>/dev/null || true)"
-  [ -n "$sig" ] || sig='claude'
-  if herd_driver_agent_runtime_native; then native=1; else native=0; fi
+  # HERD-735 (GH #805): fingerprint the SPAWN driver — the runtime resolved for THIS builder at
+  # launch — never the coordinator's own ACTIVE one. The pre-fix bug called both helpers below with
+  # no argument, so they silently defaulted to the active driver; a claude-active room checking a
+  # grok-spawned builder then fingerprinted it against 'claude', missed, and read a live agent DEAD.
+  local spawn_drv sig native
+  spawn_drv="$(herd_driver_agent_spawn_driver "$slug" 2>/dev/null || true)"
+  if [ -n "$spawn_drv" ]; then
+    sig="$(herd_driver_agent_process_signature "$spawn_drv" 2>/dev/null || true)"
+    [ -n "$sig" ] || sig='claude'
+    if herd_driver_agent_runtime_native "$spawn_drv"; then native=1; else native=0; fi
+  else
+    # No recoverable spawn record (an agent started before this seam existed, or a write that
+    # failed): assuming nativeness here is exactly the bug this fixes, so don't. Fingerprint against
+    # the UNION of every known driver's signature — a live foreign-runtime pane still gets a real
+    # chance to resolve alive — and treat as non-native so a miss degrades to 'unknown', never a
+    # fabricated 'dead' (the same conservative rule HERD-654 already gives an explicitly non-native
+    # driver, applied here because we cannot rule out that ANY known driver spawned this agent).
+    sig="$(herd_driver_agent_process_signature_all 2>/dev/null || true)"
+    [ -n "$sig" ] || sig='claude'
+    native=0
+  fi
   herdr pane process-info --pane "$pane" 2>/dev/null | SIG="$sig" NATIVE="$native" python3 -c '
 import sys, json, os
 sigs = os.environ.get("SIG", "claude").split() or ["claude"]
@@ -1264,6 +1340,9 @@ herd_driver_start_agent() {
   local _res rt_driver
   _res="$(herd_model_resolve "$model")" || return 1
   rt_driver="${_res%%$'\t'*}"; model="${_res#*$'\t'}"
+  # HERD-735: persist the resolved spawn driver so a later liveness probe fingerprints THIS agent's
+  # own runtime instead of defaulting to the coordinator's active one.
+  herd_driver_agent_spawn_driver_write "$slug" "$rt_driver"
   if _herd_driver_is_headless; then
     _herd_headless_start_agent "$slug" "$wt" "$model" "$flags" "$pointer" "$rt_driver"
   else
@@ -1405,6 +1484,9 @@ herd_driver_launch_agent() {
     local _res; _res="$(herd_model_resolve "$sa_model")" || return 1
     sa_driver="${_res%%$'\t'*}"; sa_model="${_res#*$'\t'}"
   fi
+  # HERD-735: persist the resolved spawn driver so a later liveness probe fingerprints THIS agent's
+  # own runtime instead of defaulting to the coordinator's active one.
+  herd_driver_agent_spawn_driver_write "$sa_name" "$sa_driver"
 
   if _herd_driver_is_headless; then
     [ -d "$sa_cwd" ] || { printf '⚠️  headless: bad cwd for launch-agent %s (%s)\n' "$sa_name" "$sa_cwd" >&2; return 1; }
