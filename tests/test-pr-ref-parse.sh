@@ -2,6 +2,13 @@
 # test-pr-ref-parse.sh — hermetic proof of HERD-522 / GH #637: the merge-time reconcile no longer
 # SILENTLY misses a markdown-decorated `Refs:` line.
 #
+# suite-deps: .github/PULL_REQUEST_TEMPLATE.md
+#
+# HERD-733: check (6) below exercises the exact commented-out `Refs:` shape
+# .github/PULL_REQUEST_TEMPLATE.md carries (a synthesized string today, not a read of the real
+# committed file, but the fixture is a direct copy of that template's shape) — precautionary pairing
+# so a future change wiring this test to the real file doesn't silently drop out of docs-scoped runs.
+#
 # THE INCIDENT. emberglen-godot PR #125 wrote its tracker ref as a markdown HEADING —
 # `## Refs: EMG-111`. Every `Refs:` parser in the engine anchored at column 0, so all of them missed
 # it identically: the PR merged, the reconcile fell through to the fuzzy path, the tracker item stayed

@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # test-pr-tracker-linking.sh — hermetic tests for deterministic PR-to-tracker linking (HERD-39).
 #
+# suite-deps: .github/PULL_REQUEST_TEMPLATE.md
+#
+# HERD-733: check C3b below feeds the REAL, committed .github/PULL_REQUEST_TEMPLATE.md through the
+# ref extractor and asserts it does NOT falsely match, so a docs-only diff that edits this file must
+# still select this test — a docs-scoped selection that ran only the doc-drift/caps-sync/conformance
+# lint tests would let that assertion silently stop running.
+#
 # Three network-free layers, NO real herdr / gh / claude / scribe drainer:
 #
 #   PART A — the builder lanes (herd-quick.sh / herd-feature.sh) thread HERD_ITEM_REF into the

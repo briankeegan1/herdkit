@@ -44,9 +44,17 @@
 #   (6c) HERD-733 MIXED: a docs path beside a mapped code path selects the UNION — doc-lint + core +
 #        the paired test — never a fail-closed full run.
 #   (6d) HERD-733 DOC-CONTENT COVERAGE: a curated test that asserts on one SPECIFIC doc's real
-#        content (test-driver-abstraction.sh on docs/driver-abstraction.md, test-map.sh on
-#        docs/control-room-map.md) is not one of the enumerated doc-lint tests, so it must declare its
-#        own `# suite-deps:` header — a diff to the doc it asserts on still selects it.
+#        content (test-driver-abstraction.sh, test-map.sh, test-plugin-manifest.sh,
+#        test-pr-tracker-linking.sh) is not one of the enumerated doc-lint tests, so it must declare
+#        its own `# suite-deps:` header — a diff to the doc it asserts on still selects it.
+#   (6e) HERD-733 GENERAL RATCHET: rather than spot-checking known pairs, SCAN the real tree for every
+#        curated test with a root-relative *.md read and assert each is covered (doc-lint/core, or its
+#        own suite-deps header) — the guard that catches the NEXT test-plugin-manifest.sh-shaped gap
+#        without a human spotting it by hand.
+#   (6f) HERD-733: mutation-prove the (6e) scanner itself — dropping a suite-deps header from a
+#        fixture copy must surface as a reported gap, proving the scan is a real guard.
+#   (6g) HERD-733 HARDENING: an explicit HERD_SUITE_DOCS_LINT_TESTS="" override fails a docs-only path
+#        closed to the full curated set rather than silently narrowing it to core-only.
 #   (7)  NO CHANGED PATHS AT ALL → the curated set (the same thorough-side default healthcheck.sh
 #        uses when it cannot tell what changed).
 #   (8)  A changed tests/test-<name>.sh selects ITSELF.
@@ -240,12 +248,14 @@ $mixed_expected"
 ok "(6c) a docs path mixed with a mapped code path selects the UNION (doc-lint + core + the paired test), not the full suite"
 
 # ── (6d) DOC-CONTENT COVERAGE (HERD-733 review fix): a curated test that asserts on one SPECIFIC
-# doc's real content must NOT be dropped by the docs-mapping narrowing. test-driver-abstraction.sh
-# greps the real docs/driver-abstraction.md and test-map.sh greps the real docs/control-room-map.md;
-# neither is one of the three enumerated doc-lint tests nor in the always-run core, so each declares
-# its own `# suite-deps:` header (rule (3)) — proving the union actually restores them, not just that
-# the header exists in the source.
-for pair in "docs/driver-abstraction.md:test-driver-abstraction.sh" "docs/control-room-map.md:test-map.sh"; do
+# doc's real content must NOT be dropped by the docs-mapping narrowing. Neither test below is one of
+# the three enumerated doc-lint tests nor in the always-run core, so each declares its own
+# `# suite-deps:` header (rule (3)) — proving the union actually restores them, not just that the
+# header exists in the source.
+for pair in "docs/driver-abstraction.md:test-driver-abstraction.sh" \
+            "docs/control-room-map.md:test-map.sh" \
+            "plugin/skills/herd-coordinator/SKILL.md:test-plugin-manifest.sh" \
+            ".github/PULL_REQUEST_TEMPLATE.md:test-pr-tracker-linking.sh"; do
   doc="${pair%%:*}"; want_test="${pair##*:}"
   has "$CURATED" "$want_test" || fail "(6d) fixture assumption broken: $want_test is not in the curated set"
   got="$(herd_suite_tests_for_diff "$ROOT/tests" "$doc")"
@@ -257,6 +267,89 @@ $got"
     || fail "(6d) $doc must not fail closed to the entire curated set — it is docs-mapped + suite-deps-covered, not unmappable"
 done
 ok "(6d) a diff to a doc a curated test asserts on by real content still selects that test, via its own suite-deps header"
+
+# ── (6e)/(6f) GENERAL DOC-CONTENT COUPLING RATCHET (HERD-733 review round 3): (6d) only spot-checks
+# already-known pairs by hand. This instead SCANS a tests dir for every curated test that reads a
+# *.md file via a root-relative reference — `$ROOT/<path>.md`, `$HERE/../<path>.md`, or
+# `$REPO/<path>.md` where THIS FILE's own REPO is defined from `$HERE/..` (the real checkout, the
+# test-plugin-manifest.sh/test-pr-tracker-linking.sh convention) and never from a temp dir (the
+# fixture convention every `REPO="$T/..."` test uses, e.g. test-backlog-reconcile.sh's own throwaway
+# BACKLOG.md/docs/guide.md) — and reports every (test, path) pair that is NOT covered: the test is
+# neither one of the enumerated doc-lint tests / in the core, nor carries a `# suite-deps:` header
+# naming that exact path. Emits one "name<TAB>path" gap per line to stdout; the scan itself never
+# fails — the caller decides whether zero hits or a non-empty gap list is the real assertion, so the
+# same function drives both the live-tree check (6e) and the (6f) mutation-prove against a fixture.
+_hk_repo_is_real_tree() {  # true iff <file>'s OWN "REPO=" assignment derives from $HERE/.. and is
+                           # never also assigned from a temp dir (the two conventions never mix today)
+  grep -qE '^REPO="\$\(cd "\$HERE/\.\." && pwd\)"' "$1" || return 1
+  grep -qE '^REPO="\$T[/"]' "$1" && return 1
+  return 0
+}
+_hk_doc_content_gaps() {  # _hk_doc_content_gaps <tests_dir> <curated-set> <docs-lint+core list>
+  local _dcg_dir="$1" _dcg_curated="$2" _dcg_covering="$3" _dcg_file _dcg_path _dcg_name _dcg_covered _dcg_c
+  while IFS=$'\t' read -r _dcg_file _dcg_path; do
+    [ -n "$_dcg_file" ] || continue
+    _dcg_name="${_dcg_file##*/}"
+    has "$_dcg_curated" "$_dcg_name" || continue           # not part of the gate — nothing to guard
+    _dcg_covered=0
+    for _dcg_c in $_dcg_covering; do [ "$_dcg_c" = "$_dcg_name" ] && _dcg_covered=1; done
+    if [ "$_dcg_covered" -eq 0 ]; then
+      grep -qE "^#[[:space:]]*suite-deps:.*(^|[[:space:]])${_dcg_path}([[:space:]]|\$)" "$_dcg_file" \
+        || printf '%s\t%s\n' "$_dcg_name" "$_dcg_path"
+    fi
+  done < <(
+    {
+      grep -rnoE '\$ROOT/[A-Za-z0-9_./-]+\.md"' "$_dcg_dir"/test-*.sh 2>/dev/null \
+        | sed -E 's#^([^:]+):[0-9]+:\$ROOT/(.*)"$#\1\t\2#'
+      grep -rnoE '\$HERE/\.\./[A-Za-z0-9_./-]+\.md"' "$_dcg_dir"/test-*.sh 2>/dev/null \
+        | sed -E 's#^([^:]+):[0-9]+:\$HERE/\.\./(.*)"$#\1\t\2#'
+      grep -rnoE '\$REPO/[A-Za-z0-9_./-]+\.md"' "$_dcg_dir"/test-*.sh 2>/dev/null \
+        | sed -E 's#^([^:]+):[0-9]+:\$REPO/(.*)"$#\1\t\2#' \
+        | while IFS=$'\t' read -r _dcg_rf _dcg_rp; do
+            [ -n "$_dcg_rf" ] || continue
+            _hk_repo_is_real_tree "$_dcg_rf" && printf '%s\t%s\n' "$_dcg_rf" "$_dcg_rp"
+          done
+    } | LC_ALL=C sort -u
+  )
+}
+
+# (6e) live tree: zero gaps, and the scan itself actually found real-tree reads (never vacuously true).
+COVERING="$DOCS_LINT $CORE"
+LIVE_HITS="$(
+  { grep -rlE '\$ROOT/[A-Za-z0-9_./-]+\.md"|\$HERE/\.\./[A-Za-z0-9_./-]+\.md"|\$REPO/[A-Za-z0-9_./-]+\.md"' \
+      "$ROOT"/tests/test-*.sh 2>/dev/null || true; } | wc -l | tr -d ' '
+)"
+[ "$LIVE_HITS" -gt 0 ] || fail "(6e) the scanner matched ZERO files with a root-relative *.md read — the scan itself is broken (it must at least find test-doc-drift.sh's README.md read)"
+LIVE_GAPS="$(_hk_doc_content_gaps "$ROOT/tests" "$CURATED" "$COVERING")"
+[ -z "$LIVE_GAPS" ] || fail "(6e) curated test(s) read real *.md content with no coverage path — add a '# suite-deps: <path>' header (or add the test to HERD_SUITE_DOCS_LINT_TESTS/core):
+$LIVE_GAPS"
+ok "(6e) every curated test reading a real, root-relative *.md file is covered by the doc-lint set, core, or its own suite-deps header"
+
+# (6f) MUTATION-PROVE the scanner itself: drop the SKILL.md suite-deps header from a fixture copy of
+# test-plugin-manifest.sh and confirm the scan actually reports the gap — proving it is a real guard,
+# not a check that would pass on any input.
+MUTDIR="$T/doc-content-mut"; mkdir -p "$MUTDIR"
+cp "$ROOT"/tests/test-*.sh "$MUTDIR"/
+sed '/^# suite-deps: plugin\/skills\/herd-coordinator\/SKILL\.md$/d' \
+  "$ROOT/tests/test-plugin-manifest.sh" > "$MUTDIR/test-plugin-manifest.sh"
+MUT_CURATED="$(herd_suite_curated_tests "$MUTDIR")"
+MUT_GAPS="$(_hk_doc_content_gaps "$MUTDIR" "$MUT_CURATED" "$COVERING")"
+has "$MUT_GAPS" "$(printf 'test-plugin-manifest.sh\tplugin/skills/herd-coordinator/SKILL.md')" \
+  || fail "(6f) stripping test-plugin-manifest.sh's suite-deps header did not surface as a gap — the scanner cannot actually catch a missing header.
+--- got ---
+$MUT_GAPS"
+ok "(6f) mutation-prove: dropping a suite-deps header from a fixture copy is caught by the same scan (6e) runs against the live tree"
+
+# ── (6g) HARDENING (non-blocking review nit): an explicit HERD_SUITE_DOCS_LINT_TESTS="" override must
+# fall a docs-only path through to FAIL-CLOSED, not silently narrow it to core-only. Rule (2) sets
+# _hsd_mapped only when a token is actually appended, so an emptied list contributes nothing and the
+# path is unmapped — same escape-hatch shape as emptying HERD_SUITE_WIDE_BLAST already has elsewhere.
+EMPTY_LINT="$(HERD_SUITE_DOCS_LINT_TESTS="" herd_suite_tests_for_diff "$ROOT/tests" README.md)"
+[ "$EMPTY_LINT" = "$CURATED" ] \
+  || fail "(6g) HERD_SUITE_DOCS_LINT_TESTS=\"\" must fall a docs path closed to the FULL curated set, not narrow it.
+--- got ---
+$EMPTY_LINT"
+ok "(6g) an explicit HERD_SUITE_DOCS_LINT_TESTS=\"\" override fails a docs-only path closed rather than silently narrowing it to core-only"
 
 # ── (7) no changed paths at all → the curated set ──────────────────────────────────────────────────
 [ "$(herd_suite_tests_for_diff "$ROOT/tests")" = "$CURATED" ] \

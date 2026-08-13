@@ -286,14 +286,17 @@ herd_suite_tests_for_diff() {
     # (2) DOCS MAPPING (HERD-733): README.md, any docs/** path, and any other *.md file at any depth
     # select the enumerated doc-lint tests. A path under tests/ is excluded here — a *.md fixture or
     # helper living in tests/ is governed by rule (1)/(3), never reclassified as a doc.
+    # _hsd_mapped is set ONLY when a token is actually appended: an explicit
+    # HERD_SUITE_DOCS_LINT_TESTS="" override must fall through to FAIL-CLOSED for a docs path with no
+    # other rule mapping it, the same as emptying HERD_SUITE_WIDE_BLAST falls through elsewhere — never
+    # silently narrow to core-only because this rule claimed the path but had nothing to contribute.
     case "$_hsd_p" in
       tests/*) : ;;
       README.md|docs/*|*.md)
         for _hsd_t in $HERD_SUITE_DOCS_LINT_TESTS; do
           [ -n "$_hsd_t" ] || continue
-          _hsd_sel="${_hsd_sel}${_hsd_t}"$'\n'
-        done
-        _hsd_mapped=1 ;;
+          _hsd_sel="${_hsd_sel}${_hsd_t}"$'\n'; _hsd_mapped=1
+        done ;;
     esac
 
     # (3) DECLARED DEPS: any test whose `# suite-deps:` header covers this path.
