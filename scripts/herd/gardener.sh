@@ -1,27 +1,45 @@
 #!/usr/bin/env bash
-# gardener.sh — the MAINTENANCE GARDENER (HERD-673): a periodic, ADVISORY doc-drift sweep that files
-# its own backlog. Composed entirely from shipped primitives — the trigger pack (triggers.sh, HERD-169)
-# schedules it, the specialist roster (.herd/agents/docs-gardener.md, HERD-667) gives the weekly agent
-# run its persona, and scribe.sh does the actual filing — this file is the ONE deterministic mechanism
-# in between: cursor + diff + dedup + cooldown, testable with no LLM in the loop.
+# gardener.sh — the MAINTENANCE GARDENER (HERD-673, tuned HERD-730): a periodic, ADVISORY doc-drift
+# sweep that files its own backlog. Composed entirely from shipped primitives — the trigger pack
+# (triggers.sh, HERD-169) schedules it, the specialist roster (.herd/agents/docs-gardener.md, HERD-667)
+# gives the weekly agent run its persona, and scribe.sh does the actual filing — this file is the ONE
+# deterministic mechanism in between: cursor + diff + dedup + rollup + cap, testable with no LLM in
+# the loop.
 #
 # CONTRACT — FILES, NEVER EDITS. Each `run` diffs merge events journaled since its OWN stored cursor
 # (a byte offset into the project journal, kept under the worktree pool — never committed) against two
 # small, deterministic sets:
 #   SURFACE  bin/herd, scripts/herd/*.sh, templates/capabilities.tsv, templates/conformance.tsv
-#   DOC      README.md, docs/**, templates/*.tmpl
-# A merge that touches SURFACE but touches NO file in DOC is real drift: the front door (or a rendered
-# rail) plausibly still describes the pre-merge world. Drift is grouped by the SURFACE FILE itself (not
-# by PR) so the SAME undocumented file recurring across several merges — in one run, or across several
-# weekly runs — collapses into ONE dedup-keyed tracker item quoting every merged PR#, instead of one
-# item per PR. Filing goes through scripts/herd/scribe.sh exactly like a human coordinator's request;
-# gardener.sh never writes README.md/docs/**/templates/*.tmpl itself. A PER-SIGNATURE FILING COOLDOWN
-# (a stamp file per surface-file signature, HERD_GARDENER_COOLDOWN_SECS — default 7d) means a standing,
-# still-unaddressed drift is not re-filed every run (the HERD-512 anomaly-rail lesson). Zero findings is
-# not silence: it still advances the cursor and journals exactly one `gardener_run findings=0` event.
+#   DOC      README.md, docs/** (excluding the two GENERATED docs below), templates/*.tmpl,
+#            templates/capabilities.tsv (it IS the manifest the rendered docs derive from, so a merge
+#            touching it alongside a SURFACE script is documented, not drift)
+#   GENERATED docs/codemap.md and docs/symbol-index.md are never drift EVIDENCE in either direction —
+#            not proof of documentation (a merge regenerating only these is still undocumented drift for
+#            any SURFACE file it also touches) and never themselves a drift TARGET.
+# A merge that touches SURFACE but touches NO file in DOC is real drift — UNLESS the surface file's own
+# diff in that merge touches only its leading `#`-comment header block (shebang + contiguous comment
+# lines), which self-documents a minor diff and is never flagged.
 #
-# `--dry-run` previews what WOULD file (surfaced file + evidence + cooldown status) without calling
+# A run's findings are ONE UNIT OF REVIEW: every drifted file found in a run is grouped by SUBSYSTEM
+# (the file's own directory) into ONE rollup tracker item per run — never one item per file (HERD-730:
+# the first live run filed fifty one-file items, pure noise). A PER-SIGNATURE FILING COOLDOWN (a stamp
+# file per surface-file signature, HERD_GARDENER_COOLDOWN_SECS — default 7d) still gates ROLLUP
+# MEMBERSHIP per file, so a standing, still-unaddressed drift is not re-included every run (the
+# HERD-512 anomaly-rail lesson). A PER-RUN FILING CAP (HERD_GARDENER_MAX_FINDINGS — default 20, 0 =
+# unlimited) bounds how many distinct drifted files land in one run's rollup; anything beyond the cap
+# is stated LOUDLY in the rollup body (never a silent drop), and the cursor is HELD BACK (not advanced)
+# so the same merge window is honestly rescanned next run — already-filed files skip via cooldown,
+# capped-out ones get a fresh shot.
+# Zero findings is not silence: it still advances the cursor and journals exactly one
+# `gardener_run findings=0` event. Filing goes through scripts/herd/scribe.sh exactly like a human
+# coordinator's request; gardener.sh never writes README.md/docs/**/templates/*.tmpl itself.
+#
+# `--dry-run` previews what WOULD file (surfaced files + evidence + cooldown/cap status) without calling
 # scribe.sh, stamping cooldown, or advancing the cursor — safe to run repeatedly.
+#
+# CURSOR INIT: an absent, corrupt, or rotated/shrunk cursor always re-baselines at the CURRENT journal
+# EOF (never offset 0) — a run's job on a fresh or invalidated cursor is to establish a baseline, never
+# to back-scan the journal's whole history as archaeology.
 #
 # SHIP-DORMANT: gated behind MAINTENANCE_GARDENER=off (default, herd-config.sh). off → `run` prints one
 # disabled notice and returns 0; no journal read, no state dir touched, no scribe call — byte-inert.
@@ -42,6 +60,7 @@
 #                             (default: `git diff-tree --no-commit-id --name-only -r <sha>`).
 #   HERD_GARDENER_SCRIBE      overrides the scribe.sh path/stub a finding is filed through.
 #   HERD_GARDENER_COOLDOWN_SECS  the per-signature filing cooldown window (default 604800 = 7 days).
+#   HERD_GARDENER_MAX_FINDINGS   the per-run rollup filing cap (default 20; 0 = unlimited).
 #   HERD_GARDENER_NOW         overrides "now" for cooldown math (epoch seconds).
 
 # _gardener_enabled — 0 iff MAINTENANCE_GARDENER opts in. Default OFF; only on|true|1|yes|enable|enabled
@@ -69,6 +88,13 @@ _gardener_now() { printf '%s' "${HERD_GARDENER_NOW:-$(date +%s 2>/dev/null || ec
 _gardener_cooldown_secs() {
   local v="${HERD_GARDENER_COOLDOWN_SECS:-604800}"
   case "$v" in ''|*[!0-9]*) printf 604800 ;; *) printf '%s' "$v" ;; esac
+}
+
+# _gardener_max_findings — the per-run rollup filing cap; non-numeric falls soft to the documented
+# default of 20. 0 means unlimited (every non-cooldown finding lands in the rollup).
+_gardener_max_findings() {
+  local v="${HERD_GARDENER_MAX_FINDINGS:-20}"
+  case "$v" in ''|*[!0-9]*) printf 20 ;; *) printf '%s' "$v" ;; esac
 }
 
 # _gardener_sig <file> — a filesystem-safe, stable signature for a drifted surface file: the path
@@ -111,11 +137,103 @@ _gardener_is_surface() {
 }
 
 # _gardener_is_doc <path> — the doc-target set a merge touching SURFACE is expected to keep pace with.
+# docs/codemap.md and docs/symbol-index.md are GENERATED docs (herd codemap / herd symbol-index) and
+# never count as doc evidence — a merge regenerating only these still counts as undocumented for any
+# SURFACE file it also touches. templates/capabilities.tsv DOES count: it is the manifest the rendered
+# docs derive from, so a merge touching it alongside a SURFACE script is documented, not drift.
 _gardener_is_doc() {
   case "$1" in
-    README.md|docs/*|templates/*.tmpl) return 0 ;;
+    docs/codemap.md|docs/symbol-index.md) return 1 ;;
+    README.md|docs/*|templates/*.tmpl|templates/capabilities.tsv) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# _gardener_header_end <sha> <path> — the 1-based line number of the LAST line of <path>'s leading
+# `#`-comment header block (shebang + contiguous comment lines) as it existed at <sha>, or empty if the
+# file has no such header (first line isn't a comment). FAIL-SOFT: an unresolvable sha/path prints
+# nothing.
+_gardener_header_end() {
+  local sha="$1" path="$2"
+  git -C "${PROJECT_ROOT:-.}" show "${sha}:${path}" 2>/dev/null | awk '
+    /^#/ { last = NR; next }
+    { exit }
+    END { if (last > 0) print last }
+  '
+}
+
+# _gardener_header_only_change <sha> <path> — true iff <path>'s own diff in merge <sha> touches ONLY
+# lines inside its leading `#`-comment header block on BOTH sides of the change (old and new blob) — a
+# self-documenting minor diff (HERD-730) that should never count as drift. Scoped to actual shipped
+# scripts (bin/herd, scripts/herd/*.sh); manifests/tsv rows don't have a comment-header convention.
+# FAIL-SOFT: any unresolvable git call (no parent, no header, malformed hunk) returns false — the
+# safest default is "still counts as drift," never silently excusing a real change.
+_gardener_header_only_change() {
+  local sha="$1" path="$2"
+  case "$path" in
+    bin/herd|scripts/herd/*.sh) : ;;
+    *) return 1 ;;
+  esac
+  local diff old_head new_head
+  diff="$(git -C "${PROJECT_ROOT:-.}" diff-tree -p --no-color --no-commit-id -r "$sha" -- "$path" 2>/dev/null)"
+  [ -n "$diff" ] || return 1
+  old_head="$(_gardener_header_end "${sha}^" "$path")"; old_head="${old_head:-0}"
+  new_head="$(_gardener_header_end "$sha" "$path")"; new_head="${new_head:-0}"
+  [ "$old_head" -gt 0 ] 2>/dev/null || return 1
+  [ "$new_head" -gt 0 ] 2>/dev/null || return 1
+  # Walk the unified diff line-by-line (not just hunk-header ranges, which include unchanged CONTEXT
+  # lines): only actual added/removed lines must fall within the header boundary on their own side.
+  printf '%s\n' "$diff" | awk -v oh="$old_head" -v nh="$new_head" '
+    /^@@/ {
+      line = $0
+      sub(/^@@ -/, "", line)
+      sub(/ @@.*/, "", line)
+      split(line, parts, " \\+")
+      split(parts[1], oarr, ",")
+      split(parts[2], narr, ",")
+      oline = oarr[1] + 0
+      nline = narr[1] + 0
+      next
+    }
+    /^diff / || /^index / || /^--- / || /^\+\+\+ / { next }
+    /^-/ { if (oline > oh) bad = 1; oline++; next }
+    /^\+/ { if (nline > nh) bad = 1; nline++; next }
+    /^ / { oline++; nline++; next }
+    END { exit (bad ? 1 : 0) }
+  '
+}
+
+# _gardener_subsystem_for <path> — the rollup grouping bucket for a drifted file: its own directory
+# (bin, scripts/herd, scripts/herd/backends, templates, …) — no hardcoded taxonomy, so any future
+# SURFACE addition buckets naturally.
+_gardener_subsystem_for() {
+  case "$1" in
+    */*) printf '%s' "${1%/*}" ;;
+    *)   printf '%s' "(root)" ;;
+  esac
+}
+
+# _gardener_render_rollup_body <rows> — <rows> is "<file>\t<prs>\n"*; renders a "## subsystem" section
+# per distinct subsystem with one "- file — PR(s) ..." line each, subsystems and files sorted for
+# determinism.
+_gardener_render_rollup_body() {
+  local rows="$1" tagged
+  tagged="$(printf '%s\n' "$rows" | while IFS=$'\t' read -r f prs; do
+    [ -n "$f" ] || continue
+    printf '%s\t%s\t%s\n' "$(_gardener_subsystem_for "$f")" "$f" "$prs"
+  done)"
+  printf '%s\n' "$tagged" | sort -t "$(printf '\t')" -k1,1 -k2,2 | awk -F'\t' '
+    $1 != prev { if (prev != "") print ""; print "## " $1; prev = $1 }
+    { print "- " $2 " — PR(s) " $3 }
+  '
+}
+
+# _gardener_count_subsystems <rows> — distinct subsystem count across <rows>, for the rollup summary line.
+_gardener_count_subsystems() {
+  local rows="$1"
+  printf '%s\n' "$rows" | awk -F'\t' '$1 != "" { print $1 }' | while IFS= read -r f; do
+    _gardener_subsystem_for "$f"; printf '\n'
+  done | sort -u | grep -c .
 }
 
 # _gardener_files_for_sha <sha> — the changed-files list for one merge commit. HERD_GARDENER_DIFF_CMD
@@ -193,17 +311,23 @@ gardener_run() {
   local cursor_file="$state/cursor"
   local size; size="$(wc -c < "$jf" 2>/dev/null | tr -cd '0-9')"; size="${size:-0}"
 
+  # CURSOR INIT (HERD-730): absent OR corrupt OR rotated/shrunk always re-baselines at the CURRENT
+  # journal EOF — never offset 0. A run's job on an invalidated cursor is to establish a baseline, not
+  # to back-scan the journal's whole history as archaeology.
   local offset first_run=0
   if [ ! -f "$cursor_file" ]; then
     first_run=1
-    offset="$size"     # pin at EOF: a first run never replays the journal's whole history
+    offset="$size"
   else
-    offset="$(cat "$cursor_file" 2>/dev/null || echo 0)"
-    case "$offset" in ''|*[!0-9]*) offset=0 ;; esac
-    [ "$offset" -le "$size" ] || offset=0   # journal rotated/shrank since — restart from 0
+    offset="$(cat "$cursor_file" 2>/dev/null || echo '')"
+    case "$offset" in ''|*[!0-9]*) first_run=1; offset="$size" ;; esac
+    if [ "$first_run" -eq 0 ] && [ "$offset" -gt "$size" ]; then
+      first_run=1
+      offset="$size"
+    fi
   fi
 
-  local nfindings=0 nfiled=0 nskipped=0
+  local nfindings=0 nfiled=0 nskipped=0 ncapped=0
 
   if [ "$first_run" -eq 0 ] && [ "$offset" -lt "$size" ]; then
     local merges; merges="$(_gardener_merges_since "$jf" "$offset")"
@@ -218,7 +342,9 @@ gardener_run() {
         while IFS= read -r f; do
           [ -n "$f" ] || continue
           _gardener_is_doc "$f" && doc_hit=1
-          _gardener_is_surface "$f" && surface_files="${surface_files}${f}"$'\n'
+          if _gardener_is_surface "$f" && ! _gardener_header_only_change "$sha" "$f"; then
+            surface_files="${surface_files}${f}"$'\n'
+          fi
         done <<EOF
 $files
 EOF
@@ -243,6 +369,11 @@ EOF
           seen[$1] = seen[$1] (seen[$1] == "" ? "" : ",") $2 }
         END { for (i = 1; i <= n; i++) print order[i] "\t" seen[order[i]] }
       ')"
+
+      # Partition grouped findings: cooldown-skip (never counted toward the cap), then within-cap →
+      # rolled into this run's ONE item, beyond-cap → truncated (loudly), reconsidered next run.
+      local cap; cap="$(_gardener_max_findings)"
+      local to_file="" n_considered=0
       local gfile gprs sig
       while IFS=$'\t' read -r gfile gprs; do
         [ -n "$gfile" ] || continue
@@ -256,27 +387,73 @@ EOF
           fi
           continue
         fi
-        if [ "$dry" -eq 1 ]; then
-          echo "🌱 [dry-run] would file: '$gfile' — merged PR(s) $gprs touched it without a README.md/docs/**/templates/*.tmpl update."
+        n_considered=$((n_considered + 1))
+        if [ "$cap" -gt 0 ] && [ "$n_considered" -gt "$cap" ]; then
+          ncapped=$((ncapped + 1))
           continue
         fi
-        local title body
-        title="Docs drift: $gfile changed without a README/docs update"
-        title="${title:0:78}"
-        body="Maintenance gardener (HERD-673): merged PR(s) $gprs modified \`$gfile\`, but none of them touched README.md, docs/**, or templates/*.tmpl in the same merge. Evidence: \`$gfile\` — PR(s) $gprs. Please check whether the docs need an update, or let this file cooldown-expire if the change was genuinely doc-inert."
-        if bash "$(_gardener_scribe_cmd)" "$title
-$body" >/dev/null 2>&1; then
-          nfiled=$((nfiled + 1))
-          _gardener_stamp_cooldown "$sig"
-          command -v journal_append >/dev/null 2>&1 && journal_append gardener_finding file "$gfile" prs "$gprs" result filed
-          echo "📝 gardener: filed a drift finding for '$gfile' (PR(s) $gprs)."
-        else
-          command -v journal_append >/dev/null 2>&1 && journal_append gardener_finding file "$gfile" prs "$gprs" result scribe-failed
-          echo "⚠️  gardener: could not enqueue a finding for '$gfile' (fail-soft: continuing)." >&2
-        fi
+        to_file="${to_file}${gfile}"$'\t'"${gprs}"$'\n'
       done <<EOF
 $grouped
 EOF
+
+      if [ "$dry" -eq 1 ]; then
+        if [ -n "$to_file" ]; then
+          while IFS=$'\t' read -r gfile gprs; do
+            [ -n "$gfile" ] || continue
+            echo "🌱 [dry-run] would file: '$gfile' — merged PR(s) $gprs touched it without a README.md/docs/**/templates/*.tmpl update."
+          done <<EOF
+$to_file
+EOF
+        fi
+        [ "$ncapped" -eq 0 ] || echo "🌱 [dry-run] per-run cap ($cap) would truncate $ncapped additional finding(s) this run — they'd be reconsidered next run."
+      elif [ -n "$to_file" ]; then
+        local nfile nsub title body sections
+        nfile="$(printf '%s\n' "$to_file" | grep -c .)"
+        nsub="$(_gardener_count_subsystems "$to_file")"
+        sections="$(_gardener_render_rollup_body "$to_file")"
+        title="Docs drift rollup: $nfile file(s) across $nsub subsystem(s)"
+        title="${title:0:78}"
+        body="Maintenance gardener (HERD-673/HERD-730): this run found $nfile drifted surface file(s) across $nsub subsystem(s) — each merged without touching README.md, docs/**, or templates/*.tmpl in the same merge. Grouped by subsystem:
+
+$sections"
+        if [ "$ncapped" -gt 0 ]; then
+          body="$body
+
+TRUNCATED: $ncapped additional drifted file(s) found this run are NOT listed above — the per-run filing cap is $cap. They remain undocumented and will be reconsidered (un-cooldowned) next run."
+        fi
+        body="$body
+
+Please check whether docs need an update for each path above, or let a path cooldown-expire if its change was genuinely doc-inert."
+
+        if bash "$(_gardener_scribe_cmd)" "$title
+$body" >/dev/null 2>&1; then
+          while IFS=$'\t' read -r gfile gprs; do
+            [ -n "$gfile" ] || continue
+            nfiled=$((nfiled + 1))
+            sig="$(_gardener_sig "$gfile")"
+            _gardener_stamp_cooldown "$sig"
+            command -v journal_append >/dev/null 2>&1 && journal_append gardener_finding file "$gfile" prs "$gprs" result filed
+          done <<EOF
+$to_file
+EOF
+          if [ "$ncapped" -gt 0 ]; then
+            echo "📝 gardener: filed a rollup drift finding covering $nfiled file(s) across $nsub subsystem(s) ($ncapped more truncated by the per-run cap)."
+          else
+            echo "📝 gardener: filed a rollup drift finding covering $nfiled file(s) across $nsub subsystem(s)."
+          fi
+        else
+          while IFS=$'\t' read -r gfile gprs; do
+            [ -n "$gfile" ] || continue
+            command -v journal_append >/dev/null 2>&1 && journal_append gardener_finding file "$gfile" prs "$gprs" result scribe-failed
+          done <<EOF
+$to_file
+EOF
+          echo "⚠️  gardener: could not enqueue the rollup drift finding (fail-soft: continuing)." >&2
+        fi
+      elif [ "$ncapped" -gt 0 ]; then
+        echo "🌱 gardener: every drifted file this run was truncated by the per-run cap ($cap) — none filed, all reconsidered next run."
+      fi
     fi
   fi
 
@@ -285,7 +462,13 @@ EOF
     return 0
   fi
 
-  printf '%s\n' "$size" > "$cursor_file" 2>/dev/null || true
+  if [ "$ncapped" -eq 0 ]; then
+    printf '%s\n' "$size" > "$cursor_file" 2>/dev/null || true
+  else
+    # Honest truncation (HERD-730): hold the cursor back so this SAME merge window is rescanned next
+    # run — already-filed files skip via cooldown, capped-out ones get a fresh shot at the rollup.
+    echo "🌱 gardener: cursor NOT advanced — $ncapped finding(s) were truncated by the per-run cap; this merge window will be rescanned next run."
+  fi
   if [ "$nfindings" -eq 0 ]; then
     if [ "$first_run" -eq 1 ]; then
       echo "🌱 gardener: FIRST RUN — baseline cursor established at the current journal EOF; no history replayed."
@@ -294,7 +477,7 @@ EOF
     fi
   fi
   command -v journal_append >/dev/null 2>&1 && \
-    journal_append gardener_run findings "$nfindings" filed "$nfiled" skipped "$nskipped" first_run "$first_run"
+    journal_append gardener_run findings "$nfindings" filed "$nfiled" skipped "$nskipped" capped "$ncapped" first_run "$first_run"
   return 0
 }
 
