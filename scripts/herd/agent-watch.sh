@@ -3530,6 +3530,11 @@ EOF
 # render — paint the whole rollup card, but ONLY when the computed frame changed.
 render() {
   frame="${HDR_LINE}"$'\n'"${RULE}"$'\n\n'
+  # HOTKEY HINT (HERD-674) — the 'v: view (<lens>)' reminder, empty (byte-identical console) unless
+  # WATCH_HOTKEYS is on AND armed on this process's own tty. Set by build_hotkey_hint.
+  if [ -n "${HOTKEY_HINT_ROW:-}" ]; then
+    frame="${frame}${HOTKEY_HINT_ROW}"
+  fi
   # ENGINE PAUSED banner (HERD-347) — the operator emergency-off switch, pinned ABOVE even the
   # engine-down alarm: a deliberate operator pause is the single most important fact on the console.
   # Set by _engine_tick_watchdog while ENGINE_PAUSE=on; empty (byte-identical console) whenever the
@@ -17410,6 +17415,153 @@ print(json.dumps([p for p in prs if keep(p)]))
 '
 }
 
+# ── In-console hotkey: 'v' toggles WATCHER_VIEW mine<->all (HERD-674) ───────────────────────────────
+# The watcher render loop had NO keypress/stdin handling anywhere (the HERD-661 descope finding) —
+# this is the seam. WATCH_HOTKEYS=on|off (default off, ship-dormant, capabilities.tsv) gates the WHOLE
+# feature: off is BYTE-INERT — no stty call, no stdin read, no listener process, no hint row,
+# indistinguishable from before this section existed. This is a MINIMAL seam for the ONE keymap below
+# ('v': view); it is deliberately not a keymap framework.
+#
+# ARMED ONLY on the watcher's OWN interactive tty ([ -t 0 ]) — never headless, sim, a piped/redirected
+# stdin, or AGENT_WATCH_LIB sourcing (which returns before the live loop ever reaches the spawn call
+# below, see the AGENT_WATCH_LIB early-return near the tick loop). A non-interactive/foreign stdin
+# degrades SILENTLY: no row, no listener, no error.
+#
+# NON-BLOCKING BY CONSTRUCTION: the tick loop itself never reads the tty. A single background LISTENER
+# process (spawned ONCE at startup, mirroring every other async leg in this file — main-health worker,
+# review dispatch) owns the ONLY blocking read: it puts stdin into raw mode (stty -icanon -echo min 1
+# time 0 — a real blocking single-keystroke read, not a busy poll, so it costs zero CPU while idle) and,
+# on 'v'/'V', bumps a counter into a marker file. Each tick's _watch_hotkeys_poll_tick does nothing but
+# read that ONE regular file — a plain file read is never a blocking tty wait, so the tick's added cost
+# is a constant few milliseconds whether or not a key was ever pressed (proven in the timing assertion
+# in tests/test-watch-hotkeys.sh).
+#
+# The flip itself is PURE IN-MEMORY: it reassigns the WATCHER_VIEW shell variable for THIS PROCESS
+# ONLY, exactly like every other in-process config read in this file. `herd config set` remains the
+# durable path; the flip never opens .herd/config or config.local, and a watcher restart (or a second
+# seat) reverts to whatever the file says.
+_watch_hotkeys_enabled() {
+  case "$(printf '%s' "${WATCH_HOTKEYS:-off}" | tr '[:upper:]' '[:lower:]')" in
+    1|true|on|yes|enable|enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# _watch_hotkeys_tty_ok — split out from _watch_hotkeys_active so a hermetic test can force the tty
+# check true without a real pty (HERD_WATCH_HOTKEYS_FORCE_TTY=1, test-only — mirrors the
+# BACKLOG_VIEW_TTY/BACKLOG_VIEW_KEY_CMD test hooks backlog-view.sh already uses for the same reason:
+# the suite runs inside a live pane, where touching the real controlling terminal would wedge it).
+# Unset in real use — always the plain `[ -t 0 ]` check.
+_watch_hotkeys_tty_ok() {
+  [ -n "${HERD_WATCH_HOTKEYS_FORCE_TTY:-}" ] && return 0
+  [ -t 0 ]
+}
+
+# _watch_hotkeys_active — enabled AND this process's own stdin is a real interactive tty. The single
+# gate both the listener spawn and the rendered hint go through, so "hint shown" always means "the
+# listener is (or will be) actually armed", never a lie about a headless/off process.
+_watch_hotkeys_active() {
+  _watch_hotkeys_enabled || return 1
+  _watch_hotkeys_tty_ok || return 1
+  return 0
+}
+
+# The marker file the background listener writes and the tick loop polls: a bare counter, one line,
+# under $TREES (or $WORKTREES_DIR/$TMPDIR fail-soft chain — mirrors _watcher_view_warn_once's path).
+_watch_hotkeys_marker_file() {
+  printf '%s' "${TREES:-${WORKTREES_DIR:-${TMPDIR:-/tmp}}}/.agent-watch-hotkeys-view"
+}
+
+_WATCH_HOTKEYS_LISTENER_PID=""   # set once the background listener is actually spawned
+_WATCH_HOTKEYS_SEEN=""           # last marker-file content this process has already acted on
+
+# _watch_hotkeys_listener_loop — THE background listener body (never called from the tick loop; only
+# ever run as the child of `_watch_hotkeys_listener_spawn`'s `&`). Saves the caller's stty state,
+# switches stdin to raw single-keystroke mode, then blocks in an ordinary `read -n 1` loop — a real
+# blocking wait, costing zero CPU while idle, exactly the shape every other long-lived herdkit
+# listener uses. Restores stty on ANY exit (TERM from the parent's cleanup, or stdin closing under it)
+# so a killed/orphaned listener never leaves the pane's tty in raw mode. Fail-soft: a non-tty stdin (no
+# controlling terminal at all) makes `stty -g` fail and the loop returns at once, touching nothing.
+_watch_hotkeys_listener_loop() {
+  local _whl_marker _whl_saved _whl_n=0 _whl_key
+  _whl_marker="$(_watch_hotkeys_marker_file)"
+  _whl_saved="$(stty -g 2>/dev/null)" || return 0
+  trap '[ -n "$_whl_saved" ] && stty "$_whl_saved" 2>/dev/null' EXIT TERM
+  stty -icanon -echo min 1 time 0 2>/dev/null || return 0
+  while IFS= read -r -n 1 _whl_key; do
+    case "$_whl_key" in
+      v|V)
+        _whl_n=$((_whl_n + 1))
+        printf '%s\n' "$_whl_n" > "${_whl_marker}.tmp.$$" 2>/dev/null \
+          && mv -f "${_whl_marker}.tmp.$$" "$_whl_marker" 2>/dev/null
+        ;;
+    esac
+  done
+}
+
+# _watch_hotkeys_listener_spawn — ONE-SHOT at watcher startup (mirrors _startup_reap_sweep and its
+# siblings, called once just before the live tick loop begins). Byte-inert unless
+# `_watch_hotkeys_active` — the enabled+tty check runs BEFORE anything else touches stdin, so
+# WATCH_HOTKEYS=off (the ship default) never calls stty, never forks the listener, never touches the
+# marker file. Deliberately does NOT touch the process's EXIT/INT/TERM traps itself — bash traps
+# overwrite rather than chain, and _acquire_watcher_singleton already owns them; its
+# _watcher_lock_cleanup trap (below) also calls _watch_hotkeys_listener_stop, unconditionally and
+# fail-soft, so a listener that was never spawned costs that call nothing.
+_watch_hotkeys_listener_spawn() {
+  _watch_hotkeys_active || return 0
+  rm -f "$(_watch_hotkeys_marker_file)" 2>/dev/null || true
+  _watch_hotkeys_listener_loop &
+  _WATCH_HOTKEYS_LISTENER_PID=$!
+}
+
+# _watch_hotkeys_listener_stop — SIGTERM -> bounded grace -> SIGKILL the listener (if one was ever
+# spawned), mirroring this file's other worker-teardown seams (_health_terminate_worker) rather than a
+# bare fire-and-forget `kill`, so a listener that ignores/misses TERM (or a slow signal delivery under
+# load) still cannot outlive a watcher exit/restart as an orphaned raw-mode reader on the pane's tty.
+# Idempotent; safe to call even when the feature was never armed (empty PID ⇒ no-op).
+_watch_hotkeys_listener_stop() {
+  local _whs_pid="$_WATCH_HOTKEYS_LISTENER_PID" _whs_i
+  [ -n "$_whs_pid" ] || return 0
+  _WATCH_HOTKEYS_LISTENER_PID=""
+  kill -TERM "$_whs_pid" 2>/dev/null || true
+  for _whs_i in 1 2 3 4 5 6; do
+    kill -0 "$_whs_pid" 2>/dev/null || return 0
+    _health_term_sleep
+  done
+  kill -KILL "$_whs_pid" 2>/dev/null || true
+}
+
+# _watch_hotkeys_poll_tick — called ONCE per tick, EARLY (before build_header/the PR fetch), so a flip
+# takes effect on the SAME tick it was pressed. Reads ONLY a plain regular file — never the tty, never
+# blocking — so its cost is a constant few milliseconds whether or not a key was ever pressed (this is
+# the NON-BLOCKING proof: see the timing assertion in tests/test-watch-hotkeys.sh). A changed marker
+# (a real keystroke landed since the last tick) flips WATCHER_VIEW mine<->all in memory; anything else
+# — not active, marker absent/unchanged, a corrupt read — is a silent no-op.
+_watch_hotkeys_poll_tick() {
+  _watch_hotkeys_active || return 0
+  local _whp_marker _whp_cur
+  _whp_marker="$(_watch_hotkeys_marker_file)"
+  _whp_cur="$(cat "$_whp_marker" 2>/dev/null || true)"
+  [ -n "$_whp_cur" ] || return 0
+  [ "$_whp_cur" != "$_WATCH_HOTKEYS_SEEN" ] || return 0
+  _WATCH_HOTKEYS_SEEN="$_whp_cur"
+  case "$(_watcher_view_lens)" in
+    mine) WATCHER_VIEW="all" ;;
+    *)    WATCHER_VIEW="mine" ;;
+  esac
+  journal_append watch_hotkey key v view "$WATCHER_VIEW"
+}
+
+# build_hotkey_hint — the rendered "v: view (<lens>)" hint row, empty (byte-identical console) unless
+# the seam is actually armed on THIS process's own tty. Mirrors every other build_* row: a pure local
+# read, safe to call every tick.
+HOTKEY_HINT_ROW=""
+build_hotkey_hint() {
+  HOTKEY_HINT_ROW=""
+  _watch_hotkeys_active || return 0
+  HOTKEY_HINT_ROW="  ${C_DIM}v: view (${C_RESET}${C_BOLD}$(_watcher_view_lens)${C_RESET}${C_DIM})${C_RESET}"$'\n'
+}
+
 # ── Multi-user / team mode: STRICT ownership gate for auto-merge (SAFETY-CRITICAL) ───────────────
 # WATCHER_SCOPE selects WHICH PRs the watcher may AUTO-MERGE. It is a NARROWING gate layered on top
 # of the watcher-view lens above: like the lens it can only ever WITHHOLD a merge, never authorize
@@ -18108,6 +18260,10 @@ _acquire_watcher_singleton() {
   _watcher_lock_cleanup() {
     [ "$(cat "$HERD_WATCHER_LOCK" 2>/dev/null)" = "$$" ] \
       && rm -f "$HERD_WATCHER_LOCK" 2>/dev/null || true
+    # HERD-674: terminate the in-console hotkey listener (if one was ever spawned) so a watcher
+    # exit/restart never leaves an orphaned raw-mode reader on the pane's tty. Fail-soft no-op when
+    # WATCH_HOTKEYS was never armed (empty PID).
+    _watch_hotkeys_listener_stop
   }
   trap '_watcher_lock_cleanup' EXIT
   trap '_watcher_lock_cleanup; exit 1' INT TERM
@@ -18325,7 +18481,13 @@ _tick_render_reconcile() {
   # no-op when the lever is off or in dry-run; guarded so nothing inside it can end the loop.
   _engine_seat_reconcile_tick || true
 
+  # HERD-674: apply any pending 'v' keypress BEFORE this tick's build_* pass, so a flip is reflected in
+  # both the hint row and the PR-selection lens on the SAME tick it was pressed. Byte-inert unless
+  # WATCH_HOTKEYS is on AND armed — see _watch_hotkeys_poll_tick's own header for the non-blocking proof.
+  _watch_hotkeys_poll_tick
+
   build_header
+  build_hotkey_hint
   build_landed
   build_reconcile_pending
   build_blocked
@@ -20236,6 +20398,11 @@ _sweep_reviewer_registry
 # so the shared _resolver_agent_alive liveness check (a live resolver is always spared) has a roster.
 AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 _sweep_stale_resolve_tabs
+
+# One-shot at STARTUP: arm the in-console 'v' hotkey listener (HERD-674) — byte-inert unless
+# WATCH_HOTKEYS is on AND this process's own stdin is a real interactive tty; see
+# _watch_hotkeys_listener_spawn's own header.
+_watch_hotkeys_listener_spawn
 
 # HERD-548 leg 2: about to enter the live tick loop — the whole one-shot startup sequence above has
 # run without this process dying, which is meaningfully further than any of the guard-exit paths above
