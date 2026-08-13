@@ -32,9 +32,15 @@
 #        that guard from a live scoped selection — proving the union really reads the committed file
 #        rather than a value that merely happens to agree with it right now.
 #   (5)  FAIL-CLOSED, wide-blast: EACH documented wide-blast path selects the curated set EXACTLY.
-#   (6)  FAIL-CLOSED, unmappable: a path no rule maps (docs, a nested backend, a template, a Python
-#        module) selects the curated set EXACTLY — and it does so even when it is mixed in with a
-#        perfectly mappable path, so one unprovable file in a diff re-arms the whole suite.
+#   (6)  FAIL-CLOSED, unmappable: a path no rule maps (a nested backend, a template, a Python module)
+#        selects the curated set EXACTLY — and it does so even when it is mixed in with a perfectly
+#        mappable path, so one unprovable file in a diff re-arms the whole suite.
+#   (6b) HERD-733 DOCS MAPPING: README.md / docs/** / a top-level *.md select the enumerated
+#        doc-drift/caps-sync/conformance lint tests + the always-run core — NOT the full curated set
+#        (the PR #800 regression this ships to fix: a docs-only diff used to fail closed to the whole
+#        ~350-test suite).
+#   (6c) HERD-733 MIXED: a docs path beside a mapped code path selects the UNION — doc-lint + core +
+#        the paired test — never a fail-closed full run.
 #   (7)  NO CHANGED PATHS AT ALL → the curated set (the same thorough-side default healthcheck.sh
 #        uses when it cannot tell what changed).
 #   (8)  A changed tests/test-<name>.sh selects ITSELF.
@@ -181,15 +187,51 @@ done
 ok "(5) every documented wide-blast path selects the entire curated set"
 
 # ── (6) FAIL-CLOSED: an unmappable path selects everything — even alongside a mappable one ─────────
-for p in README.md docs/codemap.md templates/postures.tsv pysrc/herd/live_runtime.py \
+# NOTE: README.md / docs/*.md are NOT unmappable any more — rule (2) DOCS MAPPING (HERD-733) below
+# claims them; this list is deliberately the paths that stay outside every rule.
+for p in templates/postures.tsv pysrc/herd/live_runtime.py \
          scripts/herd/backends/github.sh scripts/ci/run-suite.sh .github/workflows/ci.yml; do
   got="$(herd_suite_tests_for_diff "$ROOT/tests" "$p")"
   [ "$got" = "$CURATED" ] || fail "(6) unmappable path '$p' must select the FULL curated set"
 done
-mixed="$(herd_suite_tests_for_diff "$ROOT/tests" scripts/herd/journal.sh README.md)"
+mixed="$(herd_suite_tests_for_diff "$ROOT/tests" scripts/herd/journal.sh pysrc/herd/live_runtime.py)"
 [ "$mixed" = "$CURATED" ] \
   || fail "(6) ONE unmappable path in a diff must re-arm the whole suite, even beside a mapped path"
 ok "(6) an unmappable path selects everything, and re-arms the whole suite when mixed with a mapped one"
+
+# ── (6b) DOCS MAPPING (HERD-733): README.md / docs/** / a top-level *.md select the doc-drift/
+# caps-sync/conformance lint tests + the always-run core — NOT the full curated set. This is the fix
+# for the PR #800 regression: a docs-only PR ran the full ~350-test suite because README.md/docs/*.md
+# paths matched no PAIRING/DECLARED-DEPS rule and fell through to FAIL-CLOSED.
+DOCS_LINT="${HERD_SUITE_DOCS_LINT_TESTS:-test-doc-drift.sh test-caps-sync-light.sh test-conformance.sh}"
+docs_expected_raw=""
+for c in $DOCS_LINT $CORE; do
+  has "$CURATED" "$c" && docs_expected_raw="${docs_expected_raw}${c}"$'\n'
+done
+docs_expected="$(printf '%s\n' "$docs_expected_raw" | sed '/^$/d' | LC_ALL=C sort -u)"
+for p in README.md docs/codemap.md docs/spikes/work-unit-abstraction.md AGENTS.md; do
+  got="$(herd_suite_tests_for_diff "$ROOT/tests" "$p")"
+  [ "$got" = "$docs_expected" ] || fail "(6b) docs path '$p' must select exactly the doc-lint tests + core.
+--- got ---
+$got
+--- want ---
+$docs_expected"
+  [ "$got" != "$CURATED" ] \
+    || fail "(6b) docs path '$p' must NOT fail closed to the entire curated set (the HERD-733 regression)"
+done
+ok "(6b) a docs-only diff (README.md / docs/**/*.md / a top-level *.md) selects exactly the doc-lint tests + core, never the full suite"
+
+# ── (6c) MIXED docs + a mapped code path → UNION, never fail-closed ────────────────────────────────
+mixed_docs="$(herd_suite_tests_for_diff "$ROOT/tests" scripts/herd/journal.sh README.md)"
+mixed_expected="$(printf '%s\ntest-journal.sh\n' "$docs_expected" | sed '/^$/d' | LC_ALL=C sort -u)"
+[ "$mixed_docs" = "$mixed_expected" ] || fail "(6c) a docs path mixed with a mapped code path must UNION.
+--- got ---
+$mixed_docs
+--- want ---
+$mixed_expected"
+[ "$mixed_docs" != "$CURATED" ] \
+  || fail "(6c) a mixed docs+code diff must not fail closed to the entire curated set"
+ok "(6c) a docs path mixed with a mapped code path selects the UNION (doc-lint + core + the paired test), not the full suite"
 
 # ── (7) no changed paths at all → the curated set ──────────────────────────────────────────────────
 [ "$(herd_suite_tests_for_diff "$ROOT/tests")" = "$CURATED" ] \
