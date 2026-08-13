@@ -821,6 +821,11 @@ herd_theme_load_console
 . "$HERE/resolver-pane.sh"
 # shellcheck source=/dev/null
 . "$HERE/resolver-claim.sh"
+# HERD-661 (GH #639 phase 2): the live builder-state publish/consume channel TEAM_PRESENCE=live reads
+# and writes through. Sourced unconditionally like resolver-claim.sh above — every function inside is
+# a no-op unless a caller actively invokes it, so sourcing costs nothing on the byte-inert (off) path.
+# shellcheck source=/dev/null
+. "$HERE/team-presence-live.sh"
 _pol="$(_effective_merge_policy)"
 AUTOMERGE=""; MERGE_OBSERVE=""
 case "$_pol" in
@@ -2593,11 +2598,15 @@ _adopt_remote_prs_explicitly_off() {
 # Fail-soft: a row missing its PR number renders nothing (drops out of the section).
 #
 # THREE forms, first match wins:
-#   1. HERD-527/HERD-663 ATTRIBUTED — the TEAM_PRESENCE cache attributes this PR to a teammate mid-
-#      build on their own machine: '👤 #<pr> <title> · <name> — building <id>' (a compact form
-#      replacing the older, wordier 'ungated here · <handle> building <id> on their machine'; <name>
-#      goes through TEAM_ALIASES). "adopt this" is exactly the wrong advice for a PR someone else is
-#      actively building, so the adopt nudge never appears on this row.
+#   1. HERD-527/HERD-663/HERD-661 ATTRIBUTED — the TEAM_PRESENCE cache attributes this PR to a
+#      teammate mid-build on their own machine: '👤 #<pr> <title> · <name> — building <id>' (a compact
+#      form replacing the older, wordier 'ungated here · <handle> building <id> on their machine';
+#      <name> goes through TEAM_ALIASES). Under TEAM_PRESENCE=live ONLY, a trailing freshness clause
+#      is appended when the live channel (team-presence-live.sh) has a marker for this PR: ' · active
+#      2m ago' (fresh) or ' · last active 3h ago (stale?)' (past _TEAM_PRESENCE_LIVE_STALE_SECS) — a
+#      plain TEAM_PRESENCE=on row, or a live row with no reachable marker, appends nothing and is
+#      BYTE-IDENTICAL to the on-only row. "adopt this" is exactly the wrong advice for a PR someone
+#      else is actively building, so the adopt nudge never appears on this row.
 #   2. HERD-663 AUTHOR FALLBACK — no tracker attribution, but the PR's `author` (present in team mode,
 #      HERD-401's _watcher_tick_fields) is known and is NOT this seat's own identity (_watcher_owner_
 #      login, memoized — see build_ungated_prs, which resolves it once per render BEFORE the row
@@ -2618,14 +2627,29 @@ EOF
   [ -n "${_ug_pr:-}" ] || return 0
   _ug_who="$(_team_presence_lookup "$_ug_pr")"
   if [ -n "$_ug_who" ]; then
-    local _ug_id _ug_assignee _ug_display
-    IFS=$'\t' read -r _ug_id _ug_assignee <<EOF
+    local _ug_id _ug_assignee _ug_status _ug_live_epoch _ug_live="" _ug_display
+    IFS=$'\t' read -r _ug_id _ug_assignee _ug_status _ug_live_epoch <<EOF
 $_ug_who
 EOF
+    # HERD-661 (GH #639 phase 2): TEAM_PRESENCE=live only — when the consume leg found a fresh live
+    # marker for this PR, append the freshness clause. Absent/unparseable epoch (TEAM_PRESENCE=on, or
+    # live with no reachable channel) leaves _ug_live empty, so the row is BYTE-IDENTICAL to on/HERD-663.
+    case "${_ug_live_epoch:-}" in
+      ''|*[!0-9]*) ;;
+      *)
+        local _ug_age=$(( $(_console_now_epoch) - _ug_live_epoch ))
+        [ "$_ug_age" -lt 0 ] && _ug_age=0
+        if [ "$_ug_age" -lt "$_TEAM_PRESENCE_LIVE_STALE_SECS" ]; then
+          _ug_live=" · active $(_fmt_age "$_ug_age") ago"
+        else
+          _ug_live=" · last active $(_fmt_age "$_ug_age") ago (stale?)"
+        fi
+        ;;
+    esac
     _ug_display="$(_team_alias_display "$_ug_assignee")"
-    printf '    %s👤%s %s#%s%s %s · %s — building %s%s' \
+    printf '    %s👤%s %s#%s%s %s · %s — building %s%s%s' \
       "$C_YELLOW" "$C_RESET" "$C_BOLD" "$_ug_pr" "$C_RESET" "${_ug_title:-}" \
-      "$_ug_display" "$_ug_id" "$C_RESET"
+      "$_ug_display" "$_ug_id" "$_ug_live" "$C_RESET"
     return 0
   fi
   if [ -n "${_ug_author:-}" ] && [ "$_ug_author" != "$(_watcher_owner_login)" ]; then
@@ -2761,14 +2785,30 @@ build_ungated_prs() {
 # roster call, both on the ~60 s cadence the adopt leg already uses. Their result is a ledger the repaint
 # reads from memory. Zero reads when TEAM_PRESENCE is off, and zero when nothing is ungated.
 
-# _team_presence_enabled — true iff TEAM_PRESENCE opts in. Default OFF; any unrecognized value reads as
-# off (fail toward the byte-identical console), mirroring _adopt_remote_prs_enabled.
+# _team_presence_enabled — true iff TEAM_PRESENCE opts into AT LEAST the phase-1 tracker join (on OR
+# live — live is additive on top of on, never a replacement for it). Default OFF; any unrecognized
+# value reads as off (fail toward the byte-identical console), mirroring _adopt_remote_prs_enabled.
 _team_presence_enabled() {
   case "$(printf '%s' "${TEAM_PRESENCE:-off}" | tr '[:upper:]' '[:lower:]')" in
-    1|true|on|yes|enable|enabled) return 0 ;;
+    1|true|on|yes|enable|enabled|live) return 0 ;;
     *) return 1 ;;
   esac
 }
+
+# _team_presence_live_enabled — true iff TEAM_PRESENCE is the THIRD value, "live" (HERD-661, GH #639
+# phase 2): arms the publish leg (this seat upserts its own live builder state) and the consume
+# upgrade (attributed rows read that state back and render a freshness clause) ON TOP OF the phase-1
+# tracker join above. TEAM_PRESENCE=on stays exactly today's behavior — this reads false for it.
+_team_presence_live_enabled() {
+  [ "$(printf '%s' "${TEAM_PRESENCE:-off}" | tr '[:upper:]' '[:lower:]')" = "live" ]
+}
+
+# _TEAM_PRESENCE_LIVE_STALE_SECS — a live row's epoch older than this renders "last active … ago
+# (stale?)" instead of "active … ago". Comfortably above the ~60s publish cadence
+# (_TEAM_PRESENCE_SCAN_INTERVAL) so ordinary scan jitter or one missed tick never flips a live builder
+# to looking stale; a seat that stopped publishing (worktree reaped, watcher down) ages past it
+# honestly. Not a config key — a fixed, documented constant, like resolver-claim.sh's TTL default.
+_TEAM_PRESENCE_LIVE_STALE_SECS=300
 
 # _TEAM_PRESENCE_CACHE — this render's in-memory copy of $TEAM_PRESENCE_LEDGER ("<pr>\t<id>\t<assignee>"
 # rows). Always EMPTY when the feature is off, so _team_presence_lookup is a single string test on the
@@ -2785,16 +2825,20 @@ _team_presence_load() {
   return 0
 }
 
-# _team_presence_lookup <pr#> → "<item-id>\t<assignee>" when this tick's cache attributes that PR to a
-# teammate mid-build, else nothing. Pure in-memory; never touches the network or the tracker.
+# _team_presence_lookup <pr#> → "<item-id>\t<assignee>\t<status>\t<epoch>" when this tick's cache
+# attributes that PR to a teammate mid-build, else nothing. The trailing status/epoch fields are only
+# ever non-empty under TEAM_PRESENCE=live (HERD-661) — a plain TEAM_PRESENCE=on row is exactly the
+# 2-field shape phase 1 shipped, so a 3-var `read` of a 2-field row leaves both trailing vars empty
+# and _ungated_pr_row's live branch is simply never taken (byte-identical to on). Pure in-memory;
+# never touches the network or the tracker.
 _team_presence_lookup() {
-  local _tp_pr="${1:-}" _tp_line _tp_num _tp_id _tp_who
+  local _tp_pr="${1:-}" _tp_num _tp_id _tp_who _tp_status _tp_epoch
   [ -n "$_tp_pr" ] || return 0
   [ -n "$_TEAM_PRESENCE_CACHE" ] || return 0
-  while IFS=$'\t' read -r _tp_num _tp_id _tp_who; do
+  while IFS=$'\t' read -r _tp_num _tp_id _tp_who _tp_status _tp_epoch; do
     [ "$_tp_num" = "$_tp_pr" ] || continue
     [ -n "${_tp_id:-}" ] && [ -n "${_tp_who:-}" ] || continue
-    printf '%s\t%s' "$_tp_id" "$_tp_who"
+    printf '%s\t%s\t%s\t%s' "$_tp_id" "$_tp_who" "${_tp_status:-}" "${_tp_epoch:-}"
     return 0
   done <<EOF
 $_TEAM_PRESENCE_CACHE
@@ -2934,10 +2978,60 @@ _team_presence_scan() {
   _tp_roster="$(_team_presence_roster)"
   _tp_rows="$(_team_presence_resolve "$_tp_ungated" "${_tp_bodies:-[]}" "$_tp_roster")"
   if [ -n "$_tp_rows" ]; then
+    _team_presence_live_enabled && _tp_rows="$(_team_presence_live_augment "$_tp_rows")"
     printf '%s\n' "$_tp_rows" > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true
   else
     : > "$TEAM_PRESENCE_LEDGER" 2>/dev/null || true
   fi
+  return 0
+}
+
+# _team_presence_live_augment <attribution-rows> — HERD-661 (GH #639 phase 2) CONSUME leg. Given
+# phase 1's "<pr>\t<item-id>\t<assignee>" rows, appends "\t<status>\t<epoch>" to each by reading that
+# PR's live marker (team-presence-live.sh) — bounded to the ALREADY-attributed PRs (typically a small
+# set), on the SAME ~60s scan cadence, never the 4s repaint. A PR with no live marker (channel
+# unreachable/absent, or a teammate on TEAM_PRESENCE=on who never publishes) keeps its plain 3-field
+# row — _team_presence_lookup/_ungated_pr_row read that identically to TEAM_PRESENCE=on's rendering,
+# so "fail-soft everywhere" holds per-row, not just per-scan.
+_team_presence_live_augment() {
+  local _tla_in="$1" _tla_pr _tla_id _tla_who _tla_live
+  while IFS=$'\t' read -r _tla_pr _tla_id _tla_who; do
+    [ -n "$_tla_pr" ] || continue
+    _tla_live="$(_team_presence_live_status_for "$_tla_pr")"
+    if [ -n "$_tla_live" ]; then
+      printf '%s\t%s\t%s\t%s\n' "$_tla_pr" "$_tla_id" "$_tla_who" "$_tla_live"
+    else
+      printf '%s\t%s\t%s\n' "$_tla_pr" "$_tla_id" "$_tla_who"
+    fi
+  done <<EOF
+$_tla_in
+EOF
+}
+
+# _team_presence_live_publish_tick — HERD-661 (GH #639 phase 2) PUBLISH leg. Runs on the SAME ~60s
+# scan cadence as _team_presence_scan just above (a RECONCILED invariant, never an event side-effect
+# — see the shared _TEAM_PRESENCE_SCAN_TICK throttle at the tick-loop call site), iterating this
+# tick's already-discovered FEATS table (zero extra gh for discovery — the exact records the
+# orphan/ungated legs already computed) and upserting a live-state marker on every worktree that (a)
+# resolved to an open PR and (b) is authored by THIS seat. A worktree ADOPTED from another author
+# (ADOPT_REMOTE_PRS: built by someone else, merely gated here) is never published to — that would
+# misattribute someone else's build as this seat's own. A worktree with no resolved PR publishes
+# nothing ("no PR = nothing published" — the tracker claim already covers pre-PR intent, mirroring
+# phase 1's join). Self-gates on TEAM_PRESENCE=live; every other value is a hard no-op (no FEATS scan,
+# no gh, byte-identical to before this feature).
+_team_presence_live_publish_tick() {
+  _team_presence_live_enabled || return 0
+  local _tlpt_me; _tlpt_me="$(_team_presence_live_seat)"
+  [ -n "$_tlpt_me" ] || return 0   # unresolvable identity — never publish under "" (fail-soft)
+  local _tlpt_rec _tlpt_dir _tlpt_slug _tlpt_branch _tlpt_pr _tlpt_mergeable _tlpt_mss _tlpt_astatus _tlpt_oid _tlpt_author _tlpt_rest
+  for _tlpt_rec in ${FEATS[@]+"${FEATS[@]}"}; do
+    IFS=$'\037' read -r _tlpt_dir _tlpt_slug _tlpt_branch _tlpt_pr _tlpt_mergeable _tlpt_mss _tlpt_astatus _tlpt_oid _tlpt_author _tlpt_rest <<EOF
+$_tlpt_rec
+EOF
+    [ -n "${_tlpt_pr:-}" ] || continue
+    [ -n "${_tlpt_author:-}" ] && [ "$_tlpt_author" = "$_tlpt_me" ] || continue
+    _team_presence_live_publish "$_tlpt_pr" "$_tlpt_slug" "$_tlpt_me" "${_tlpt_astatus:-}"
+  done
   return 0
 }
 
@@ -18773,6 +18867,10 @@ EOF
     _TEAM_PRESENCE_SCAN_TICK=$((_TEAM_PRESENCE_SCAN_TICK + 1))
     if [ "$_TEAM_PRESENCE_SCAN_TICK" -ge "$_TEAM_PRESENCE_SCAN_INTERVAL" ]; then
       _TEAM_PRESENCE_SCAN_TICK=0
+      # HERD-661 (GH #639 phase 2): PUBLISH this seat's own live builder state BEFORE consuming
+      # everyone else's, on the identical throttled tick — seat-symmetric (every seat runs both
+      # legs), and ordering this first means a fresh watcher's very first scan can see its own row.
+      _team_presence_live_publish_tick
       _team_presence_scan
     fi
   fi
