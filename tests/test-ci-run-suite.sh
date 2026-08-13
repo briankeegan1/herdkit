@@ -147,17 +147,19 @@ done
 printf '#!/usr/bin/env bash\n: alpha\n' > "$SR/scripts/herd/alpha.sh"
 printf '#!/usr/bin/env bash\n: beta\n'  > "$SR/scripts/herd/beta.sh"
 printf 'test-core-guard.sh\n' > "$SR/tests/scope-core.tsv"     # the always-run core, in every selection
-printf '# fixture readme\n' > "$SR/README.md"                  # an UNMAPPABLE path (fail-closed probe)
+# an UNMAPPABLE path (fail-closed probe) — NOT README.md/docs/*.md: HERD-733 maps those to the
+# doc-lint tests instead of failing closed, so the probe here must be a non-docs, non-paired path.
+printf 'fixture blob\n' > "$SR/blob.dat"
 # curated mode needs a herd.bats the runner's parse guard accepts (it never runs it AS bats).
 printf '#!/usr/bin/env bats\n\n@test "fixture placeholder" {\n  true\n}\n' > "$SR/tests/herd.bats"
 chmod +x "$SR/tests"/*.sh
 
 GITQ=(git -C "$SR" -c user.email=t@t -c user.name=t)
 "${GITQ[@]}" init -q
-"${GITQ[@]}" add README.md scripts/herd/alpha.sh scripts/herd/beta.sh tests/herd.bats \
+"${GITQ[@]}" add blob.dat scripts/herd/alpha.sh scripts/herd/beta.sh tests/herd.bats \
   tests/scope-core.tsv tests/test-alpha.sh tests/test-beta.sh tests/test-gamma.sh \
   tests/test-delta.sh tests/test-epsilon.sh tests/test-core-guard.sh
-"${GITQ[@]}" commit -q -m base -- README.md scripts tests
+"${GITQ[@]}" commit -q -m base -- blob.dat scripts tests
 "${GITQ[@]}" branch scope-base                                 # the "PR base branch" this diffs against
 
 ALL_SIX="$(printf 'test-alpha.sh\ntest-beta.sh\ntest-core-guard.sh\ntest-delta.sh\ntest-epsilon.sh\ntest-gamma.sh\n')"
@@ -217,8 +219,8 @@ pass
 
 # (8) FAIL-CLOSED, unmappable path: one file no rule maps re-arms the WHOLE curated set, and the run
 # is identical to the unscoped one — the byte-identical guarantee that makes narrowing safe.
-printf '# fixture readme touched\n' > "$SR/README.md"
-"${GITQ[@]}" commit -q -m touch-readme -- README.md
+printf 'fixture blob touched\n' > "$SR/blob.dat"
+"${GITQ[@]}" commit -q -m touch-blob -- blob.dat
 scope_run 1 1 scope-base
 [ "$RC" -eq 0 ] || fail "(8) fail-closed run: expected rc 0, got $RC.  Out:\n$OUT"
 grep -q "scoped 6 of 6 curated tests (fail-closed:" <<< "$OUT" \

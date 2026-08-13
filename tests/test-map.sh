@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # test-map.sh — hermetic test for the `herd map` subcommand (bin/herd → cmd_map).
 #
+# suite-deps: docs/control-room-map.md
+#
+# HERD-733: section 2/2b below greps the REAL, committed docs/control-room-map.md for dozens of
+# content needles (pipeline stages, gating capability names, operator commands), so a docs-only diff
+# that edits this file must still select this test — a docs-scoped selection that ran only the
+# doc-drift/caps-sync/conformance lint tests would let those assertions silently stop running.
+#
 # `herd map` RENDERS the committed operator-facing docs/control-room-map.md (glow if available,
 # else cat; fail-soft). It is deliberately DISTINCT from `herd codemap`, which regenerates a
 # scanned artifact. This asserts the contract from HERD-148:

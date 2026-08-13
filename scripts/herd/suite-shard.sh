@@ -43,19 +43,35 @@
 #   unrecognized value reads as FULL: a typo must never silently narrow the authoritative gate.
 #
 # herd_suite_tests_for_diff <tests_dir> <changed-path>...
-#   Prints the curated tests this diff can affect, one per line, LC_ALL=C sorted. THREE rules, in
-#   order — and the third is the one that makes the other two safe:
+#   Prints the curated tests this diff can affect, one per line, LC_ALL=C sorted. FOUR rules, in
+#   order — and the last is the one that makes the other three safe:
 #     (1) PAIRING (the gate-coverage convention, HERD-292): a changed scripts/herd/<name>.sh selects
 #         its paired tests/test-<name>.sh. A changed tests/test-<name>.sh selects itself.
-#     (2) DECLARED DEPS: a test may declare cross-file coverage with a
+#     (2) DOCS MAPPING (HERD-733): README.md, any docs/** path, and any other *.md file AT ANY DEPTH
+#         (never one under tests/, which rule (1) already governs — the case pattern below is NOT
+#         restricted to the repo root) selects the enumerated doc-drift/caps-sync/conformance lint
+#         tests (HERD_SUITE_DOCS_LINT_TESTS below) instead of falling through to FAIL-CLOSED. A
+#         documentation-only diff cannot break engine logic, but it CAN drift out of sync with the
+#         manifest those lints check docs against — this is the fix for the regression PR #800
+#         exposed: a docs-only PR ran the full ~350-test suite (12.3m) because README.md/docs/*.md
+#         paths matched no PAIRING/DECLARED-DEPS rule and fell through to (4). A curated test that
+#         asserts on a SPECIFIC doc's real content (test-driver-abstraction.sh on
+#         docs/driver-abstraction.md, test-map.sh on docs/control-room-map.md) is NOT covered by the
+#         three enumerated lints — those tests declare their own `# suite-deps:` header (rule (3)
+#         below) so a diff to the doc they assert on still unions them in.
+#     (3) DECLARED DEPS: a test may declare cross-file coverage with a
 #             # suite-deps: <path-or-glob> [<path-or-glob>…]
 #         header line. Any changed path matching a token selects that test. This is how a test that
 #         covers a file it is not NAME-paired with (a template, a backend, a sibling script) stays
-#         selected — the escape hatch that keeps rule (1)'s narrowness honest.
-#     (3) FAIL-CLOSED: any changed path that rules (1)+(2) cannot map, and any path on the
+#         selected — the escape hatch that keeps rules (1)/(2)'s narrowness honest.
+#     (4) FAIL-CLOSED: any changed path that rules (1)-(3) cannot map, and any path on the
 #         WIDE-BLAST list (bin/herd, herd-config.sh, agent-watch.sh, either healthcheck wrapper,
 #         templates/capabilities.tsv, this library, and the bats discovery surface), selects the
 #         ENTIRE curated set. Unmappable never means "select nothing"; it means "select everything".
+#         A non-docs unmappable path stays unmappable — rule (2) narrows ONLY docs-shaped paths.
+#   MIXED diffs union every rule that fires: a docs path beside a paired scripts/herd/<name>.sh diff
+#   selects the doc-lint tests + the paired test + the core, never the full set — only a path NONE of
+#   rules (1)-(3) can map re-arms FAIL-CLOSED, even when it sits beside an otherwise-mappable path.
 #   Plus an ALWAYS-RUN CORE (herd_suite_core_tests, HERD-585: sourced from the committed
 #   tests/scope-core.tsv): the cross-cutting manifest/lint/hermeticity proofs that ANY diff can trip
 #   regardless of which file it touched. The core is unioned into every scoped selection, so scoping
@@ -109,6 +125,13 @@ herd_suite_core_tests() {
 #   • tests/herd.bats, tests/discover-tests.bash, tests/gate-coverage-exempt.tsv — the discovery
 #     surface that decides what "the suite" even is.
 HERD_SUITE_WIDE_BLAST="${HERD_SUITE_WIDE_BLAST:-bin/herd scripts/herd/herd-config.sh scripts/herd/agent-watch.sh scripts/herd/healthcheck.sh .herd/healthcheck.project.sh templates/capabilities.tsv scripts/herd/suite-shard.sh tests/herd.bats tests/discover-tests.bash tests/gate-coverage-exempt.tsv}"
+
+# DOCS-LINT tests (HERD-733): the enumerated doc-drift/caps-sync/conformance lint tests a docs-only
+# diff selects instead of falling through to FAIL-CLOSED (see herd_suite_tests_for_diff's rule (2)
+# above). An explicit constant — not a re-derivation from tests/scope-core.tsv — so this mapping
+# stays correct even if a future core trim ever moved one of these names out of the always-run set;
+# today all three already ride in the committed core, so a docs-only selection is exactly the core.
+HERD_SUITE_DOCS_LINT_TESTS="${HERD_SUITE_DOCS_LINT_TESTS:-test-doc-drift.sh test-caps-sync-light.sh test-conformance.sh}"
 
 herd_suite_curated_tests() {
   local _hsc_dir="${1:-}" _hsc_exempt="${2:-}"
@@ -207,7 +230,7 @@ EOF
 }
 
 # herd_suite_tests_for_diff <tests_dir> <changed-path>… — the curated tests this diff can affect,
-# one per line, LC_ALL=C sorted-unique. See the header block for the three rules and the always-run
+# one per line, LC_ALL=C sorted-unique. See the header block for the four rules and the always-run
 # core. Returns the FULL curated set (never nothing) whenever it cannot prove a narrower answer:
 # no changed paths given, a wide-blast path, or a path no rule maps.
 herd_suite_tests_for_diff() {
@@ -231,7 +254,7 @@ herd_suite_tests_for_diff() {
     [ -n "$_hsd_p" ] || continue
     _hsd_p="${_hsd_p#./}"
 
-    # (3a) WIDE-BLAST: a change here can affect anything → the entire curated set, immediately.
+    # (4a) WIDE-BLAST: a change here can affect anything → the entire curated set, immediately.
     for _hsd_t in ${HERD_SUITE_WIDE_BLAST:-}; do
       if [ "$_hsd_p" = "$_hsd_t" ]; then
         [ "$_hsd_restore" -eq 1 ] && set +f
@@ -260,7 +283,23 @@ herd_suite_tests_for_diff() {
         esac ;;
     esac
 
-    # (2) DECLARED DEPS: any test whose `# suite-deps:` header covers this path.
+    # (2) DOCS MAPPING (HERD-733): README.md, any docs/** path, and any other *.md file at any depth
+    # select the enumerated doc-lint tests. A path under tests/ is excluded here — a *.md fixture or
+    # helper living in tests/ is governed by rule (1)/(3), never reclassified as a doc.
+    # _hsd_mapped is set ONLY when a token is actually appended: an explicit
+    # HERD_SUITE_DOCS_LINT_TESTS="" override must fall through to FAIL-CLOSED for a docs path with no
+    # other rule mapping it, the same as emptying HERD_SUITE_WIDE_BLAST falls through elsewhere — never
+    # silently narrow to core-only because this rule claimed the path but had nothing to contribute.
+    case "$_hsd_p" in
+      tests/*) : ;;
+      README.md|docs/*|*.md)
+        for _hsd_t in $HERD_SUITE_DOCS_LINT_TESTS; do
+          [ -n "$_hsd_t" ] || continue
+          _hsd_sel="${_hsd_sel}${_hsd_t}"$'\n'; _hsd_mapped=1
+        done ;;
+    esac
+
+    # (3) DECLARED DEPS: any test whose `# suite-deps:` header covers this path.
     while IFS=$'\t' read -r _hsd_t _hsd_tok; do
       [ -n "$_hsd_t" ] && [ -n "$_hsd_tok" ] || continue
       # shellcheck disable=SC2254  # $_hsd_tok is deliberately a PATTERN, not a literal
@@ -271,9 +310,9 @@ herd_suite_tests_for_diff() {
 $_hsd_deps
 EOF
 
-    # (3b) UNMAPPABLE: no pairing, no declared dep → fail CLOSED to the entire curated set. This is
-    # what makes a narrow selection safe: "we could not prove which tests cover this" is answered
-    # with everything, never with nothing.
+    # (4b) UNMAPPABLE: no pairing, no docs mapping, no declared dep → fail CLOSED to the entire
+    # curated set. This is what makes a narrow selection safe: "we could not prove which tests cover
+    # this" is answered with everything, never with nothing.
     if [ "$_hsd_mapped" -eq 0 ]; then
       [ "$_hsd_restore" -eq 1 ] && set +f
       printf '%s\n' "$_hsd_curated"

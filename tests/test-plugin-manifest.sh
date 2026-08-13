@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # test-plugin-manifest.sh — hermetic, network-free validation of the Claude Code plugin wrapper.
 #
+# suite-deps: plugin/skills/herd-coordinator/SKILL.md
+#
+# HERD-733: section 4 below asserts on the REAL, committed SKILL.md's frontmatter and delegation
+# contract, so a docs-only diff that edits this file must still select this test — a docs-scoped
+# selection that ran only the doc-drift/caps-sync/conformance lint tests would let that assertion
+# silently stop running.
+#
 # The plugin is a THIN packaging layer: the herdkit CLI stays the source of truth and the plugin
 # skill delegates to the CLI-rendered coordinator. This test asserts the packaging is valid JSON
 # and internally consistent — the manifest, the marketplace listing, and the wrapper skill all

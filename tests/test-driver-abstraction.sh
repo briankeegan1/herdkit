@@ -4,6 +4,13 @@
 # substitution in bin/herd's render_skill(), selected by the HERD_DRIVER config key (default
 # herdr-claude).
 #
+# suite-deps: docs/driver-abstraction.md
+#
+# HERD-733: check (8) below asserts on the REAL, committed docs/driver-abstraction.md's content
+# (the GH #564 reference and the herdr pane run/send-keys/read permission examples), so a docs-only
+# diff that edits this file must still select this test — a docs-scoped selection that ran only the
+# doc-drift/caps-sync/conformance lint tests would let that assertion silently stop running.
+#
 # The CRITICAL INVARIANT this locks in: with HERD_DRIVER unset/default the rendered coordinator skill
 # is FUNCTIONALLY IDENTICAL to before the abstraction — the key driver incantations appear verbatim
 # and NO {{...}} token survives unsubstituted. This render-equivalence check is the safety rail for a
