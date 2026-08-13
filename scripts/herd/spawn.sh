@@ -17,6 +17,7 @@
 #   HERD_SPAWN_PRIO=<n> spawn.sh <slug> feature "<task>"           # drains in band <n> (HERD-630)
 #   HERD_SPAWN_GEN=<id> spawn.sh <slug> feature "<task>"           # part of published plan <id> (HERD-642;
 #                                                                  #   set by `herd queue plan`, not by hand)
+#   HERD_AGENT=<name> spawn.sh <slug> feature "<task>"             # build it with a SPECIALIST AGENT (HERD-667)
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/herd-config.sh"
@@ -84,6 +85,18 @@ case "$PRIO" in ''|*[!0-9]*) PRIO="" ;; esac
 GEN="${HERD_SPAWN_GEN:-}"
 case "$GEN" in *[!0-9A-Za-z._-]*) GEN="" ;; esac
 
+# Specialist agent (HERD-667) — an OPTIONAL agent-definition NAME the lane should build this item
+# with. Rides its OWN sidecar ($INTENT_ID.agent) for exactly the reason .ref/.after/.prio/.gen do: the
+# .req body's positional slug/lane/task parse is FROZEN (docs/spikes/coordinator-work-queue.md §3.2).
+# The watcher's drain re-exports it as HERD_AGENT so a queued spawn selects the same agent a direct
+# lane invocation would — without it the intent would record an intent nothing acts on.
+# Empty on every ordinary enqueue: no sidecar, no drain-side export, byte-for-byte a pre-HERD-667
+# enqueue. A value carrying anything but plain definition-name characters is DROPPED rather than
+# written, so a typo degrades to a plain builder (which is also what an unknown name does) instead of
+# smuggling an argv token through the queue.
+AGENT="${HERD_AGENT:-}"
+case "$AGENT" in .*|-*|*/*|*[!0-9A-Za-z._-]*) AGENT="" ;; esac
+
 # Enqueue atomically (temp then mv); filename sorts FIFO so oldest is drained first. The tracker ref
 # rides in a SIDECAR ($INTENT_ID.ref) rather than the .req body, so the positional slug/lane/task
 # parse (spawn-step.sh) is unchanged and an intent enqueued by an OLDER engine (no sidecar) still
@@ -122,6 +135,7 @@ INTENT_ID="$(iq_mint_id "$Q")"
 [ -n "$AFTER" ] && printf '%s\n' "$AFTER" > "$Q/$INTENT_ID.after"
 [ -n "$PRIO" ] && printf '%s\n' "$PRIO" > "$Q/$INTENT_ID.prio"
 [ -n "$GEN" ] && printf '%s\n' "$GEN" > "$Q/$INTENT_ID.gen"
+[ -n "$AGENT" ] && printf '%s\n' "$AGENT" > "$Q/$INTENT_ID.agent"
 # Sidecars FIRST, then the atomic publish (temp + one rename), so every sidecar is present the instant
 # the intent becomes claimable.
 iq_publish "$Q" "$INTENT_ID" "$SLUG
@@ -143,5 +157,5 @@ ${WATCHER_OWNER:-}
 sequenced next (spawn intent $INTENT_ID)" >/dev/null 2>&1 || true
 fi
 
-printf '🚀 queued: %s (%s)%s%s%s%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}" "${AFTER:+  after: $AFTER}" "${PRIO:+  prio: $PRIO}" "${GEN:+  gen: $GEN}"
+printf '🚀 queued: %s (%s)%s%s%s%s%s\n' "$SLUG" "$LANE" "${ITEM_REF:+  ref: $ITEM_REF}" "${AFTER:+  after: $AFTER}" "${PRIO:+  prio: $PRIO}" "${GEN:+  gen: $GEN}" "${AGENT:+  agent: $AGENT}"
 printf 'INTENT_ID %s\n' "$INTENT_ID"

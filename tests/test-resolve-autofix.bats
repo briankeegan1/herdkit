@@ -82,13 +82,19 @@ teardown() {
   rm -rf "$T"
 }
 
-# tick <sha> — one CONFLICTING classify + resolve pass, in the SAME order the production tick calls
-# them (_classify_conflict, then _dispatch_conflict_autofix), waiting for the backgrounded resolver
-# lane (HERD-237) to finish before returning so the stub's synchronous verdict write is observable.
+# tick <sha> [author] — one CONFLICTING classify + resolve pass, in the SAME order the production
+# tick calls them (_classify_conflict, then _dispatch_conflict_autofix), waiting for the backgrounded
+# resolver lane (HERD-237) to finish before returning so the stub's synchronous verdict write is
+# observable. [author], when given, is HERD-655's AUTOFIX_SCOPE input; omitted (the default for every
+# test above) queues the bypass sentinel, so those tests stay exactly as they were pre-HERD-655.
 tick() {
   DISPLAY=(); FLAIR_STATE=()
-  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=()
-  _classify_conflict 0 "$PR" "$SLUG" "$BRANCH" "$1"
+  CONF_IDX=(); CONF_SLUG=(); CONF_PR=(); CONF_BRANCH=(); CONF_SHA=(); CONF_REASON=(); CONF_AUTHOR=()
+  if [ "$#" -ge 2 ]; then
+    _classify_conflict 0 "$PR" "$SLUG" "$BRANCH" "$1" "$2"
+  else
+    _classify_conflict 0 "$PR" "$SLUG" "$BRANCH" "$1"
+  fi
   _dispatch_conflict_autofix
   _spawn_resolver_wait
 }
@@ -162,4 +168,60 @@ tick() {
   [ "$(resolver_dispatch_count "$PR")" -eq 2 ]
   resolver_dispatched_sha "$PR" "$SHA2"
   [[ "${DISPLAY[0]}" == *"resolving · auto"* ]]
+}
+
+# ── AUTOFIX_SCOPE (HERD-655, GitHub issue #771): never auto-resolve another operator's conflict ────
+# GROUNDED: this is the exact incident rail -- a seat's RESOLVE_AUTOFIX dispatched a resolver against
+# the OTHER operator's conflicting PR. These cases prove _dispatch_conflict_autofix now consults the
+# shared _autofix_scope_permits check before it ever calls spawn_resolver.
+
+@test "AUTOFIX_SCOPE=own (default) + foreign author: WITHHELD -- no dispatch, no resolve_autodispatch" {
+  RESOLVE_AUTOFIX="on"
+  export WATCHER_OWNER="alice"
+  tick "$SHA1" "bob"
+  [ "$(resolver_dispatch_count "$PR")" -eq 0 ]
+  [ ! -s "$STUB_RESOLVE_LOG" ]
+  [[ "${DISPLAY[0]}" == *"needs you"* ]]
+  [[ "${DISPLAY[0]}" == *"autofix withheld"* ]]
+  grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE"
+  grep -q '"rail":"resolve"' "$JOURNAL_FILE"
+  ! grep -q '"event":"resolve_autodispatch"' "$JOURNAL_FILE"
+}
+
+@test "AUTOFIX_SCOPE=own (default) + own author: PERMITTED -- dispatches exactly like before" {
+  RESOLVE_AUTOFIX="on"
+  export WATCHER_OWNER="alice"
+  tick "$SHA1" "alice"
+  [ "$(resolver_dispatch_count "$PR")" -eq 1 ]
+  [[ "${DISPLAY[0]}" == *"resolving"*"auto"* ]]
+  ! grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE"
+}
+
+@test "AUTOFIX_SCOPE=all + foreign author: PERMITTED -- explicit opt-in restores today's behavior" {
+  RESOLVE_AUTOFIX="on"
+  export AUTOFIX_SCOPE="all" WATCHER_OWNER="alice"
+  tick "$SHA1" "bob"
+  [ "$(resolver_dispatch_count "$PR")" -eq 1 ]
+  [[ "${DISPLAY[0]}" == *"resolving"*"auto"* ]]
+  ! grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE"
+}
+
+@test "AUTOFIX_SCOPE=own + unresolvable operator identity: WITHHELD fail-closed (never fires blind)" {
+  RESOLVE_AUTOFIX="on"
+  # No WATCHER_OWNER/WATCHER_VIEW_AUTHOR, and the stubbed gh (setup()) answers every call with rc 0
+  # and no output -- the identity resolves to empty.
+  tick "$SHA1" "alice"
+  [ "$(resolver_dispatch_count "$PR")" -eq 0 ]
+  [ ! -s "$STUB_RESOLVE_LOG" ]
+  grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE"
+  grep -q '"reason":"noowner"' "$JOURNAL_FILE"
+}
+
+@test "a call site predating AUTOFIX_SCOPE (no author arg) is never scoped -- byte-identical" {
+  RESOLVE_AUTOFIX="on"
+  # No WATCHER_OWNER, no author passed to tick -- mirrors every test above this section verbatim.
+  tick "$SHA1"
+  [ "$(resolver_dispatch_count "$PR")" -eq 1 ]
+  [[ "${DISPLAY[0]}" == *"resolving"*"auto"* ]]
+  ! grep -q '"event":"autofix_scope_withheld"' "$JOURNAL_FILE"
 }

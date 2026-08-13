@@ -309,4 +309,30 @@ ROW_OFF="$(CORE_SURFACE_GLOB="" _gate_phase_row "core-b" " #21" 21 shaB "FALLBAC
   || fail "(8) with the lever off the row must be byte-identical to the fallback (got: $ROW_OFF)"
 ok "(8) the console row is rendered from the SAME marker the gate wrote, and is inert when off"
 
+
+# ══ (9) the EXECUTED CLI must resolve config itself (HERD-669) ══════════════════════════════════
+# Regression: the $0-guarded CLI block never sourced herd-config.sh, so a subprocess invocation
+# (`core-surface.sh scenarios <worktree>`) always saw CORE_SURFACE_GLOB as empty and reported
+# "feature off" — even against a worktree whose diff genuinely touches the core glob. Prove the
+# CLI, run as a real subprocess (never sourced), resolves the SAME project config a sourcing
+# caller would — a synthetic HERD_CONFIG_FILE here, standing in for a project's .herd/config.
+CLI_CFG="$T/cli-config"
+printf 'CORE_SURFACE_GLOB=%q\n' "$GLOB" > "$CLI_CFG"
+
+git -C "$FIX" checkout -q feat/core 2>/dev/null
+CLI_OUT="$(HERD_CONFIG_FILE="$CLI_CFG" bash "$LIB" scenarios "$FIX" main 2>&1)"
+CLI_RC=$?
+[ "$CLI_RC" = 0 ] || fail "(9) CLI scenarios on a core diff must exit 0 (rc=$CLI_RC, out: $CLI_OUT)"
+[ -n "$CLI_OUT" ] || fail "(9) CLI scenarios on a core diff must print non-empty output"
+[ "$CLI_OUT" = "sandbox-scenario.sh" ] || fail "(9) CLI scenarios wrong output: $CLI_OUT"
+ok "(9a) the executed CLI sources config itself: a core diff yields non-empty scenarios + rc=0"
+
+git -C "$FIX" checkout -q feat/noncore 2>/dev/null
+HERD_CONFIG_FILE="$CLI_CFG" bash "$LIB" scenarios "$FIX" main >"$T/cli-noncore.out" 2>&1
+CLI_RC=$?
+[ "$CLI_RC" = 1 ] || fail "(9) CLI scenarios on a non-core diff must exit 1 (rc=$CLI_RC, out: $(cat "$T/cli-noncore.out"))"
+[ -s "$T/cli-noncore.out" ] && fail "(9) CLI scenarios on a non-core diff must print NOTHING (got: $(cat "$T/cli-noncore.out"))"
+ok "(9b) a non-core diff still exits 1 with no output through the same executed CLI path"
+git -C "$FIX" checkout -q feat/core 2>/dev/null
+
 echo "ALL PASS ($pass checks) — CORE_SURFACE_GLOB core-surface gate (HERD-577)"
