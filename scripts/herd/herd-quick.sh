@@ -58,6 +58,10 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # such steps; the watcher owns the pre/post-merge seams. Sourcing DEFINES functions only (CLI dispatch
 # is $0-guarded), so this is byte-inert when .herd/steps.tsv is absent/empty.
 . "$HERE/steps.sh"
+# Specialist agent roster (HERD-667) — sourced for the OPTIONAL HERD_AGENT=<name> selection below.
+# Sourcing DEFINES functions only (CLI dispatch is $0-guarded), so this is byte-inert when HERD_AGENT
+# is unset — the ship default and the byte-identical-spawn case the roster test asserts.
+. "$HERE/agents.sh"
 _HERD_DRIVER_NAME="$(herd_driver_name)"
 # Force-spawn override: a leading --force/-f (or HERD_FORCE_SPAWN=1) bypasses the advisory
 # review-gate saturation check below, for urgent items. Only recognized as the FIRST arg so it can
@@ -155,6 +159,19 @@ _DRIVER_RUNTIME="$(herd_model_driver_for "$_MODEL_REF" 2>/dev/null || true)"; [ 
 # permissions. An explicit HERD_CLAUDE_FLAGS override still wins. Byte-identical for herdr-claude/headless
 # (their permission flag IS --dangerously-skip-permissions). Resolved AFTER _DRIVER_RUNTIME, before spawn.
 CLAUDE_FLAGS="$(herd_driver_lane_permission_flags "$_DRIVER_RUNTIME")"
+# Specialist agent selection (HERD-667) — OPTIONAL, opt-in via HERD_AGENT=<name>, resolved against the
+# RESOLVED runtime driver so each runtime gets the mechanism it actually has: a by-name selector is
+# appended to the spawn's <flags> (which herd_driver_agent_spawn_argv already word-splits into the
+# argv, so selection needs no new seam), and a runtime with none gets the definition body injected
+# into the task spec ($AGENT_SPEC_BLOCK below). Exactly one is ever non-empty, and BOTH are empty when
+# HERD_AGENT is unset — so the default spawn's argv and task spec stay BYTE-IDENTICAL. A name whose
+# last verify said it does NOT resolve warns LOUDLY and spawns anyway (never a block).
+_AGENT_SELECT=""
+if [ -n "${HERD_AGENT:-}" ]; then
+  herd_roster_lane_warn "$HERD_AGENT" "$_DRIVER_RUNTIME"
+  _AGENT_SELECT="$(herd_roster_lane_select_flags "$HERD_AGENT" "$_DRIVER_RUNTIME")"
+  if [ -n "$_AGENT_SELECT" ]; then CLAUDE_FLAGS="$CLAUDE_FLAGS $_AGENT_SELECT"; fi
+fi
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # Model accessibility preflight (HERD-282): refuse BEFORE any worktree/claim/tab/agent when the
@@ -325,7 +342,17 @@ If your change needs a manual step you cannot perform yourself (a live smoke tes
 # Prompt-cache-aware ordering: the STABLE workflow-rules preamble MUST lead so many close-in-time
 # builder prompts share the cached prefix (Anthropic's cache keys on the longest shared PREFIX,
 # 5-min TTL); the UNIQUE caller task trails. Empty task → rules alone.
-if [ -n "$TASK" ]; then SPEC="$RULES"$'\n\n'"$TASK"; else SPEC="$RULES"; fi
+#
+# HERD-667 PROMPT INJECTION: on a runtime with no by-name agent selector (codex has none at all), the
+# selected definition's body IS the delivery mechanism — it rides here, between the STABLE rules and
+# the unique caller task, so the shared prompt-cache prefix stays maximal for every builder on the
+# same rules. Empty unless HERD_AGENT names a definition AND the runtime lacks a selector, and it
+# carries its own leading blank line — so an unset lever leaves this concatenation byte-identical.
+AGENT_SPEC_BLOCK=""
+if [ -n "${HERD_AGENT:-}" ]; then
+  AGENT_SPEC_BLOCK="$(herd_roster_lane_spec_block "$HERD_AGENT" "$_DRIVER_RUNTIME")"
+fi
+if [ -n "$TASK" ]; then SPEC="$RULES$AGENT_SPEC_BLOCK"$'\n\n'"$TASK"; else SPEC="$RULES$AGENT_SPEC_BLOCK"; fi
 TASK_SPEC_FILE="$WORKTREES_DIR/$SLUG.task.md"
 POINTER="$(herd_write_task_spec "$TASK_SPEC_FILE" "$SPEC")"
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
