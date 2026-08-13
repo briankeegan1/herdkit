@@ -48,6 +48,27 @@ DRIVER_AGENT_COST_USAGE_KEYS='input_tokens output_tokens cache_creation_input_to
 # plain `in` (never a regex) — see driver.sh's herd_driver_agent_process_signature.
 DRIVER_AGENT_PROCESS_SIGNATURE='claude'
 
+# ── Specialist-agent ROSTER bindings (HERD-667, epic HERD-666) ────────────────────────────────────
+# How this runtime resolves a NAMED agent definition (.herd/agents/<name>.md), read by
+# scripts/herd/agents.sh. Three classes, same contract as the exec block: COMMITTED, ZERO-SECRET,
+# SHAPES only. Ship-dormant — nothing reads them unless an operator authors a definition and sets
+# HERD_AGENT (or runs `herd agents`).
+#   DEFINITION_DIR   where the runtime LOOKS UP definitions. A RELATIVE path is REPO-scope (resolved
+#                    against PROJECT_ROOT); an absolute / $HOME-rooted one is USER-scope.
+#   SELECT_FLAG      the by-name selection flag shape ('<name>' is substituted), or an @degrade
+#                    sentinel when the runtime exposes no by-name selector.
+#   DEFINITION_MODE  native | install | inject — see agents.sh's herd_roster_mode.
+# VERIFIED on this machine (claude 2.1.229): repo-scope `.claude/agents/*.md` is read natively, so
+# NOTHING has to be published anywhere for a definition to be visible — mode=native.
+DRIVER_AGENT_DEFINITION_DIR='.claude/agents'
+DRIVER_AGENT_DEFINITION_MODE='native'
+# No BY-NAME agent selector exists on the spawn/exec surface: claude 2.1.229 has `--agents <json>`,
+# which passes INLINE definitions rather than naming one from the definition dir, and subagents are
+# otherwise dispatched by the model itself. Bound to the drivers' honest @degrade sentinel rather than
+# a guessed flag, so agents.sh reads "no selector" and takes the portable INJECT path (the definition
+# body is prepended to the task spec) — which is also the path `herd agents verify` then probes.
+DRIVER_AGENT_SELECT_FLAG='@degrade:no-by-name-agent-selection-flag-claude-2.1.229'
+
 # ── Agent-runtime UPDATE bindings (HERD-149 — the AGENT_UPDATE knob) ───────────────────────────────
 # The runtime-specific data the AGENT_UPDATE mechanism (scripts/herd/agent-update.sh) needs to keep
 # THIS driver's agent runtime current: the CLI binary (command-resolved for installer detection AND

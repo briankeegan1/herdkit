@@ -1444,7 +1444,7 @@ EOF
         ref "${ref:-}" reason "${reason:-escalated}" age "$age"
     fi
     rm -f "$q/$id.escalated" "$q/$id.cancelled" "$q/$id.ref" "$q/$id.after" "$q/$id.prio" \
-          "$q/$id.gen" 2>/dev/null || true
+          "$q/$id.gen" "$q/$id.agent" 2>/dev/null || true
   done < "$INTENT_ESCALATION_LEDGER"
   herd_console_trim "$INTENT_ESCALATION_ACK"
   return 0
@@ -19035,10 +19035,31 @@ _intent_reground_closed() {
   [ "${_irc_parsed%%$'\t'*}" = "closed" ]
 }
 
+# _drain_lane_agent <claimed-path> — the SPECIALIST AGENT (HERD-667) an intent asked to be built with:
+# the first line of its `.agent` sidecar, re-validated here against the same definition-name grammar
+# the enqueue applied (a queue file is on disk between two processes, so the drain never trusts it
+# unvalidated). Empty for every ordinary intent — which is what keeps the launch below byte-identical.
+_drain_lane_agent() {
+  local _dla_f="${1%.req.mine}.agent" _dla_v=""
+  [ -f "$_dla_f" ] || return 0
+  _dla_v="$(sed -n 1p "$_dla_f" 2>/dev/null || true)"
+  case "$_dla_v" in ''|.*|-*|*/*|*[!0-9A-Za-z._-]*) return 0 ;; esac
+  printf '%s' "$_dla_v"
+}
+
 _drain_lane_worker() {
   local _dlw_claimed="$1" _dlw_slug="$2" _dlw_lane="$3" _dlw_ref="$4" _dlw_task="$5" _dlw_leased="${6:-}"
   local _dlw_out="" _dlw_rc=0 _dlw_bin="$HERE/herd-quick.sh"
   [ "$_dlw_lane" = "feature" ] && _dlw_bin="$HERE/herd-feature.sh"
+  # HERD-667: re-export the intent's specialist-agent name as HERD_AGENT so a QUEUED spawn selects the
+  # same agent a direct lane invocation would. Exported inside the command substitution's own subshell
+  # (never on the lane's argv) so an intent WITHOUT one leaves both branches' argv AND environment
+  # byte-identical — the same discipline the lease-handoff branch below is spelled out for.
+  # The `command -v` guard is the same shape the lever reads below use, and for the same reason: a
+  # live watcher always has the helper, but the hermetic tests extract THIS function alone — a missing
+  # helper must read as "no specialist agent" (the byte-identical path), silently, never as an error.
+  local _dlw_agent=""
+  command -v _drain_lane_agent >/dev/null 2>&1 && _dlw_agent="$(_drain_lane_agent "$_dlw_claimed")"
   # (The claim is bound to this worker's pid by the drain, synchronously, before the tick continues —
   # see `spawn-step.sh own` at the launch site. $BASHPID would let the worker do it itself, but bash
   # 3.2 — still macOS's /bin/bash — has no BASHPID, and the parent already holds the pid as `$!`.)
@@ -19054,9 +19075,11 @@ _drain_lane_worker() {
   # path a watcher takes with CAPACITY_BUDGET off — keeps byte-identically the argv AND environment it
   # had before this change.
   if [ "$_dlw_leased" = "1" ]; then
-    _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" HERD_AGENT_LEASE_HELD=1 bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+    _dlw_out="$(if [ -n "$_dlw_agent" ]; then export HERD_AGENT="$_dlw_agent"; fi
+                HERD_ITEM_REF="$_dlw_ref" HERD_AGENT_LEASE_HELD=1 bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
   else
-    _dlw_out="$(HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
+    _dlw_out="$(if [ -n "$_dlw_agent" ]; then export HERD_AGENT="$_dlw_agent"; fi
+                HERD_ITEM_REF="$_dlw_ref" bash "$_dlw_bin" "$_dlw_slug" "$_dlw_task" 2>&1)" || _dlw_rc=$?
   fi
   # Each outcome below is journaled only if spawn-step ACTED on the claim we still hold. It exits 3
   # when the claim has vanished (reclaimed under us, or already consumed) — journal that loudly as
