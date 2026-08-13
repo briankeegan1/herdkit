@@ -161,6 +161,58 @@ Worked zero-network proof of the raw edges (not the de-id transforms themselves)
 
 ---
 
+## Part 3 — Per-project `GH_TOKEN` (GitHub rate-limit partition)
+
+**Origin:** HERD-671. Several herdkit projects/watchers on one machine, by default, all authenticate
+`gh` as the SAME operator identity (`gh auth login`). GitHub's API rate limits are enforced **per
+user**, not per token or per process — so every watcher on that machine draws from one shared
+5000/hr GraphQL bucket (and the parallel REST bucket). A busy evening on one project (a burst of
+review/health dispatch, each spending its own `gh` calls) can exhaust that shared bucket and starve
+every *other* project's watcher mid-gate, and — the grounding incident — when the rate-limit window
+resets, every watcher that was backed off resumes at once and can re-drain it instantly.
+
+### The lever: `GH_TOKEN`
+
+| | |
+|--|--|
+| **Key** | `GH_TOKEN` |
+| **Scope** | secrets-file only — lives in a project's `.herd/secrets` (gitignored); `herd config set GH_TOKEN` is refused (the key name is secret-shaped) |
+| **Default** | absent → every `gh` call in that project keeps using the operator's already-authenticated identity (`gh auth login`), byte-identical to before this key existed |
+| **Wiring** | `scripts/herd/herd-config.sh` reads the single `GH_TOKEN=` line out of `.herd/secrets` via `grep` (it never *sources* the file, so no other secret or shell code in it ever reaches this process) and exports it into the watcher's process; every lane/builder worktree spawned from there inherits the export |
+| **Consumption** | `gh` (and `gh api graphql`) already prefer `GH_TOKEN`/`GITHUB_TOKEN` over a stored `gh auth login` credential the moment it is present in the process environment — exporting it here *is* the whole integration, no other seam changes |
+
+```sh
+# In THIS project's .herd/secrets (gitignored, chmod 600):
+echo 'GH_TOKEN=ghp_xxx_or_a_github_app_installation_token' >> .herd/secrets
+```
+
+### The machine-account requirement — read this before setting it
+
+**A partition requires a DIFFERENTLY-OWNED identity.** `GH_TOKEN` only isolates this project's rate
+limit if the token belongs to a *different* GitHub account (or app installation) than the one every
+other watcher on the machine already authenticates as:
+
+- ✅ **A dedicated machine/bot account's PAT**, or a **GitHub App installation token** scoped to this
+  repo — a genuinely separate identity with its own 5000/hr bucket.
+- ❌ **A second personal access token for the same human account** — GitHub counts every token that
+  identity holds against the SAME bucket. Setting `GH_TOKEN` to another PAT off your own account
+  changes *which credential* `gh` uses; it does not change *whose* rate limit it draws from, and
+  partitions nothing.
+
+If every watcher on a machine shares one human's identity and none can move to a machine account,
+`GH_TOKEN` has nothing to partition — pair it instead (or only) with `WATCHER_IDLE_CADENCE` (widens
+idle watchers' polling instead of adding buckets) or simply run fewer concurrent watchers.
+
+### What this is *not*
+
+- Not a new authentication mechanism — `gh`'s own `GH_TOKEN`/`GITHUB_TOKEN` precedence is what does
+  the work; herdkit only decides *whether* to export a value.
+- Not a fix for a genuinely overloaded single project — it partitions **across** projects, not within
+  one busy watcher's own bucket.
+- Not committed anywhere — `GH_TOKEN` only ever lives in the gitignored `.herd/secrets`.
+
+---
+
 ## Quick reference
 
 | Goal | Lever |
@@ -170,6 +222,8 @@ Worked zero-network proof of the raw edges (not the de-id transforms themselves)
 | Pre-run pull + screen (de-id) | `templates/connector-fetch.sh` + `CONNECTOR_FETCH_SCREEN` |
 | Post-merge push (re-id + deliver) | `templates/connector-post.sh` + `.herd/steps.tsv` post-merge row |
 | Prove what crossed | `.herd/journal.jsonl` → `herd log` / `herd why` (`step_run` events) |
+| Partition this project's GitHub rate-limit bucket | `GH_TOKEN` in `.herd/secrets` — MUST be a differently-owned identity (machine account / GitHub App), never a second personal PAT |
+| Widen an idle watcher's `gh` polling cadence | `WATCHER_IDLE_CADENCE` (+ `WATCHER_IDLE_REMOTE_SECS`) |
 
 Further reading: [`docs/connector-seams.md`](connector-seams.md), [`docs/driver-abstraction.md`](driver-abstraction.md),
 `templates/config.example` (commented `ANTHROPIC_BASE_URL` block), `templates/capabilities.tsv`

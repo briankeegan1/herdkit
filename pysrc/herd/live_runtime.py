@@ -142,12 +142,12 @@ class LiveCandidate:
     """
 
     __slots__ = ("pr", "sha", "slug", "base", "worktree", "stale", "hv_hold", "approved",
-                 "hv_body", "author", "assignees", "labels", "review_decision", "merge_status",
-                 "restale_laps", "agent_status", "wake_succeeds", "dirty", "branch")
+                 "hv_body", "hv_body_pooled", "author", "assignees", "labels", "review_decision",
+                 "merge_status", "restale_laps", "agent_status", "wake_succeeds", "dirty", "branch")
 
     def __init__(self, pr, sha, slug="", base="", worktree="", stale=False,
-                 hv_hold=False, approved=False, hv_body="", author="", assignees=None,
-                 labels=None, review_decision="", merge_status="", restale_laps=0,
+                 hv_hold=False, approved=False, hv_body="", hv_body_pooled=False, author="",
+                 assignees=None, labels=None, review_decision="", merge_status="", restale_laps=0,
                  agent_status="", wake_succeeds=True, dirty=False, branch=""):
         self.pr = str(pr)
         self.sha = str(sha)
@@ -163,6 +163,14 @@ class LiveCandidate:
         self.hv_hold = bool(hv_hold)
         self.approved = bool(approved)
         self.hv_body = str(hv_body)
+        # HERD-671 leg 1: True iff `hv_body` was already populated by the SAME pooled discovery call
+        # that fetched this candidate (discover_via_graphql now requests `body` alongside the other PR
+        # fields), so `_resolve_hold_inputs` can skip its own per-PR `gh pr view --json body` round-trip
+        # entirely. False (the default, and always false for a fixture/dry-run candidate that never set
+        # it) means "the pool did not carry a body for this candidate" — the live hold layer falls back
+        # to its own read exactly as before this task, so behavior is unchanged wherever discovery
+        # cannot or does not pool the body.
+        self.hv_body_pooled = bool(hv_body_pooled)
         # SCOPE fields (task HERD-324 leg 3): the identity/labels the watcher-view lens + the
         # WATCHER_SCOPE ownership gate filter discovery on, so a foreign-owner PR never enters
         # classification. Absent in a legacy fixture → empty, which the default (mine/all) passes.
@@ -197,7 +205,8 @@ class LiveCandidate:
             pr=d["pr"], sha=d["sha"], slug=d.get("slug", ""), base=d.get("base", ""),
             worktree=d.get("worktree", ""), stale=d.get("stale", False),
             hv_hold=d.get("hv_hold", False), approved=d.get("approved", False),
-            hv_body=d.get("hv_body", ""), author=d.get("author", ""),
+            hv_body=d.get("hv_body", ""), hv_body_pooled=d.get("hv_body_pooled", False),
+            author=d.get("author", ""),
             assignees=d.get("assignees"), labels=d.get("labels"),
             review_decision=d.get("review_decision", ""), merge_status=d.get("merge_status", ""),
             restale_laps=d.get("restale_laps", 0),
@@ -2191,10 +2200,14 @@ def discover_via_graphql(repo=None, limit=50):
     Never called under ``--dry-run`` (that path uses :class:`FixtureDiscovery`), so a test never runs
     ``gh``.
     """
+    # HERD-671 leg 1: `body` rides this SAME round-trip so the hold layer's `hv_body` read (bash
+    # parity: LiveHoldSource.hv_body / agent-watch.sh's per-PR `gh pr view --json body`) never has to
+    # spend its own per-PR call — see `hv_body_pooled` on LiveCandidate and `_resolve_hold_inputs`. One
+    # extra scalar field on an already-batched query costs nothing extra in request count.
     query = (
         "query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){"
         "pullRequests(states:OPEN,first:$n){nodes{number headRefName mergeStateStatus "
-        "headRefOid baseRefName reviewDecision isDraft author{login} "
+        "headRefOid baseRefName reviewDecision isDraft body author{login} "
         "assignees(first:10){nodes{login}} labels(first:20){nodes{name}}}}}}"
     )
     owner, name = _repo_owner_name(repo)
@@ -2224,6 +2237,7 @@ def discover_via_graphql(repo=None, limit=50):
             worktree=_worktree_for_slug(slug),
             stale=(node.get("mergeStateStatus") == "BEHIND"),
             merge_status=node.get("mergeStateStatus", ""),
+            hv_body=node.get("body") or "", hv_body_pooled=True,
             author=((node.get("author") or {}).get("login", "")),
             assignees=[(a or {}).get("login", "") for a in
                        ((node.get("assignees") or {}).get("nodes") or [])],
@@ -6075,6 +6089,14 @@ class LiveTick:
             return True
         cand.approved = bool(self.hold_source.approved(cand.pr, cand.sha))
         if self._merge_policy != "auto":
+            return True
+        # HERD-671 leg 1: discovery already carried this candidate's body (one pooled call for every
+        # candidate, not one `gh pr view` per candidate) — trust it and skip the per-PR live read
+        # entirely. `discover_via_graphql` raises on a failed round-trip (the whole tick aborts/backs
+        # off before ever reaching a candidate walk), so a pooled body reaching here is exactly as
+        # trustworthy as a successful individual read was.
+        if cand.hv_body_pooled:
+            cand.hv_hold = _human_verify.has(cand.hv_body)
             return True
         body, rc = self.hold_source.hv_body(cand.pr)
         if rc != 0:
