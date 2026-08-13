@@ -281,6 +281,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `GATE_SCALE` → `agent-watch.sh`
 - `GATE_STATUS` → `agent-watch.sh`, `config-viability.sh`
 - `GATE_STATUS_PENDING` → —
+- `GH_TOKEN` → —
 - `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
 - `HEALTHCHECK_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
@@ -408,6 +409,8 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WATCHER_AUTOMERGE` → `bin/herd`, `merge-policy.sh`, `posture-lint.sh`
 - `WATCHER_CRASHLOOP_GUARD` → `herd-watch.sh`
 - `WATCHER_FLAIR` → `agent-watch.sh`
+- `WATCHER_IDLE_CADENCE` → `agent-watch.sh`
+- `WATCHER_IDLE_REMOTE_SECS` → `agent-watch.sh`
 - `WATCHER_OWNER` → `bin/herd`, `agent-watch.sh`, `engine-seat.sh`, `herd-claim.sh`, `posture-lint.sh`, `resolver-claim.sh`, `spawn.sh`, `team-presence-live.sh`, `tracker-state-sweep.sh`
 - `WATCHER_RESURRECT` → `bin/herd`, `watcher-resurrect.sh`
 - `WATCHER_SCOPE` → `agent-watch.sh`, `posture-lint.sh`, `resolver-claim.sh`
