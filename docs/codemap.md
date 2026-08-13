@@ -171,6 +171,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `changelog.sh` → `herd-config.sh`
 - `codemap.sh` → `herd-config.sh`
 - `coordinator.sh` → `driver.sh`, `herd-config.sh`, `herd-preflight.sh`, `layout-reconcile.sh`
+- `core-surface.sh` → `herd-config.sh`
 - `create-retry.sh` → `herd-config.sh`, `journal.sh`
 - `dep-watcher.sh` → `deps-parse.sh`, `driver.sh`, `herd-config.sh`, `herd-links.sh`
 - `driver.sh` → `herd-config.sh`

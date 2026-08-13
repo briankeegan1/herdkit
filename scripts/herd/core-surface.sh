@@ -254,6 +254,13 @@ herd_core_surface_run() {
 # ── CLI ───────────────────────────────────────────────────────────────────────────────────────────
 # Executed form only. Sourcing this file defines the functions and runs nothing.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  # HERD-669: an executed CLI call (unlike a sourced library caller, which always sources
+  # herd-config.sh itself first) never had CORE_SURFACE_GLOB — or any other project config — loaded,
+  # so `core-surface.sh scenarios <worktree>` silently resolved the glob as empty and reported
+  # "feature off" on EVERY invocation. Mirrors driver.sh's CLI entrypoint exactly: source
+  # herd-config.sh (resolves the consuming project's .herd/config) before dispatching.
+  # shellcheck source=/dev/null
+  . "$_HERD_CORE_SURFACE_HERE/herd-config.sh"
   _cs_verb="${1:-}"; shift || true
   case "$_cs_verb" in
     glob)      herd_core_surface_glob; printf '\n' ;;
