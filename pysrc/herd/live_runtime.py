@@ -339,7 +339,7 @@ def _count_live_inflight(state_dir, prefix):
         return 0
     if prefix in _INFLIGHT_TIMEOUT_PREFIXES:
         timeout = _pos_int(os.environ.get("HEALTH_INFLIGHT_TIMEOUT"), 1800)
-        live = lambda p: _inflight_verified_live(p, timeout)
+        live = lambda p: _inflight_verified_live(p, timeout, _health_heartbeat_file(p))
     else:
         live = _marker_live
     n = 0
@@ -849,42 +849,113 @@ def _marker_age_or_mtime(path):
         return None
 
 
-def _inflight_verified_live(path, timeout):
+_HEALTH_HEARTBEAT_GRACE = 180
+"""How fresh a health worker's progress-log heartbeat must be to corroborate liveness when the tracked
+pid itself cannot prove it (HERD-736; mirrors agent-watch.sh's ``_HEALTH_HEARTBEAT_GRACE``). A literal,
+not a config key — the suite already tees per-test progress lines into "<log>.progress" as it runs
+(HEALTHCHECK_PROGRESS_LOG, HERD-494/533), so a worker that is still legitimately testing something
+writes there at least every few tests. Generous enough to survive one slow test without a false
+negative, tight enough that a truly wedged/gone worker is still caught promptly."""
+
+
+def _health_heartbeat_file(inflight_path):
+    """The progress-log heartbeat companion for an in-flight marker path (HERD-736; mirrors
+    agent-watch.sh's ``_health_heartbeat_file``). Every dispatcher in this module hands its worker
+    ``HEALTHCHECK_PROGRESS_LOG="<log>.progress"`` (HERD-494/533's convention, honored by both the
+    classic and merge-result rails — see :data:`_HEALTH_WORKER_SH`), and every log file is named
+    identically to its own in-flight marker with ``-inflight-`` swapped for ``-log-``. A pure string
+    derivation, never a filesystem probe of its own: an unrecognized marker name yields ``""``, which
+    :func:`_inflight_verified_live` then never corroborates — the byte-identical fallback."""
+    if not inflight_path:
+        return ""
+    d, base = os.path.split(inflight_path)
+    if "-inflight-" not in base:
+        return ""
+    return os.path.join(d, base.replace("-inflight-", "-log-", 1) + ".progress")
+
+
+def _bump_dispatch_count(path):
+    """Increment (or create at 1) the redispatch counter at ``path`` and return the NEW value (HERD-736
+    leg 3; mirrors agent-watch.sh's ``_health_bump_dispatch_count``). Best-effort/fail-soft to 1 on any
+    read fault — under-counting only costs one missed loud event, never a false one."""
+    n = 0
+    try:
+        with open(path, encoding="utf-8") as fh:
+            n = int((fh.readline() or "0").strip())
+    except Exception:
+        n = 0
+    n += 1
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("%d\n" % n)
+    except Exception:
+        pass
+    return n
+
+
+def _heartbeat_fresh(path, grace=_HEALTH_HEARTBEAT_GRACE):
+    """True iff ``path`` exists and was written within the last ``grace`` seconds (mirrors
+    agent-watch.sh's ``_heartbeat_fresh``). Fail-soft: an absent/unreadable file is NEVER fresh — a
+    heartbeat must be POSITIVELY observed, never assumed."""
+    if not path:
+        return False
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return False
+    try:
+        return (int(_now_epoch()) - int(mt)) < grace
+    except Exception:
+        return False
+
+
+def _inflight_verified_live(path, timeout, heartbeat_path=""):
     """THE shared "does this in-flight marker still legitimately hold a health/merge-result slot" check
     (HERD-451 — mirrors agent-watch.sh's ``_inflight_verified_live`` verbatim, cross-referenced; Rule 2,
     one notion of liveness, never two divergent copies). Recycling-safe IDENTITY, not bare existence:
-      * pid dead → not live.
+      * pid dead → NOT live UNLESS ``heartbeat_path`` is given and still FRESH (HERD-736: the tracked
+        pid is sometimes a wrapper — ``bash -c "<script>"`` running a suite it itself launched as a
+        foreground child — whose own exit is not proof the suite subtree is gone; a still-fresh
+        progress-log heartbeat is independent, positive evidence real work is ongoing under an identity
+        the marker never named). No heartbeat path given (every non-health caller) → byte-identical.
       * pid alive AND the marker's recorded start-time matches the pid's CURRENT one → live, UNBOUNDED
         (a verified-same-process worker is trusted for as long as it legitimately runs — the SEPARATE
         inflight-timeout the corpse sweep enforces decides whether to TERM a long-running one, not this).
       * pid alive but the recorded start-time does NOT match → NOT live (the classic PID-RECYCLING case;
-        already handled by ``_marker_live`` and unchanged here).
+        already handled by ``_marker_live`` and unchanged here). A heartbeat NEVER overrides this: pid
+        recycling is positive evidence of a DIFFERENT process, and trusting a heartbeat over it would
+        resurrect the exact recycled-pid failure HERD-451 closed.
       * pid alive but NO start-time was ever recorded (a legacy pre-restart-safe marker, or any writer
         that bypassed ``_marker_write``) → identity CANNOT be proven from the marker alone. A bare
         ``kill -0`` success is trusted ONLY within ``timeout`` seconds of the marker's age (dispatch-ts,
-        else file mtime); past that it reads as NOT live. An unverifiable marker no longer gets an
-        indefinite pass just because *some* process now happens to hold that recycled pid — the EXACT
-        GROUNDED 2026-07-31 failure: a stale ``.health-inflight-*`` marker's recorded pid had been
-        recycled by the OS onto the watcher itself / an unrelated ``sleep``, and the old bare-existence
-        check trusted it forever, wedging the HEALTH_CONCURRENCY slot with zero suites actually running.
+        else file mtime), OR for as long as the heartbeat stays fresh past that bound; past both it
+        reads as NOT live. An unverifiable marker no longer gets an indefinite pass just because *some*
+        process now happens to hold that recycled pid — the EXACT GROUNDED 2026-07-31 failure: a stale
+        ``.health-inflight-*`` marker's recorded pid had been recycled by the OS onto the watcher itself
+        / an unrelated ``sleep``, and the old bare-existence check trusted it forever, wedging the
+        HEALTH_CONCURRENCY slot with zero suites actually running.
     """
     try:
         lines = open(path, encoding="utf-8").read().splitlines()
     except Exception:
         return False
     pid = (lines[0].strip() if lines else "")
-    if not pid or not _pid_live(pid):
+    if not pid:
         return False
+    if not _pid_live(pid):
+        return bool(heartbeat_path) and _heartbeat_fresh(heartbeat_path)
     st = (lines[1].strip() if len(lines) > 1 else "")
     if st:
         cur = _pid_starttime(pid)
         if not cur:
             return True          # transient ps hiccup — trust the recorded identity, unchanged
-        return cur == st
+        return cur == st         # recycled pid — never trusted, heartbeat or not
     age = _marker_age_or_mtime(path)
     if age is None:
         return True              # no signal at all — fail toward not reaping
-    return age < timeout
+    if age < timeout:
+        return True
+    return bool(heartbeat_path) and _heartbeat_fresh(heartbeat_path)
 
 
 _MARKER_SHA_RE = re.compile(r'^[0-9a-f]{7,40}$')
@@ -1148,6 +1219,18 @@ class LiveState:
 
     def health_log_file(self, cand):
         return self._p(".health-log-%s" % self._health_key(cand))
+
+    def health_dispatch_count_file(self, cand):
+        # HERD-736 leg 3: SAME filename agent-watch.sh's `_health_dispatch_count_file` writes, so the
+        # tally is the true global dispatch count for this (pr, sha) regardless of which engine/seat
+        # actually launched a given worker.
+        return self._p(".health-dispatch-count-%s" % self._health_key(cand))
+
+    def health_adopted_file(self, cand):
+        # HERD-736 leg 2: SAME filename agent-watch.sh's `_health_adopted_file` writes — see its
+        # docstring for why this lives OUTSIDE the `.health-inflight-` prefix (PR #808 round-1 review:
+        # a sidecar sharing that prefix was mis-walked as a marker by the corpse sweep's own glob).
+        return self._p(".health-adopted-%s" % self._health_key(cand))
 
     def health_cached_verdict(self, cand):
         """The TERMINAL health verdict cached for this exact head sha — reuse with no suite re-run
@@ -3319,14 +3402,22 @@ class LiveGates:
                     # exact tick observed it under, so a later tick can tell whether the operator has
                     # since released a changed gate posture — see gate_config_generation's docstring.
                     st.record_health_generation(cand, D.gate_config_generation(self.config))
-                    st.rm(disp, inflight)
+                    st.rm(disp, inflight, st.health_adopted_file(cand),
+                          st.health_dispatch_count_file(cand))
                     return verdict
                 # Nonce matched but the payload is unparseable / truncated → an infra death, NOT a verdict;
                 # never cache. Drop it and re-dispatch next tick (bounded once the suite finally succeeds).
                 st.rm(disp)
                 return WAIT
         # 3. IN FLIGHT: a live worker on this exact (pr, sha) → wait, never a second overlapping suite.
-        if inflight and _marker_live(inflight):
+        # HERD-736: _inflight_verified_live (not bare _marker_live) — the SAME identity check the
+        # corpse sweep uses (Rule 2, one notion of liveness), heartbeat-corroborated so a dispatch
+        # wrapper's own pid exiting can never be mistaken for the suite itself being gone, and bounded
+        # by HEALTH_INFLIGHT_TIMEOUT rather than trusting an identity-unprovable marker's bare pid
+        # forever (the HERD-451 hole bare _marker_live still has at this one call site).
+        if inflight and _inflight_verified_live(
+                inflight, _pos_int(os.environ.get("HEALTH_INFLIGHT_TIMEOUT"), 1800),
+                _health_heartbeat_file(inflight)):
             return WAIT
         # 3.5 HARD pre-dispatch worktree validation (task HERD-346, leg 2): NEVER shell the suite at a
         #     worktree that isn't there — healthcheck.sh <missing> usage-errors into a phantom CODEERROR
@@ -3650,6 +3741,16 @@ class LiveGates:
         _marker_write(inflight, proc.pid, nonce=nonce)
         self.journal.append("healthcheck_started", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
                             "pid", proc.pid, "log_path", log or "")
+        # HERD-736 leg 3: loud, distinct visibility the moment a SECOND dispatch lands on this exact
+        # (pr, sha) — never routine (a new commit gets a new key), so it must never blend into the
+        # ordinary healthcheck_started stream. Counter file shared with agent-watch.sh's own dispatch
+        # sites, so the tally is correct even across an engine flip mid-loop.
+        count_file = st.health_dispatch_count_file(cand)
+        if count_file:
+            n = _bump_dispatch_count(count_file)
+            if n >= 2:
+                self.journal.append("health_redispatch_loop", "key", st._health_key(cand), "count", n,
+                                    "pr", cand.pr, "sha", cand.sha, "slug", cand.slug)
 
     # ── merge-result gate (§6.4, HERD-296) — the whole health rail, retargeted at head+base ────────
     def _merge_result_health(self, cand):
@@ -3708,7 +3809,11 @@ class LiveGates:
                 st.rm(disp)
                 return WAIT
         # 3. IN FLIGHT: a live worker already materializing/testing this exact head sha → wait.
-        if inflight and _marker_live(inflight):
+        # HERD-736: heartbeat-corroborated _inflight_verified_live — see the classic rail's identical
+        # step 3 for the full rationale (Rule 2, one notion of liveness).
+        if inflight and _inflight_verified_live(
+                inflight, _pos_int(os.environ.get("HEALTH_INFLIGHT_TIMEOUT"), 1800),
+                _health_heartbeat_file(inflight)):
             return WAIT
         # 3.5 same pre-dispatch worktree validation as the classic rail (task HERD-346) — the source
         #     worktree the materialize step reads from must actually be there.
