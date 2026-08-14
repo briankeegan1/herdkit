@@ -1184,6 +1184,65 @@ export PR_FETCH_UNIFY            # HERD-675: reach the Python engine core the wa
 # (default) = DORMANT: the gate returns immediately and behavior is byte-identical to no budget. A
 # non-numeric value is treated as dormant (never enforce on a typo). Consumed by agent-watch.sh + the lanes.
 : "${BUDGET_DAILY:=""}"          # '' (default, dormant) | a USD number, e.g. 25 — daily spend ceiling; see capabilities.tsv / cost.sh
+# BUDGET_ITEM_MAX (HERD-738) — a PER-ITEM spend cap in USD, sibling of BUDGET_DAILY's whole-day ceiling.
+# One work item eating a disproportionate share of the day's budget (a runaway refix loop, a stuck
+# review escalation) is a JUDGMENT MOMENT, not a silent continuation: the watcher SCANS each live
+# builder's OWN transcript directory (cost.sh's cost_report_dir — the exact reader cost_emit_merge
+# already uses, just pointed at an IN-FLIGHT worktree instead of waiting for merge) each tick, sums its
+# builder+review usd, and — past the cap — journals `budget_item_over` ONCE per (slug,pr) and paints a
+# LOUD needs-you console row (build_budget_item_note). NEVER kills or blocks the item; the row is
+# purely advisory, exactly like a needs-you row anywhere else in this console — the operator decides.
+# EMPTY (default) = DORMANT: no scan, no row, byte-identical console. A non-numeric value is treated as
+# dormant (never enforce on a typo). Consumed by agent-watch.sh via cost.sh (budget_item_total /
+# budget_item_exceeded).
+: "${BUDGET_ITEM_MAX:=""}"       # '' (default, dormant) | a USD number, e.g. 15 — per-item spend cap
+# ── The degradation ladder (HERD-738, child of EPIC HERD-737) ────────────────────────────────────
+# BUDGET_LADDER — off (default) | on. A ladder of DEGRADING rungs that engage BEFORE BUDGET_DAILY's
+# hard stop (the existing HERD-95 spawn-refuse), so a day trending toward the ceiling spends less per
+# unit of work instead of running at full throttle right up to the wall. REUSES existing machinery at
+# every rung — nothing here reimplements cost math, review dispatch or trigger scheduling:
+#   rung 1 (spend >= BUDGET_LADDER_RUNGS field 1, default 60%) — reduce EFFECTIVE REVIEW_CONCURRENCY /
+#     HEALTH_CONCURRENCY (divided by BUDGET_LADDER_CONCURRENCY_DIVISOR, floored at 1). Folded into
+#     _review_conc / _health_conc (agent-watch.sh) AFTER GATE_SCALE, so the two levers compose (scale
+#     up for fleet size, then down for spend pressure) and the SAME derived caps reach the Python engine
+#     core via herd_engine_live_tick's existing per-tick env override — no engine-core change needed.
+#   rung 2 (spend >= field 2, default 80%) — force the CHEAP review tier for LOW-RISK diffs, reusing
+#     REVIEW_MODEL_CHEAP tiering (_classify_review_tier / the ported Python classifier) EXACTLY as
+#     REVIEW_ESCALATE_GLOB/REVIEW_TIERING already define it: a risky or oversized diff still gets the
+#     full reviewer — the ladder can only ever route an ALREADY-low-risk diff to the cheap tier, never
+#     downgrade a flagged one. Pairs best with an operator REVIEW_ESCALATE_GLOB pinning engine paths.
+#   rung 3 (spend >= field 3, default 95%) — POSTPONE non-critical scheduled dispatches (a gardener run,
+#     an advisory sweep — any .herd/triggers.tsv row whose name matches BUDGET_LADDER_NONCRITICAL_GLOB):
+#     triggers_run_one (triggers.sh) skips the fire entirely and leaves the trigger's snapshot/last-fired
+#     UNTOUCHED, so it simply fires on the next due tick once spend drops back — a deferral, never a
+#     silent drop.
+#   (hard stop) — BUDGET_DAILY's existing spawn-refuse / drain-pause (unchanged by this key).
+# IN-FLIGHT WORK ALWAYS RUNS TO ITS GATE at every rung — the ladder only ever throttles NEW dispatches
+# (concurrency ceilings, tier choice for a review not yet running, a trigger not yet fired), never a
+# worker already in progress.
+# Every rung TRANSITION (not every tick) is journaled once as `budget_degrade rung=N` (agent-watch.sh's
+# once-per-change guard, mirroring _gate_scale_journal_once) — the trial-visible ladder trail.
+# DORMANT unless BOTH this key is "on" AND BUDGET_DAILY is a positive number — a ladder with no ceiling
+# to measure percentage against has nothing to rung on, so it silently reads rung 0 forever. off
+# (default) → budget_ladder_rung always prints 0, byte-identical to before this key existed. Consumed
+# by cost.sh (budget_ladder_rung), agent-watch.sh (_review_conc/_health_conc/_review_gate_step,
+# build_budget_ladder_note) and triggers.sh (triggers_run_one).
+: "${BUDGET_LADDER:="off"}"      # off (default, ship-dormant) | on
+# BUDGET_LADDER_RUNGS — three ascending PERCENT-OF-BUDGET_DAILY thresholds, comma-separated, for rungs
+# 1/2/3 above. Default "60,80,95". Each field independently falls back to its own default when blank,
+# non-numeric or the list is short — a typo degrades gracefully (never aborts, never a fabricated rung).
+: "${BUDGET_LADDER_RUNGS:="60,80,95"}"
+# BUDGET_LADDER_CONCURRENCY_DIVISOR — rung 1 divides the (GATE_SCALE-derived) REVIEW_CONCURRENCY /
+# HEALTH_CONCURRENCY floor by this integer, clamped to a minimum of 1 (concurrency never reaches 0 —
+# that would stop the gate entirely, which is BUDGET_DAILY's job, not the ladder's). Default 2 (halve).
+: "${BUDGET_LADDER_CONCURRENCY_DIVISOR:="2"}"
+# BUDGET_LADDER_NONCRITICAL_GLOB — an egrep pattern matched against a .herd/triggers.tsv trigger's
+# `name` field; a match is "non-critical" and eligible for rung 3's postponement. Default matches this
+# repo's own maintenance-gardener trigger pack (maintenance-gardener, gardener-graphify-refresh,
+# gardener-conformance-report) plus the common "*-sweep"/"*-advisory" naming this engine's advisory
+# sweeps use. A REAL feature/quick spawn trigger is never matched by the default pattern, so it is
+# never postponed by the ladder — only maintenance-shaped triggers are.
+: "${BUDGET_LADDER_NONCRITICAL_GLOB:="gardener|drift-sweep|reconcile-sweep|-advisory"}"
 # INFRA-timeout circuit breaker (HERD-110) — stop the watcher re-dispatching gates into a dead/hung
 # environment. INFRA_BREAKER_MAX consecutive INFRA failures (non-verdict reviewer deaths — a claude
 # exec-hang / env failure, NOT a real PASS/BLOCK verdict) OPEN a GLOBAL breaker: new review/health

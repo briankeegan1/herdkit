@@ -461,6 +461,12 @@ team-presence-live.sh	unit	tests/test-team-presence-live.sh
 TEAM_ALIASES	unit	tests/test-team-presence.sh
 TEAM_ALIASES	unit	tests/test-ungated-pr-rows.sh
 BUDGET_DAILY	unit	tests/test-budget-governance.sh
+BUDGET_ITEM_MAX	unit	tests/test-budget-governance.sh
+BUDGET_LADDER	sim	scripts/herd/sim/yolo-drain-scenario.sh
+BUDGET_LADDER_RUNGS	unit	tests/test-budget-governance.sh
+BUDGET_LADDER_CONCURRENCY_DIVISOR	unit	tests/test-budget-governance.sh
+BUDGET_LADDER_NONCRITICAL_GLOB	unit	tests/test-budget-governance.sh
+herd budget [status | override <reason> | override --clear]	unit	tests/test-budget-governance.sh
 MODEL_ESCALATE_GLOB	unit	tests/test-model-escalate.sh
 MODEL_ESCALATE	unit	tests/test-model-escalate.sh
 REVIEW_ESCALATE_GLOB	unit	tests/test-risk-tiered-review.sh

@@ -6,6 +6,9 @@ Reads the newline-separated journal file list on stdin (live journal + rotated a
   $HERD_COST_FULL_LINES  pre-formatted "component=.. model=.. .. usd=.." lines (from bash's
                          cost_report_full) — this module NEVER scans a transcript itself
   $HERD_COST_FULL_NOTE   the "nothing to add" note when there are no such lines
+  $HERD_COST_FORECAST    HERD-738: pre-formatted "<spent> <burn_per_hr> <projected_eod> <cap>" USD
+                         figures (from bash's cost.sh budget_forecast) — this module never computes
+                         the forecast itself. Empty when BUDGET_DAILY is unset (dormant).
 
 Pure reader, zero mutation. Byte-identical to the historical inline `python3 -c` program in
 bin/herd cmd_cost (kept there as the fail-soft fallback); the two share this exact source.
@@ -153,6 +156,20 @@ def main():
     print("Merged PRs (billed):     %d" % len(merged))
     if merged:
         print("Cost per merged PR:      $%.4f" % (grand / len(merged)))
+    # HERD-738: the FORECAST line — today's spend + burn rate + projected end-of-day vs the
+    # BUDGET_DAILY ceiling. Pre-computed by bash's cost.sh budget_forecast (this module never re-derives
+    # it); empty whenever BUDGET_DAILY is unset, so herd cost is byte-identical with no budget configured.
+    FORECAST = os.environ.get("HERD_COST_FORECAST", "")
+    if FORECAST:
+        _fparts = FORECAST.split()
+        if len(_fparts) == 4:
+            try:
+                f_spent, f_burn, f_proj, f_cap = (float(x) for x in _fparts)
+                print("")
+                print("Forecast:                today $%.4f · burn $%.4f/hr · projected EOD $%.4f (ceiling $%.4f)"
+                      % (f_spent, f_burn, f_proj, f_cap))
+            except ValueError:
+                pass
     if FULL:
         print_full_section(grand)
 

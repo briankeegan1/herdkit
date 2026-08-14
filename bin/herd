@@ -8732,8 +8732,16 @@ cmd_cost() {
     say "  (the watcher writes cost events at merge time — none recorded yet)"
     return 0
   fi
+  # HERD-738: today's spend + burn rate + projected end-of-day vs BUDGET_DAILY, computed once here
+  # (cost.sh's pure reader) and handed to whichever reader (python module or inline fallback) renders
+  # the rollup — neither re-derives it. Empty whenever BUDGET_DAILY is unset (dormant).
+  local forecast=""
+  if type budget_forecast >/dev/null 2>&1; then
+    forecast="$(budget_forecast 2>/dev/null || true)"
+  fi
   export HERD_COST_PR="$pr" HERD_COST_FULL="$full" \
-    HERD_COST_FULL_LINES="$full_lines" HERD_COST_FULL_NOTE="$full_note"
+    HERD_COST_FULL_LINES="$full_lines" HERD_COST_FULL_NOTE="$full_note" \
+    HERD_COST_FORECAST="$forecast"
   if _herd_py_ok; then
     if printf '%s\n' "$files" | _herd_py_reader cost; then return 0; fi
     warn "herd cost: python reader unavailable — using builtin fallback"
@@ -8879,9 +8887,86 @@ print("Total spend recorded:   $%.4f" % grand)
 print("Merged PRs (billed):     %d" % len(merged))
 if merged:
     print("Cost per merged PR:      $%.4f" % (grand / len(merged)))
+# HERD-738: the FORECAST line — today spend + burn rate + projected end-of-day vs the BUDGET_DAILY
+# ceiling. Pre-computed by cost.sh budget_forecast (byte-identical to pysrc/herd/cost.py, the same
+# block); empty whenever BUDGET_DAILY is unset.
+FORECAST = os.environ.get("HERD_COST_FORECAST", "")
+if FORECAST:
+    _fparts = FORECAST.split()
+    if len(_fparts) == 4:
+        try:
+            f_spent, f_burn, f_proj, f_cap = (float(x) for x in _fparts)
+            print("")
+            print("Forecast:                today $%.4f · burn $%.4f/hr · projected EOD $%.4f (ceiling $%.4f)"
+                  % (f_spent, f_burn, f_proj, f_cap))
+        except ValueError:
+            pass
 if FULL:
     print_full_section(grand)
 '
+}
+
+# cmd_budget — HERD-738: the operator surface for the degradation ladder + the manual budget rescue.
+#   herd budget status              spend/cap/rung/forecast at a glance — no mutation.
+#   herd budget override <reason>   arm the manual rescue: BUDGET_DAILY's ceiling AND the ladder are
+#                                    both bypassed until cleared. Journaled distinctly as
+#                                    `budget_override` (never conflated with a per-spawn --force).
+#   herd budget override --clear    disarm the rescue.
+# Pure dispatch onto cost.sh's own functions — no cost/ladder math lives here.
+cmd_budget() {
+  _herd_require_project_config
+  _journal_load_config
+  type budget_daily_exceeded >/dev/null 2>&1 || die "herd budget: cost.sh unavailable in this tree"
+  local sub="${1:-status}"; shift 2>/dev/null || true
+  case "$sub" in
+    status)
+      local cap="${BUDGET_DAILY:-}" spent
+      spent="$(cost_day_total 2>/dev/null || printf 0)"
+      say "spend today:     \$${spent}"
+      if [ -z "$cap" ]; then
+        say "BUDGET_DAILY:    unset — no ceiling, no ladder"
+        return 0
+      fi
+      say "BUDGET_DAILY:    \$${cap}"
+      if budget_override_active; then
+        say "override:        ${c_dim}ARMED${c_rst} — the ceiling and ladder are bypassed"
+      elif budget_daily_exceeded >/dev/null; then
+        say "ceiling:         ${c_dim}EXCEEDED${c_rst} — new spawns are refused"
+      else
+        say "ceiling:         under budget"
+      fi
+      if [ "${BUDGET_LADDER:-off}" = "on" ]; then
+        say "ladder rung:     $(budget_ladder_rung 2>/dev/null || printf 0)/3"
+      else
+        say "ladder:          off"
+      fi
+      local fc; fc="$(budget_forecast 2>/dev/null || true)"
+      if [ -n "$fc" ]; then
+        local f_spent f_burn f_proj f_cap
+        read -r f_spent f_burn f_proj f_cap <<<"$fc"
+        say "forecast:        burn \$${f_burn}/hr · projected EOD \$${f_proj}"
+      fi
+      [ -n "${BUDGET_ITEM_MAX:-}" ] && say "BUDGET_ITEM_MAX: \$${BUDGET_ITEM_MAX}"
+      ;;
+    override)
+      case "${1:-}" in
+        --clear)
+          budget_override_clear
+          say "budget override cleared — BUDGET_DAILY and the ladder are enforced again."
+          ;;
+        "")
+          die "usage: herd budget override <reason> | herd budget override --clear"
+          ;;
+        *)
+          local reason="$*"
+          budget_override_set "$reason"
+          say "budget override ARMED: $reason"
+          say "  BUDGET_DAILY and the degradation ladder are bypassed until 'herd budget override --clear'."
+          ;;
+      esac
+      ;;
+    *) die "usage: herd budget [status | override <reason> | override --clear]" ;;
+  esac
 }
 
 # cmd_stats — the SHEPHERD'S DIGEST CARD (HERD-146): a compact, DETERMINISTIC (zero-LLM) rollup of a
@@ -9494,6 +9579,11 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       transcripts and appends their token/USD + a complete session
                                       total (the default view stays merge-gated + unchanged).
                                       Prices are PERISHABLE (scripts/herd/cost.sh) — verify vs current
+  herd budget [status | override <reason> | override --clear]
+                                      HERD-738: spend/cap/ladder-rung/forecast at a glance (status,
+                                      the default); arm/clear a manual budget rescue that bypasses
+                                      BUDGET_DAILY + the degradation ladder, journaled distinctly
+                                      (budget_override) as an operator intervention.
   herd stats [--today|--since <date>|--pr N]
                                       a shepherd's digest CARD: a compact, deterministic (no-LLM)
                                       rollup of a journal window — PRs merged (a 🐑 each), review
@@ -9638,6 +9728,7 @@ case "${1:-help}" in
   why)     shift; cmd_why "$@" ;;
   approve) shift; cmd_approve "$@" ;;
   cost)    shift; cmd_cost "$@" ;;
+  budget)  shift; cmd_budget "$@" ;;
   stats)   shift; cmd_stats "$@" ;;
   changelog) shift; cmd_changelog "$@" ;;
   ledger-report) shift; cmd_ledger_report "$@" ;;
