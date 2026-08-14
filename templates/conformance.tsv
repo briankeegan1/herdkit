@@ -613,3 +613,6 @@ agent-watch.sh	unit	tests/test-queue-plan-surface.sh
 spawn.sh	unit	tests/test-queue-plan-surface.sh
 console-section.sh	unit	tests/test-queue-plan-surface.sh
 herd notes [list|ack <n|all>]	unit	tests/test-intent-queue-note-ack-tenant.sh
+OUTCOME_LEDGER	unit	tests/test-outcome-ledger.sh
+herd ledger-report [--json | --alerts | --daily [--file PATH]]	unit	tests/test-outcome-ledger.sh
+herd intervene <ref> <safety|product|infra-recovery|convenience> "<note>"	unit	tests/test-outcome-ledger.sh
