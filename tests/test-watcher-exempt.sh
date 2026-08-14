@@ -33,6 +33,12 @@
 #   (j) HERD-524 (#636): a candidate that dies between the last scan and the render drops out silently
 #   (k) HERD-524: watcher_legacy_cmd — the shared "is this command line EXECUTING agent-watch.sh?"
 #       predicate the untagged-legacy KILL leg must pass a candidate through
+#   (l) HERD-743 (GH #812): a YOUNG non-lock-holder (a losing HERD-209/252 singleton spawn still working
+#       through its own refusal) that survives the base persistence window but dies before the lock
+#       cross-check's settle window elapses → no alarm, even though it outlived the base ~0.6s window
+#   (m) HERD-743: the SAME young-non-lock-holder duplicate still alarms once it AGES past the settle
+#       window (a genuine duplicate that merely isn't the lock holder is never permanently silenced), and
+#       an UNREADABLE/absent lockfile skips the cross-check entirely — today's persistence-only behavior
 #   (g) THE SAFETY RAIL (PR #387 review): a lock-absent STRAY that has dispatched a gate worker is
 #       STILL listed. watcher_list_mains feeds _stop_project_watcher's SIGTERM loop, not just the
 #       status count, and the gate-child guard cannot tell such a stray from a reparented fork — on
@@ -257,6 +263,74 @@ operator following the remedy line kills the one healthy watcher"
 [ "$(HERD_SWEEP_PS_CMD="$T/ps-dying" _status_watcher_live_pids "$CANON"$'\n'"$ORPHAN")" = "$CANON" ] \
   || fail "(j) _status_watcher_live_pids kept a pid the process table no longer holds"
 ok; echo "PASS (j) a pid that dies between scan and render drops out silently (control still alarms)"
+
+# ── (l)/(m) HERD-743 (GH #812): the lock-holder cross-check ─────────────────────────────────────
+# CANON holds $HERD_WATCHER_LOCK for this whole file. LOSER is a second herd-watch-wxws-tagged pid that
+# is NOT the lock holder — exactly a losing HERD-209/252 singleton spawn still working through its own
+# refusal. HERD_SWEEP_PS_ETIME_CMD plants its synthetic age; without it every pid here reads "unreadable"
+# and _wx_pid_settled's fail-open would treat it as already-settled, silently defeating these two cases.
+LOSER=800030
+_plant_loser_table() {   # $1 = destination, $2 = the call number ($3="" ⇒ never) from which LOSER is gone
+  cat > "$1" <<EOF
+#!/usr/bin/env bash
+n=0; [ -f "$T/ps-loser-calls" ] && n="\$(cat "$T/ps-loser-calls")"
+n=\$(( n + 1 )); printf '%s\n' "\$n" > "$T/ps-loser-calls"
+printf '%s 1 %s herd-watch-wxws bash agent-watch.sh --watch\n' "$CANON" "$CANON"
+if [ -z "$2" ] || [ "\$n" -lt "$2" ]; then
+  printf '%s 1 %s herd-watch-wxws bash agent-watch.sh\n' "$LOSER" "$LOSER"
+fi
+exit 0
+EOF
+  chmod +x "$1"
+}
+cat > "$T/ps-loser-young" <<'ETIME'
+#!/usr/bin/env bash
+printf '00:01'
+ETIME
+chmod +x "$T/ps-loser-young"
+cat > "$T/ps-loser-old" <<'ETIME'
+#!/usr/bin/env bash
+printf '00:05'
+ETIME
+chmod +x "$T/ps-loser-old"
+
+# (l) LOSER survives the base 3-sample window (still alive through call 5) but is YOUNG (1s, under the
+# 2s default settle window) and dies (call 6) during the cross-check's extra wait → no alarm.
+_plant_loser_table "$T/ps-loser" 6
+: > "$T/ps-loser-calls"
+LFIRST="$(HERD_SWEEP_PS_CMD="$T/ps-loser" watcher_list_mains)"
+[ "$(printf '%s\n' "$LFIRST" | grep -c .)" -eq 2 ] || fail "(l) fixture: the first sample should see 2 mains"
+HERD_SWEEP_PS_CMD="$T/ps-loser" HERD_SWEEP_PS_ETIME_CMD="$T/ps-loser-young" \
+  HERD_STATUS_DUP_SAMPLES=3 HERD_STATUS_DUP_SLEEP=0 HERD_STATUS_DUP_SETTLE_ROUNDS=10 \
+  _status_dup_verified "$LFIRST" >/dev/null \
+  && fail "(l) a young non-lock-holder (a losing singleton spawn, HERD-209/252) still alarmed after \
+outliving the base ~0.6s persistence window — an operator following the remedy could kill the real watcher"
+ok; echo "PASS (l) a young non-lock-holder that dies during the settle window never alarms, even once it outlives the base window"
+
+# (m) SAME shape, but LOSER never dies and reads OLD (5s, past the settle window) from the first look —
+# a genuine duplicate that simply isn't the lock holder must still alarm, and without extra delay.
+_plant_loser_table "$T/ps-loser-persist" ""
+: > "$T/ps-loser-calls"
+PFIRST="$(HERD_SWEEP_PS_CMD="$T/ps-loser-persist" watcher_list_mains)"
+SURV="$(HERD_SWEEP_PS_CMD="$T/ps-loser-persist" HERD_SWEEP_PS_ETIME_CMD="$T/ps-loser-old" \
+  HERD_STATUS_DUP_SAMPLES=3 HERD_STATUS_DUP_SLEEP=0 HERD_STATUS_DUP_SETTLE_ROUNDS=10 \
+  _status_dup_verified "$PFIRST")" \
+  || fail "(m) a genuine persistent duplicate that is NOT the lock holder stopped alarming — the lock \
+cross-check must never permanently silence a real duplicate"
+grep -qx "$LOSER" <<< "$SURV" || fail "(m) the persistent non-lock-holder duplicate was not reported: '$SURV'"
+# … and an UNREADABLE/absent lockfile skips the cross-check entirely: the SAME young-and-dying LOSER
+# fixture from (l) now alarms, because the base persistence-only check (today's behavior) never learns
+# LOSER isn't the lock holder in the first place.
+_plant_loser_table "$T/ps-loser-nolock" 6
+: > "$T/ps-loser-calls"
+NLFIRST="$(HERD_SWEEP_PS_CMD="$T/ps-loser-nolock" watcher_list_mains)"
+( unset HERD_WATCHER_LOCK
+  HERD_SWEEP_PS_CMD="$T/ps-loser-nolock" HERD_SWEEP_PS_ETIME_CMD="$T/ps-loser-young" \
+    HERD_STATUS_DUP_SAMPLES=3 HERD_STATUS_DUP_SLEEP=0 \
+    _status_dup_verified "$NLFIRST" >/dev/null ) \
+  || fail "(m) an unreadable lockfile changed the alarm behavior — the cross-check must fail-soft to \
+today's persistence-only check, not gate the alarm on a lock it could not read"
+ok; echo "PASS (m) a genuine non-lock-holder duplicate still alarms (no delay once already old); an unreadable lockfile skips the cross-check"
 
 # ── (k) HERD-524: the shared untagged-legacy predicate (a KILL path's proof) ────────────────────
 # _stop_project_watcher's phase-2 leg finds UNTAGGED legacy watchers with 'pgrep -f agent-watch.sh' —

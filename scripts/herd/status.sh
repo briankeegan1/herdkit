@@ -357,13 +357,33 @@ _status_dup_sleep() {
 #     line tells a human (or an autonomous coordinator) to kill what it names; naming a dead pid invites
 #     killing the one healthy watcher instead. A pid that vanished between scan and render drops out
 #     silently, and if that leaves ≤1 main there is no alarm at all.
+#   • LOCK-HOLDER CROSS-CHECK (HERD-743, GH #812) — PERSISTENCE alone is not always enough. The
+#     HERD-209/252 singleton refuses a losing spawn LOUDLY, but the refusal itself is not instant: the
+#     losing image has to finish sourcing agent-watch.sh and run its own kill/retry loop before it exits,
+#     which can take multiple seconds — long enough to survive every sample of the ~0.6s window above.
+#     Fired 4+ times in one session, each time naming a pid that was gone seconds later while the FIRST
+#     pid held the watcher lockfile the whole time — an operator following the remedy could have killed
+#     the real watcher. _status_dup_settle cross-checks every survivor against the lockfile holder
+#     (watcher-exempt.sh's watcher_lock_pid, the shared identity seam, HERD-266): a candidate that does
+#     NOT hold the lock and has not yet lived past the settle window is presumed to be exactly that
+#     spawn-in-flight, and its wait — ONLY its wait — is extended a few more samples so it has time to
+#     either die (no alarm) or age past the window (still alarms — see below). The lock holder itself,
+#     and any candidate already older than the settle window, never waits an extra tick: the happy path
+#     (a genuine duplicate, or a healthy control room) stays exactly as fast as before this check existed.
+#     NEVER weakens the true alarm: a genuine duplicate that is not the lock holder (e.g. a stale/removed
+#     lockfile) ages past the settle window like anything else and still alarms; two long-lived mains
+#     alarm regardless of lock state. Fail-soft: an unreadable/absent lockfile skips the cross-check
+#     entirely — today's persistence-only behavior, unchanged.
 # On success it PRINTS the pids that survived every check — the only ones the operator should be told to
 # stop. The caller must render those, never the first sample's: re-reading the list after verification
 # (as an earlier revision did) can catch a shrunk sample and print a nonsensical '⚠ 1 watcher mains
 # alive (pids 12345)'.
 # Returns 0 (alarm — verified real, surviving pids on stdout), 1 (do not alarm). Read-only.
 # HERD_STATUS_DUP_SAMPLES / HERD_STATUS_DUP_SLEEP are test seams; the defaults cost ~0.6s and only on
-# the already-suspect path.
+# the already-suspect path. HERD_STATUS_DUP_SETTLE_ROUNDS bounds _status_dup_settle's extra wait so a
+# non-lock-holder that never dies and never ages (a ps hiccup, a stuck test double) cannot hang this
+# forever — past the bound it is treated as real, the same fail-toward-the-alarm bias as everywhere else
+# in this check.
 _status_dup_verified() {
   local pids="${1:-}" samples="${HERD_STATUS_DUP_SAMPLES:-3}" i=1
   if declare -f watcher_handoff_active >/dev/null 2>&1 && watcher_handoff_active; then
@@ -379,9 +399,50 @@ _status_dup_verified() {
     [ "$(_status_watcher_count "$pids")" -gt 1 ] || return 1
     i=$(( i + 1 ))
   done
+  # Lock-holder cross-check (HERD-743): give a young non-lock-holder the extra time its OWN refusal
+  # needs, without slowing down the happy path.
+  pids="$(_status_dup_settle "$pids")"
+  [ "$(_status_watcher_count "$pids")" -gt 1 ] || return 1
   # Last gate, at render time: only pids that are STILL alive are named.
   pids="$(_status_watcher_live_pids "$pids")"
   [ "$(_status_watcher_count "$pids")" -gt 1 ] || return 1
+  printf '%s\n' "$pids"
+}
+
+# _status_dup_settle <candidate-pids> — the HERD-743 lock-holder cross-check. See _status_dup_verified's
+# header for the full incident/rationale; this is the mechanics. Uses watcher-exempt.sh's shared seams
+# (watcher_lock_pid, _wx_pid_settled/WATCHER_SETTLE_SECS) rather than re-implementing them — ONE answer
+# to "is this pid settled", never a second opinion status.sh grows on its own (the same HERD-266
+# doctrine that put the identity check itself in that file). Not declared there because the WAIT-for-time
+# loop below is specific to this on-demand, multi-second-tolerant surface (watcher_list_mains_settled's
+# own settle filter is deliberately instant-only — see its header — for the every-4s tick path).
+# Fail-soft: when either shared seam is missing (a standalone source predating watcher-exempt.sh, or the
+# file absent outright) or the lockfile is unreadable/absent, this is a no-op — today's behavior.
+_status_dup_settle() {
+  local pids="${1:-}"
+  declare -f watcher_lock_pid >/dev/null 2>&1 && declare -f _wx_pid_settled >/dev/null 2>&1 \
+    || { printf '%s\n' "$pids"; return 0; }
+  local lockpid; lockpid="$(watcher_lock_pid)"
+  [ -n "$lockpid" ] || { printf '%s\n' "$pids"; return 0; }
+
+  local rounds=0 max="${HERD_STATUS_DUP_SETTLE_ROUNDS:-10}" pid suspect
+  case "$max" in ''|*[!0-9]*) max=10 ;; esac
+  while :; do
+    suspect=""
+    while IFS= read -r pid; do
+      [ -n "$pid" ] || continue
+      [ "$pid" = "$lockpid" ] && continue    # the lock holder is never a suspect
+      _wx_pid_settled "$pid" && continue     # already past the settle window ⇒ treated as real
+      suspect="${suspect}${suspect:+$'\n'}$pid"
+    done <<EOF
+$pids
+EOF
+    [ -n "$suspect" ] || break                # nothing left waiting on time ⇒ done
+    [ "$rounds" -lt "$max" ] || break          # bounded — a stuck candidate falls through to the alarm
+    _status_dup_sleep
+    pids="$(_status_pid_intersect "$pids" "$(_status_watcher_pids)")"
+    rounds=$(( rounds + 1 ))
+  done
   printf '%s\n' "$pids"
 }
 
