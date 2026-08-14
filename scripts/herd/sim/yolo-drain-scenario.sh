@@ -53,6 +53,9 @@
 #                        file surface on the default branch (default: 02; empty disables the leg).
 #     --no-bundle        do NOT bundle same-surface items (one builder per item) — the control arm
 #                        that shows what the collision map buys.
+#     --ladder           HERD-738: arm BUDGET_LADDER=on alongside --budget, so the pre-spawn gate
+#                        observes + prints the real degradation rung (cost.sh budget_ladder_rung) on
+#                        its way toward the hard stop; asserted in a `ladder_rung_reached` checkpoint.
 #
 # Exit: 0 = the run matched its expected stop condition with no failed checkpoint · 1 = otherwise.
 set -uo pipefail
@@ -74,7 +77,7 @@ info() { printf '  %s→%s %s\n' "$c_dim" "$c_rst" "$*"; }
 
 # ── args ────────────────────────────────────────────────────────────────────────────────────────
 ART=""; KEEP=""; POSTURE="yolo"; N=3; CAPACITY=2; BUDGET=""; COST_PER_ITEM=1
-ESCALATE_AT=""; DIRTY_ITEM="02"; BUNDLE=1
+ESCALATE_AT=""; DIRTY_ITEM="02"; BUNDLE=1; LADDER=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --artifacts|--state) [ $# -ge 2 ] || { echo "yolo-drain: $1 requires a value" >&2; exit 1; }; ART="$2"; KEEP=1; shift 2 ;;
@@ -87,6 +90,7 @@ while [ $# -gt 0 ]; do
     --escalate-at)   [ $# -ge 2 ] || { echo "yolo-drain: --escalate-at requires a value" >&2; exit 1; }; ESCALATE_AT="$2"; shift 2 ;;
     --dirty-item)    [ $# -ge 2 ] || { echo "yolo-drain: --dirty-item requires a value" >&2; exit 1; }; DIRTY_ITEM="$2"; shift 2 ;;
     --no-bundle)     BUNDLE=0; shift ;;
+    --ladder)        LADDER=1; shift ;;
     -h|--help)       grep -E '^#' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "yolo-drain: unknown arg: $1" >&2; exit 1 ;;
   esac
@@ -120,6 +124,11 @@ posture_apply "$POSTURE"
 [ -n "$BUDGET" ] && export BUDGET_DAILY="$BUDGET"
 : "${BUDGET_DAILY:=}"
 export BUDGET_DAILY
+# HERD-738: --ladder arms the degradation ladder for this run (dormant, BUDGET_LADDER=off, otherwise —
+# same ship-dormant default as the real engine).
+[ -n "$LADDER" ] && export BUDGET_LADDER=on
+: "${BUDGET_LADDER:=off}"
+export BUDGET_LADDER
 
 # ── the real budget rail: journal + cost.sh, pinned to this run's throwaway journal ─────────────
 export JOURNAL_FILE="$ART/journal.jsonl"
@@ -229,6 +238,7 @@ _events_for() {
 # ── counters ────────────────────────────────────────────────────────────────────────────────────
 CYCLES=0; BUNDLES=0; BUILDERS=0; NOTES_ROUTED=0; RESOLVER_DISPATCHES=0; ESCALATIONS=0
 GATE_FAILURES=0; DRAINED=0; SPEND_ITEMS=0; STOP_REASON=""; DIGEST_EMITTED=false
+MAX_LADDER_RUNG=0   # HERD-738: the highest budget_ladder_rung observed at the pre-spawn gate this run
 SECONDS=0
 
 # ── scorecard ───────────────────────────────────────────────────────────────────────────────────
@@ -349,6 +359,21 @@ while :; do
     [ "$spawned_this_cycle" -ge "$CAPACITY" ] && break
     group="${G_TOKS[$gi]}"; surf="${G_SURF[$gi]}"
     ntoks="$(printf '%s\n' $group | grep -c . || true)"
+
+    # HERD-738: the DEGRADATION LADDER, observed at the SAME pre-spawn point, BEFORE the hard stop
+    # below — cost.sh's REAL budget_ladder_rung, the exact predicate agent-watch.sh's
+    # _review_conc/_health_conc/_review_gate_step and triggers.sh's triggers_run_one all act on
+    # (rung 1: concurrency halved · rung 2: cheap review tier forced for low-risk diffs · rung 3:
+    # non-critical triggers postponed). Byte-inert (always reads 0) unless --ladder armed BUDGET_LADDER=on.
+    if type budget_ladder_rung >/dev/null 2>&1; then
+      _rung="$(budget_ladder_rung)"
+      case "$_rung" in ''|*[!0-9]*) _rung=0 ;; esac
+      if [ "$_rung" -gt "$MAX_LADDER_RUNG" ]; then
+        MAX_LADDER_RUNG="$_rung"
+        printf '  %s⚠️%s  budget ladder rung %s/3 reached (spend $%s / $%s)\n' \
+          "$c_yel" "$c_rst" "$_rung" "$(cost_day_total)" "${BUDGET_DAILY:-?}"
+      fi
+    fi
 
     # ── STOP CONDITION 2: the BUDGET_DAILY ceiling, enforced at the PRE-SPAWN gate ──────────────
     # cost.sh's own predicate — the same one herd-feature.sh / herd-quick.sh / the watcher drain use.
@@ -543,6 +568,17 @@ if [ "$STOP_REASON" = "budget-ceiling" ]; then
   fi
 fi
 
+# HERD-738: with --ladder armed, the run must have DEGRADED (rung >= 1) on its way to the hard stop —
+# the ladder's whole point is to throttle BEFORE the ceiling, never only measure alongside it. Skipped
+# (not asserted either way) when --ladder was never passed, so the ladder-off runs above stay unaffected.
+if [ -n "$LADDER" ]; then
+  if [ "$MAX_LADDER_RUNG" -ge 1 ]; then
+    checkpoint ladder_rung_reached pass "the degradation ladder reached rung $MAX_LADDER_RUNG/3 before the BUDGET_DAILY hard stop"
+  else
+    checkpoint ladder_rung_reached fail "--ladder was armed but rung never left 0 — the ladder degraded nothing before the stop"
+  fi
+fi
+
 if [ "$STOP_REASON" = "escalation" ] && [ "$ESCALATIONS" -gt 0 ]; then
   checkpoint escalation_halted_the_loop pass "the resolver's ESCALATE halted the drain with $REMAINING item(s) still open"
 fi
@@ -580,6 +616,7 @@ printf '  notes_routed:         %d · resolver_dispatches: %d · escalations: %d
 printf '  coordinator_prompts:  %d\n' "$PROMPTS"
 printf '  stop_reason:          %s (digest: %s)\n' "$STOP_REASON" "$DIGEST_EMITTED"
 printf '  spend / budget:       $%s / %s\n' "$(cost_day_total)" "${BUDGET_DAILY:-<unset>}"
+[ -n "$LADDER" ] && printf '  ladder max rung:      %s/3\n' "$MAX_LADDER_RUNG"
 printf '  result:               %s\n' "$RESULT"
 printf '  scorecard:            %s\n' "$SCARD"
 

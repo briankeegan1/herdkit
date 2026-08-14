@@ -594,6 +594,15 @@ SPAWN_HELD_STATE="$TREES/.agent-watch-spawn-held"
 # and cleared when spend falls back under the ceiling. Untouched (stays empty) when BUDGET_DAILY is
 # dormant, so a no-budget watcher is byte-identical to before.
 _BUDGET_DRAIN_PAUSED=""
+# Degradation-ladder + per-item-cap state (HERD-738), siblings of _BUDGET_DRAIN_PAUSED above:
+#   • _BUDGET_LADDER_LAST_RUNG — the last rung (0-3) journaled via `budget_degrade`, in-process only, so
+#     a steady rung never re-journals every ~4s tick — only a CHANGE does (mirrors _GATE_SCALE_LAST_SIG).
+#   • _BUDGET_ITEM_SEEN — space-joined "<slug>:<pr>" tokens already journaled via `budget_item_over`,
+#     in-process only, so a standing over-cap item journals once, not every tick (the console ROW itself
+#     still rewrites every tick from live state — see build_budget_item_rows).
+# Both stay empty while BUDGET_LADDER/BUDGET_ITEM_MAX are dormant (the ship defaults).
+_BUDGET_LADDER_LAST_RUNG=""
+_BUDGET_ITEM_SEEN=""
 # Stall TTL for a held spawn intent (seconds; 0 disables stall surfacing). REUSES dep-watcher's
 # DEP_STALE_TTL so operators tune one knob; default mirrors dep-watcher.sh (86400 = 1 day).
 DEP_STALE_TTL="${DEP_STALE_TTL:-86400}"
@@ -944,16 +953,40 @@ _gate_scale_journal_once() {
 # before this key existed. GATE_SCALE=on runs the configured value through _gate_scale_derive as a
 # FLOOR (never lowered). Feeds BOTH the console (via build_gate_scale_note) and the LIVE Python engine
 # core (herd_engine_live_tick passes these same two values as an explicit env override per tick).
+# ── BUDGET LADDER rung 1 (HERD-738) — degrade concurrency under sustained spend pressure ──────────
+# _budget_ladder_reduce_conc <value> — echo <value> unchanged when the ladder is off/below rung 1
+# (byte-identical); at rung >= 1, divide it by BUDGET_LADDER_CONCURRENCY_DIVISOR (default 2), floored
+# at 1 — the gate never goes fully serial-to-zero from this lever (that is BUDGET_DAILY's hard-stop
+# job, not the ladder's). `type` guards every call so a tree without cost.sh (or a hermetic caller that
+# sourced this file alone) degrades to the plain pass-through, same posture as _gate_scale_enabled.
+_budget_ladder_reduce_conc() {
+  local _blc_val="$1" _blc_rung _blc_div _blc_reduced
+  type budget_ladder_rung >/dev/null 2>&1 || { printf '%s' "$_blc_val"; return 0; }
+  _blc_rung="$(budget_ladder_rung 2>/dev/null)" || _blc_rung=0
+  case "$_blc_rung" in ''|*[!0-9]*) _blc_rung=0 ;; esac
+  [ "$_blc_rung" -ge 1 ] 2>/dev/null || { printf '%s' "$_blc_val"; return 0; }
+  case "$_blc_val" in ''|*[!0-9]*) printf '%s' "$_blc_val"; return 0 ;; esac
+  _blc_div="${BUDGET_LADDER_CONCURRENCY_DIVISOR:-2}"
+  case "$_blc_div" in ''|*[!0-9]*) _blc_div=2 ;; esac
+  [ "$_blc_div" -ge 1 ] 2>/dev/null || _blc_div=2
+  _blc_reduced=$(( _blc_val / _blc_div ))
+  [ "$_blc_reduced" -lt 1 ] && _blc_reduced=1
+  printf '%s' "$_blc_reduced"
+}
 _review_conc()  {
-  local _rc_floor; _rc_floor="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
-  _gate_scale_enabled || { printf '%s' "$_rc_floor"; return 0; }
-  _gate_scale_derive "$_rc_floor"
+  local _rc_floor _rc_val
+  _rc_floor="$(herd_numeric REVIEW_CONCURRENCY 2)" || true
+  _rc_val="$_rc_floor"
+  _gate_scale_enabled && _rc_val="$(_gate_scale_derive "$_rc_floor")"
+  _budget_ladder_reduce_conc "$_rc_val"
 }
 _spawn_ahead()  { herd_numeric SPAWN_AHEAD 1 || true; }
 _health_conc()  {
-  local _hc_floor; _hc_floor="$(herd_numeric HEALTH_CONCURRENCY 1)" || true
-  _gate_scale_enabled || { printf '%s' "$_hc_floor"; return 0; }
-  _gate_scale_derive "$_hc_floor"
+  local _hc_floor _hc_val
+  _hc_floor="$(herd_numeric HEALTH_CONCURRENCY 1)" || true
+  _hc_val="$_hc_floor"
+  _gate_scale_enabled && _hc_val="$(_gate_scale_derive "$_hc_floor")"
+  _budget_ladder_reduce_conc "$_hc_val"
 }
 # CODEMAP_AUTOREFRESH is cosmetic (post-merge map refresh, never a gate). Unrecognized values fail
 # soft toward ACTIVE (default true) so a typo never freezes the maps.
@@ -3643,6 +3676,17 @@ render() {
   if [ -n "${GATE_SCALE_NOTE:-}" ]; then
     frame="${frame}  ${C_DIM}gate scale${C_RESET}"$'\n'"${GATE_SCALE_NOTE}"$'\n'
   fi
+  # BUDGET LADDER (HERD-738) — the degradation rung (1-3) when BUDGET_LADDER=on and today's spend has
+  # crossed a threshold. Empty whenever BUDGET_LADDER is off (default) or the ladder is at rung 0, so
+  # the console is byte-identical to before when the lever is dormant or spend is under the first rung.
+  if [ -n "${BUDGET_LADDER_NOTE:-}" ]; then
+    frame="${frame}  ${C_DIM}budget ladder${C_RESET}"$'\n'"${BUDGET_LADDER_NOTE}"$'\n'
+  fi
+  # BUDGET ITEM CAP (HERD-738) — needs-you-adjacent: one item is over BUDGET_ITEM_MAX. Empty whenever
+  # BUDGET_ITEM_MAX is unset (default) or no open item has crossed it, byte-identical console either way.
+  if [ -n "${BUDGET_ITEM_ROWS:-}" ]; then
+    frame="${frame}  ${C_RED}budget item cap${C_RESET}"$'\n'"${BUDGET_ITEM_ROWS}"$'\n'
+  fi
   # OPERATOR INBOX (HERD-184) — cross-seat comments needing the coordinator, just above the in-flight
   # rows (needs-you-adjacent). Empty unless OPERATOR_INBOX is on AND a comment has been surfaced, so
   # byte-identical when the feature is unused.
@@ -5453,6 +5497,35 @@ _review_gate_step() {
     [ "$tier" = "CHEAP" ] && _rt_model="$REVIEW_MODEL_CHEAP"
     # DOCS-only diff (opt-in via DOCS_ONLY_GLOB): a real adversarial review on the cheapest tier.
     [ "$tier" = "DOCS" ]  && _rt_model="$REVIEW_MODEL_DOCS"
+  fi
+
+  # BUDGET LADDER rung 2 (HERD-738): under sustained spend pressure, force the CHEAP review tier for
+  # LOW-RISK diffs even when the operator never opted into REVIEW_ESCALATE_GLOB/DOCS_ONLY_GLOB tiering.
+  # Reuses the SAME fail-safe classifier as above (_review_tier/_classify_review_tier) — a risky or
+  # oversized diff still comes back STRONG, so the ladder can only ever route an ALREADY-low-risk diff
+  # to the cheap tier, never downgrade a flagged one. Only engages when no tier decision has been made
+  # yet, so an operator's own glob-driven STRONG/DOCS/CHEAP choice above always wins. Byte-inert
+  # whenever BUDGET_LADDER is off or spend sits below its rung-2 threshold.
+  if [ -z "$_rt_model" ] && type budget_ladder_rung >/dev/null 2>&1; then
+    local _bl_rung; _bl_rung="$(budget_ladder_rung 2>/dev/null)" || _bl_rung=0
+    case "$_bl_rung" in ''|*[!0-9]*) _bl_rung=0 ;; esac
+    if [ "$_bl_rung" -ge 2 ] 2>/dev/null; then
+      local _bl_tier; _bl_tier="$(_review_tier "$pr" "$sha")"
+      case "$_bl_tier" in
+        CHEAP)
+          _rt_model="$REVIEW_MODEL_CHEAP"
+          journal_append budget_degrade_review pr "$pr" sha "$sha" rung "$_bl_rung" tier CHEAP model "$_rt_model" ;;
+        DOCS)
+          _rt_model="$REVIEW_MODEL_DOCS"
+          journal_append budget_degrade_review pr "$pr" sha "$sha" rung "$_bl_rung" tier DOCS model "$_rt_model" ;;
+        SKIP)
+          record_review "$pr" "$sha" "PASS" "skipped-low-risk"
+          rm -f "$(_review_tier_file "$pr" "$sha")" 2>/dev/null || true
+          journal_append review_skipped pr "$pr" sha "$sha" reason "budget ladder rung $_bl_rung: docs/test-only low-risk diff"
+          echo PASS; return 0 ;;
+        *) : ;;   # STRONG (or unclassifiable) — never downgrade
+      esac
+    fi
   fi
 
   # SMALL-MECHANICAL-DIFF FLOOR (HERD-559 leg 2, opt-in via REVIEW_MECH_FLOOR). Consulted ONLY when
@@ -16167,6 +16240,95 @@ build_gate_scale_note() {
   GATE_SCALE_NOTE="    ${C_DIM}review=${_gsn_eff_r} health=${_gsn_eff_h} · scaled${C_RESET} ${C_DIM}(builders=${_gsn_builders}, floor review=${_gsn_floor_r} health=${_gsn_floor_h})${C_RESET}"$'\n'
 }
 
+# _budget_ladder_journal_once <rung> — journal `budget_degrade rung=N` only when the rung CHANGES from
+# the last journaled value (module-level, per process) — a steady degraded day never spams the journal
+# on every ~4s tick, mirroring _gate_scale_journal_once exactly.
+_budget_ladder_journal_once() {
+  local rung="$1"
+  [ "$rung" = "$_BUDGET_LADDER_LAST_RUNG" ] && return 0
+  _BUDGET_LADDER_LAST_RUNG="$rung"
+  journal_append budget_degrade rung "$rung"
+}
+
+# build_budget_ladder_note — BUDGET_LADDER (HERD-738) console row + once-per-change journal line.
+# Reads the SAME budget_ladder_rung (cost.sh) that _review_conc/_health_conc/_review_gate_step already
+# act on, so the row is provably the rung the gate is degrading under THIS tick, never a separately
+# computed number. Empty (byte-identical console, no journal call) whenever BUDGET_LADDER is off, or
+# cost.sh was never sourced (a tree without it — same fail-soft posture as every other budget/gate-scale
+# reader here).
+build_budget_ladder_note() {
+  BUDGET_LADDER_NOTE=""
+  type budget_ladder_rung >/dev/null 2>&1 || return 0
+  [ "${BUDGET_LADDER:-off}" = "on" ] || return 0
+  local _bln_rung; _bln_rung="$(budget_ladder_rung 2>/dev/null)" || _bln_rung=0
+  case "$_bln_rung" in ''|*[!0-9]*) _bln_rung=0 ;; esac
+  _budget_ladder_journal_once "$_bln_rung"
+  [ "$_bln_rung" -ge 1 ] 2>/dev/null || return 0
+  local _bln_spent _bln_cap _bln_r _bln_h _bln_what
+  _bln_spent="$(cost_day_total 2>/dev/null || printf 0)"
+  _bln_cap="${BUDGET_DAILY:-?}"
+  _bln_r="$(_review_conc 2>/dev/null || printf '?')"
+  _bln_h="$(_health_conc 2>/dev/null || printf '?')"
+  case "$_bln_rung" in
+    1) _bln_what="concurrency reduced (review=${_bln_r} health=${_bln_h})" ;;
+    2) _bln_what="concurrency reduced + cheap review tier forced for low-risk diffs" ;;
+    3) _bln_what="concurrency reduced + cheap review tier forced + non-critical dispatches postponed" ;;
+    *) _bln_what="degraded" ;;
+  esac
+  BUDGET_LADDER_NOTE="    ${C_YELLOW}rung ${_bln_rung}/3${C_RESET} ${C_DIM}· \$${_bln_spent} / \$${_bln_cap} · ${_bln_what}${C_RESET}"$'\n'
+}
+
+# ── BUDGET ITEM CAP (HERD-738) — live per-item spend advisory ─────────────────────────────────────
+# BUDGET_ITEM_MAX rows are REWRITTEN WHOLE each tick from a LIVE scan of every open builder's own
+# transcript directory (cost_report_dir, the exact reader cost_emit_merge already uses at merge time —
+# pointed here at an IN-FLIGHT worktree instead) rather than kept in a persistent ack ledger, mirroring
+# ORPHAN_PR_LEDGER's style: since recorded spend only ever grows, an over-cap item stays over cap until
+# it leaves FEATS (merges or closes), at which point the row simply stops being written next tick — no
+# ack command needed. NEVER blocks or kills the item; purely advisory, exactly like any other
+# needs-you row in this console.
+BUDGET_ITEM_ROWS=""
+
+# _budget_item_seen_once <key> — true (and records) the FIRST time this (slug,pr) key is seen this
+# process; false on every later tick for the same key. Gates the journal call only — the console row
+# itself is rebuilt every tick regardless.
+_budget_item_seen_once() {
+  local key="$1"
+  case " ${_BUDGET_ITEM_SEEN} " in *" $key "*) return 1 ;; esac
+  _BUDGET_ITEM_SEEN="${_BUDGET_ITEM_SEEN} $key"
+  return 0
+}
+
+# build_budget_item_rows — scan every open builder worktree's transcript dir for its (builder+review)
+# spend so far and flag any past BUDGET_ITEM_MAX. Dormant (empty, no scan) whenever BUDGET_ITEM_MAX is
+# empty/non-numeric — same posture as BUDGET_DAILY's own case-pattern validation (a USD cap may be a
+# decimal, so this deliberately does NOT go through herd_numeric, which is integer-only).
+build_budget_item_rows() {
+  BUDGET_ITEM_ROWS=""
+  local cap="${BUDGET_ITEM_MAX:-}"
+  case "$cap" in ''|*[!0-9.]*) return 0 ;; esac
+  type cost_report_dir >/dev/null 2>&1 || return 0
+  type _cost_transcript_dir >/dev/null 2>&1 || return 0
+  local rec dir slug branch prnum rest rows=""
+  for rec in ${FEATS[@]+"${FEATS[@]}"}; do
+    IFS=$'\037' read -r dir slug branch prnum rest <<EOF
+$rec
+EOF
+    [ -n "${prnum:-}" ] || continue
+    [ -d "${dir:-}" ] || continue
+    local _bir_tdir _bir_spent
+    _bir_tdir="$(_cost_transcript_dir "$dir")"
+    [ -d "$_bir_tdir" ] || continue
+    _bir_spent="$(cost_report_dir "$_bir_tdir" all 2>/dev/null | awk '{for(i=1;i<=NF;i++){split($i,kv,"="); if(kv[1]=="usd") s+=kv[2]}} END{printf "%.4f", s+0}')"
+    awk -v s="$_bir_spent" -v c="$cap" 'BEGIN{exit !(s+0>c+0)}' || continue
+    local _bir_key="${slug}:${prnum}"
+    if _budget_item_seen_once "$_bir_key"; then
+      journal_append budget_item_over slug "$slug" pr "$prnum" spent "$_bir_spent" cap "$cap"
+    fi
+    rows="${rows}    ${C_RED}⛔${C_RESET} ${C_RED}needs-you · budget item cap:${C_RESET} ${C_BOLD}$(_slug_cell "$slug")${C_RESET} ${C_DIM}#${prnum}${C_RESET} ${C_RED}spent \$${_bir_spent} > BUDGET_ITEM_MAX \$${cap}${C_RESET}"$'\n'
+  done
+  BUDGET_ITEM_ROWS="$rows"
+}
+
 # _health_fail_detail <log> — the ONE line that best names why this suite failed. Every caller used to
 # fall back to `sed -n 1p` when the log carried no TAP 'not ok', which quotes healthcheck.sh's own
 # CLASSIFIER BANNER ("❌ CODE ERROR") — true, but content-free: it names no test, no file, no reason
@@ -18831,6 +18993,7 @@ _tick_render_reconcile() {
   build_sweep_note
   build_health_headroom_note  # HERD-281: advisory when suite duration approaches HEALTH_INFLIGHT_TIMEOUT
   build_gate_scale_note       # HERD-542: derived review/health caps when GATE_SCALE=on has scaled them
+  build_budget_ladder_note    # HERD-738: the degradation rung when BUDGET_LADDER=on has degraded them
 
   # HERD-615: paint the cold-start skeletal frame — see _first_frame_paint's own header for why this
   # sits exactly here (every build_* call above this line is a pure ledger/local read; everything
@@ -18898,6 +19061,10 @@ _tick_render_reconcile() {
   while IFS= read -r rec; do
     [ -n "$rec" ] && FEATS+=("$rec")
   done < <(PRS_JSON="$PRS_JSON" AGENTS_JSON="$AGENTS_JSON" WT="$WT" MAIN="$MAIN" TREES="$TREES" _discover_feature_worktrees)
+
+  # BUDGET ITEM CAP (HERD-738) — needs FEATS (dir/slug/pr per live builder), so it runs here rather
+  # than alongside build_gate_scale_note above. Byte-inert scan whenever BUDGET_ITEM_MAX is unset.
+  build_budget_item_rows
 
   # Classify each feature into a display line; collect merge candidates separately.
   DISPLAY=()

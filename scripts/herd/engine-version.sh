@@ -338,7 +338,7 @@ herd_engine_shadow_tick() {
 herd_engine_live_tick() {
   herd_engine_impl >/dev/null 2>&1   # resolve (fires the retired-value warning once if ENGINE_IMPL is stale)
   command -v python3 >/dev/null 2>&1 || return 1
-  local home pyp _tick_stderr _tick_rc _gs_health="" _gs_review="" _gs_seat=""
+  local home pyp _tick_stderr _tick_rc _gs_health="" _gs_review="" _gs_seat="" _bl_tiering=""
   home="${HERDKIT_HOME:-$(cd "$_HERD_ENGINE_DIR/../.." 2>/dev/null && pwd)}"
   pyp="$home/pysrc"
   [ -f "$pyp/herd/live_runtime.py" ] || return 1
@@ -346,6 +346,18 @@ herd_engine_live_tick() {
   _tick_stderr="$(mktemp 2>/dev/null || printf '%s' "/tmp/herd-tick-err-$$")"
   type _health_conc >/dev/null 2>&1 && _gs_health="$(_health_conc 2>/dev/null)"
   type _review_conc >/dev/null 2>&1 && _gs_review="$(_review_conc 2>/dev/null)"
+  # HERD-738 rung 2: when the budget ladder has degraded past its cheap-review threshold, pass
+  # REVIEW_TIERING=on as an explicit env override for THIS tick — the SAME pattern as _gs_health/
+  # _gs_review above — so the Python engine core's already-ported risk-tier classifier
+  # (LiveGates._review_tier, gated on this exact key) engages without any engine-core change. Reuses
+  # the operator's own REVIEW_ESCALATE_GLOB/DOCS_ONLY_GLOB/REVIEW_MECH_FLOOR verbatim — the override
+  # only ever flips the ONE master switch, never invents a classification rule. A `type` guard covers
+  # the rare hermetic caller that sourced this file without cost.sh/agent-watch.sh.
+  if type budget_ladder_rung >/dev/null 2>&1; then
+    local _bl_rung; _bl_rung="$(budget_ladder_rung 2>/dev/null)" || _bl_rung=0
+    case "$_bl_rung" in ''|*[!0-9]*) _bl_rung=0 ;; esac
+    [ "$_bl_rung" -ge 2 ] 2>/dev/null && _bl_tiering="on"
+  fi
   # HERD-675: pass THIS bash process's already-resolved seat id through as an explicit env override —
   # the SAME pattern as _gs_health/_gs_review above — so live_runtime.py's `_pr_fetch_cache_seat` (the
   # unified PR-list cache's filename stamp under PR_FETCH_UNIFY=on) names the IDENTICAL file this
@@ -356,6 +368,7 @@ herd_engine_live_tick() {
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$pyp" WORKTREES_DIR="${WORKTREES_DIR:-}" PROJECT_ROOT="${PROJECT_ROOT:-}" \
     HEALTH_CONCURRENCY="${_gs_health:-${HEALTH_CONCURRENCY:-}}" REVIEW_CONCURRENCY="${_gs_review:-${REVIEW_CONCURRENCY:-}}" \
     HERD_ENGINE_SEAT_ID="${_gs_seat:-${HERD_ENGINE_SEAT_ID:-}}" \
+    REVIEW_TIERING="${_bl_tiering:-${REVIEW_TIERING:-}}" \
     python3 -m herd.live_runtime --tick >/dev/null 2>"$_tick_stderr"
   _tick_rc=$?
   # Capture the last non-empty stderr line so the caller can surface a self-explaining fault reason.

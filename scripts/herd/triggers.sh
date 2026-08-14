@@ -264,6 +264,27 @@ triggers_run_one() {
   snap="$(_triggers_snapshot_file "$name")" || { echo "🛑 triggers: '$name' — cannot resolve state dir." >&2; return 0; }
   last="$(_triggers_last_file "$name")"     || return 0
 
+  # BUDGET LADDER rung 3 (HERD-738): postpone NON-CRITICAL triggers (gardener runs, advisory sweeps —
+  # matched by BUDGET_LADDER_NONCRITICAL_GLOB) once spend crosses the ladder's rung-3 threshold. A
+  # postponed trigger's snapshot/last-fired timestamp are left COMPLETELY untouched, so triggers_due
+  # fires it again on the very next tick once spend drops back — a DEFERRAL, never a silent drop, and
+  # never mid-flight: this check runs before the input command even executes, so a postponed trigger
+  # costs nothing (no gh call, no spawn, no mechanical run). Byte-inert whenever BUDGET_LADDER is off,
+  # spend sits below the threshold, or this trigger's name doesn't match the glob — a real feature/quick
+  # spawn trigger the operator did NOT name into the (default maintenance-shaped) glob is never touched.
+  if type budget_ladder_rung >/dev/null 2>&1; then
+    local _bl_rung; _bl_rung="$(budget_ladder_rung 2>/dev/null)" || _bl_rung=0
+    case "$_bl_rung" in ''|*[!0-9]*) _bl_rung=0 ;; esac
+    if [ "$_bl_rung" -ge 3 ] 2>/dev/null; then
+      local _bl_glob="${BUDGET_LADDER_NONCRITICAL_GLOB:-gardener|drift-sweep|reconcile-sweep|-advisory}"
+      if grep -qE "$_bl_glob" <<<"$name" 2>/dev/null; then   # here-string, not a pipe (HERD-297)
+        echo "⏸️  trigger '$name': postponed — budget ladder rung $_bl_rung (non-critical dispatch deferred until spend eases)."
+        command -v journal_append >/dev/null 2>&1 && journal_append budget_degrade_postponed name "$name" rung "$_bl_rung"
+        return 0
+      fi
+    fi
+  fi
+
   # 1. Current input set: the input command's stdout, blank lines dropped, sorted-unique.
   out="$( cd "$dir" 2>/dev/null && bash -c "$input" )"; rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -377,6 +398,9 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   . "$_TR_HERE/herd-config.sh"
   # shellcheck source=scripts/herd/journal.sh
   [ -f "$_TR_HERE/journal.sh" ] && . "$_TR_HERE/journal.sh"
+  # HERD-738: cost.sh for budget_ladder_rung (rung-3 postponement, above). Guarded exactly like
+  # journal.sh above — a tree without it degrades to the plain unpostponed dispatch (byte-identical).
+  [ -f "$_TR_HERE/cost.sh" ] && . "$_TR_HERE/cost.sh"
   _tr_cmd="${1:-}"; shift 2>/dev/null || true
   case "$_tr_cmd" in
     tick)     triggers_tick "$@" ;;

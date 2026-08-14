@@ -377,6 +377,7 @@ print("%.6f" % total)
 # exceeded) with zero work — byte-identical to no budget. FAIL-SOFT throughout. This is the ONE
 # predicate the watcher drain and both lanes consult, so the ceiling can never diverge between them.
 budget_daily_exceeded() {
+  budget_override_active && return 1   # HERD-738: an armed manual rescue bypasses the ceiling entirely
   local cap="${BUDGET_DAILY:-}"
   [ -n "$cap" ] || return 1
   case "$cap" in ''|*[!0-9.]*) return 1 ;; esac   # non-numeric (a typo) → dormant, never enforce
@@ -385,6 +386,113 @@ budget_daily_exceeded() {
   awk -v t="$total" -v c="$cap" 'BEGIN { exit !((t + 0) > (c + 0)) }' || return 1
   printf '%s %s' "$total" "$cap"
   return 0
+}
+
+# ── Manual budget rescue (HERD-738) — budget_override ────────────────────────────────────────────
+# An operator who has judged an over-budget day (or a degraded ladder rung) SAFE to keep running needs
+# a way to say so that is DISTINCT from a per-spawn HERD_FORCE_SPAWN=1 (which overrides exactly ONE
+# spawn and is already journaled as budget_spawn_forced) — a STANDING rescue that lasts until
+# explicitly cleared, recorded as its own `budget_override` journal event so a trial/audit can count it
+# as a deliberate INTERVENTION rather than mistaking it for the ladder easing or the ceiling healing on
+# its own. While armed, budget_daily_exceeded and budget_ladder_rung both bypass their own math
+# entirely (checked FIRST, above) — the rescue wins outright, not just "one more spawn".
+#
+# _budget_override_file — the marker path: $WORKTREES_DIR/.herd/budget-override, mirroring journal.sh's
+# own $WORKTREES_DIR/.herd/journal.jsonl convention. Empty (no WORKTREES_DIR) → no marker possible.
+_budget_override_file() {
+  [ -n "${WORKTREES_DIR:-}" ] || return 1
+  printf '%s/.herd/budget-override' "$WORKTREES_DIR"
+}
+
+# budget_override_active — 0 (TRUE) iff a rescue marker is currently set; 1 (dormant) otherwise,
+# including when WORKTREES_DIR cannot be resolved (fail-soft: no marker possible ⇒ never active).
+budget_override_active() {
+  local f; f="$(_budget_override_file 2>/dev/null)" || return 1
+  [ -s "$f" ]
+}
+
+# budget_override_set <reason> — arm the rescue: write the marker (one "<epoch>\t<reason>" line) and
+# journal `budget_override action=set reason=<reason>`. The journal call fires even when the marker
+# write itself fails (a full disk must never hide the intervention). Returns 1 only when WORKTREES_DIR
+# cannot be resolved at all (nothing to arm).
+budget_override_set() {
+  local reason="${1:-manual rescue}" f
+  f="$(_budget_override_file 2>/dev/null)" || {
+    type journal_append >/dev/null 2>&1 && journal_append budget_override action set reason "$reason" result no-worktrees-dir
+    return 1
+  }
+  mkdir -p "$(dirname "$f")" 2>/dev/null || true
+  printf '%s\t%s\n' "$(date +%s 2>/dev/null || echo 0)" "$reason" > "$f" 2>/dev/null || true
+  type journal_append >/dev/null 2>&1 && journal_append budget_override action set reason "$reason"
+  return 0
+}
+
+# budget_override_clear — disarm the rescue: remove the marker and journal `budget_override
+# action=clear`. Idempotent — clearing an already-clear override is a no-op journal line, never an error.
+budget_override_clear() {
+  local f; f="$(_budget_override_file 2>/dev/null)" || return 1
+  rm -f "$f" 2>/dev/null || true
+  type journal_append >/dev/null 2>&1 && journal_append budget_override action clear
+  return 0
+}
+
+# ── The degradation ladder (HERD-738) ─────────────────────────────────────────────────────────────
+# budget_ladder_rung — echo the current DEGRADATION RUNG: 0 (no degradation) | 1 | 2 | 3. DORMANT
+# (always prints 0) unless BUDGET_LADDER=on AND BUDGET_DAILY resolves to a positive number — with no
+# ceiling there is no percentage to rung on. A live budget_override also forces rung 0 (the rescue
+# overrides the ladder exactly as it overrides the hard stop, above). BUDGET_LADDER_RUNGS is three
+# comma-separated ASCENDING percent-of-BUDGET_DAILY thresholds (default "60,80,95"); each field falls
+# back to its own built-in default independently when blank or non-numeric, so a partial typo degrades
+# gracefully rather than aborting or fabricating a rung. FAIL-SOFT throughout, same posture as
+# budget_daily_exceeded — never aborts a caller under `set -euo pipefail`.
+budget_ladder_rung() {
+  [ "${BUDGET_LADDER:-off}" = "on" ] || { printf 0; return 0; }
+  budget_override_active && { printf 0; return 0; }
+  local cap="${BUDGET_DAILY:-}"
+  case "$cap" in ''|*[!0-9.]*) printf 0; return 0 ;; esac
+  local spent; spent="$(cost_day_total)"
+  local rungs="${BUDGET_LADDER_RUNGS:-60,80,95}" p1 p2 p3
+  p1="$(printf '%s' "$rungs" | cut -d, -f1)"; case "$p1" in ''|*[!0-9.]*) p1=60 ;; esac
+  p2="$(printf '%s' "$rungs" | cut -d, -f2)"; case "$p2" in ''|*[!0-9.]*) p2=80 ;; esac
+  p3="$(printf '%s' "$rungs" | cut -d, -f3)"; case "$p3" in ''|*[!0-9.]*) p3=95 ;; esac
+  awk -v s="$spent" -v c="$cap" -v p1="$p1" -v p2="$p2" -v p3="$p3" 'BEGIN {
+    if (c + 0 <= 0) { print 0; exit }
+    pct = (s / c) * 100
+    r = 0
+    if (pct + 0 >= p1 + 0) r = 1
+    if (pct + 0 >= p2 + 0) r = 2
+    if (pct + 0 >= p3 + 0) r = 3
+    print r
+  }'
+}
+
+# budget_forecast — echo "<spent> <burn_per_hr> <projected_eod> <cap>" (space-separated USD figures)
+# for today's spend against BUDGET_DAILY: burn_per_hr is today's spend divided by hours elapsed since
+# UTC midnight (floored at one minute so a just-past-midnight call never divides by ~0 into a
+# fabricated spike), projected_eod is spent + burn_per_hr * hours remaining today. DORMANT (empty
+# output, rc 1) when BUDGET_DAILY is empty/non-numeric — nothing to project against. FAIL-SOFT: no
+# python3 → empty output, rc 1. HERD_FORECAST_NOW ("HH:MM:SS", UTC) is a TEST SEAM overriding "now" —
+# unset in production, where real UTC wall-clock time is used.
+budget_forecast() {
+  local cap="${BUDGET_DAILY:-}"
+  case "$cap" in ''|*[!0-9.]*) return 1 ;; esac
+  command -v python3 >/dev/null 2>&1 || return 1
+  local spent; spent="$(cost_day_total)"
+  HERD_FORECAST_NOW="${HERD_FORECAST_NOW:-}" python3 -c '
+import sys, os, datetime
+spent = float(sys.argv[1]); cap = float(sys.argv[2])
+override = os.environ.get("HERD_FORECAST_NOW", "")
+if override:
+    h, m, s = (int(x) for x in override.split(":"))
+else:
+    now = datetime.datetime.now(datetime.timezone.utc)
+    h, m, s = now.hour, now.minute, now.second
+elapsed_h = max((h * 3600 + m * 60 + s) / 3600.0, 1.0 / 60)
+remaining_h = max(0.0, 24.0 - elapsed_h)
+burn = spent / elapsed_h
+projected = spent + burn * remaining_h
+print("%.6f %.6f %.6f %.6f" % (spent, burn, projected, cap))
+' "$spent" "$cap" 2>/dev/null
 }
 
 # cost_emit_merge <pr> <slug> <worktree> — BEST-EFFORT, SILENT, ALWAYS returns 0. Reads the
