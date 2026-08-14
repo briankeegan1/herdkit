@@ -893,6 +893,171 @@ def _bump_dispatch_count(path):
     return n
 
 
+_HEALTH_VERDICTLESS_REDISPATCH_MAX = 3
+"""How many CONSECUTIVE verdictless dispatches one (pr, sha) key may burn before the rail STOPS
+re-dispatching and escalates (HERD-742, GitHub issue #813; mirrors agent-watch.sh's
+``_HEALTH_VERDICTLESS_REDISPATCH_MAX`` — read its header there for the grounded failure and the whole
+rationale, this is the SAME bound, not a second one).
+
+A worker killed before its one-shot verdict write leaves a 0-byte ``<log>``, so the collect leg reads no
+verdict, the corpse sweep journals ``health_died``, and the next tick dispatched the same suite again —
+83 laps over ~15 h on emberglen-godot PR #425, with no needs-you row. ``HEALTH_EARLY_REAP_SECS`` /
+``HEALTH_INFLIGHT_TIMEOUT`` bound a LIVE worker, never this dead-and-restarted cycle. An inline
+constant, not a config key — a runaway bound is never an operator preference (the HERD-228 precedent)."""
+
+_HEALTH_SALVAGE_TAG = ("salvaged from the .progress companion "
+                       "(worker died before writing its verdict)")
+"""Tag appended to a verdict recovered from the progress companion (HERD-742 leg 2), so no downstream
+surface can read a salvaged red as an ordinary collected one. Mirrors agent-watch.sh's
+``_HEALTH_SALVAGE_TAG`` byte-for-byte."""
+
+_SALVAGE_TAP_PLAN_RE = re.compile(r"^1\.\.([0-9]+)")
+_SALVAGE_TAP_RESULT_RE = re.compile(r"^(?:ok|not ok) ")
+_SALVAGE_TAP_NOTOK_RE = re.compile(r"^[ \t]*not ok( |$)")
+_SALVAGE_SUITE_HEADER_RE = re.compile(r"^suite: ([0-9]+) tests$")
+_SALVAGE_PROGRESS_RE = re.compile(r"^\[health-progress\] ")
+_SALVAGE_PROGRESS_FAIL_RE = re.compile(r"^\[health-progress\] .+ FAIL$")
+
+
+def _dispatch_count(path):
+    """The current verdictless-dispatch tally at ``path``; 0 when absent/unreadable/garbage (mirrors
+    agent-watch.sh's ``_health_dispatch_count``). Fail-soft toward 0 on purpose: under-counting costs one
+    extra lap, over-counting would stop a HEALTHY gate on a read fault."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return max(0, int((fh.readline() or "0").strip() or 0))
+    except Exception:
+        return 0
+
+
+def _health_redispatch_capped(count_path, cap_path):
+    """THE bound (HERD-742) — True iff the cap is already armed for this key, or the key has burned its
+    whole budget of consecutive verdictless dispatches. Mirrors agent-watch.sh's
+    ``_health_redispatch_capped`` verbatim, over the SAME two files, so bash's gate/sim surface and this
+    live dispatcher can never disagree about whether a key is capped."""
+    if cap_path and os.path.exists(cap_path):
+        return True
+    return _dispatch_count(count_path) >= _HEALTH_VERDICTLESS_REDISPATCH_MAX
+
+
+def _health_redispatch_cap_arm(cap_path, count_path, pr, sha, slug):
+    """Arm the cap ONCE for this key and return the lap count it recorded, or 0 when it was already
+    armed (or could not be written). Mirrors agent-watch.sh's ``_health_redispatch_cap_arm``: one line
+    ``<epoch>\\t<pr>\\t<sha>\\t<slug>\\t<laps>`` — the file the bash render half reads to paint the
+    needs-you row — and the counter is CLEARED, so an operator who removes the marker (the remedy that
+    row names) buys one more full budget rather than an instant re-cap. Idempotent: a standing cap is a
+    STATE, not a repeating event, so an already-armed key writes nothing and journals nothing."""
+    if not cap_path or os.path.exists(cap_path):
+        return 0
+    laps = _dispatch_count(count_path)
+    try:
+        with open(cap_path, "w", encoding="utf-8") as fh:
+            fh.write("%d\t%s\t%s\t%s\t%d\n" % (int(_now_epoch()), pr, sha, slug or "", laps))
+    except Exception:
+        return 0
+    try:
+        if count_path:
+            os.remove(count_path)
+    except OSError:
+        pass
+    return laps
+
+
+def _health_progress_source(log_path):
+    """The companion a suite's live progress is actually being written to — the solo retry's
+    ``<log>.retry.progress`` when it carries bytes and is newer than (or the only) main
+    ``<log>.progress``, else that main companion, else ``log_path`` itself when neither exists (mirrors
+    agent-watch.sh's ``_health_progress_source``, HERD-533/570)."""
+    if not log_path:
+        return ""
+    retry, main = log_path + ".retry.progress", log_path + ".progress"
+
+    def _size(p):
+        try:
+            return os.path.getsize(p)
+        except OSError:
+            return 0
+
+    def _mtime(p):
+        try:
+            return os.path.getmtime(p)
+        except OSError:
+            return 0.0
+
+    if _size(retry) > 0 and (_size(main) <= 0 or _mtime(retry) > _mtime(main)):
+        return retry
+    if _size(main) > 0:
+        return main
+    return log_path
+
+
+def _health_salvage_detail(log_path):
+    """The failing line a COMPLETE progress tail proves for ``log_path``, or ``""`` when there is nothing
+    to salvage (HERD-742 leg 2; mirrors agent-watch.sh's ``_health_salvage_detail``).
+
+    A worker killed mid-run leaves ``<log>`` at 0 bytes while its ``.progress`` companion holds the real
+    suite output — on the grounded incident it held the actual failing output for 15 hours while the gate
+    re-ran the suite 83 times to re-derive it. Completeness is read the same two ways the live running row
+    counts progress (agent-watch.sh's ``_health_progress``): the project-wrapper ``suite: N tests`` header
+    plus its ``[health-progress] …`` completion lines, else a bare TAP ``1..N`` plan plus its ok/not-ok
+    result lines.
+
+    DELIBERATELY ONE-SIDED — only a FAILING tail is ever salvaged. An all-pass tail proves the TAP tests
+    passed, NOT that the suite did (healthcheck.sh's rc also carries the syntax/shellcheck/leak-guard/
+    caps-sync probes, which emit no TAP lines), and a fabricated CLEAN is the one mistake here that could
+    MERGE code no suite ever cleared. An all-pass tail falls through to the ordinary (now bounded)
+    re-dispatch. Never raises: any read fault reads as "nothing to salvage"."""
+    if not log_path:
+        return ""
+    try:
+        if os.path.getsize(log_path) > 0:
+            return ""                      # a real log exists — never salvage over a real verdict
+    except OSError:
+        pass                               # absent log is exactly the 0-byte case this exists for
+    src = _health_progress_source(log_path)
+    if not src or src == log_path:
+        return ""                          # no companion at all — nothing was ever streamed
+    planned_tap = planned_hdr = 0
+    done_tap = done_hdr = 0
+    notok = fail_line = ""
+    try:
+        with open(src, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.rstrip("\n")
+                if not planned_hdr:
+                    m = _SALVAGE_SUITE_HEADER_RE.match(line)
+                    if m:
+                        planned_hdr = int(m.group(1))
+                if _SALVAGE_PROGRESS_RE.match(line):
+                    done_hdr += 1
+                    if not fail_line and _SALVAGE_PROGRESS_FAIL_RE.match(line):
+                        fail_line = line
+                    continue
+                if not planned_tap:
+                    m = _SALVAGE_TAP_PLAN_RE.match(line)
+                    if m:
+                        planned_tap = int(m.group(1))
+                        continue
+                if _SALVAGE_TAP_RESULT_RE.match(line):
+                    done_tap += 1
+                if not notok and _SALVAGE_TAP_NOTOK_RE.match(line):
+                    notok = " ".join(line.split())
+    except Exception:
+        return ""
+    # Same precedence as _health_progress: the wrapper's exact header/completion counting wins when it
+    # is present; otherwise the TAP plan governs.
+    if planned_hdr > 0:
+        done, planned = done_hdr, planned_hdr
+    else:
+        done, planned = done_tap, planned_tap
+    if planned <= 0 or done < planned:
+        return ""                          # incomplete tail — a partial run proves nothing
+    detail = notok or fail_line
+    if not detail:
+        return ""                          # all-pass tail — never salvaged (see above)
+    return detail[:200]
+
+
 def _heartbeat_fresh(path, grace=_HEALTH_HEARTBEAT_GRACE):
     """True iff ``path`` exists and was written within the last ``grace`` seconds (mirrors
     agent-watch.sh's ``_heartbeat_fresh``). Fail-soft: an absent/unreadable file is NEVER fresh — a
@@ -1225,6 +1390,12 @@ class LiveState:
         # tally is the true global dispatch count for this (pr, sha) regardless of which engine/seat
         # actually launched a given worker.
         return self._p(".health-dispatch-count-%s" % self._health_key(cand))
+
+    def health_redispatch_cap_file(self, cand):
+        # HERD-742: SAME filename agent-watch.sh's `_health_redispatch_cap_file` writes and reads — the
+        # bash render half (`_gate_phase_row`) paints the needs-you row straight off this marker, so a
+        # cap armed by THIS engine surfaces on the console with no second mechanism.
+        return self._p(".health-redispatch-cap-%s" % self._health_key(cand))
 
     def health_adopted_file(self, cand):
         # HERD-736 leg 2: SAME filename agent-watch.sh's `_health_adopted_file` writes — see its
@@ -3402,8 +3573,13 @@ class LiveGates:
                     # exact tick observed it under, so a later tick can tell whether the operator has
                     # since released a changed gate posture — see gate_config_generation's docstring.
                     st.record_health_generation(cand, D.gate_config_generation(self.config))
+                    # RESET-ON-PROGRESS (HERD-742): a TERMINAL verdict — and only a terminal verdict —
+                    # zeroes the verdictless-lap budget, counter AND cap marker together. The
+                    # unparseable-payload path below deliberately leaves both standing: it is an infra
+                    # death that re-dispatches, and clearing the budget there would hand THAT loop the
+                    # unbounded budget this cap exists to close.
                     st.rm(disp, inflight, st.health_adopted_file(cand),
-                          st.health_dispatch_count_file(cand))
+                          st.health_dispatch_count_file(cand), st.health_redispatch_cap_file(cand))
                     return verdict
                 # Nonce matched but the payload is unparseable / truncated → an infra death, NOT a verdict;
                 # never cache. Drop it and re-dispatch next tick (bounded once the suite finally succeeds).
@@ -3418,6 +3594,49 @@ class LiveGates:
         if inflight and _inflight_verified_live(
                 inflight, _pos_int(os.environ.get("HEALTH_INFLIGHT_TIMEOUT"), 1800),
                 _health_heartbeat_file(inflight)):
+            return WAIT
+        # 3.2 SALVAGE BEFORE BURNING A LAP (HERD-742 leg 2). No live worker and no collectable result:
+        #     the last worker died before its one-shot verdict write. Its ".progress" companion may
+        #     nonetheless already hold a COMPLETE, FAILING suite tail — the verdict is then proven, and a
+        #     fresh ~9-60 min suite would only re-derive it (83 times, on the grounded incident). Record
+        #     that red exactly as the collect leg above does (sha-cache + generation stamp), TAGGED so no
+        #     downstream surface can read it as an ordinary collected verdict, and reset the lap budget:
+        #     this key made real progress. Never salvages a PASS — see _health_salvage_detail's header
+        #     for why that asymmetry is load-bearing. Byte-inert on every tick with no companion on disk,
+        #     which is every tick before a worker has ever run for this key. Sequenced ABOVE the
+        #     no-worktree guard (3.5) on purpose, and safely: that guard exists to stop healthcheck.sh
+        #     usage-erroring into a PHANTOM red, whereas this records a red only from a real prior run's
+        #     own completed output — and it shells nothing. Same order as bash's gate step, so the two
+        #     engines reach the bound at the same point in the state machine.
+        salvaged = _health_salvage_detail(st.health_log_file(cand)) if cand.sha else ""
+        if salvaged:
+            detail = "%s · %s" % (salvaged, _HEALTH_SALVAGE_TAG)
+            self.journal.append("health_verdict_salvaged", "pr", cand.pr, "sha", cand.sha,
+                                "slug", cand.slug,
+                                "source", _health_progress_source(st.health_log_file(cand)),
+                                "detail", detail)
+            st.record_health_result(cand, "CODEERROR", detail)
+            st.record_health_generation(cand, D.gate_config_generation(self.config))
+            st.rm(st.health_dispatch_count_file(cand), st.health_redispatch_cap_file(cand))
+            return "CODEERROR"
+        # 3.3 RE-DISPATCH CAP (HERD-742 leg 1). This key has burned its budget of CONSECUTIVE verdictless
+        #     laps — STOP. Arm the durable cap marker once (the bash render half paints its needs-you row
+        #     straight off that file, naming the lap count and the .progress path to read), journal the
+        #     distinct `health_redispatch_cap` event, and HOLD: no slot taken, no suite started, nothing
+        #     merged. WAIT rather than a fabricated CODEERROR because there IS no verdict — inventing a
+        #     red here would bounce a builder at a phantom test failure, the HERD-346/#453 pathology.
+        #     Sequenced BEFORE the worktree/slot legs so the bound holds regardless of capacity, and
+        #     gated on a non-empty sha (without one the counter key is not sha-scoped, so it must not
+        #     gate — the same rule the HERD-228 infra cap follows).
+        if cand.sha and _health_redispatch_capped(st.health_dispatch_count_file(cand),
+                                                  st.health_redispatch_cap_file(cand)):
+            laps = _health_redispatch_cap_arm(st.health_redispatch_cap_file(cand),
+                                              st.health_dispatch_count_file(cand),
+                                              cand.pr, cand.sha, cand.slug)
+            if laps:
+                self.journal.append("health_redispatch_cap", "key", st._health_key(cand),
+                                    "count", laps, "pr", cand.pr, "sha", cand.sha, "slug", cand.slug,
+                                    "progress", (st.health_log_file(cand) or "") + ".progress")
             return WAIT
         # 3.5 HARD pre-dispatch worktree validation (task HERD-346, leg 2): NEVER shell the suite at a
         #     worktree that isn't there — healthcheck.sh <missing> usage-errors into a phantom CODEERROR
@@ -6714,6 +6933,16 @@ class LiveTick:
                               st.health_log_file_sha(cand.pr, sha))
                         self.journal.append("gate_superseded", "pr", cand.pr, "rail", "health",
                                             "old_sha", sha, "new_sha", cur, "action", "session_kill")
+                # HERD-742: the verdictless-lap counter and its cap marker are keyed by (pr, sha) too, and
+                # a DEAD key leaves no in-flight marker for the loop above to find — so they are swept on
+                # their own. Without this a cap armed for a sha the PR has since moved past would keep
+                # painting a needs-you row off stale evidence (pane-truth: a red row must be TRUE now),
+                # and the old counter would leak one file per superseded head forever. Mirrors the same
+                # sweep bash's `_discard_stale_health` does over these exact two prefixes.
+                for path, _sha in st.stale_inflight(".health-redispatch-cap", cand.pr, cur):
+                    st.rm(path)
+                for path, _sha in st.stale_inflight(".health-dispatch-count", cand.pr, cur):
+                    st.rm(path)
                 # review rail — terminate the stale reviewer's subtree, retire its stamped pane, reap scratch.
                 for path, sha in st.stale_inflight(".review-inflight", cand.pr, cur, journal=self.journal):
                     if _terminate_worker(path):

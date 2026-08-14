@@ -299,6 +299,8 @@ Anchors point at the emit site; the k/v keys after `event` are the required fiel
 | `review_dispatched` | pr, sha, pid, model, log_path, pin | `agent-watch.sh:2545` |
 | `healthcheck_started` | pr, slug, sha, pid, log_path | `agent-watch.sh:10390` |
 | `healthcheck_outcome` | pr, slug, outcome(CLEAN\|FLAKY\|CODEERROR) | `agent-watch.sh:10273` |
+| `health_redispatch_cap` | key, count, pr, sha, slug, progress | `agent-watch.sh:_health_redispatch_cap_arm` + port `live_runtime.py:LiveGates.health` (HERD-742/#813 — THE bound on VERDICTLESS re-dispatch: after `_HEALTH_VERDICTLESS_REDISPATCH_MAX` consecutive laps whose worker died before writing a verdict, the rail STOPS dispatching, arms a durable `.health-redispatch-cap-<pr>-<sha>` marker and escalates to a needs-you row. Emitted ONCE per armed key — a standing cap is a state, not a repeating event — and cleared, with the counter, by any terminal-verdict collect. `progress` names the `.progress` companion an operator reads) |
+| `health_verdict_salvaged` | pr, sha, slug, source, detail | `agent-watch.sh:_healthcheck_gate` + port `live_runtime.py:LiveGates.health` (HERD-742 leg 2 — a worker died before its one-shot verdict write, but its `.progress` companion already held a COMPLETE, FAILING suite tail, so that red was recorded instead of burning another lap. Only a FAILING tail is ever salvaged; an all-pass one falls through to the ordinary bounded re-dispatch) |
 | `stale_dup_hold` | pr, sha, slug, kind, reason | `agent-watch.sh:7896` |
 | `refix_bounce` | pr, sha, slug, round, agent_status_before, rule, location | `agent-watch.sh:7321` |
 | `refix_wake_result` | pr, sha, slug, round, agent_status_before, agent_status_after, woke, escalated | `agent-watch.sh:7359` |

@@ -16530,6 +16530,15 @@ _gate_phase_row() {
         "$(_health_log_file "${_gpr_pr}-${_gpr_sha}")"
       return 0
     fi
+    # 1b. VERDICTLESS RE-DISPATCH CAPPED (HERD-742) — the loudest thing this row can say, and the ONLY
+    #     state here where nothing is running and nothing will start on its own again. Read from the
+    #     durable cap marker, so it paints under EITHER engine (live_runtime.py arms the same file).
+    #     Sequenced AFTER the live-worker check so a suite that IS running always wins the row: a cap
+    #     forbids dispatch, so the two can only coexist if a worker was started by hand.
+    if [ -f "$(_health_redispatch_cap_file "${_gpr_pr}-${_gpr_sha}")" ]; then
+      _health_redispatch_cap_row "$_gpr_sl" "$_gpr_pn" "${_gpr_pr}-${_gpr_sha}"
+      return 0
+    fi
     _gpr_inf="$(_review_inflight_file "$_gpr_pr" "$_gpr_sha")"
     if [ -f "$_gpr_inf" ] && _review_pid_live "$_gpr_inf"; then
       printf '%s' "    ${C_YELLOW}🔍${C_RESET} ${C_BOLD}${_gpr_sl}${C_RESET}${_gpr_pn} ${C_YELLOW}review · in progress ($(_fmt_age "$(_marker_age_or_mtime "$_gpr_inf")"))${C_RESET}"
@@ -16641,6 +16650,141 @@ _health_redispatch_loop_note() {
   local _k="$1" _n="$2" _pr="$3" _sha="$4" _slug="$5"
   [ "${_n:-0}" -ge 2 ] 2>/dev/null || return 0
   journal_append health_redispatch_loop key "$_k" count "$_n" pr "$_pr" sha "$_sha" slug "$_slug"
+}
+
+# ── BOUNDED VERDICTLESS RE-DISPATCH (HERD-742, GitHub issue #813) ──────────────────────────────────
+# GROUNDED FAILURE (emberglen-godot PR #425, 2026-08-13): a health worker that dies BEFORE its one-shot
+# verdict write leaves a 0-byte <log> — the tailable "<log>.progress" companion fills AS the suite runs,
+# but <log> itself is written in ONE SHOT at the very end (see _health_worker and live_runtime.py's
+# _HEALTH_WORKER_SH). The corpse sweep therefore reads exactly what it should ("no verdict, worker
+# gone"), journals `health_died`, drops the marker … and the very next tick dispatches the SAME suite
+# again. 83 laps over ~15 h, a full suite burned every ~11 min, and not one needs-you row.
+#
+# Nothing existing bounds THIS cycle: HEALTH_EARLY_REAP_SECS (0 by default) and HEALTH_INFLIGHT_TIMEOUT
+# bound a LIVE worker, never a dead-and-restarted one; HERD-736 leg 3's _health_bump_dispatch_count /
+# _health_redispatch_loop_note only make the loop VISIBLE in the journal; and _HEALTH_INFRA_REDISPATCH_MAX
+# bounds the tab-leak-guard path, which needs a collected VERDICT to be reached at all.
+#
+# THE BOUND, mirroring _HEALTH_INFRA_REDISPATCH_MAX's shape: count consecutive dispatches for one
+# (pr,sha)/main-<sha> key in the counter HERD-736 already keeps (_health_dispatch_count_file — the SAME
+# file both engines write, so the tally stays right even when laps alternate engines/seats), and once it
+# reaches the cap STOP dispatching: arm a durable cap marker, journal a distinct `health_redispatch_cap`
+# event, and paint a loud needs-you row naming the lap count AND the .progress path where the tail the
+# dead worker DID leave behind can be read. An inline constant, not a config key — the same call
+# HERD-228 made: this is a runaway bound, never an operator preference.
+#
+# RESET-ON-PROGRESS (like refix_rail_reset): any successful terminal-verdict COLLECT clears both the
+# counter and the cap marker, so the budget counts CONSECUTIVE verdictless laps, never a lifetime tally.
+# A new commit is a new key with its own fresh budget. Arming CLEARS the counter too, so an operator who
+# removes the cap marker (the remedy the row names) buys one more full budget instead of an instant re-cap.
+#
+# CROSS-ENGINE (multi-seat doctrine rule 2 — ONE notion of the bound, never two divergent ones): the
+# LIVE dispatcher is pysrc/herd/live_runtime.py's LiveGates.health (this bash gate is the SUT of the
+# hermetic test/sim surface — see _healthcheck_gate's retirement note). Both engines read and write the
+# SAME counter file, the SAME cap-marker file and the SAME `health_redispatch_cap` event, and
+# live_runtime.py's `_health_redispatch_capped` / `_health_salvage_detail` mirror the two predicates
+# below verbatim (cross-referenced there, exactly as `_inflight_verified_live` is).
+# tests/test-health-redispatch-cap.sh drives BOTH engines over the same on-disk fixtures and asserts
+# they agree, so the mirror cannot drift silently.
+_HEALTH_VERDICTLESS_REDISPATCH_MAX=3
+
+# _health_redispatch_cap_file <key> — the durable "this key is capped" marker, one line
+# "<epoch>\t<pr>\t<sha>\t<slug>\t<laps>". Its EXISTENCE is the standing bound (the counter is cleared
+# when it is armed), so deleting this ONE file is the entire re-arm remedy the needs-you row names.
+# Deliberately its own `.health-redispatch-cap-` prefix — never under `.health-inflight-`, whose glob
+# loops (_sweep_gate_corpses, _health_inflight_boot_reconcile) would misread a sidecar as a dead marker
+# (the PR #808 round-1 review finding recorded on _health_adopted_file).
+_health_redispatch_cap_file() { printf '%s' "$TREES/.health-redispatch-cap-$1"; }
+
+# _health_dispatch_count <key> — the current verdictless-dispatch tally for this key; 0 when the counter
+# is absent, unreadable or garbage. Fail-soft toward 0 on purpose: under-counting costs one extra lap,
+# over-counting would stop a healthy gate on a read fault.
+_health_dispatch_count() {
+  local _hdc_n
+  _hdc_n="$(cat "$(_health_dispatch_count_file "$1")" 2>/dev/null | tr -cd '0-9')"
+  case "$_hdc_n" in ''|*[!0-9]*) printf 0 ;; *) printf '%s' "$_hdc_n" ;; esac
+}
+
+# _health_redispatch_capped <key> — THE bound. True iff the cap is already armed for this key, or the key
+# has burned its whole budget of consecutive verdictless dispatches.
+_health_redispatch_capped() {
+  [ -f "$(_health_redispatch_cap_file "$1")" ] && return 0
+  [ "$(_health_dispatch_count "$1")" -ge "$_HEALTH_VERDICTLESS_REDISPATCH_MAX" ] 2>/dev/null
+}
+
+# _health_redispatch_cap_arm <key> <pr#> <sha> <slug> — arm the cap ONCE: write the durable marker (what
+# the row and the re-arm remedy read), journal the distinct `health_redispatch_cap` event, and clear the
+# counter so a hand-cleared cap gets a full fresh budget. Idempotent: an already-armed key writes nothing
+# and journals nothing — a standing cap is a STATE, not a repeating event.
+_health_redispatch_cap_arm() {
+  local _hca_key="$1" _hca_pr="${2:-}" _hca_sha="${3:-}" _hca_slug="${4:-}" _hca_f _hca_n
+  _hca_f="$(_health_redispatch_cap_file "$_hca_key")"
+  [ -f "$_hca_f" ] && return 0
+  _hca_n="$(_health_dispatch_count "$_hca_key")"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(_now_epoch)" "$_hca_pr" "$_hca_sha" "$_hca_slug" "$_hca_n" \
+    > "$_hca_f" 2>/dev/null || true
+  rm -f "$(_health_dispatch_count_file "$_hca_key")" 2>/dev/null || true
+  journal_append health_redispatch_cap key "$_hca_key" count "$_hca_n" pr "$_hca_pr" sha "$_hca_sha" \
+    slug "$_hca_slug" progress "$(_health_heartbeat_file "$_hca_key")"
+}
+
+# _health_redispatch_cap_clear <key> — RESET-ON-PROGRESS: a terminal verdict landed (or a fresh budget is
+# wanted), so both the cap marker and the counter go. Fail-soft; safe to call when neither exists.
+_health_redispatch_cap_clear() {
+  rm -f "$(_health_redispatch_cap_file "$1")" "$(_health_dispatch_count_file "$1")" 2>/dev/null || true
+}
+
+# _health_redispatch_cap_row <slug-cell> <pr-cell> <key> — THE one needs-you row for a capped key, shared
+# by the bash gate step and the render half (_gate_phase_row) so both engines surface the SAME row. Two
+# lines, mirroring _health_needs_you_row: the BLOCKER (the suite died verdictless N× on this exact sha
+# and nothing is retrying it — this is not a slow suite) and the REMEDY (read the tail the dead worker
+# left in its .progress companion, then re-arm by deleting the marker; a new commit re-arms too).
+_health_redispatch_cap_row() {
+  local _hcr_sl="$1" _hcr_pn="$2" _hcr_key="$3" _hcr_n
+  _hcr_n="$(sed -n '1p' "$(_health_redispatch_cap_file "$_hcr_key")" 2>/dev/null | cut -f5)"
+  case "${_hcr_n:-}" in ''|*[!0-9]*) _hcr_n="$_HEALTH_VERDICTLESS_REDISPATCH_MAX" ;; esac
+  printf '%s' "    ${C_RED}🛑${C_RESET} ${C_BOLD}${_hcr_sl}${C_RESET}${_hcr_pn} ${C_RED}needs you · health worker died verdictless ${_hcr_n}× · re-dispatch STOPPED (no suite is running)${C_RESET}"$'\n'"       ${C_DIM}└─ read the last suite tail: $(_health_heartbeat_file "$_hcr_key") · re-arm with: rm $(_health_redispatch_cap_file "$_hcr_key") (a new commit re-arms too)${C_RESET}"
+}
+
+# ── SALVAGE-BEFORE-A-LAP (HERD-742 leg 2) ──────────────────────────────────────────────────────────
+# The dead worker's <log> is 0 bytes, but its ".progress" companion held the real suite output the whole
+# time (HERD-494/533) — on the grounded incident it held the actual failing output for 15 hours while the
+# gate re-ran the suite 83 times to re-derive it. When that companion shows a COMPLETE run (every planned
+# test accounted for) AND at least one of them FAILED, the verdict is already proven: record it instead
+# of burning another ~9-60 min lap.
+#
+# DELIBERATELY ONE-SIDED — only a FAILING tail is ever salvaged. An all-pass tail proves the TAP tests
+# passed, NOT that the suite passed: healthcheck.sh's rc also carries the syntax / shellcheck /
+# leak-guard / caps-sync probes, which never appear as TAP lines. A fabricated CLEAN is the one mistake
+# on this path that could MERGE code no suite ever cleared, so an all-pass tail falls through to the
+# ordinary (now bounded) re-dispatch, exactly as before.
+_HEALTH_SALVAGE_TAG='salvaged from the .progress companion (worker died before writing its verdict)'
+
+# _health_salvage_detail <log> — the failing line a COMPLETE progress tail proves for <log>, or EMPTY when
+# there is nothing to salvage (a real log exists, no companion, an incomplete tail, or an all-pass one).
+# Completeness is read through the SAME _health_progress parse the live running row uses — one notion of
+# "how far along is this suite", never a second private parser — which handles both companion shapes:
+# the project-wrapper "suite: N tests" + "[health-progress] …" lines and a bare TAP "1..N" plan.
+_health_salvage_detail() {
+  local _hsd_log="${1:-}" _hsd_src _hsd_prog _hsd_pair _hsd_k _hsd_n _hsd_fail
+  [ -n "$_hsd_log" ] || return 0
+  [ -s "$_hsd_log" ] && return 0                      # a real log exists — never salvage over it
+  _hsd_src="$(_health_progress_source "$_hsd_log")"
+  [ "$_hsd_src" = "$_hsd_log" ] && return 0           # no companion at all — nothing was ever streamed
+  [ -s "$_hsd_src" ] || return 0
+  _hsd_prog="$(_health_progress "$_hsd_log")"          # "<k>/<N>" or "test <k>/<N>"
+  _hsd_pair="$(printf '%s' "$_hsd_prog" | grep -oE '[0-9]+/[0-9]+' | sed -n '1p')"
+  [ -n "$_hsd_pair" ] || return 0
+  _hsd_k="${_hsd_pair%/*}"; _hsd_n="${_hsd_pair#*/}"
+  case "${_hsd_k}${_hsd_n}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$_hsd_n" -gt 0 ] 2>/dev/null || return 0
+  [ "$_hsd_k" -ge "$_hsd_n" ] 2>/dev/null || return 0  # incomplete tail — a partial run proves nothing
+  _hsd_fail="$(_health_first_notok "$_hsd_src")"
+  if [ -z "$_hsd_fail" ]; then
+    _hsd_fail="$(grep -m1 -E '^\[health-progress\] .+ FAIL$' "$_hsd_src" 2>/dev/null | tr '\t' ' ')"
+  fi
+  [ -n "$_hsd_fail" ] || return 0                      # all-pass tail — never salvaged (see above)
+  printf '%s' "${_hsd_fail:0:200}"
 }
 
 # _heartbeat_fresh <file> [grace] — true iff <file> exists and was written within the last <grace>
@@ -16889,7 +17033,11 @@ _discard_stale_health() {
       journal_append infra_event component agent-watch reason health_stale_sha_term pr "$pr" sha "$msha"
     fi
   done
-  for f in "$TREES/.health-result-$pr-"* "$TREES/.health-infra-$pr-"*; do
+  # HERD-742: the verdictless-lap counter and its cap marker are keyed by (pr,sha) exactly like the
+  # result/infra files, so they are swept the same way — a new commit gets a fresh budget, and a cap
+  # marker for a sha the PR has moved past can never keep painting a needs-you row for stale evidence.
+  for f in "$TREES/.health-result-$pr-"* "$TREES/.health-infra-$pr-"* \
+           "$TREES/.health-dispatch-count-$pr-"* "$TREES/.health-redispatch-cap-$pr-"*; do
     [ -e "$f" ] || continue
     base="$(basename "$f")"
     [ "${base##*-}" = "$sha" ] && continue
@@ -17377,7 +17525,8 @@ _healthcheck_gate() {
         journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_d" ;;
       *)
         # Unparseable / truncated worker output → an infra death, NOT a verdict. Never cache; free the
-        # slot and re-dispatch on the next tick (bounded implicitly by the sha-cache once it succeeds).
+        # slot and re-dispatch on the next tick — bounded by the HERD-742 cap below, which is exactly
+        # why this branch must NOT clear the dispatch counter (see the rm's own guard).
         _HC_RESULT="RUNNING"
         journal_append infra_event component agent-watch reason health_bad_result key "$_hg_key" ;;
     esac
@@ -17388,8 +17537,14 @@ _healthcheck_gate() {
       *) _health_duration_record "$_hg_elapsed"
          _phase_anomaly_observe healthcheck "health-check" "$_hg_elapsed" ;;   # HERD-496
     esac
-    rm -f "$_hg_disp" "$_hg_inflight" "$(_health_adopted_file "$_hg_key")" \
-      "$(_health_dispatch_count_file "$_hg_key")" 2>/dev/null || true
+    rm -f "$_hg_disp" "$_hg_inflight" "$(_health_adopted_file "$_hg_key")" 2>/dev/null || true
+    # RESET-ON-PROGRESS (HERD-742, mirroring refix_rail_reset and live_runtime.py's collect leg): the
+    # verdictless-lap budget is zeroed by a TERMINAL VERDICT, not by merely consuming an out-file. An
+    # unparseable/truncated payload (the `*)` branch above) is an infra death that re-dispatches, so
+    # clearing the counter there would hand that loop an unbounded budget — the very bug being closed.
+    case "$_hg_v" in
+      CLEAN|FLAKY|CODEERROR) _health_redispatch_cap_clear "$_hg_key" ;;
+    esac
     lifecycle_retire health-worker "$_hg_key" collected     # HERD-193 RETIRE: result consumed
     return 0
   fi
@@ -17409,6 +17564,42 @@ _healthcheck_gate() {
     rm -f "$_hg_inflight" 2>/dev/null || true
     lifecycle_retire health-worker "$_hg_key" severed        # HERD-193 RETIRE: worker died verdictless
     journal_append infra_event component agent-watch reason health_died key "$_hg_key"
+  fi
+
+  # SALVAGE BEFORE BURNING A LAP (HERD-742 leg 2). The worker is gone and left a 0-byte one-shot <log>,
+  # but its ".progress" companion may already hold a COMPLETE, FAILING suite tail — the verdict is then
+  # proven and re-running the suite only re-derives it. Record that red exactly as the collector would
+  # (ledger + sha-cache + row) instead of dispatching again. Empty sha ⇒ no cache ⇒ no salvage: a verdict
+  # that cannot be cached would be re-salvaged every tick. Never salvages a PASS — see the tag's header.
+  if [ -n "$_hg_sha" ]; then
+    local _hg_salv _hg_sid
+    _hg_salv="$(_health_salvage_detail "$_hg_log")"
+    if [ -n "$_hg_salv" ]; then
+      _hg_sid="$(_health_fail_identity "$_hg_salv")"
+      _hg_salv="${_hg_salv} · ${_HEALTH_SALVAGE_TAG}"
+      record_healthcheck "$_hg_pr" "$_hg_slug" 1 "code-error" "$_hg_sid"
+      record_health_result "$_hg_pr" "$_hg_sha" "CODEERROR" "$_hg_salv"
+      _health_redispatch_cap_clear "$_hg_key"
+      journal_append health_verdict_salvaged pr "$_hg_pr" slug "$_hg_slug" sha "$_hg_sha" \
+        source "$(_health_progress_source "$_hg_log")" detail "$_hg_salv"
+      _handle_health_codeerror "$_hg_pr" "$_hg_slug" "$_hg_sha" "$_hg_idx" "$_hg_dir" "$_hg_salv"
+      _HC_RESULT="CODEERROR"
+      journal_append healthcheck_outcome pr "$_hg_pr" slug "$_hg_slug" outcome CODEERROR detail "$_hg_salv"
+      return 0
+    fi
+  fi
+
+  # RE-DISPATCH CAP (HERD-742 leg 1). This key has burned its budget of consecutive verdictless laps —
+  # STOP. Arm the durable cap (once), paint the loud needs-you row naming the lap count and the .progress
+  # path, and HOLD: no slot is taken, no suite starts, nothing merges. QUEUED (not CODEERROR) because
+  # there IS no verdict — fabricating a red here would bounce a builder at a phantom test failure, which
+  # is the HERD-346/#453 pathology; the row + `health_redispatch_cap` event carry the escalation instead.
+  # An empty sha keeps the pre-HERD-742 behavior (the counter key is not sha-scoped, so it must not gate).
+  if [ -n "$_hg_sha" ] && _health_redispatch_capped "$_hg_key"; then
+    _health_redispatch_cap_arm "$_hg_key" "$_hg_pr" "$_hg_sha" "$_hg_slug"
+    DISPLAY[_hg_idx]="$(_health_redispatch_cap_row "$_hg_sl" "$_hg_pn" "$_hg_key")"
+    _HC_RESULT="QUEUED"
+    return 0
   fi
 
   # SELF-RESTART QUIESCE (HERD-251): draining toward an in-place re-exec — start no new suite. Reached
@@ -19378,6 +19569,14 @@ EOF
           # actually in and say what is awaited, rather than shouting GitHub's mergeStateStatus token.
           DISPLAY[i]="$(_gate_phase_row "$sl" "$pn" "$prnum" "$headsha" \
             "    ${C_YELLOW}🩺${C_RESET} ${C_BOLD}${sl}${C_RESET}${pn} ${C_YELLOW}gating · awaiting ${GATE_STATUS_CONTEXT} blessing (${mstate:-?})${C_RESET}")"
+        fi
+        # HERD-742: a health rail whose verdictless re-dispatch is CAPPED is a needs-you state — the row
+        # _gate_phase_row just painted says so, and the hard flair rule (see the FLAIR block's header:
+        # flair NEVER softens a red/needs-you state) means the pasture header must not read 'busy' at it.
+        # _gate_phase_row runs in a command substitution, so it cannot set this itself; re-read the same
+        # marker here. One `[ -f ]` per candidate — byte-identical whenever no cap is armed.
+        if [ -n "$headsha" ] && [ -f "$(_health_redispatch_cap_file "${prnum}-${headsha}")" ]; then
+          FLAIR_STATE[i]="attention"
         fi
         # A HELD candidate already set its own flair above (attention — it is waiting on a human, not
         # on the engine); everything else on this branch is engine-busy.
