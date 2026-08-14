@@ -357,6 +357,19 @@ unset HERD_OL_NOW
 # project's own WORKTREES_DIR-derived journal path inside the `bin/herd` subprocess (env is inherited).
 unset JOURNAL_FILE
 PROJ="$T/proj"; PTREES="$T/proj-trees"
+
+# run_herd <args...> — invoke the real bin/herd from $PROJ. The suite runner that drives THIS test
+# file (scripts/ci/run-suite.sh) exports HERD_JOURNAL_HERMETIC=1 (+ HERMETIC_TEST=<name>) for its
+# whole run, which is journal.sh's OWN safety net against a hermetic test polluting a real project
+# journal (_journal_in_test_context) — it wins even with JOURNAL_FILE unset, redirecting any write to
+# a throwaway per-process path instead of $PTREES's journal. That guard is correct for a test that
+# might resolve WORKTREES_DIR onto something real; THIS section deliberately targets an isolated
+# mktemp fixture project, so it is safe to prove the genuine WORKTREES_DIR-derived write path by
+# clearing every test-context signal for just this subprocess.
+run_herd() {
+  ( cd "$PROJ" && unset HERMETIC_TEST HERD_HERMETIC_GUARD HERD_JOURNAL_HERMETIC BATS_TEST_FILENAME BATS_TEST_NAME
+    HERD_NONINTERACTIVE=1 bash "$HERD_BIN" "$@" 2>&1 )
+}
 mkdir -p "$PROJ/.herd" "$PTREES/.herd"
 cat > "$PROJ/.herd/config" <<CFG
 PROJECT_ROOT="$GITROOT"
@@ -367,33 +380,33 @@ OUTCOME_LEDGER="off"
 CFG
 cp "$JFILE" "$PTREES/.herd/journal.jsonl"
 
-off_bin="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" ledger-report 2>&1)"; rc=$?
+off_bin="$(run_herd ledger-report)"; rc=$?
 [ "$rc" -eq 0 ] || fail "herd ledger-report (off): should exit 0, got $rc"
 grep -q 'OUTCOME_LEDGER is off' <<< "$off_bin" || fail "herd ledger-report (off): dormant note missing: $off_bin"
 ok
 
-off_bin_int="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" intervene REF-CORE safety "note" 2>&1)"; rc=$?
+off_bin_int="$(run_herd intervene REF-CORE safety "note")"; rc=$?
 [ "$rc" -eq 0 ] || fail "herd intervene (off): should exit 0, got $rc"
 grep -q 'OUTCOME_LEDGER is off' <<< "$off_bin_int" || fail "herd intervene (off): dormant note missing: $off_bin_int"
 ok
 
 sed -i.bak 's/OUTCOME_LEDGER="off"/OUTCOME_LEDGER="on"/' "$PROJ/.herd/config"; rm -f "$PROJ/.herd/config.bak"
-on_bin="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" ledger-report 2>&1)"; rc=$?
+on_bin="$(run_herd ledger-report)"; rc=$?
 [ "$rc" -eq 0 ] || fail "herd ledger-report (on): should exit 0, got $rc: $on_bin"
 grep -q 'REF-CORE' <<< "$on_bin" || fail "herd ledger-report (on): missing REF-CORE row: $on_bin"
 ok
 
-on_bin_json="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" ledger-report --json 2>&1)"
+on_bin_json="$(run_herd ledger-report --json)"
 grep -q '"ref":"REF-CORE"' <<< "$on_bin_json" || fail "herd ledger-report --json (on): missing REF-CORE: $on_bin_json"
 ok
 
-on_bin_int="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" intervene REF-CORE product "a genuine judgment call" 2>&1)"; rc=$?
+on_bin_int="$(run_herd intervene REF-CORE product "a genuine judgment call")"; rc=$?
 [ "$rc" -eq 0 ] || fail "herd intervene (on): should succeed, got $rc: $on_bin_int"
 grep -q 'intervened' <<< "$on_bin_int" || fail "herd intervene (on): missing confirmation: $on_bin_int"
 grep -q '"event":"intervention"' "$PTREES/.herd/journal.jsonl" || fail "herd intervene (on): no journal event written"
 ok
 
-bad_taxonomy="$(cd "$PROJ" && HERD_NONINTERACTIVE=1 bash "$HERD_BIN" intervene REF-CORE bogus "note" 2>&1)"; rc=$?
+bad_taxonomy="$(run_herd intervene REF-CORE bogus "note")"; rc=$?
 [ "$rc" -eq 2 ] || fail "herd intervene (on, bad taxonomy): should refuse with rc=2, got $rc"
 ok
 
