@@ -5448,6 +5448,18 @@ cmd_sweep() {
   # Legs 1–4. sweep.sh loads its own helper substrate and journals every action it takes.
   bash "$SCRIPTS_DIR/sweep.sh" ${args[@]+"${args[@]}"} || return $?
 
+  # ── leg 6: outcome-ledger delayed evaluations (HERD-739) ──
+  # Deliberately NOT folded into sweep.sh: sweep.sh sources agent-watch.sh as a library (AGENT_WATCH_LIB
+  # =1), which is exactly the hot-path entanglement the outcome ledger is supposed to stay clear of.
+  # This leg calls the fully standalone scripts/herd/outcome-ledger.sh as its OWN process instead —
+  # gated on OUTCOME_LEDGER here (not just the script's own dormant refusal) so a `herd sweep --dry-run`
+  # or an off project never even execs it, and `herd sweep`'s output is byte-identical with the lever
+  # off. Skipped under --dry-run like every other leg (it only journals eval events, but --dry-run's
+  # contract is "touches nothing"); --no-restart alone does not skip it (only leg 5 cares about that).
+  if [ "${OUTCOME_LEDGER:-off}" = "on" ] && [ -z "$dry" ]; then
+    bash "$SCRIPTS_DIR/outcome-ledger.sh" sweep || true
+  fi
+
   [ "$restart" -eq 1 ] || return 0
 
   # ── leg 5: watcher pane restart + one-tick verify ──
@@ -8971,6 +8983,28 @@ cmd_changelog() {
   bash "$SCRIPTS_DIR/changelog.sh" "$@"
 }
 
+# cmd_ledger_report — the OUTCOME LEDGER reader (HERD-739). Pure dispatch to
+# scripts/herd/outcome-ledger.sh, which owns config loading + the OUTCOME_LEDGER=off dormant refusal
+# (mirrors cmd_changelog's delegation to changelog.sh — the CLI wrapper here only translates
+# herd's flag-based UX into the script's subcommand-based one).
+cmd_ledger_report() {
+  case "${1:-}" in
+    --json)    bash "$SCRIPTS_DIR/outcome-ledger.sh" report --json ;;
+    --alerts)  bash "$SCRIPTS_DIR/outcome-ledger.sh" alerts ;;
+    --daily)   shift; bash "$SCRIPTS_DIR/outcome-ledger.sh" daily "$@" ;;
+    -h|--help) say "usage: herd ledger-report [--json | --alerts | --daily [--file PATH]]" ;;
+    "")        bash "$SCRIPTS_DIR/outcome-ledger.sh" report ;;
+    *)         die "usage: herd ledger-report [--json | --alerts | --daily [--file PATH]]" ;;
+  esac
+}
+
+# cmd_intervene — record one first-class OUTCOME LEDGER intervention entry (HERD-739): a human
+# touched the pipeline, classified by the safety|product|infra-recovery|convenience taxonomy. Pure
+# dispatch to scripts/herd/outcome-ledger.sh, which owns validation + the OUTCOME_LEDGER=off refusal.
+cmd_intervene() {
+  bash "$SCRIPTS_DIR/outcome-ledger.sh" intervene "$@"
+}
+
 # cmd_triage — OSS auto-triage (HERD-255 / HERD-168 part 1/3). Pure dispatch to
 # scripts/herd/oss-triage.sh. Opt-in via OSS_TRIAGE=on; default off → byte-inert. NEVER auto-posts
 # to GitHub — drafts a ranked shortlist for human approval only, via the research lane.
@@ -9564,6 +9598,22 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       LLM). tag <ver> promotes [Unreleased] → [ver] - date and cuts
                                       a local annotated git tag. Ship-dormant — never auto-run;
                                       does not push or publish (see docs/releasing.md)
+  herd ledger-report [--json | --alerts | --daily [--file PATH]]
+                                      the OUTCOME LEDGER MVP reader (HERD-739): a per-tracker-ref
+                                      VALUE record derived mechanically from the journal (merge, cost,
+                                      verdict_recorded, refix events joined via `reconcile`'s pr→ref
+                                      link) — disposition, spend, review verdicts, risk class, and the
+                                      delayed +24h/+7d evaluation slots. --json prints the full derived
+                                      model; --alerts prints only the loud rows (missing evals,
+                                      reversions, unresolved value past +7d) and exits 1 iff any fired;
+                                      --daily writes today's UTC markdown report into the worktree
+                                      pool. Ship-dormant behind OUTCOME_LEDGER=off (default)
+  herd intervene <ref> <safety|product|infra-recovery|convenience> "<note>"
+                                      record one first-class OUTCOME LEDGER intervention (HERD-739):
+                                      a human touched the pipeline for this tracker ref. The streak
+                                      scorer reads these — convenience counts against autonomy,
+                                      product-judgment means the system failed to surface a decision.
+                                      Ship-dormant behind OUTCOME_LEDGER=off (default)
   herd triage [run|report]            OSS auto-triage (HERD-255): list open issues on HERD_REPO,
                                       enqueue research-lane classify+draft per NEW issue, write a
                                       ranked shortlist for human approval. Opt-in OSS_TRIAGE=on
@@ -9681,6 +9731,8 @@ case "${1:-help}" in
   budget)  shift; cmd_budget "$@" ;;
   stats)   shift; cmd_stats "$@" ;;
   changelog) shift; cmd_changelog "$@" ;;
+  ledger-report) shift; cmd_ledger_report "$@" ;;
+  intervene) shift; cmd_intervene "$@" ;;
   triage)  shift; cmd_triage "$@" ;;
   update)  shift; cmd_update "$@" ;;
   agent-update) shift; cmd_agent_update "$@" ;;

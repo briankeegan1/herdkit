@@ -473,6 +473,16 @@ esac
 # off. Defaulted here so the mechanism + CLI see it under `set -u`.
 : "${AGENT_UPDATE:="off"}"
 
+# OUTCOME_LEDGER — the OUTCOME LEDGER MVP (HERD-739): a per-tracker-item VALUE record derived
+# MECHANICALLY from the engine journal (merge/cost/verdict_recorded/refix events joined via the
+# existing `reconcile` pr→ref link), plus first-class `herd intervene` entries and a delayed +24h/+7d
+# re-evaluation sweep leg. Default "off": `herd ledger-report`, `herd intervene` and the sweep leg all
+# refuse with one dormant line and write NOTHING — byte-identical to before this key existed, and
+# `herd sweep`'s own output is unchanged (its leg 6 is gated on this same key, not just the script's
+# own refusal). Set "on" to enable. See scripts/herd/outcome-ledger.sh for the full contract. Defaulted
+# here so the CLI + sweep leg see it under `set -u`.
+: "${OUTCOME_LEDGER:="off"}"
+
 # ENGINE_MIN — the ENGINE VERSION HANDSHAKE floor (HERD-179): the minimum herdkit ENGINE LEVEL this
 # project requires. Committed in .herd/config and stamped MONOTONICALLY by `herd upgrade` to the level
 # of the engine that ran it. An engine BELOW this floor is STALE: every write path (lane spawn
