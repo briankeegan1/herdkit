@@ -129,13 +129,22 @@ def main():
     out.append("  %sPRS%s       %d open\n" % (b, x, _to_int(n_prs)))
     for (pnum, pbr, pmerge, pmstate, preview, phealth, pdec, pattn) in prs:
         mcol = r if pattn == "1" else g
-        out.append("    %s#%s%s %s%-24s%s %s%s%s%s%s%s%s\n" % (
-            d, pnum, x, b, pbr[:24], x,
-            mcol, (pmerge or "UNKNOWN"), x,
-            (" · %s" % pmstate) if pmstate else "",
-            (" · review %s" % preview) if preview else "",
-            (" · health %s" % phealth) if phealth else "",
-            (" · %s" % pdec) if pdec else ""))
+        if phealth == "capped":
+            # HERD-742 grounding (emberglen-godot #447): a capped redispatch loop is the loudest thing
+            # this row can say — nothing is running and nothing restarts on its own — so it gets its
+            # own line instead of folding into the quiet "· health capped" suffix, which reads as fine.
+            out.append("    %s#%s%s %s%-24s%s %s⚠️ needs you · health-check stuck (redispatch cap) — re-task by hand%s%s\n" % (
+                d, pnum, x, b, pbr[:24], x,
+                r, x,
+                (" · %s" % pdec) if pdec else ""))
+        else:
+            out.append("    %s#%s%s %s%-24s%s %s%s%s%s%s%s%s\n" % (
+                d, pnum, x, b, pbr[:24], x,
+                mcol, (pmerge or "UNKNOWN"), x,
+                (" · %s" % pmstate) if pmstate else "",
+                (" · review %s" % preview) if preview else "",
+                (" · health %s" % phealth) if phealth else "",
+                (" · %s" % pdec) if pdec else ""))
 
     if bl_kind == "file":
         out.append("  %sBACKLOG%s   %s open · %s in-progress\n" % (b, x, bl_open, bl_inprog))

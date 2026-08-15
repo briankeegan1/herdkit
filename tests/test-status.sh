@@ -271,4 +271,45 @@ bc="$(grep '^BCOUNTS' <<< "$snap" | tr $'\037' ' ')"
 [ "$bc" = "BCOUNTS 0 0 0 0" ] || fail "an in-use worktree must never be counted dead, got: '$bc'"
 ok
 
+# ── _status_gather surfaces a capped health redispatch loop as "needs you" ────────────────────────
+# GROUNDED FAILURE (emberglen-godot #447, 2026-08-14): a capped redispatch loop (HERD-742) never
+# writes a verdict row to the health ledger — the worker died before its one-shot write — so gather
+# used to read an empty health field and the PR row looked clean at a glance. Prove gather now checks
+# the SAME durable cap marker agent-watch.sh's live console already renders (_health_redispatch_cap_file),
+# flips ATTENTION, and the PR record's health field reads "capped".
+CB="$T/cappedbin"; mkdir -p "$CB"
+printf '#!/bin/sh\nexit 0\n' > "$CB/git"; chmod +x "$CB/git"
+CAP_SHA="eeab9ba3cb8cd0b0183fce20cb6f10b88398edfd"
+printf '#!/bin/sh\nprintf '"'"'[{"number":447,"title":"flanking-crit","headRefName":"feat/flanking-crit","headRefOid":"%s","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":""}]'"'"'\n' "$CAP_SHA" > "$CB/gh"
+chmod +x "$CB/gh"
+CROOT="$T/cproj"; CTREES="$T/ctrees"; mkdir -p "$CROOT" "$CTREES"
+capped_snap() {
+  ( PATH="$CB:$PATH" PROJECT_ROOT="$CROOT" WORKTREES_DIR="$CTREES" SCRIBE_BACKEND=file \
+      BACKLOG_FILE="$CROOT/BACKLOG.md" HERD_WATCH_ARGV0="herd-watch-nope-$$-does-not-exist" \
+      _status_gather 2>/dev/null )
+}
+
+snap="$(capped_snap)"
+prec="$(grep $'^PR\037' <<< "$snap")"
+IFS=$'\037' read -r _tag pnum pbr pmerge pmstate preview phealth pdec pattn <<EOF
+$prec
+EOF
+[ -z "$phealth" ] || fail "no cap marker → health should be empty, got: '$phealth'"
+[ "$pattn" = "0" ] || fail "no cap marker → attn should be 0, got: '$pattn'"
+arec="$(grep '^ATTENTION' <<< "$snap" | tr $'\037' ' ')"
+[ "$arec" = "ATTENTION 0" ] || fail "no cap marker → ATTENTION must stay 0, got: '$arec'"
+
+touch "$CTREES/.health-redispatch-cap-447-${CAP_SHA}"
+snap="$(capped_snap)"
+prec="$(grep $'^PR\037' <<< "$snap")"
+IFS=$'\037' read -r _tag pnum pbr pmerge pmstate preview phealth pdec pattn <<EOF
+$prec
+EOF
+[ "$phealth" = "capped" ] || fail "capped marker present → health should read 'capped', got: '$phealth'"
+[ "$pattn" = "1" ]        || fail "capped marker present → attn should flip to 1, got: '$pattn'"
+arec="$(grep '^ATTENTION' <<< "$snap" | tr $'\037' ' ')"
+[ "$arec" = "ATTENTION 1" ] || fail "capped marker present → ATTENTION must flip to 1, got: '$arec'"
+grep -q 'health-stuck:#447' <<< "$snap" || fail "REASONS must name the stuck PR (health-stuck:#447)"
+ok
+
 echo "ALL PASS ($pass checks)"
