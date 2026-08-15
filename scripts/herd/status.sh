@@ -653,12 +653,22 @@ $rec
 EOF
     review="$(_status_latest_review "$review_ledger" "$num" "$headsha")"
     health="$(_status_latest_health "$health_ledger" "$num")"
+    # A capped redispatch loop (HERD-742) never writes a verdict row to the health ledger — the worker
+    # died before its one-shot write — so `health` above comes back empty and this row silently reads
+    # as clean. Check the same durable cap marker agent-watch.sh's live console already renders
+    # (_health_redispatch_cap_file), so the one-shot snapshot agrees with the watcher instead of going
+    # blind exactly when a PR is stuck (emberglen-godot #447, 2026-08-14).
+    if [ -n "$headsha" ] && [ -f "$trees/.health-redispatch-cap-${num}-${headsha}" ]; then
+      health="capped"
+    fi
     attn="$(_status_pr_attention "$mergeable" "$review" "$decision")"
+    [ "$health" = "capped" ] && attn=1
     if [ "$attn" = "1" ]; then
       attention=1
       case "$mergeable" in CONFLICTING) reasons="${reasons} conflicting-pr:#${num}" ;; esac
       [ "$review" = "BLOCK" ] && reasons="${reasons} review-blocked:#${num}"
       [ "$decision" = "CHANGES_REQUESTED" ] && reasons="${reasons} changes-requested:#${num}"
+      [ "$health" = "capped" ] && reasons="${reasons} health-stuck:#${num}"
     fi
     printf 'PR%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
       "$US" "$num" "$US" "$brnch" "$US" "$mergeable" "$US" "$mstate" \
@@ -769,13 +779,23 @@ EOF
 $rest
 EOF
         [ "$pattn" = "1" ] && mcol="$r" || mcol="$g"
-        pr_rows="${pr_rows}$(printf '    %s#%s%s %s%-24s%s %s%s%s%s%s%s%s' \
-          "$d" "$pnum" "$x" "$b" "${pbr:0:24}" "$x" \
-          "$mcol" "${pmerge:-UNKNOWN}" "$x" \
-          "${pmstate:+ · $pmstate}" \
-          "${preview:+ · review $preview}" \
-          "${phealth:+ · health $phealth}" \
-          "${pdec:+ · $pdec}")"$'\n'
+        if [ "$phealth" = "capped" ]; then
+          # HERD-742 grounding (emberglen-godot #447): a capped redispatch loop is the loudest thing
+          # this row can say — nothing is running and nothing restarts on its own — so it gets its own
+          # line instead of folding into the quiet "· health capped" suffix below, which reads as fine.
+          pr_rows="${pr_rows}$(printf '    %s#%s%s %s%-24s%s %s⚠️ needs you · health-check stuck (redispatch cap) — re-task by hand%s%s' \
+            "$d" "$pnum" "$x" "$b" "${pbr:0:24}" "$x" \
+            "$r" "$x" \
+            "${pdec:+ · $pdec}")"$'\n'
+        else
+          pr_rows="${pr_rows}$(printf '    %s#%s%s %s%-24s%s %s%s%s%s%s%s%s' \
+            "$d" "$pnum" "$x" "$b" "${pbr:0:24}" "$x" \
+            "$mcol" "${pmerge:-UNKNOWN}" "$x" \
+            "${pmstate:+ · $pmstate}" \
+            "${preview:+ · review $preview}" \
+            "${phealth:+ · health $phealth}" \
+            "${pdec:+ · $pdec}")"$'\n'
+        fi
         ;;
       BACKLOG)   IFS=$US read -r bl_kind bl_open bl_inprog <<EOF
 $rest
