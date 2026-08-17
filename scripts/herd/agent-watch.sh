@@ -9665,6 +9665,32 @@ _interval_spans_wake() {
   return 0
 }
 
+# _anomaly_wake_settle_secs — the configured ANOMALY_WAKE_SETTLE_SECS in seconds. 0 = off. A
+# non-numeric value falls soft to the DOCUMENTED default, same discipline as
+# _anomaly_file_cooldown_secs — a typo must not silently disarm this guard.
+_anomaly_wake_settle_secs() {
+  local _aws_v="${ANOMALY_WAKE_SETTLE_SECS:-300}"
+  case "$_aws_v" in ''|*[!0-9]*) printf 300 ;; *) printf '%s' "$_aws_v" ;; esac
+}
+
+# _interval_near_wake <start-epoch> — true iff the machine's most recent wake landed BEFORE
+# <start-epoch> but inside the settle window (_anomaly_wake_settle_secs). Distinct failure mode
+# from _interval_spans_wake: this catches a phase that started measuring AFTER the machine had
+# already resumed, but before the system actually caught back up (cold disk cache, mds/Spotlight
+# reindexing, thermal-throttle recovery) — several short, clustered anomalies right after a wake are
+# this, not a second sleep each one individually spans. Same fail-soft contract: no probe, or the
+# settle window disabled (0), reads as "no", never suppresses a genuine anomaly.
+_interval_near_wake() {
+  local _inw_start="${1:-}" _inw_wake _inw_settle
+  case "$_inw_start" in ''|*[!0-9]*) return 1 ;; esac
+  _inw_wake="$(_wake_probe_epoch)" || return 1
+  [ -n "$_inw_wake" ] || return 1
+  [ "$_inw_wake" -le "$_inw_start" ] || return 1
+  _inw_settle="$(_anomaly_wake_settle_secs)"
+  [ "$_inw_settle" -gt 0 ] || return 1
+  [ $(( _inw_start - _inw_wake )) -lt "$_inw_settle" ]
+}
+
 # ── HERD-512(b): PER-PHASE FILING COOLDOWN ─────────────────────────────────────────────────────────
 # The honest-identity dedup (phase+seconds+p95) only collapses an IDENTICAL re-reading; a phase that is
 # genuinely degraded for a while files a FRESH item every tick it reads differently — which is how one
@@ -9754,9 +9780,15 @@ _phase_anomaly_observe() {
   # HERD-512(a): a measured interval that a machine suspend/wake boundary falls inside is wall clock,
   # not work — drop it ENTIRELY (no baseline sample, so the sleep never pollutes the rolling median;
   # no journal line; no filing). Fail-soft: no probe ⇒ observe exactly as before.
+  # HERD-750: same drop, for a phase that started measuring AFTER the machine had already resumed but
+  # before the system settled back down (_interval_near_wake) — the failure mode a single boundary-
+  # spans check cannot see, since the interval never touches the wake edge at all.
   _pa_now="$(_now_epoch)"
   if [ "$_pa_now" -ge "$_pa_secs" ]; then
-    if _interval_spans_wake "$(( _pa_now - _pa_secs ))" "$_pa_now"; then return 0; fi
+    if _interval_spans_wake "$(( _pa_now - _pa_secs ))" "$_pa_now" \
+       || _interval_near_wake "$(( _pa_now - _pa_secs ))"; then
+      return 0
+    fi
   fi
   _pa_stats="$(_phase_duration_observe "$_pa_phase" "$_pa_secs")" || return 0
   IFS=$'\t' read -r _pa_median _pa_p95 _pa_n <<EOF

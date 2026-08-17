@@ -57,6 +57,7 @@ export HERD_FAKE_LOADAVG=0
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 
 for fn in _sysctl_timeval_epoch _wake_probe_epoch _interval_spans_wake \
+          _anomaly_wake_settle_secs _interval_near_wake \
           _anomaly_file_cooldown_secs _anomaly_file_in_cooldown _anomaly_file_stamp \
           _phase_anomaly_observe; do
   type "$fn" >/dev/null 2>&1 || fail "$fn not defined after sourcing"
@@ -122,7 +123,7 @@ ok
 # ── (a3) wake OUTSIDE the measured interval → observe + file, unchanged ─────────────────────────────
 : > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
 _learn outside_phase
-_wake_probe_epoch() { printf '%s' "$(( NOW - 500 ))"; }   # interval is [NOW-400, NOW] — well clear
+_wake_probe_epoch() { printf '%s' "$(( NOW - 800 ))"; }   # interval is [NOW-400, NOW] — well clear of BOTH the spans check and the 300s settle window
 _phase_anomaly_observe outside_phase "outside phase" 400
 grep -q '^phase_anomaly ' "$JLOG" || fail "a wake outside the interval suppressed a REAL anomaly: $(cat "$JLOG")"
 [ "$(_ledger_lines)" -eq 1 ] || fail "expected one ledger row: $(cat "$ANOMALY_LEDGER" 2>/dev/null)"
@@ -144,9 +145,46 @@ ok
 
 # The same phase, same duration, with the boundary moved out of the interval, still fires — proving
 # (a4) suppressed the reading for the WAKE reason and not because the phase went quiet.
-_wake_probe_epoch() { printf '%s' "$(( NOW - 500 ))"; }
+_wake_probe_epoch() { printf '%s' "$(( NOW - 800 ))"; }   # clear of both guards, same margin as (a3)
 _phase_anomaly_observe asleep_phase "asleep phase" 400
 grep -q '^phase_anomaly ' "$JLOG" || fail "the skip was not wake-scoped — the phase never fires: $(cat "$JLOG")"
+ok
+
+# ── (a5) _interval_near_wake's own truth table (HERD-750) ──────────────────────────────────────────
+export ANOMALY_WAKE_SETTLE_SECS=300
+_wake_probe_epoch() { printf '%s' "$(( NOW - 100 ))"; }   # woke 100s ago — inside the 300s settle window
+_interval_near_wake "$NOW" || fail "a start within the settle window must read as near-wake"
+_wake_probe_epoch() { printf '%s' "$(( NOW - 400 ))"; }   # woke 400s ago — outside the 300s window
+_interval_near_wake "$NOW" && fail "a start outside the settle window must not read as near-wake"
+_wake_probe_epoch() { printf '%s' "$(( NOW + 50 ))"; }    # a wake AFTER start is not a PRIOR wake
+_interval_near_wake "$NOW" && fail "a wake after the start must not read as near-wake"
+_wake_probe_epoch() { return 1; }
+_interval_near_wake "$NOW" && fail "an unavailable probe must fail soft to 'no near-wake'"
+ANOMALY_WAKE_SETTLE_SECS=0
+_wake_probe_epoch() { printf '%s' "$(( NOW - 100 ))"; }
+_interval_near_wake "$NOW" && fail "ANOMALY_WAKE_SETTLE_SECS=0 must disable the guard"
+export ANOMALY_WAKE_SETTLE_SECS=300
+ok
+
+# ── (a6) the settle window catches a phase whose OWN interval never touches the wake edge ──────────
+# GROUNDED 2026-08-17: this is the exact false-filing shape — a phase that STARTS after the machine
+# already resumed, so _interval_spans_wake alone (a3/a4 above) cannot see it.
+: > "$JLOG"; : > "$SCRIBELOG"; rm -f "$ANOMALY_LEDGER"
+_learn settling_phase
+BASE_BEFORE="$T/settling-before.txt"; cp "$(_baseline_file settling_phase)" "$BASE_BEFORE"
+_wake_probe_epoch() { printf '%s' "$(( NOW - 400 ))"; }   # woke 400s before "now"; interval is [NOW-200,NOW]
+_phase_anomaly_observe settling_phase "settling phase" 200   # never spans NOW-400 — (a3/a4) alone would fire
+[ ! -s "$JLOG" ]      || fail "a post-wake settling interval journaled anyway: $(cat "$JLOG")"
+[ "$(_ledger_lines)" -eq 0 ] || fail "a post-wake settling interval painted a row: $(cat "$ANOMALY_LEDGER")"
+[ "$(_scribed)" -eq 0 ] || fail "a post-wake settling interval filed an item: $(cat "$SCRIBELOG")"
+cmp -s "$BASE_BEFORE" "$(_baseline_file settling_phase)" \
+  || fail "a post-wake settling interval POLLUTED the rolling baseline"
+ok
+
+# same phase, wake pushed outside the settle window — fires normally
+_wake_probe_epoch() { printf '%s' "$(( NOW - 700 ))"; }
+_phase_anomaly_observe settling_phase "settling phase" 200
+grep -q '^phase_anomaly ' "$JLOG" || fail "the settle-window skip was not wake-scoped — the phase never fires: $(cat "$JLOG")"
 ok
 
 # ── (b) PER-PHASE FILING COOLDOWN ───────────────────────────────────────────────────────────────────
