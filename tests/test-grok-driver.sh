@@ -48,9 +48,9 @@ ok; echo "PASS (2) grok.driver bindings are zero-secret"
 exact(){ awk -F= -v k="$1" '$1==k{sub(/^[^=]+=/,"");print}' "$DRIVER"; }
 grepd(){ grep -qF -e "$1" "$DRIVER" || fail "grok.driver missing real flag/incantation: $1"; }
 grepd 'grok --model <model> --always-approve'              # interactive spawn (grok's real flags)
-grepd '--append-rules-to-system-prompt <agents-rules> "<prompt>"'  # grok-context-injection: additive conventions grounding
+grepd '--rules <agents-rules> "<prompt>"'                   # grok-context-injection: additive conventions grounding (real flag: --rules)
 grepd 'grok -p "<prompt>" --model <model> --always-approve' # one-shot / headless (-p,--single)
-grepd 'grok --continue --always-approve'                    # resume (-c,--continue)
+grepd 'grok -p "<prompt>" --continue --always-approve'      # resume (-c,--continue, prompt sent via -p)
 grepd '--always-approve'                                    # permission / auto-approve flag
 [ "$(exact DRIVER_AGENT_MODEL_SWITCH)" = "'/model <model>'" ] || fail "grok model-switch not '/model <model>'"
 # The mux stays herdr — swap the RUNTIME, not the multiplexer.
@@ -109,8 +109,10 @@ done
 ok; echo "PASS (5) HERD_DRIVER=grok renders cleanly — binding table resolves, no leftover token"
 
 # ── 6. CONTEXT-INJECTION: a grok interactive spawn's COMPOSED argv carries the repo-root AGENTS.md
-#      conventions (grok has no CLAUDE.md auto-load), while a claude spawn's argv is byte-IDENTICAL to
-#      before (no conventions leak, no new flag) — the grok-context-injection invariant. ────────────
+#      conventions via the real --rules flag (belt-and-suspenders: grok itself already auto-discovers
+#      AGENTS.md/CLAUDE.md hierarchically per docs.x.ai/build/features/project-rules, HERD-767), while a
+#      claude spawn's argv is byte-IDENTICAL to before (no conventions leak, no new flag) — the
+#      grok-context-injection invariant. ──────────────────────────────────────────────────────────────
 command -v python3 >/dev/null 2>&1 || fail "python3 required for the compose test"
 CROOT="$T/convroot"; mkdir -p "$CROOT"
 AGENTS_MARK="SENTINEL_AGENTS_CONVENTION_XYZZY"
@@ -140,8 +142,8 @@ claude_argv="$(compose_argv herdr-claude "$CROOT")" || fail "composing a claude 
 
 # (a) grok's composed argv carries the conventions AND the additive append-rules flag.
 case "$grok_argv" in
-  *"--append-rules-to-system-prompt"*) : ;;
-  *) fail "grok spawn argv missing --append-rules-to-system-prompt: $grok_argv" ;;
+  *"--rules"*) : ;;
+  *) fail "grok spawn argv missing --rules: $grok_argv" ;;
 esac
 case "$grok_argv" in
   *"$AGENTS_MARK"*) : ;;
@@ -152,7 +154,7 @@ case "$claude_argv" in
   *"$AGENTS_MARK"*) fail "claude spawn argv LEAKED AGENTS.md conventions (must stay byte-identical): $claude_argv" ;;
 esac
 case "$claude_argv" in
-  *"--append-rules-to-system-prompt"*) fail "claude spawn argv grew an append-rules flag (must stay byte-identical): $claude_argv" ;;
+  *"--rules"*) fail "claude spawn argv grew an append-rules flag (must stay byte-identical): $claude_argv" ;;
 esac
 # The claude argv is exactly the pre-injection native shape (proves byte-identity, not just absence).
 [ "$claude_argv" = "claude${SEP}--model${SEP}grok-model${SEP}--always-approve${SEP}POINTER_TEXT${SEP}" ] \
@@ -163,7 +165,7 @@ esac
 EMPTY="$T/emptyroot"; mkdir -p "$EMPTY"
 grok_bare="$(compose_argv grok "$EMPTY")" || fail "composing a bare grok spawn argv failed"
 case "$grok_bare" in
-  *"--append-rules-to-system-prompt"*) fail "grok argv kept a dangling append-rules flag with no AGENTS.md: $grok_bare" ;;
+  *"--rules"*) fail "grok argv kept a dangling append-rules flag with no AGENTS.md: $grok_bare" ;;
 esac
 [ "$grok_bare" = "grok${SEP}--model${SEP}grok-model${SEP}--always-approve${SEP}POINTER_TEXT${SEP}" ] \
   || fail "bare grok spawn argv (no conventions) drifted from the plain grok shape: $grok_bare"

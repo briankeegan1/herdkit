@@ -307,10 +307,13 @@ herd_driver_agent_spawn_argv() {
   [ -n "$binding" ] || binding='claude --model <model> --dangerously-skip-permissions "<prompt>"'
   [ -n "$perm" ]    || perm='--dangerously-skip-permissions'
   # HERD grok-context-injection: a binding may carry a <agents-rules> value token (only grok.driver
-  # does today) — the repo-root project conventions (AGENTS.md/CLAUDE.md) grounding a runtime that
-  # does NOT auto-load CLAUDE.md. Resolve it ONLY when the token is present, so a claude/headless spawn
-  # (whose binding has no such token) never even reads the file — its argv is byte-identical to before.
-  # Fail-soft: no conventions → empty, and the composer drops the flag+value pair (see <agents-rules>).
+  # does today) — the repo-root project conventions (AGENTS.md/CLAUDE.md), inlined as belt-and-suspenders
+  # reinforcement even though Grok Build itself already auto-discovers AGENTS.md/CLAUDE.md hierarchically
+  # (docs.x.ai/build/features/project-rules, re-verified HERD-767/epic HERD-754 step 8 — the driver's
+  # own comment on DRIVER_AGENT_INTERACTIVE_SPAWN previously claimed the opposite; that was wrong).
+  # Resolve it ONLY when the token is present, so a claude/headless spawn (whose binding has no such
+  # token) never even reads the file — its argv is byte-identical to before. Fail-soft: no conventions →
+  # empty, and the composer drops the flag+value pair (see <agents-rules>).
   local agents=""
   case "$binding" in *'<agents-rules>'*)
     command -v herd_agents_conventions >/dev/null 2>&1 && agents="$(herd_agents_conventions)" ;;
@@ -335,8 +338,14 @@ try:
         elif t == "<agents-rules>":
             if agents:
                 out.append(agents)
-            elif out and out[-1] == "--append-rules-to-system-prompt":
-                out.pop()                          # no conventions → drop the append-rules flag+value pair
+            elif out:
+                # no conventions → drop the flag+value pair. The preceding token IS that flag by
+                # construction (the binding template always pairs a flag literal immediately before
+                # <agents-rules>) — popped unconditionally rather than matched against a hardcoded
+                # flag string, so a driver renaming its rules-injection flag (as grok real flag was
+                # corrected from --append-rules-to-system-prompt to --rules, HERD-767) can never leave
+                # this drop silently broken again.
+                out.pop()
         elif t == "<prompt>":
             out.append(prompt)
         elif t == perm:

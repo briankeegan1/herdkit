@@ -48,8 +48,15 @@
 # ("steering: not yet probeable (step 7 pending)") rather than left out of the list — an absent row
 # reads as "nothing to check here", which is the lie this arrangement exists to prevent.
 #
-# SCOPE: codex only. Grok is step 8 of the epic and has no built runtime support to probe, so this
-# file deliberately declares no grok probes rather than guessing at them.
+# SCOPE: codex carries the only LIVE probes — the three that actually call production machinery
+# (agents.sh's real injection path, codex-exec-adapter.sh, the real .codex/agents scan) against a real
+# binary. Grok (HERD-767, epic HERD-754 step 8) has no built live-probe implementation — building one
+# on a guessed event schema would be exactly the fabrication this framework exists to avoid (grok's own
+# `--output-format json/streaming-json` EXISTS per docs but its event shape has never been observed; see
+# templates/drivers/grok.driver's ONESHOT_EXEC comment) — so grok gets a single, explicit `deferred` row
+# instead: this file's hook point (herd_rtconf_driver / herd_rtconf_probes, both driver-aware below)
+# reports "grok is not installed on this machine" / "not yet probeable" honestly, the same way codex's
+# own step-7 rows do, rather than grok being silently absent from `herd doctor` the way it was before.
 #
 # CONTRACT:
 #   • SOURCED, not executed, by bin/herd's `herd doctor --runtime-conformance`. Defines functions
@@ -72,10 +79,23 @@ _HERD_RTCONF_ASK_FALLBACK='Print ONLY the value of the "sentinel" field from you
 # ── target: which runtime this file's probes are about ────────────────────────────────────────────
 
 # herd_rtconf_driver — the DRIVER whose runtime is probed. `codex` by default: it is the only runtime
-# steps 1-5 actually built and verified support for, so defaulting to the ACTIVE driver would report
-# "no probes" on a normal claude seat and hide the codex evidence the epic exists to keep honest.
-# HERD_RTCONF_DRIVER overrides (the seam a future grok step, or a test, uses).
-herd_rtconf_driver() { printf '%s' "${HERD_RTCONF_DRIVER:-codex}"; }
+# steps 1-5 actually built and verified LIVE-probe support for, so defaulting every seat to the ACTIVE
+# driver would report "no probes" on a normal claude seat and hide the codex evidence the epic exists
+# to keep honest. HERD_RTCONF_DRIVER overrides explicitly (the seam tests use, and an operator who wants
+# to check a specific driver's conformance regardless of what the project is actively running).
+# HERD-767 (epic HERD-754 step 8) hook point: the ONE exception to the hardcoded codex default is grok
+# — when the PROJECT's actual active driver (herd_driver_name, from .herd/config's HERD_DRIVER) is grok
+# and there is no explicit override, report on grok rather than silently reporting codex evidence for a
+# seat that isn't even running codex. This is deliberately narrow (grok only, not "any active driver")
+# so codex/claude seats keep today's exact behavior — see _herd_rtconf_default_driver.
+herd_rtconf_driver() { printf '%s' "${HERD_RTCONF_DRIVER:-$(_herd_rtconf_default_driver)}"; }
+_herd_rtconf_default_driver() {
+  if command -v herd_driver_name >/dev/null 2>&1 && [ "$(herd_driver_name 2>/dev/null)" = "grok" ]; then
+    printf 'grok'
+  else
+    printf 'codex'
+  fi
+}
 
 # herd_rtconf_runtime [driver] — the runtime EXECUTABLE that driver spawns, resolved through
 # driver.sh's own binding reader (never a hardcoded 'codex' literal). Falls back to the driver name
@@ -114,7 +134,18 @@ herd_rtconf_version() {
 #   mode=live      an empirical probe exists and runs against the real binary
 #   mode=deferred  the capability is not probeable yet; <detail> says WHY. Deferred rows are printed
 #                  on every report — see this file's header on explicit degradation.
+# DRIVER-AWARE (HERD-767, epic HERD-754 step 8): dispatches on herd_rtconf_driver so a grok-targeted
+# report/probe run gets grok's own (deferred-only) row instead of codex's three live probes — a grok
+# binary would otherwise silently be asked codex-shaped questions about .codex/agents and
+# codex-exec-adapter.sh, which it can never answer.
 herd_rtconf_probes() {
+  case "$(herd_rtconf_driver)" in
+    grok) herd_rtconf_probes_grok ;;
+    *)    herd_rtconf_probes_codex ;;
+  esac
+}
+
+herd_rtconf_probes_codex() {
   printf '%s\n' \
 "specialist-definition	live	specialist definition loading + selection	positive (injected roster body returns its sentinel) AND negative control (bare prompt must not)" \
 "structured-exec-events	live	structured events from one bounded exec call	codex-exec-adapter.sh parses the real live stream into a completed state with a real thread_id" \
@@ -122,6 +153,20 @@ herd_rtconf_probes() {
 "session-resume-exact	deferred	resume an EXACT prior session	needs durable SDK/app-server coordination (HERD-754 step 7, not built yet) — codex exec is one synchronous turn, so nothing here can re-enter a specific thread" \
 "steering	deferred	steer a run mid-flight	needs durable SDK/app-server coordination (HERD-754 step 7, not built yet) — no live session exists to send a mid-run instruction to" \
 "interruption	deferred	interrupt a run mid-flight	needs durable SDK/app-server coordination (HERD-754 step 7, not built yet) — a bounded one-shot call can only be killed, which proves nothing about interruption semantics"
+}
+
+# herd_rtconf_probes_grok — ONE explicit, honest `deferred` row (HERD-767, epic HERD-754 step 8) rather
+# than silence. No live probe implementation exists: building one (a grok-exec-adapter parsing
+# `--output-format json/streaming-json`, a roster injection probe for DEFINITION_MODE=install, …) on a
+# schema nobody has observed would be exactly the guessing this framework exists to refuse — see
+# templates/drivers/grok.driver's ONESHOT_EXEC comment. `herd_rtconf_run`/`herd_rtconf_report` already
+# report the installed-version state (`unavailable`/`<not installed>`) around this row using the real
+# grok binary name, resolved the same driver-generic way as codex's — so on every machine that has
+# actually run this (none, as of this audit), the honest "grok is not installed on this machine" line
+# prints instead of grok being absent from `herd doctor` output entirely.
+herd_rtconf_probes_grok() {
+  printf '%s\n' \
+"grok-runtime	deferred	grok exec-binding conformance (epic HERD-754 step 8)	no live probe implementation exists yet (HERD-754 step 8, HERD-767) — templates/drivers/grok.driver's exec bindings were re-audited against docs.x.ai on 2026-08-18 but grok is not installed on any machine that has built a live probe, so real runtime BEHAVIOR (argv acceptance, --rules/--continue composition, --output-format event shape) stays unverified; deferred honestly rather than guessed, same discipline as codex's step-7 rows"
 }
 
 # herd_rtconf_probe_field <id> <col> — one field (2=mode, 3=title, 4=detail) of a probe row, or empty

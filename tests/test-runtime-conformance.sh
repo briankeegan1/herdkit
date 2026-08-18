@@ -206,5 +206,48 @@ else
   pass; echo "PASS (12) LIVE: the structured-exec-events probe genuinely passes against the installed codex, recorded keyed to its real version — and stops being trusted on a version bump"
 fi
 
+# ── 13. HERD-767 (epic HERD-754 step 8) grok probe table: an explicit HERD_RTCONF_DRIVER=grok override
+#     returns ONE honest, explicit deferred row — never codex's codex-shaped probe ids, and never an
+#     empty table (silence is exactly what this step exists to avoid). ────────────────────────────────
+_RT_ENV=(HERD_RTCONF_DRIVER=grok)
+gtable="$(rtconf_sh 'herd_rtconf_probes')"
+[ "$(printf '%s\n' "$gtable" | grep -c .)" -eq 1 ] || fail "(13) grok probe table should declare exactly 1 row, got: $gtable"
+case "$gtable" in *"grok-runtime"*"deferred"*) : ;; *) fail "(13) grok probe table missing its deferred grok-runtime row: $gtable" ;; esac
+[ "$(rtconf_sh 'herd_rtconf_probe_field grok-runtime 2')" = "deferred" ] || fail "(13) grok-runtime must be mode=deferred"
+case "$(rtconf_sh 'herd_rtconf_probe_field grok-runtime 4')" in
+  *"HERD-754 step 8"*) : ;;
+  *) fail "(13) grok-runtime's deferred reason must name epic HERD-754 step 8" ;;
+esac
+case "$gtable" in *"specialist-definition"*) fail "(13) grok probe table must NOT carry codex's probe ids" ;; esac
+_RT_ENV=()
+pass; echo "PASS (13) HERD_RTCONF_DRIVER=grok declares exactly one explicit deferred row, never codex's live probe ids"
+
+# ── 14. ACTIVE-DRIVER auto-detection: with NO explicit HERD_RTCONF_DRIVER override, herd_rtconf_driver
+#     targets grok when the PROJECT's active driver (HERD_DRIVER, read by herd_driver_name) is grok —
+#     the hook point that stops a grok seat from silently getting codex's report — while every other
+#     active driver (unset, codex, herdr-claude) keeps today's hardcoded codex default untouched. ─────
+_RT_ENV=(HERD_DRIVER=grok)
+[ "$(rtconf_sh 'herd_rtconf_driver')" = "grok" ] || fail "(14) an active grok driver must auto-target grok with no explicit override"
+_RT_ENV=(HERD_DRIVER=codex)
+[ "$(rtconf_sh 'herd_rtconf_driver')" = "codex" ] || fail "(14) an active codex driver must resolve codex (unchanged)"
+_RT_ENV=(HERD_DRIVER=herdr-claude)
+[ "$(rtconf_sh 'herd_rtconf_driver')" = "codex" ] || fail "(14) a normal claude seat must still default to codex (byte-identical to before HERD-767)"
+_RT_ENV=()
+[ "$(rtconf_sh 'herd_rtconf_driver')" = "codex" ] || fail "(14) no active driver set at all must still default to codex"
+pass; echo "PASS (14) herd_rtconf_driver auto-targets grok ONLY when the project's active driver is grok; every other seat is unchanged"
+
+# ── 15. grok is not installed on this dev machine (true of every machine this audit has run on) — run
+#     and report must both degrade HONESTLY: no crash, no guessed pass, and the explicit deferred row
+#     still prints. Mirrors case (8)'s codex-absent proof but for the grok hook point specifically. ────
+_RT_ENV=(HERD_RTCONF_DRIVER=grok)
+grun="$(rtconf_sh 'herd_rtconf_run'; echo "rc=$?")"
+case "$grun" in *"grok is not installed"*"rc=0"*) : ;; *) fail "(15) herd_rtconf_run for grok must degrade cleanly and honestly, got: $grun" ;; esac
+grpt="$(rtconf_sh 'herd_rtconf_report')"
+case "$grpt" in *"driver grok"*"runtime grok"*) : ;; *) fail "(15) report header must name driver+runtime grok: $grpt" ;; esac
+case "$grpt" in *"<not installed>"*) : ;; *) fail "(15) report header must say grok is not installed: $grpt" ;; esac
+case "$grpt" in *"grok-runtime"*"not yet probeable"*) : ;; *) fail "(15) report must print the grok-runtime deferred row: $grpt" ;; esac
+_RT_ENV=()
+pass; echo "PASS (15) grok (absent on this machine) degrades honestly through both herd_rtconf_run and herd_rtconf_report — never a crash, never a guessed result"
+
 echo "─────────────────────────────────────────────"
 echo "runtime-conformance.sh: $PASS checks passed"
