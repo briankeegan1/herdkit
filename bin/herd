@@ -5407,6 +5407,17 @@ cmd_conformance() {
 #   herd doctor --probe      the dependency doctor PLUS a LIVE re-probe of the specialist agent roster
 #                            (HERD-667) instead of the cached read the plain form does. The roster leg
 #                            is advisory either way and never changes the exit status.
+#   herd doctor --runtime-conformance [--probe]
+#                            the RUNTIME CONFORMANCE report (HERD-763, epic HERD-754 step 6): what the
+#                            agent runtime installed on THIS machine was last empirically proved to do
+#                            — specialist-definition delivery, structured exec events, project-level
+#                            agent discovery — with every result VERSION-KEYED, so a runtime upgrade
+#                            invalidates the prior verdict instead of being silently trusted.
+#                            Capabilities that are not probeable yet (exact-session resume, steering,
+#                            interruption — they need step 7's durable coordination) are PRINTED as
+#                            explicitly deferred rows rather than omitted. Reads the cache; `--probe`
+#                            runs the live probes first. Report-only, always exits 0
+#                            (scripts/herd/runtime-conformance.sh).
 cmd_doctor() {
   # Source the config loader too: herd_doctor's config-dup check (issue #115) uses its scanner
   # (_herd_config_dup_keys). Pre-set the once-per-process marker so the loader's PASSIVE dup warning
@@ -5421,6 +5432,22 @@ cmd_doctor() {
       # shellcheck source=/dev/null
       . "$SCRIPTS_DIR/posture-lint.sh"
       herd_doctor_posture   # report-only, always 0 — advisory, never a gate
+      return 0 ;;
+    --runtime-conformance)
+      # HERD-763: the RUNTIME conformance leg — empirical, version-keyed evidence about the agent
+      # runtime BINARY installed here, kept separate from the dependency doctor's "is it present"
+      # question. Report-only and always 0 (a conformance result is evidence, never a gate), and it
+      # deliberately does NOT ride along with the plain `herd doctor`: the live probes cost real model
+      # turns, so they stay opt-in and the no-flag form is byte-identical to before this existed.
+      # shellcheck source=/dev/null
+      . "$SCRIPTS_DIR/driver.sh"
+      # shellcheck source=/dev/null
+      . "$SCRIPTS_DIR/agents.sh"
+      # shellcheck source=/dev/null
+      . "$SCRIPTS_DIR/codex-exec-adapter.sh"
+      # shellcheck source=/dev/null
+      . "$SCRIPTS_DIR/runtime-conformance.sh"
+      herd_rtconf_report "${2:-}"
       return 0 ;;
     ""|--probe)
       # HERD-667: the roster leg is ADVISORY and rides AFTER the dependency doctor — it reads the
@@ -5437,7 +5464,7 @@ cmd_doctor() {
       . "$SCRIPTS_DIR/agents.sh"
       herd_roster_doctor_section "${1:-}" || true
       [ "$_dr_rc" -eq 0 ] || exit 1 ;;
-    *)  die "usage: herd doctor [--posture|--probe]" ;;
+    *)  die "usage: herd doctor [--posture|--probe|--runtime-conformance [--probe]]" ;;
   esac
 }
 
@@ -9592,6 +9619,15 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd doctor --probe                 the dependency doctor plus a LIVE re-probe of the specialist
                                       agent roster (the plain form reads the cached verdicts).
                                       The roster leg is advisory and never changes the exit status
+  herd doctor --runtime-conformance [--probe]
+                                      runtime conformance report: what the agent runtime installed on
+                                      THIS machine was last empirically proved to do (specialist
+                                      definition delivery, structured exec events, project agent
+                                      discovery), every result VERSION-KEYED so a runtime upgrade
+                                      invalidates it instead of being silently trusted. Capabilities
+                                      that are not probeable yet are printed as explicitly deferred
+                                      rows, never omitted. --probe runs the live probes first.
+                                      Advisory — always exits 0
   herd upgrade                        bump HERD_VERSION + re-render the coordinator skill
   herd render                         re-render only the coordinator skill from .herd/config
   herd codemap [--check]              regenerate docs/codemap.md: a deterministic native map of the
