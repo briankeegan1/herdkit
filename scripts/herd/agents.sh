@@ -679,6 +679,92 @@ herd_roster_list() {
   return 0
 }
 
+# ── herd agents list --json: the roster as a machine contract (HERD-759) ─────────────────────────
+# herd_roster_list_json — the SAME roster + driver bindings + CACHED per-entry verdicts
+# herd_roster_list renders as a table, encoded as ONE object so a non-Claude coordinator runtime can
+# read roster state without parsing a column layout. Like the text list it is a pure READ of the
+# cache — it NEVER spawns a probe (`herd agents verify` owns that) — and it always exits 0.
+#
+# THE CONTRACT (schema "herd.agents/v1"):
+#   schema           string        contract id + version
+#   roster_dir       string|null   where the committed definitions live
+#   driver           string|null   the ACTIVE driver the verdicts below are keyed to
+#   definition_mode  string|null   native | install | inject
+#   selection        string|null   how this runtime selects a definition (herd_roster_probe_kind)
+#   lookup_path      string|null   the runtime's real definition lookup dir; null when it has none
+#   count            int           number of real definitions
+#   definitions      array         one object per definition, name-sorted:
+#                                    name         string
+#                                    state        string  the CACHED verdict for (driver, sha) —
+#                                                 ok | unresolved | indeterminate | no-sentinel |
+#                                                 unverified (never verified against this pair)
+#                                    detail       string|null  the cached verdict's detail line
+#                                    description  string|null  frontmatter `description`, UNTRUNCATED
+#                                                 (the table elides it at 72 chars; a machine gets it
+#                                                 whole)
+#                                    sha          string|null  the definition sha the state is keyed to
+#                                    path         string|null  the definition file
+#   skipped          array         files in the roster dir that are NOT definitions:
+#                                    {name, reason}
+# The text list's trailing prose lines have no JSON counterpart on purpose — they explain the table,
+# they are not roster state.
+herd_roster_list_json() {
+  local US=$'\037'
+  local drv mode kind dir n f sha cached desc defs="" skips=""
+  drv="$(herd_driver_name 2>/dev/null || printf 'herdr-claude')"
+  mode="$(herd_roster_mode "$drv")"
+  kind="$(herd_roster_probe_kind "$drv")"
+  dir="$(herd_roster_definition_dir "$drv")"
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    f="$(herd_roster_path "$n")" || continue
+    sha="$(herd_roster_sha "$f")"
+    desc="$(herd_roster_field "$f" description)"
+    # $cached is "<verdict>\t<detail>" (or empty when never verified) — handed over WITH its tab and
+    # split in python, so an absent detail can never be mistaken for the verdict repeated.
+    cached="$(herd_roster_cache_get "$drv" "$n" "$sha")"
+    defs="${defs}${n}${US}${cached}${US}${desc}${US}${sha}${US}${f}"$'\n'
+  done <<< "$(herd_roster_names)"
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    skips="${skips}${n}${US}$(_herd_roster_skip_reason "$(herd_roster_dir)/$n.md")"$'\n'
+  done <<< "$(herd_roster_skipped_names)"
+  ROSTER_DIR="$(herd_roster_dir)" DRIVER="$drv" MODE="$mode" KIND="$kind" LOOKUP="$dir" \
+  DEFS="$defs" SKIPS="$skips" python3 -c '
+import os, sys, json
+US = "\x1f"
+
+def nz(v):
+    return v if v else None
+
+def rows(var):
+    return [l for l in (os.environ.get(var) or "").split("\n") if l]
+
+defs = []
+for line in rows("DEFS"):
+    p = (line.split(US) + [""] * 5)[:5]
+    verdict, _, detail = p[1].partition("\t")
+    defs.append({"name": p[0], "state": verdict or "unverified", "detail": nz(detail),
+                 "description": nz(p[2]), "sha": nz(p[3]), "path": nz(p[4])})
+skipped = []
+for line in rows("SKIPS"):
+    p = (line.split(US) + [""] * 2)[:2]
+    skipped.append({"name": p[0], "reason": nz(p[1])})
+
+json.dump({"schema": "herd.agents/v1",
+           "roster_dir": nz(os.environ.get("ROSTER_DIR")),
+           "driver": nz(os.environ.get("DRIVER")),
+           "definition_mode": nz(os.environ.get("MODE")),
+           "selection": nz(os.environ.get("KIND")),
+           "lookup_path": nz(os.environ.get("LOOKUP")),
+           "count": len(defs),
+           "definitions": defs,
+           "skipped": skipped}, sys.stdout, indent=2)
+print()
+'
+  return 0
+}
+
 # herd_roster_show <name> — the full definition (frontmatter fields + body).
 herd_roster_show() {
   local n="${1:-}" f
@@ -767,7 +853,14 @@ _herd_roster_cli() {
   local sub="${1:-list}" n rc=0
   shift 2>/dev/null || true
   case "$sub" in
-    list|'') herd_roster_list ;;
+    list|'')
+      # HERD-759: --json serves the documented herd.agents/v1 contract instead of the table. The
+      # no-flag path is untouched — herd_roster_list is not even reached with the flag present.
+      case "${1:-}" in
+        --json) herd_roster_list_json ;;
+        '')     herd_roster_list ;;
+        *)      printf 'usage: herd agents list [--json]\n' >&2; return 2 ;;
+      esac ;;
     show)    herd_roster_show "${1:-}" || return 1 ;;
     new)     herd_roster_scaffold "${1:-}" || return 1 ;;
     install) herd_roster_install "${HERD_DRIVER:-}" || return 1 ;;
@@ -787,9 +880,9 @@ _herd_roster_cli() {
       fi ;;
     dir)     herd_roster_dir; echo ;;
     -h|--help|help)
-      printf 'usage: herd agents {list|new <name>|show <name>|install|verify [<name>]|dir}\n' ;;
+      printf 'usage: herd agents {list [--json]|new <name>|show <name>|install|verify [<name>]|dir}\n' ;;
     *)
-      printf 'usage: herd agents {list|new <name>|show <name>|install|verify [<name>]|dir}\n' >&2
+      printf 'usage: herd agents {list [--json]|new <name>|show <name>|install|verify [<name>]|dir}\n' >&2
       rc=2 ;;
   esac
   return "$rc"

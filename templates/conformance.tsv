@@ -77,6 +77,7 @@ herd map	unit	tests/test-map.sh
 herd codemap	unit	tests/test-codemap.sh
 herd symbol-index	unit	tests/test-symbol-index.sh
 herd agents <list|new|show|install|verify>	unit	tests/test-agent-roster.sh
+herd agents <list|new|show|install|verify>	unit	tests/test-json-output.sh
 herd ledger <set|get|list|rm|compact|path>	unit	tests/test-ledger.sh
 herd ledger <set|get|list|rm|compact|path>	unit	tests/test-cli-note-context.sh
 herd advise "<question>" [context…]	unit	tests/test-advise.sh
@@ -94,8 +95,10 @@ herd watcher-resurrect	unit	tests/test-watcher-resurrect.sh
 herd update [--force]	unit	tests/test-cli-update.sh
 herd log [--pr N] [--tail]	unit	tests/test-journal.sh
 herd why <pr#>	unit	tests/test-journal.sh
+herd why <pr#>	unit	tests/test-json-output.sh
 herd approve [<pr#|slug>] [--sha <sha>]	unit	tests/test-cli-approve.sh
 herd status	unit	tests/test-status.sh
+herd status	unit	tests/test-json-output.sh
 herd sweep	unit	tests/test-sweep.sh
 herd sweep	unit	tests/test-sweep-origin-reachable.sh
 herd sweep	unit	tests/test-sweep-once-guards.sh
@@ -104,6 +107,7 @@ herd stats [--today|--since <date>|--pr N]	unit	tests/test-stats.sh
 herd changelog [generate|tag <ver>]	unit	tests/test-changelog.sh
 herd triage [run|report]	unit	tests/test-oss-triage.sh
 herd backlog	unit	tests/test-cli-backlog.sh
+herd backlog	unit	tests/test-json-output.sh
 herd backend switch	unit	tests/test-cli-backend-switch.sh
 herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-report.sh
 herd report [--to <link>] [--dep] "<symptom>"	unit	tests/test-cli-links.sh

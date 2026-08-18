@@ -5448,6 +5448,17 @@ cmd_status() {
   # needs attention (a DEAD builder, a CONFLICTING PR, or a review-blocked PR); 0 when healthy.
   # All the work lives in scripts/herd/status.sh (sourced at startup); this just loads config and
   # runs it, mirroring cmd_backlog's loader so `herd status` binds to THIS repo's project.
+  # HERD-759: `--json` swaps the FORMAT stage for the documented herd.status/v1 machine contract
+  # (scripts/herd/status.sh's _status_format_json) — same gather, same exit contract. Purely
+  # additive: without the flag every byte of the human report is unchanged.
+  local as_json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --json)    as_json=1 ;;
+      -h|--help) say "usage: herd status [--json]"; return 0 ;;
+      *)         die "unknown 'herd status' flag: $a — usage: herd status [--json]" ;;
+    esac
+  done
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
   [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
@@ -5462,7 +5473,11 @@ cmd_status() {
   # the engine is current or the project pins no ENGINE_MIN floor; never changes the exit contract.
   if command -v herd_engine_warn_if_stale >/dev/null 2>&1; then herd_engine_warn_if_stale "herd status"; fi
   local rc=0
-  _status_run || rc=$?
+  if [ "$as_json" = 1 ]; then
+    _status_run --json || rc=$?
+  else
+    _status_run || rc=$?
+  fi
   return "$rc"
 }
 
@@ -5544,6 +5559,49 @@ cmd_sweep() {
   return 1
 }
 
+# ── herd backlog --json: the OPEN work set as a machine contract (HERD-759) ──────────────────────
+# _backlog_emit_json <backend> <mode> <raw-lines> — encode _backend_list_open's output as ONE object.
+#
+# WHY IT ENCODES LINES, NOT A RE-QUERY: every backend already agrees on ONE output op, and that op is
+# what the plain list prints. Re-asking the backend a second, JSON-shaped question would be a second
+# source of truth that can drift from the human list; encoding the SAME bytes cannot.
+#
+# THE CONTRACT (schema "herd.backlog/v1"):
+#   schema   string   contract id + version
+#   backend  string   the active SCRIBE_BACKEND that produced the list
+#   mode     string   which set this is — "open" today (the only list mode with a --json form)
+#   count    int      number of items
+#   items    array    one object per line, in backend order:
+#                       line   string       the backend's line VERBATIM — always populated, the
+#                                           lossless fallback for any consumer
+#                       id     string|null  the item ref, for a backend that mints ids and emits the
+#                                           shared "#<id> <title>" shape (github: "7"; linear:
+#                                           "HERD-759"). NULL on the file backend, whose lines are
+#                                           markdown bullets with no id to report — reporting a made-up
+#                                           one would be worse than reporting none.
+#                       title  string|null  the text after that ref; null exactly when id is null.
+# Deterministic; never mutates anything. The id/title split is a parse of a documented line shape, not
+# an inference: a line that does not match it yields nulls rather than a guess.
+_backlog_emit_json() {
+  BACKEND="${1:-}" MODE="${2:-}" RAW="${3:-}" python3 -c '
+import os, sys, json, re
+items = []
+for line in (os.environ.get("RAW") or "").split("\n"):
+    if not line.strip():
+        continue
+    m = re.match(r"^#(\S+)[ \t]+(.*)$", line)
+    items.append({"line": line,
+                  "id": m.group(1) if m else None,
+                  "title": m.group(2) if m else None})
+json.dump({"schema": "herd.backlog/v1",
+           "backend": os.environ.get("BACKEND") or None,
+           "mode": os.environ.get("MODE") or None,
+           "count": len(items),
+           "items": items}, sys.stdout, indent=2)
+print()
+'
+}
+
 cmd_backlog() {
   # Print the project's OPEN work items via the active SCRIBE_BACKEND — the generic,
   # backend-agnostic "what's my open work?" command. The file backend greps $BACKLOG_FILE,
@@ -5557,6 +5615,10 @@ cmd_backlog() {
   #                             backend defines _backend_list_open_rich (linear); backends
   #                             without the op fall back to the plain list, so a consumer can
   #                             always ask for --rich and key its rendering off the line shape
+  #   herd backlog --json       the OPEN list as ONE machine-readable object (HERD-759) — the same
+  #                             _backend_list_open output the plain mode prints, encoded so a
+  #                             non-Claude coordinator runtime can read the work set without
+  #                             scraping console text. See _backlog_emit_json for the contract.
   #   herd backlog --closed     plain "#<id> <title>" lines for CLOSED (completed/canceled) items
   #                             (_backend_list_closed — HERD-490). The default list is OPEN-only by
   #                             design, so a "does this already exist?" search that stops at the
@@ -5584,6 +5646,7 @@ cmd_backlog() {
   local mode="plain" ref="" blocker=""
   case "${1:-}" in
     --rich)   mode="rich" ;;
+    --json)   mode="json" ;;
     --closed) mode="closed" ;;
     show)    mode="show"; ref="${2:-}"
              [ -n "$ref" ] || die "usage: herd backlog show <#id>" ;;
@@ -5595,7 +5658,7 @@ cmd_backlog() {
     unqueue) mode="unqueue"; ref="${2:-}"
              [ -n "$ref" ] || die "usage: herd backlog unqueue <#id>" ;;
     '')      ;;
-    *)       die "usage: herd backlog [--rich | --closed | show <#id> | browse | queued | queue <#id> [--after <blocker>] | unqueue <#id>]" ;;
+    *)       die "usage: herd backlog [--rich | --json | --closed | show <#id> | browse | queued | queue <#id> [--after <blocker>] | unqueue <#id>]" ;;
   esac
   local root; root="$(pwd)"
   local cfg="$root/.herd/config"
@@ -5623,6 +5686,14 @@ cmd_backlog() {
   case "$mode" in
     plain)
       _backend_list_open ;;
+    json)
+      # HERD-759: the SAME op the plain list prints, encoded once. Captured (not piped) so a backend
+      # that exits NON-ZERO on a transport failure (HERD-652) still fails the command instead of
+      # emitting an authoritative-looking empty item list.
+      local _bl_raw _bl_rc=0
+      _bl_raw="$(_backend_list_open)" || _bl_rc=$?
+      [ "$_bl_rc" -eq 0 ] || return "$_bl_rc"
+      _backlog_emit_json "$SCRIBE_BACKEND" "open" "$_bl_raw" ;;
     closed)
       # HERD-490: OPTIONAL op — a backend that mints no ids of its own (file/changelog) has no
       # separate closed set to show. Fail-soft: a note on stderr, empty list, exit 0 (advisory).
@@ -8593,14 +8664,107 @@ cmd_log() {
   fi
 }
 
+# ── herd why --json: one PR's gate history as a machine contract (HERD-759) ──────────────────────
+# _why_emit_json <journal-files> — every journal event recorded for $HERD_WHY_PR, chronologically,
+# plus the small derived gate summary a coordinator actually branches on.
+#
+# THE CONTRACT (schema "herd.why/v1"):
+#   schema   string   contract id + version
+#   pr       int      the PR this history is for
+#   count    int      number of events
+#   summary  object   derived STRICTLY from the events below — never from a second probe, so it can
+#                     never disagree with them. Each member is null when no such event exists:
+#                       latest_verdict  {value, source, sha, reason, ts} — the LAST verdict_recorded
+#                       latest_health   {outcome, detail, ts}           — the LAST healthcheck_outcome
+#                       merged          bool — a `merge` or `merge_observed` event was recorded
+#                       first_ts / last_ts  string|null — the history's time span
+#   events   array    the raw journal objects for this PR, sorted by `ts`. Emitted VERBATIM: the
+#                     journal is already JSON, its event vocabulary grows over time, and re-shaping
+#                     each event here would either drop fields a future reader needs or invent ones
+#                     the writer never recorded. Every object carries at least `ts` and `event`.
+# Read-only; never writes the journal. The human render (its describe() table) is deliberately NOT
+# duplicated here — prose is for the text path; a machine gets the recorded fields.
+_why_emit_json() {
+  printf '%s\n' "${1:-}" | python3 -c '
+import sys, os, json
+pr = os.environ["HERD_WHY_PR"]
+rows = []
+for path in sys.stdin.read().split("\n"):
+    path = path.strip()
+    if not path:
+        continue
+    try:
+        f = open(path, encoding="utf-8")
+    except OSError:
+        continue
+    with f:
+        for raw in f:
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                o = json.loads(raw)
+            except Exception:
+                continue
+            if str(o.get("pr", "")) == pr:
+                rows.append(o)
+rows.sort(key=lambda o: str(o.get("ts", "")))
+
+def nz(v):
+    return v if v not in (None, "") else None
+
+latest_verdict = latest_health = None
+merged = False
+for o in rows:
+    ev = o.get("event")
+    if ev == "verdict_recorded":
+        latest_verdict = {"value": nz(o.get("value")), "source": nz(o.get("source")),
+                          "sha": nz(o.get("sha")), "reason": nz(o.get("reason")),
+                          "ts": nz(o.get("ts"))}
+    elif ev == "healthcheck_outcome":
+        latest_health = {"outcome": nz(o.get("outcome")), "detail": nz(o.get("detail")),
+                         "ts": nz(o.get("ts"))}
+    elif ev in ("merge", "merge_observed"):
+        merged = True
+
+json.dump({"schema": "herd.why/v1",
+           "pr": int(pr),
+           "count": len(rows),
+           "summary": {"latest_verdict": latest_verdict,
+                       "latest_health": latest_health,
+                       "merged": merged,
+                       "first_ts": nz(rows[0].get("ts")) if rows else None,
+                       "last_ts": nz(rows[-1].get("ts")) if rows else None},
+           "events": rows}, sys.stdout, indent=2)
+print()
+'
+}
+
 cmd_why() {
-  local pr="${1:-}"
+  # HERD-759: `--json` swaps the RENDER for the documented herd.why/v1 machine contract, so a
+  # non-Claude coordinator runtime can read a PR's gate state without scraping the human history.
+  # Purely additive — without the flag the argument handling and both text paths below are unchanged.
+  local pr="" as_json=0 a
+  for a in "$@"; do
+    case "$a" in
+      --json)    as_json=1 ;;
+      -h|--help) say "usage: herd why <pr#> [--json]"; return 0 ;;
+      -*)        die "unknown 'herd why' flag: $a — usage: herd why <pr#> [--json]" ;;
+      *)         [ -z "$pr" ] || die "usage: herd why <pr#> [--json]"; pr="$a" ;;
+    esac
+  done
   [ -n "$pr" ] || die "usage: herd why <pr#>"
   case "$pr" in \#*) pr="${pr#\#}" ;; esac
-  [ -n "$pr" ] && [ -z "${pr//[0-9]/}" ] || die "herd why: <pr#> must be a number (got '$1')"
+  [ -n "$pr" ] && [ -z "${pr//[0-9]/}" ] || die "herd why: <pr#> must be a number (got '$pr')"
   _journal_load_config
   if command -v herd_theme_load_cli >/dev/null 2>&1; then herd_theme_load_cli; fi
   local files; files="$(_journal_all_files)"
+  if [ "$as_json" = 1 ]; then
+    # An EMPTY file list is not an error here: no journal yet ⇒ zero events, which the contract
+    # states as count 0 / events [] rather than as prose a machine has to parse.
+    HERD_WHY_PR="$pr" _why_emit_json "$files"
+    return $?
+  fi
   if [ -z "$files" ]; then
     say "no engine journal yet at ${c_dim}$WORKTREES_DIR/.herd/journal.jsonl${c_rst}"
     return 0
@@ -9441,9 +9605,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       the SPECIALIST AGENT ROSTER — committed per-project agent
                                       definitions (.herd/agents/<name>.md: frontmatter name/
                                       description/sentinel, body = the system prompt):
-                                        list             roster + the ACTIVE driver's cached
+                                        list [--json]    roster + the ACTIVE driver's cached
                                                          resolution state, definition mode and lookup
-                                                         path (no spawning)
+                                                         path (no spawning); --json emits the stable
+                                                         herd.agents/v1 object
                                         new <name>       scaffold a definition (sentinel included)
                                         show <name>      print one definition
                                         install          publish the committed definitions to the
@@ -9604,10 +9769,13 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       macOS (issue #137). --dry-run previews without running
   herd log [--pr N] [--tail]          page the engine journal (.herd/journal.jsonl): one line per
                                       gate event; --pr filters to one PR, --tail follows live
-  herd status                         one-shot READ-ONLY control-room snapshot for THIS project:
+  herd status [--json]                one-shot READ-ONLY control-room snapshot for THIS project:
                                       watcher alive?, in-flight builders (+ DEAD detection), open
                                       PRs + gate state, backlog counts. Deterministic, no LLM, no
-                                      mutation; exits non-zero when something needs attention
+                                      mutation; exits non-zero when something needs attention.
+                                      --json emits the same snapshot as the stable herd.status/v1
+                                      object (same exit contract) for a non-Claude coordinator
+                                      runtime or any script
   herd sweep [--dry-run] [--no-restart]
                                       one-command control-room cleanup: reap merged/closed-PR
                                       worktrees (sha-anchored), close stale engine tabs, drop
@@ -9616,9 +9784,11 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                       it cannot prove disposable (real dirt, unpushed unique
                                       commits) is FLAGGED with evidence, never deleted.
                                       --dry-run prints the full plan and touches nothing
-  herd why <pr#>                      summarize one PR's full gate history from the journal —
+  herd why <pr#> [--json]             summarize one PR's full gate history from the journal —
                                       dispatches, verdicts (+provenance), health attempts, refixes,
-                                      merge/reap — chronologically; the first post-mortem tool
+                                      merge/reap — chronologically; the first post-mortem tool.
+                                      --json emits the raw events plus a derived gate summary as the
+                                      stable herd.why/v1 object
   herd approve [<pr#|slug>] [--sha <sha>]
                                       the approval front door under MERGE_POLICY=approve (an alias
                                       for scripts/herd/herd-approve.sh — same records, same watcher):
@@ -9677,6 +9847,7 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd backlog                        list open work items via the active backend
               [--rich]                TSV with workflow state + description (backends that
                                       support it; others fall back to the plain list)
+              [--json]                the same open list as the stable herd.backlog/v1 object
               [show <#id>]            one item's full detail (state, description, URL)
               [browse]                interactive fzf picker with a live detail preview
                                       (soft-degrades to the plain list without fzf)
