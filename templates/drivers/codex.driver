@@ -87,13 +87,37 @@ DRIVER_AGENT_COST_USAGE_KEYS='@degrade:no-verified-codex-usage-token-schema'
 DRIVER_AGENT_PROCESS_SIGNATURE='codex'
 
 # ── Specialist-agent ROSTER bindings (HERD-667, epic HERD-666) ────────────────────────────────────
-# PRE-AUDIT (2026-08-12, codex 0.147.0 on this machine): Codex has NO named-agent selection and no
-# agent-definition lookup directory — neither a `--agent <name>` flag nor a scanned `agents/` dir.
-# Both capabilities are therefore bound to the drivers' @degrade sentinel rather than a guessed flag
-# or an invented path, and DEFINITION_MODE is `inject`: scripts/herd/agents.sh prepends the
-# definition body to the builder's task spec. That fallback is FIRST-CLASS, not a consolation prize —
-# it is the one mechanism that works on ANY runtime, and it is what `herd agents verify` probes here
-# (positive: body injected → sentinel returns; negative control: nothing injected → it must not).
-DRIVER_AGENT_DEFINITION_DIR='@degrade:no-agent-definition-lookup-path-codex-0.147.0'
-DRIVER_AGENT_SELECT_FLAG='@degrade:no-named-agent-selection-codex-0.147.0'
+# CORRECTION (2026-08-18, HERD-761, epic HERD-754 step 5): the original 2026-08-12 pre-audit said
+# Codex has "no agent-definition lookup directory ... neither a --agent flag nor a scanned agents/
+# dir". That was WRONG about the directory, re-verified live against the real codex-cli 0.147.0
+# binary (/opt/homebrew/bin/codex) before touching this binding:
+#   • `.codex/agents/*.toml` IS real and natively parsed. Proof: dropping a malformed file there
+#     (missing the required field) makes `codex exec` emit
+#     `Ignoring malformed agent role definition: agent role file at <path> must define
+#     `developer_instructions`` — codex only ever writes that message about a file it actually
+#     opened and tried to deserialize, so the directory is genuinely scanned, not absent.
+#   • A NAME-BY-FLAG selector is still genuinely absent: `codex exec --agent probe ...` fails fast
+#     with `error: unexpected argument '--agent' found` (clap's own usage error) — confirmed absent
+#     in `codex --help` / `codex exec --help` and by a string search of the compiled binary for
+#     `--agent`/`agent_name`-shaped CLI flags, which found none.
+#   • This is EXACTLY the T3 trap scripts/herd/agents.sh documents for claude's `.claude/agents/*.md`
+#     (see agents.sh's header, and docs/spikes/specialist-agent-roster.md § 3a): a real, natively
+#     read per-project definition directory that governs SUBAGENT roles the runtime's own multi-agent
+#     machinery may dispatch to (codex ships `multi_agent`/`multi_agent_v2` feature flags and
+#     SubagentStart/SubagentStop hook events — see `codex features list`), never the MAIN session's
+#     own persona for a `codex exec` oneshot. Verified live: a fully valid `.codex/agents/probe.toml`
+#     (`name` + `description` + `developer_instructions` carrying a unique sentinel) sitting in the
+#     workdir has ZERO effect on a bare `codex exec` turn asked for that sentinel — it answers
+#     NO-SENTINEL every time, with NO selection mechanism engaged. tests/test-codex-agent-roster-live.sh
+#     is the automated, live (skip-if-`codex`-absent) proof of exactly this pair of findings.
+# DEFINITION_MODE therefore stays `inject`, unchanged: scripts/herd/agents.sh prepends the definition
+# body to the builder's task spec, the one mechanism that actually governs a codex oneshot's whole
+# session — also re-verified live (a real `codex exec` turn, given the roster's real injected
+# `herd_roster_lane_spec_block` output, correctly echoed back the sentinel). SELECT_FLAG stays
+# @degrade — there is still no by-name selector — but its reason text is corrected to name the real
+# gap (no flag), not a nonexistent one (no directory). DEFINITION_DIR is corrected to the real,
+# natively-scanned repo-scope path so `herd agents list`/`doctor` report the honest lookup path,
+# exactly mirroring claude's own `DEFINITION_DIR` (real dir, `inject` mode) shape.
+DRIVER_AGENT_DEFINITION_DIR='.codex/agents'
+DRIVER_AGENT_SELECT_FLAG='@degrade:no-by-name-agent-selection-flag-codex-0.147.0'
 DRIVER_AGENT_DEFINITION_MODE='inject'

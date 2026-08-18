@@ -136,9 +136,12 @@ got="$(HERD_DRIVER=grok roster_sh 'herd_roster_definition_dir')"
 got="$(HERD_DRIVER=stub roster_sh 'herd_roster_definition_dir')"
 [ "$got" = "$T/home/.stub-agent/agents" ] || fail "(4) stub definition dir = [$got]"
 _ROSTER_ENV=()
-# codex binds @degrade for the dir → no lookup path at all.
+# codex 0.147.0 DOES have a real, natively-scanned repo-scope definition dir (`.codex/agents/*.toml`
+# — HERD-761 re-verification, templates/drivers/codex.driver's CORRECTION comment); it is bound like
+# claude's (real dir, still no by-name selector — see case 3) rather than @degrade.
 got="$(HERD_DRIVER=codex roster_sh 'herd_roster_definition_dir')"
-[ -z "$got" ] || fail "(4) codex reported a definition dir it does not have: [$got]"
+[ "$got" = "$T/proj/.codex/agents" ] \
+  || fail "(4) codex definition dir = [$got], expected repo-scope $T/proj/.codex/agents"
 # A binding carrying a command substitution is REFUSED rather than evaluated.
 got="$(roster_sh "_herd_roster_expand '/tmp/\$(touch $T/pwned)/agents'")"
 [ -z "$got" ] || fail "(4) expansion did not refuse a command-substitution binding: [$got]"
