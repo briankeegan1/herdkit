@@ -50,6 +50,11 @@
 #       it (basewt/h313 — no glob, no $TREES), is reaped by PROOF alone; one carrying a unique commit
 #       is still FLAGGED. A same-shaped tree INSIDE $TREES with a non-glob name waits out an age floor.
 #  (22) HERD-638: once that age floor is cleared, the in-pool tree from (21) is reaped too.
+#  (23) issue #820: when this project's $MAIN happens to equal the engine's own install root (the
+#       herdkit-workspace-on-itself layout), a FOREIGN project's health worker is never attributed
+#       merely because its argv names the shared scripts/herd/healthcheck.sh path — a live cross-
+#       project kill (emberglen-godot's healthcheck TERMed 6/6 by the herdkit workspace's own sweep).
+#       A genuine own worker (a real worktree path under $TREES) is still correctly attributed.
 #
 # Fully hermetic: a temp git repo + real worktrees, stubbed gh/herdr, headless driver, seams for the
 # process table and cwd probe. NO network, NO model, NO panes, NO real processes killed but our own.
@@ -272,6 +277,53 @@ grep -q "^$VICTIM	" <<< "$PROCS" || fail "(6) the orphan victim was not detected
 grep -q "^$LIVEWORKER	" <<< "$PROCS" && fail "(6) a LIVE gate worker was listed as an orphan — killing it strands the PR"
 grep -q '9999901' <<< "$PROCS" && fail "(6) a foreign project's process was listed as an orphan"
 ok; echo "PASS (6) attribution rejects sibling/foreign paths; a live gate worker is never an orphan"
+
+# ── (23) issue #820: the shared engine script path must never itself grant attribution ─────────────
+# Reproduces the live incident: a project whose $MAIN equals the engine's own install root (the
+# herdkit-workspace-on-itself layout) must not claim a FOREIGN project's health worker just because
+# its argv names the shared scripts/herd/healthcheck.sh path. A worker that ALSO names a real
+# worktree path under this project's own $TREES is still correctly attributed.
+# $HERE (reassigned by sourcing agent-watch.sh, above) is scripts/herd — the real install ROOT is
+# TWO levels up from there, same as PYSRC's derivation earlier in this file. A single dirname() here
+# would repeat the exact bug this test exists to catch (it did, on the first draft of this test: a
+# too-shallow reference silently agreed with a too-shallow implementation).
+ENGINE_HOME="$(dirname "$(dirname "$HERE")")"
+# _sweep_engine_home's TWO branches (HERDKIT_HOME exported vs. derived from BASH_SOURCE) must AGREE on
+# the SAME real install — this is exactly the class of bug review caught on the first version of this
+# fix (#822): the derived branch silently returned .../scripts instead of the true root, which the
+# behavioral check below alone did not catch (the wrong-but-nested value still happened to sit above
+# healthcheck.sh's own path). Assert the VALUE, not just downstream behavior on one path.
+_prior_hkh="${HERDKIT_HOME:-}"
+unset HERDKIT_HOME
+GOT_HOME_DERIVED="$(_sweep_engine_home)"
+[ "$GOT_HOME_DERIVED" = "$ENGINE_HOME" ] \
+  || fail "(23) _sweep_engine_home (derived) = '$GOT_HOME_DERIVED', want '$ENGINE_HOME'"
+export HERDKIT_HOME="/some/other/install"
+GOT_HOME_EXPORTED="$(_sweep_engine_home)"
+[ "$GOT_HOME_EXPORTED" = "/some/other/install" ] \
+  || fail "(23) _sweep_engine_home (exported) = '$GOT_HOME_EXPORTED', want '/some/other/install'"
+if [ -n "$_prior_hkh" ]; then export HERDKIT_HOME="$_prior_hkh"; else unset HERDKIT_HOME; fi
+ok; echo "PASS (23) _sweep_engine_home: derived and exported branches agree on the real install root"
+
+FOREIGN_WT="/elsewhere/emberglen-godot-trees/pr-501"
+SELF_TREES_820="$T/self-workspace-trees"
+bash -c 'sleep 60' & FOREIGN_820=$!; disown 2>/dev/null || true
+bash -c 'sleep 60' & OWN_820=$!; disown 2>/dev/null || true
+cat > "$T/ps-820" <<EOF
+#!/usr/bin/env bash
+printf '%s 1 0 bash %s/scripts/herd/healthcheck.sh %s\n' "$FOREIGN_820" "$ENGINE_HOME" "$FOREIGN_WT"
+printf '%s 1 0 bash %s/scripts/herd/healthcheck.sh %s/pr-99\n' "$OWN_820" "$ENGINE_HOME" "$SELF_TREES_820"
+EOF
+chmod +x "$T/ps-820"
+MAIN="$ENGINE_HOME" TREES="$SELF_TREES_820" _sweep_owns_path "$ENGINE_HOME/scripts/herd/healthcheck.sh" \
+  && fail "(23) the shared engine script path alone must never grant attribution"
+ROWS820="$(MAIN="$ENGINE_HOME" TREES="$SELF_TREES_820" HERD_SWEEP_PS_CMD="$T/ps-820" sweep_orphan_procs)"
+grep -q "^$FOREIGN_820	" <<< "$ROWS820" \
+  && fail "(23) a foreign project's worker was attributed via the shared engine script path (issue #820)"
+grep -q "^$OWN_820	" <<< "$ROWS820" \
+  || fail "(23) a genuine own worker (own worktree path present) was not detected"
+kill "$FOREIGN_820" "$OWN_820" 2>/dev/null || true
+ok; echo "PASS (23) issue #820: the shared engine script path never grants attribution on its own"
 
 # ── (20) HERD-348: session exemption spares a detached gate worker's WHOLE subtree ────────────────
 # The python engine dispatches the health suite with start_new_session=True, so the worker is a session

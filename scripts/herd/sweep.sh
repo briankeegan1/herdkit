@@ -875,14 +875,48 @@ _sweep_live_marker_sessions() {
   done < <(_sweep_live_marker_pids)
 }
 
+# _sweep_engine_home — this running copy of the engine's own install root (parent of scripts/herd),
+# so an engine SCRIPT path (scripts/herd/*.sh, pysrc/) can be excluded from project attribution below.
+# Prefers the exported HERDKIT_HOME (bin/herd's own computation); falls back to deriving it from
+# sweep.sh's OWN BASH_SOURCE (never the inherited $HERE — sweep.sh does not assign HERE itself, so
+# reading it here trips the config-manifest's GHOST-key scanner: an undeclared, unassigned UPPER_CASE
+# read looks exactly like a forgotten config key). BASH_SOURCE[0] resolves to sweep.sh's own path
+# regardless of who sourced it, same discipline agent-watch.sh's own HERE computation uses.
+_sweep_engine_home() {
+  if [ -n "${HERDKIT_HOME:-}" ]; then printf '%s' "$HERDKIT_HOME"; return 0; fi
+  local _seh_here
+  # BASH_SOURCE[0] is sweep.sh's own path (…/scripts/herd/sweep.sh); dirname of THAT is …/scripts/herd
+  # (the same dir $HERE used to name) — the install root is ONE level further up than that, so this
+  # needs dirname applied TWICE, not once. Caught by review on the first version of this fix (#822):
+  # the single-dirname form silently landed on …/scripts instead of the true root, disagreeing with
+  # the HERDKIT_HOME-exported branch above even though it happened not to break the one test scenario
+  # that shipped with it.
+  _seh_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+  printf '%s' "$(dirname "$(dirname "$_seh_here")")"
+}
+
 # _sweep_owns_path <path> — success iff <path> lies inside this project's main checkout or worktrees
 # dir. Uses a PATH-BOUNDARY test ("$MAIN/" …), never a bare substring: `/src/herdkit` is a prefix of
 # the sibling `/src/herdkit-trees`, so a substring match would attribute (and kill) another project's
 # processes — issue #60's cross-project kill, in a new costume. Same trailing-slash discipline as
 # herd-config.sh's foreign-cwd guard. An empty MAIN/TREES never matches.
+#
+# ISSUE #820: a path under the engine's OWN install (scripts/herd/*.sh, pysrc/) is EXCLUDED before
+# either boundary test runs. Every workspace's health/review worker invokes the SAME shared engine
+# script — `<engine-home>/scripts/herd/healthcheck.sh` — so when a project's own $MAIN happens to BE
+# the engine's install (the herdkit-workspace-on-itself dogfood layout, or any global-install setup
+# where one machine's herdkit checkout is ALSO run as a workspace), that shared script path is a
+# prefix of $MAIN and every OTHER project's worker on the same box gets wrongly claimed as an orphan
+# of THIS project and TERMed mid-suite (live evidence: issue #820, emberglen-godot's healthcheck
+# killed 6/6 by the herdkit workspace's own sweep, ~60 min of wasted suite time per PR). A project's
+# genuine attribution never rests on the shared engine script path alone — it is always a WORKTREE
+# path (under $TREES) or the worker's cwd — so excluding the engine-home prefix here costs no real
+# detection; see the (6)/(23) test pair in tests/test-sweep.sh.
 _sweep_owns_path() {
-  local p="${1:-}"
+  local p="${1:-}" _sop_home
   [ -n "$p" ] || return 1
+  _sop_home="$(_sweep_engine_home)"
+  [ -n "$_sop_home" ] && case "$p/" in "$_sop_home"/*) return 1 ;; esac
   [ -n "$MAIN" ]  && case "$p/" in "$MAIN"/*)  return 0 ;; esac
   [ -n "$TREES" ] && case "$p/" in "$TREES"/*) return 0 ;; esac
   return 1
