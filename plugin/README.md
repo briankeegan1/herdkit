@@ -2,6 +2,11 @@
 
 A **thin Claude Code plugin** that exposes the herdkit **coordinator** as an installable skill.
 
+> The Codex-side sibling of this package lives at [`plugins/herdkit-coordinator/`](../plugins/herdkit-coordinator/README.md)
+> (`.codex-plugin/plugin.json` + `.agents/plugins/marketplace.json`). It follows the same
+> thin-wrapper philosophy stated below; the two packages are independent and neither
+> duplicates the other.
+
 > **The herdkit CLI is the source of truth.** This plugin does not contain the coordinator logic.
 > It wraps the CLI: on invocation it runs `herd render` (which renders the canonical coordinator
 > skill from `templates/coordinator.md.tmpl` + your project's `.herd/config`) and hands off to that
