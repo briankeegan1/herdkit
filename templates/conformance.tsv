@@ -631,3 +631,4 @@ codex-exec-adapter.sh	unit	tests/test-codex-exec-adapter.sh
 codex-durable-coordinator.sh	unit	tests/test-codex-durable-coordinator.sh
 runtime-conformance.sh	unit	tests/test-runtime-conformance.sh
 plugins/herdkit-coordinator	unit	tests/test-codex-plugin-manifest.sh
+herdr-plugin.toml	unit	tests/test-herdr-plugin-manifest.sh
