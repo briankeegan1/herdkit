@@ -867,20 +867,144 @@ EOF
   return 0
 }
 
+# ── JSON FORMAT stage (HERD-759) ─────────────────────────────────────────────────────────────────
+# _status_format_json — render the SAME <US>-delimited snapshot on stdin as ONE machine-readable
+# object, so a NON-CLAUDE coordinator runtime (or any script) can read control-room state without
+# scraping the human report or a pane. Reachable ONLY via `herd status --json`: without the flag not
+# one byte of the text formatters above changes, and this function is never called.
+#
+# It formats the snapshot the SAME gather produced — there is no second gather, no second source of
+# truth — so the JSON and the human report can only ever describe the same sample.
+#
+# THE CONTRACT (schema "herd.status/v1"). The key set is STABLE: a value the snapshot genuinely does
+# not carry is `null` (never guessed, never silently dropped), so a consumer can test presence
+# without probing for missing keys.
+#   schema      string   contract id + version — bump the version, never the meaning of a field
+#   workspace   string   WORKSPACE_NAME of the project this snapshot describes
+#   root        string   its checkout root
+#   watcher     object   {state: alive|down|dup|handoff, pid: string|null (the first main),
+#                         count: int, pids: [string] (populated only in the `dup` state — the
+#                         verified survivors the operator should stop)}
+#   builders    object   {building,done,idle,dead: int, items: [{state, slug, pr: int|null}]},
+#                        state ∈ building|done|idle|dead|agentdead|agentmissing|inuse
+#   prs         object   {open: int, items: [{number: int|null, branch, mergeable, merge_state,
+#                         review, health, review_decision: string|null, attention: bool}]}
+#   backlog     object   {kind: file|other, backend: string|null, open: int|null,
+#                         in_progress: int|null} — counts are null on a tracker backend, which has
+#                        no local emoji state to count (the text report says the same in prose)
+#   notes       object   {unacked: int, newest_slug: string|null, newest_age: string|null}
+#   codemap     object   {present: bool, fresh: bool}
+#   attention   bool     the snapshot's own verdict — identical to the text report's ⚠️/✅ line
+#   reasons     [string] the attention tokens ("dead-builder:<slug>", "conflicting-pr:#<n>", …)
+# EXIT: identical to the text formatters — 1 on attention, 0 when healthy — so a caller may branch on
+# either the field or the exit status and never see the two disagree.
+# The COLORS record is deliberately dropped: an ANSI palette is a rendering concern, not state.
+_status_format_json() {
+  python3 -c '
+import sys, json
+US = "\x1f"
+
+def num(s):
+    try:
+        return int(s)
+    except (TypeError, ValueError):
+        return None
+
+def nz(s):
+    return s if s else None
+
+workspace = root = None
+watcher = {"state": "down", "pid": None, "count": 0, "pids": []}
+builders = {"building": 0, "done": 0, "idle": 0, "dead": 0, "items": []}
+prs = {"open": 0, "items": []}
+backlog = {"kind": None, "backend": None, "open": None, "in_progress": None}
+notes = {"unacked": 0, "newest_slug": None, "newest_age": None}
+codemap = {"present": False, "fresh": False}
+attention = False
+reasons = []
+
+for raw in sys.stdin.read().split("\n"):
+    if not raw:
+        continue
+    parts = raw.split(US)
+    key = parts[0]
+    f = parts[1:]
+    def g(i):
+        return f[i] if i < len(f) else ""
+    if key == "WORKSPACE":
+        workspace = nz(g(0))
+    elif key == "ROOT":
+        root = nz(g(0))
+    elif key == "WATCHER":
+        watcher = {"state": g(0) or "down", "pid": nz(g(1)),
+                   "count": num(g(2)) or 0, "pids": g(3).split()}
+    elif key == "BCOUNTS":
+        builders["building"] = num(g(0)) or 0
+        builders["done"] = num(g(1)) or 0
+        builders["idle"] = num(g(2)) or 0
+        builders["dead"] = num(g(3)) or 0
+    elif key == "BUILDER":
+        builders["items"].append({"state": g(0), "slug": g(1), "pr": num(g(2))})
+    elif key == "PRCOUNT":
+        prs["open"] = num(g(0)) or 0
+    elif key == "PR":
+        prs["items"].append({"number": num(g(0)), "branch": nz(g(1)),
+                             "mergeable": nz(g(2)), "merge_state": nz(g(3)),
+                             "review": nz(g(4)), "health": nz(g(5)),
+                             "review_decision": nz(g(6)), "attention": g(7) == "1"})
+    elif key == "BACKLOG":
+        if g(0) == "file":
+            backlog = {"kind": "file", "backend": "file",
+                       "open": num(g(1)), "in_progress": num(g(2))}
+        else:
+            backlog = {"kind": "other", "backend": nz(g(1)),
+                       "open": None, "in_progress": None}
+    elif key == "NOTES":
+        notes = {"unacked": num(g(0)) or 0, "newest_slug": nz(g(1)), "newest_age": nz(g(2))}
+    elif key == "CODEMAP":
+        codemap = {"present": g(0) == "1", "fresh": g(1) == "1"}
+    elif key == "ATTENTION":
+        attention = g(0) == "1"
+    elif key == "REASONS":
+        reasons = g(0).split()
+
+json.dump({"schema": "herd.status/v1", "workspace": workspace, "root": root,
+           "watcher": watcher, "builders": builders, "prs": prs, "backlog": backlog,
+           "notes": notes, "codemap": codemap, "attention": attention,
+           "reasons": reasons}, sys.stdout, indent=2)
+print()
+sys.exit(1 if attention else 0)
+'
+}
+
 # _status_run — gather ONCE, then FORMAT via python (fail-soft to the bash formatter). The snapshot is
 # buffered to a rewindable temp file so both paths read the same bytes and a mid-render python failure
 # (empty output) falls back cleanly. HERD_STATUS_SNAPSHOT_FILE is a TEST SEAM: when it names a readable
 # file, gather is skipped and that committed snapshot fixture is formatted directly — the hook the
 # golden parity test uses to drive the FORMAT stage both ways without any live probe. Returns 1 on
 # attention, 0 when healthy (the snapshot's verdict, preserved across both format paths).
+# HERD-759: `--json` selects _status_format_json INSTEAD of the two text formatters — same gather, same
+# snapshot bytes, same exit contract. Without the flag the dispatch below is untouched.
 _status_run() {
-  local snap="" snap_is_temp=0 rc
+  local snap="" snap_is_temp=0 rc as_json=0
+  [ "${1:-}" = "--json" ] && as_json=1
   if [ -n "${HERD_STATUS_SNAPSHOT_FILE:-}" ] && [ -f "$HERD_STATUS_SNAPSHOT_FILE" ]; then
     snap="$HERD_STATUS_SNAPSHOT_FILE"
   else
-    snap="$(mktemp 2>/dev/null)" || { _status_gather | _status_format_bash; return $?; }
+    snap="$(mktemp 2>/dev/null)" || {
+      if [ "$as_json" = 1 ]; then _status_gather | _status_format_json; return $?; fi
+      _status_gather | _status_format_bash; return $?
+    }
     snap_is_temp=1
     _status_gather > "$snap" || true
+  fi
+  # HERD-759 machine contract: one formatter, no fallback chain — a JSON caller must never be served
+  # a half-rendered object or silently handed human text, so this path is deliberately not fail-soft
+  # into the text formatters.
+  if [ "$as_json" = 1 ]; then
+    _status_format_json <"$snap"; rc=$?
+    [ "$snap_is_temp" = 1 ] && rm -f "$snap"
+    return "$rc"
   fi
   # Python FORMAT path — mirrors the P1 reader dispatch: preflight the package once (memoised), buffer
   # its output, and use it ONLY if it rendered something. Empty output = HERD_ENGINE_PY=0 or an
