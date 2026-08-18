@@ -34,10 +34,19 @@ REPO="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 Q="$TREES/backlog-queue"
 REQ="${1:?usage: scribe.sh \"<backlog change>\"}"
-CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 # The scribe only edits one markdown file + commits — a light, mechanical job. Default to the
 # configured scribe model (Sonnet); override with SCRIBE_MODEL=… for a specific run.
 SCRIBE_MODEL="${SCRIBE_MODEL:-$MODEL_SCRIBE}"
+# HERD-770: resolve the spawn's permission flag through the SHARED lane seam, keyed to the RUNTIME
+# the (optionally runtime-qualified) scribe model resolves to — NOT a hardcoded claude flag. An
+# eager CLAUDE_FLAGS=--dangerously-skip-permissions leaked the claude-only flag into a Codex spawn
+# (codex 0.147.0 rejects it) because a non-empty <flags> OVERRIDES the driver's own permission
+# binding in herd_driver_agent_spawn_argv. herd_driver_lane_permission_flags preserves EXPLICIT
+# HERD_CLAUDE_FLAGS override precedence, is byte-identical for herdr-claude/headless (their flag IS
+# --dangerously-skip-permissions), and yields the Codex bypass flag under the Codex runtime. A bad
+# ref falls soft to the active driver here; the launch below still loud-refuses and the durably
+# queued request survives.
+CLAUDE_FLAGS="$(herd_driver_lane_permission_flags "$(herd_model_driver_for "$SCRIBE_MODEL" 2>/dev/null || true)")"
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. Enqueue atomically (temp then mv); name sorts FIFO.
