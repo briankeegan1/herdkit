@@ -232,6 +232,12 @@ EXEMPT_PREFIX_EXCEPTIONS = {"HERD_BRAND"}
 # Explicit internal/computed vars (paths, ids, models resolved in-engine, single-word locals).
 EXEMPT_NAMES = {
     "ADVISE_MODEL", "AGENTS_JSON", "BLOCKED", "CELEBRATE",
+    "CODEX_BIN",  # HERD-760: codex-exec-adapter.sh's test seam for the codex binary path (defaults to
+                  # plain 'codex' on PATH) — same class as HERD_SWEEP_PS_CMD/HERD_FAKE_NOW elsewhere in
+                  # this codebase, never a .herd/config knob.
+    "CODEX_EXEC_ADAPTER_KEEP_RAW",  # HERD-760: codex-exec-adapter.sh's debug flag to retain the raw
+                  # codex exec --json output for inspection — same class as HEALTHCHECK_PROGRESS_LOG /
+                  # GATE_SCALE_CORES_OVERRIDE above, a dev seam, not an operator-facing knob.
     "CONSOLE_LEDGER_MAX",  # console-section.sh's bounded-ledger row cap. Its own header states these
                            # console constants are inline ON PURPOSE — "a legibility property of the
                            # console, not an operator knob (no config key, no manifest row)" — so
