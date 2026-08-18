@@ -608,7 +608,34 @@ _On every invocation, read live state to surface what is configured:_
     # completeness lint on its own output.
     _rs_emit() {
       local _tmpl="$1" _out="$2" _label="$3"
-      local line _dk
+      local line _dk _ck
+
+      # HERD-758 (HERD-754 step 2): CAPABILITY TOKENS — the per-TARGET half of the token machinery.
+      # This one template now renders to more than one agent runtime (Claude's
+      # .claude/commands/<name>.md, Codex's .agents/skills/herd-coordinator/SKILL.md), so a VENDOR
+      # TOOL NAME can no longer be hardcoded in the shared prose: a Codex seat told to "present the
+      # menu with AskUserQuestion" is told to use a tool that does not exist on its runtime. The
+      # template instead carries {{CAP_<ABSTRACT_INTERACTION>}} tokens naming the INTERACTION, and
+      # each render target resolves them here. Distinct from the {{DRIVER_*}} tokens above, which
+      # bind the MULTIPLEXER/runtime control surface per HERD_DRIVER: one driver can feed several
+      # targets, so capability resolution keys off the target label, not the driver.
+      # DEGRADE, NEVER GUESS: a target whose native capability is unverified resolves to
+      # vendor-neutral PROSE describing the interaction — HERD-754 is explicit that an unverified
+      # capability degrades safely rather than being invented. Add a capability token by naming it in
+      # _crefs and giving it a value in every arm below; the completeness lint then proves no target
+      # left it unbound.
+      local _crefs='CAP_ASK_USER'
+      local CAP_ASK_USER
+      case "$_label" in
+        codex-skill)
+          # Codex: no verified native decision-request tool → neutral prose, no invented tool name.
+          CAP_ASK_USER='a multiple-choice question to the user' ;;
+        *)
+          # Claude targets (coordinator, autopilot): the literal Claude tool name, so their rendered
+          # output stays BYTE-IDENTICAL to before capability tokens existed (hard constraint).
+          CAP_ASK_USER='AskUserQuestion' ;;
+      esac
+
       while IFS= read -r line || [ -n "$line" ]; do
         # HERD-216: {{OPERATING_POSTURE}} is either a multi-line section or empty. When empty (human
         # autonomy default) drop the token line entirely so the rendered skill stays byte-identical —
@@ -622,6 +649,10 @@ _On every invocation, read live state to surface what is configured:_
         # capability the driver omits survives to the completeness lint.
         for _dk in $_dvars; do
           line="${line//\{\{$_dk\}\}/${!_dk}}"
+        done
+        # Capability tokens: resolved for THIS target (see the doctrine note above).
+        for _ck in $_crefs; do
+          line="${line//\{\{$_ck\}\}/${!_ck}}"
         done
         line="${line//\{\{WORKSPACE_NAME\}\}/$WORKSPACE_NAME}"
         line="${line//\{\{PROJECT_ROOT\}\}/$PROJECT_ROOT}"
@@ -678,7 +709,10 @@ _On every invocation, read live state to surface what is configured:_
     # autopilot skill's fixed name above. Codex's skill-discovery convention keys a skill by a
     # `name:` frontmatter field (Claude's coordinator.md.tmpl only carries `description:`); rather
     # than fork the template for that one line, splice `name: herd-coordinator` into the SAME
-    # rendered frontmatter after _rs_emit runs, so the body below it is identical either way.
+    # rendered frontmatter after _rs_emit runs, so the body below it is identical either way — save
+    # for the per-target CAPABILITY TOKENS (HERD-758, step 2), the ONE sanctioned divergence: each
+    # {{CAP_*}} resolves to what THIS runtime can actually do, so neither seat is handed an
+    # instruction naming a tool the other one owns.
     local codex_skill_dir="$root/.agents/skills/herd-coordinator"
     local codex_skill_out="$codex_skill_dir/SKILL.md"
     mkdir -p "$codex_skill_dir"
