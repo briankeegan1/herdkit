@@ -17,7 +17,7 @@ id = "herdkit"
 name = "herdkit"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Autonomous, gated multi-agent delivery for herdr — a coordinator drains a backlog into isolated worktree builders, a watcher lands each change once its healthcheck + adversarial review are green. Actions: init, launch/reload the control room, status, doctor, backlog."
+description = "Governance and parallelism for herdr-based agent workflows — a coordinator drains your backlog into isolated worktree builders (Claude Code, Codex, or Grok), and a watcher lands each change once its healthcheck + adversarial review are green. Actions: init, launch/reload the control room, status, backlog, doctor."
 platforms = ["macos", "linux"]
 
 # Runs once on `herdr plugin install`, after you confirm. Wires this checkout's `herd` onto PATH and

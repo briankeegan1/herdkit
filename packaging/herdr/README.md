@@ -1,5 +1,9 @@
 # herdkit as a herdr plugin
 
+**Governance and parallelism for herdr-based agent workflows** — a coordinator drains your backlog
+into isolated worktree builders (Claude Code, Codex, or Grok — pick per lane via `HERD_DRIVER` /
+`MODEL_*`), and a watcher lands each change once its healthcheck + adversarial review are green.
+
 herdkit ships as a first-class [herdr plugin](https://herdr.dev/docs/plugins/) and is listed on the
 [herdr plugin marketplace](https://herdr.dev/docs/marketplace/) (an automatic index of public GitHub
 repos tagged `herdr-plugin`). The manifest is [`herdr-plugin.toml`](../../herdr-plugin.toml) at the
