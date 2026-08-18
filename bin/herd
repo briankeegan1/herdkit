@@ -5415,8 +5415,11 @@ cmd_conformance() {
 #                            invalidates the prior verdict instead of being silently trusted.
 #                            Capabilities that are not probeable yet (exact-session resume, steering,
 #                            interruption — they need step 7's durable coordination) are PRINTED as
-#                            explicitly deferred rows rather than omitted. Reads the cache; `--probe`
-#                            runs the live probes first. Report-only, always exits 0
+#                            explicitly deferred rows rather than omitted. On a grok-driver project
+#                            (step 8, HERD-767) it reports honestly instead: grok has no live probes
+#                            built yet, so it prints one explicit deferred row and — same as codex —
+#                            says plainly when the runtime binary itself is not installed. Reads the
+#                            cache; `--probe` runs the live probes first. Report-only, always exits 0
 #                            (scripts/herd/runtime-conformance.sh).
 cmd_doctor() {
   # Source the config loader too: herd_doctor's config-dup check (issue #115) uses its scanner

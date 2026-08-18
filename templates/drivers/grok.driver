@@ -19,11 +19,20 @@
 # DRIVER_AGENT_* exec block below is data the P2–P4 routing (Brian's queue) consumes; nothing renders
 # it yet. Proof: tests/test-grok-driver.sh.
 #
-# FLAGS ARE RESEARCHED, NOT GUESSED. Every grok flag below is from the Grok Build CLI headless
-# reference (docs.x.ai/build/cli/headless-scripting): interactive `grok`; `-p,--single <PROMPT>`
+# FLAGS ARE RESEARCHED, NOT GUESSED. Every grok flag below is from the canonical Grok Build CLI docs:
+# docs.x.ai/build/cli/headless-scripting, docs.x.ai/build/cli/reference and (for the rules-injection
+# finding below) docs.x.ai/build/features/project-rules — interactive `grok`; `-p,--single <PROMPT>`
 # ("send one prompt"); `-m,--model <MODEL>`; `--output-format {plain|json|streaming-json}`;
-# `--always-approve` ("auto-approve tool executions"); session flags `-s,--session-id <ID>`,
-# `-r,--resume <ID>`, `-c,--continue`; and the `/model` TUI command.
+# `--always-approve` ("auto-approve tool executions", alias `--yolo`); session flags
+# `-s,--session-id <UUID>`, `-r,--resume [<ID>]`, `-c,--continue` ("continue the most recent session
+# for the current directory" — a genuinely documented session-continuation mechanism, not an
+# assumption); `--rules <TEXT>` ("extra rules appended to the system prompt"); and the `/model` TUI
+# command. RE-AUDITED 2026-08-18 (HERD-767, epic HERD-754 step 8) against those three pages: this pass
+# found and fixed one real drift (see the CONTEXT-INJECTION note on DRIVER_AGENT_INTERACTIVE_SPAWN
+# below) and tightened DRIVER_AGENT_RESUME to the one prompt-delivery shape every fetched doc example
+# actually demonstrates. The grok binary itself remains NOT INSTALLED on this dev machine (`command -v
+# grok` fails here) — every claim below is a documentation claim, not a live-verified one; see each
+# binding's comment for exactly what is confirmed by docs vs. still only an assumption.
 
 # ── MUX capabilities (herdr) — IDENTICAL to herdr-claude: this driver swaps the RUNTIME, not the
 #    multiplexer, so every herdr incantation below is byte-for-byte the default's. ──────────────────
@@ -55,36 +64,74 @@ DRIVER_SEND_KEYS='herdr pane send-keys <pane> <keys>'
 # honest alternative to inventing a rate-limit regex or a token schema the runtime never promised.
 
 # interactive-spawn — open a Grok TUI seeded with the task prompt; --always-approve = hands-off tools.
-# CONTEXT-INJECTION (grok-context-injection): Grok does NOT auto-load CLAUDE.md/AGENTS.md the way Claude
-# Code does, so a grok builder would otherwise start with NO project conventions. The <agents-rules>
-# token is resolved at spawn time (herd_driver_agent_spawn_argv) to the repo-root AGENTS.md/CLAUDE.md
-# conventions and passed via --append-rules-to-system-prompt (ADDITIVE — it augments Grok's own system
-# prompt rather than replacing it, unlike --system-prompt-override). FAIL-SOFT: when there is no
-# AGENTS.md/CLAUDE.md the composer DROPS the flag+value pair, so the spawn is byte-identical to the
-# plain `grok --model <model> --always-approve "<prompt>"` shape. Claude/headless bindings carry no
-# such token, so their argv is unaffected.
-DRIVER_AGENT_INTERACTIVE_SPAWN='grok --model <model> --always-approve --append-rules-to-system-prompt <agents-rules> "<prompt>"'
-# one-shot-exec — headless, prints and exits. `-p,--single` is Grok Build's `claude -p` analog.
+# CONTEXT-INJECTION (grok-context-injection): CORRECTED 2026-08-18 (HERD-767, epic HERD-754 step 8).
+# The prior comment here claimed "Grok does NOT auto-load CLAUDE.md/AGENTS.md the way Claude Code
+# does" — that premise was WRONG, and re-verifying it caught a second, more serious bug alongside it.
+# docs.x.ai/build/features/project-rules is explicit that Grok auto-discovers project rules on its own:
+# "Grok loads rules in this order, with deeper files taking precedence on conflicts: 1. Global rules
+# in ~/.grok/ 2. Every directory from the repo root down to the working directory" — it names AGENTS.md
+# and CLAUDE.md by name among the files it searches for. So a grok builder spawned with cwd inside its
+# worktree already gets AGENTS.md for free, with NO flag required. Separately, the flag this binding
+# used to inject it with — `--append-rules-to-system-prompt` — does not exist in either canonical flags
+# page (docs.x.ai/build/cli/reference documents `--rules <TEXT>` — "extra rules appended to the system
+# prompt" — as the real single-run rules-injection flag; a Claude-Code-flag-name alias the same
+# reference page lists, `--append-system-prompt`, is also NOT `--append-rules-to-system-prompt`). A
+# headless spawn built from the old value would have failed outright on a real grok binary with an
+# unrecognized-argument error — this is exactly the kind of guessed-flag drift this audit exists to
+# catch. Fixed to the real flag; the token stays bound (harmless, additive, and belt-and-suspenders
+# against a builder cwd shallower than the repo root) rather than removed, since `--rules` costs
+# nothing when Grok's own auto-load already covers the common case. FAIL-SOFT is unchanged: when there
+# is no AGENTS.md/CLAUDE.md the composer DROPS the flag+value pair (scripts/herd/driver.sh), so the
+# spawn is byte-identical to the plain `grok --model <model> --always-approve "<prompt>"` shape.
+# Claude/headless bindings carry no <agents-rules> token, so their argv is unaffected either way.
+DRIVER_AGENT_INTERACTIVE_SPAWN='grok --model <model> --always-approve --rules <agents-rules> "<prompt>"'
+# one-shot-exec — headless, prints and exits. `-p,--single` is Grok Build's `claude -p` analog. Every
+# headless example on docs.x.ai/build/cli/headless-scripting and .../reference sends its prompt via
+# `-p`, never as a bare positional argument, so this shape is the best-grounded one documented.
+# STRUCTURED-OUTPUT FINDING (hunted for per HERD-767's audit): grok DOES have a `codex exec --json`
+# analog — `--output-format {plain|json|streaming-json}` is real and documented ("one JSON object at
+# the end" / "newline-delimited JSON events"). EXISTENCE is confirmed; the actual event/object SCHEMA
+# is not — no example payload is shown on either docs page, and the binary is not installed here to
+# observe one. Building a grok-exec-adapter (the analog of scripts/herd/codex-exec-adapter.sh) on a
+# guessed schema would be exactly the fabrication this driver avoids everywhere else, so this binding
+# stays plain-text (no --output-format bound) rather than guess at the JSON shape; that adapter is
+# left for a future step once a machine with `grok` installed can observe a real stream.
 DRIVER_AGENT_ONESHOT_EXEC='grok -p "<prompt>" --model <model> --always-approve'
-# resume — continue the most recent session in the cwd with full context. Grok analog of
-# `claude --continue` (`-r,--resume <ID>` / `-s,--session-id <ID>` target a specific session).
-DRIVER_AGENT_RESUME='grok --continue --always-approve "<prompt>"'
-# model-switch — the `/model <model>` TUI slash command, delivered via the mux DRIVER_SEND_TEXT
-# (same shape as Claude Code — both TUIs expose `/model`).
+# resume — continue the most recent session in the cwd with full context. `-c,--continue` ("continue
+# the most recent session for the current directory") is confirmed genuinely documented, not an
+# assumption — Grok analog of `claude --continue` (`-r,--resume [<ID>]` / `-s,--session-id <UUID>`
+# target a specific session instead). TIGHTENED 2026-08-18: the prior binding sent the resumed prompt
+# as a bare trailing positional (`grok --continue --always-approve "<prompt>"`); no fetched doc example
+# ever sends a headless prompt that way — every single example (plain, --model, --output-format
+# variants) uses `-p`. Switched to `-p "<prompt>" --continue --always-approve` so prompt delivery uses
+# the one shape docs actually demonstrate; combining `-p` with `-c` in the same invocation is still not
+# shown in an example, so that specific combination remains a documentation-grounded composition of two
+# independently-confirmed flags, not a live-verified one — flag the PR calls this out explicitly.
+DRIVER_AGENT_RESUME='grok -p "<prompt>" --continue --always-approve'
+# model-switch — the `/model <model>` TUI slash command, delivered via the mux DRIVER_SEND_TEXT.
+# CONFIRMED (not just assumed by Claude-Code analogy): docs.x.ai/build/overview lists it verbatim among
+# Grok Build's own top-level CLI usage patterns ("`/model <name>` — Switch models within the TUI").
 DRIVER_AGENT_MODEL_SWITCH='/model <model>'
-# permission-mode flag — Grok's auto-approve-tool-executions flag, the analog of Claude's
-# `--dangerously-skip-permissions`: a hands-off builder in an isolated worktree. Overridable via
-# HERD_CLAUDE_FLAGS.
+# permission-mode flag — Grok's auto-approve-tool-executions flag (alias `--yolo`, confirmed on
+# docs.x.ai/build/cli/reference), the analog of Claude's `--dangerously-skip-permissions`: a hands-off
+# builder in an isolated worktree. Overridable via HERD_CLAUDE_FLAGS.
 DRIVER_AGENT_PERMISSION_FLAG='--always-approve'
-# limit-detection — DEGRADED: no verified Grok usage-limit banner (`/usage` shows credit balance in
-# the TUI, not a scrapeable banner). Fail-safe: never matches → falls through to the hook sentinel.
+# limit-detection — DEGRADED: RE-CHECKED 2026-08-18 against docs.x.ai/build/cli/reference and
+# .../headless-scripting — neither documents a usage-limit banner string, and no doc surfaces one
+# (`/usage` shows a credit balance in the TUI, not a scrapeable banner). Still no verifiable stable
+# contract, so this stays @degrade rather than guessing a regex. Fail-safe: never matches → falls
+# through to the hook sentinel.
 DRIVER_AGENT_LIMIT_PATTERN='@degrade:no-verified-grok-usage-limit-banner'
 # session-identity — Grok Build stores headless sessions under ~/.grok/sessions (keyed by
 # --session-id), rebindable via $HERD_TRANSCRIPT_ROOT. Real Grok equivalent of ~/.claude/projects.
+# CONFIRMED verbatim on docs.x.ai/build/cli/headless-scripting: "Headless sessions are stored in
+# ~/.grok/sessions".
 DRIVER_AGENT_SESSION_ID='${HERD_TRANSCRIPT_ROOT:-$HOME/.grok/sessions}/<session-id>'
-# cost/telemetry parse — DEGRADED: Grok's session token-usage JSON keys + a grok-model→USD price
-# table are not a verifiable stable contract here. Fail-safe: names no real field → cost.sh sums
-# nothing and marks the model `unpriced` rather than reporting a fabricated $0.
+# cost/telemetry parse — DEGRADED: RE-CHECKED 2026-08-18 — Grok's session token-usage JSON keys and a
+# grok-model→USD price table are still not documented anywhere on docs.x.ai (the headless-scripting and
+# reference pages describe flags and output formats, never a usage/cost object shape), so this remains
+# not a verifiable stable contract here. Fail-safe: names no real field → cost.sh sums nothing and marks
+# the model `unpriced` rather than reporting a fabricated $0.
 DRIVER_AGENT_COST_USAGE_KEYS='@degrade:no-verified-grok-usage-token-schema'
 # process-signature (HERD-428) — the pane-cmdline substring(s) that identify a LIVE Grok agent in a
 # pane's foreground process list; the control-room pane-role probe (layout-reconcile.sh
