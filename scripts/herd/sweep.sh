@@ -885,8 +885,14 @@ _sweep_live_marker_sessions() {
 _sweep_engine_home() {
   if [ -n "${HERDKIT_HOME:-}" ]; then printf '%s' "$HERDKIT_HOME"; return 0; fi
   local _seh_here
+  # BASH_SOURCE[0] is sweep.sh's own path (…/scripts/herd/sweep.sh); dirname of THAT is …/scripts/herd
+  # (the same dir $HERE used to name) — the install root is ONE level further up than that, so this
+  # needs dirname applied TWICE, not once. Caught by review on the first version of this fix (#822):
+  # the single-dirname form silently landed on …/scripts instead of the true root, disagreeing with
+  # the HERDKIT_HOME-exported branch above even though it happened not to break the one test scenario
+  # that shipped with it.
   _seh_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
-  printf '%s' "$(dirname "$_seh_here")"
+  printf '%s' "$(dirname "$(dirname "$_seh_here")")"
 }
 
 # _sweep_owns_path <path> — success iff <path> lies inside this project's main checkout or worktrees
