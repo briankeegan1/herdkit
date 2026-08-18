@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # test-herdr-plugin-manifest.sh — hermetic, network-free validation of the HERDR plugin package.
 #
-# suite-deps: herdr-plugin.toml packaging/herdr/action.sh packaging/herdr/pane.sh
+# suite-deps: herdr-plugin.toml packaging/herdr/action.sh packaging/herdr/pane.sh packaging/herdr/README.md
 #
 # The herdr-side sibling of tests/test-plugin-manifest.sh (Claude Code plugin under plugin/) and
 # tests/test-codex-plugin-manifest.sh (Codex plugin under plugins/). Same doctrine: a THIN packaging
