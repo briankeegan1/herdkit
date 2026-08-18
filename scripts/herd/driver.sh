@@ -1906,6 +1906,81 @@ _herd_wake_transcript_growing() {
   { [ "${cur_size:-0}" -gt "${prev_size:-0}" ] || [ "${cur_mt:-0}" -gt "${prev_mt:-0}" ]; }
 }
 
+# ── Structured-signal precedence (HERD-768 demote pass) ──────────────────────────────────────────────
+# herd_driver_agent_status_resolved above is a SCRAPE fallback, however carefully guarded: its two
+# rescue paths read pane TEXT (a spinner glyph next to a hint string) and transcript file growth — real
+# signals, but neither is the runtime reporting its own state; both infer it from side effects. HERD-754
+# ("no lifecycle decision relies solely on argv, cwd, pane text, or process-name attribution") calls for
+# a REAL structured signal to be preferred wherever one exists, with the scrape path demoted to an
+# explicit, labeled fallback instead of being silently equal-weighted with it. Tonight's Codex work gives
+# exactly that for a codex-driven agent: codex-durable-coordinator.sh's (HERD-766) session_state is read
+# from the coordinator's OWN tracked wrapper pid plus on-disk turn bookkeeping written by codex itself
+# (via codex-exec-adapter.sh, HERD-760's JSON event parser) — never a pane read, never an argv/cwd/
+# process-name match (see _codex_durable_compose). This section is ADDITIVE and DOES NOT touch
+# herd_driver_agent_status_resolved: every existing caller/test keeps its exact bare-word contract,
+# byte-identical (tests/test-status-corroborate.sh is the rail). No caller creates a durable session
+# under the convention below yet, so in TODAY's tree this is a no-op — it only ESTABLISHES precedence
+# for the next caller that wires a codex builder through the durable coordinator.
+
+# _herd_codex_durable_session_dir <slug> — the bookkeeping directory a codex-durable session (HERD-766)
+# for <slug> would live under, IF one exists: <agent-dir>/codex-durable, a subdirectory of the SAME
+# per-slug WORKTREES_DIR/.herd/agents/<slug> convention herd_driver_agent_spawn_driver_write already
+# writes into (no new top-level layout). Pure path composer; does not check existence.
+_herd_codex_durable_session_dir() {
+  local slug="${1:-}"
+  [ -n "$slug" ] || return 1
+  printf '%s/codex-durable' "$(_herd_agent_dir "$slug")"
+}
+
+# _herd_codex_durable_lifecycle <slug> — the STRUCTURED status word for <slug>'s codex-durable session,
+# or nothing (rc 1) when no such session exists yet, codex-durable-coordinator.sh was never sourced by
+# this caller, or jq is unavailable — every absent-signal case degrades to "no structured read", never a
+# guess (fail-soft, mirrors every other soft-dependency check in this file, e.g. `command -v
+# herd_agents_conventions`). Vocabulary mapped onto the SAME words every scrape-based caller already
+# expects, derived ONLY from codex_durable_status's own JSON (never a pane, never an argv/cwd/process
+# match):
+#   session_state working                                        → working
+#   session_state idle, last turn's state == completed            → done
+#   session_state idle, no turn yet / turn failed / turn unknown   → idle
+#   session_state cancelled (a turn was interrupted; thread survives, resumable) → idle
+_herd_codex_durable_lifecycle() {
+  local slug="${1:-}" sdir out state tstate
+  [ -n "$slug" ] || return 1
+  command -v codex_durable_status >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  sdir="$(_herd_codex_durable_session_dir "$slug")" || return 1
+  [ -f "$sdir/workdir" ] || return 1
+  out="$(codex_durable_status "$sdir" 2>/dev/null)"
+  [ -n "$out" ] || return 1
+  state="$(printf '%s' "$out" | jq -r '.session_state // empty' 2>/dev/null)"
+  case "$state" in
+    working)   printf 'working' ;;
+    cancelled) printf 'idle' ;;
+    idle)
+      tstate="$(printf '%s' "$out" | jq -r '.turn.state // empty' 2>/dev/null)"
+      if [ "$tstate" = "completed" ]; then printf 'done'; else printf 'idle'; fi ;;
+    *) return 1 ;;
+  esac
+}
+
+# herd_driver_agent_status_resolved_ex <slug> <raw-status> [pane] — like herd_driver_agent_status_resolved
+# above, but ALSO names which KIND of evidence backed the answer, so a caller can tell structured-source
+# from fallback-source apart instead of the two being indistinguishable (HERD-768 acceptance criterion
+# (c)): prints "<status> structured" when a codex-durable session's own tracked state answered it — in
+# that case pane/argv/transcript inference is NEVER consulted, not even attempted — or "<status> fallback"
+# when it fell through to herd_driver_agent_status_resolved's raw-passthrough / pane-scrape /
+# transcript-growth path, TODAY's exact behavior, completely unchanged. herd_driver_agent_status_resolved
+# itself stays untouched; this is a strictly ADDITIVE entry point.
+herd_driver_agent_status_resolved_ex() {
+  local slug="${1:-}" raw="${2:-}" pane="${3:-}" structured
+  structured="$(_herd_codex_durable_lifecycle "$slug" 2>/dev/null)"
+  if [ -n "$structured" ]; then
+    printf '%s structured' "$structured"
+    return 0
+  fi
+  printf '%s fallback' "$(herd_driver_agent_status_resolved "$slug" "$raw" "$pane")"
+}
+
 # _herd_wake_agent_status <name> [pane] — agent_status word for the agent REGISTERED as <name> out of
 # herd_driver_agent_list_json's roster (identity match on `name` OR `agent`, the same tolerance every
 # other roster reader in this file uses), passed through the shared corroboration resolver above.
