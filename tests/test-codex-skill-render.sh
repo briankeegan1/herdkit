@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# test-codex-skill-render.sh — hermetic proof for HERD-754 step 1 (Codex/Grok portability epic,
-# first delivery step ONLY): the coordinator skill also renders to Codex's project-scoped
-# repository-skill discovery path (.agents/skills/herd-coordinator/SKILL.md), from the SAME
-# template + token machinery as the Claude render, while the Claude render itself stays
-# byte-identical to before this change.
+# test-codex-skill-render.sh — hermetic proof for HERD-754 steps 1-2 (Codex/Grok portability epic):
+# (step 1) the coordinator skill also renders to Codex's project-scoped repository-skill discovery
+# path (.agents/skills/herd-coordinator/SKILL.md), from the SAME template + token machinery as the
+# Claude render; (step 2, HERD-758) that shared template names no VENDOR TOOL in its prescriptive
+# prose — it carries abstract {{CAP_*}} capability tokens each render target resolves for itself.
+# Throughout, the Claude render itself stays byte-identical to before these changes.
 #
 # What this asserts:
 #   (A) EVERY render path emits it: `herd init` renders .agents/skills/herd-coordinator/SKILL.md
@@ -11,9 +12,11 @@
 #       VALUES actually substituted; `herd render` regenerates it deterministically when absent.
 #   (B) Frontmatter shape: opens with `---`, `name: herd-coordinator` then `description:`, closes
 #       with a second `---` — the convention Codex's repository-skill discovery expects.
-#   (C) SAME CANONICAL SOURCE: the rendered body (everything past the frontmatter) is
-#       BYTE-IDENTICAL to the Claude render's body — one template, two rendered surfaces, so a fix
-#       to templates/coordinator.md.tmpl can never drift between them (multi-seat doctrine rule 2).
+#   (C) SAME CANONICAL SOURCE: the rendered body (everything past the frontmatter) is BYTE-IDENTICAL
+#       to the Claude render's body once the per-target CAPABILITY TOKENS (F, below) are normalized —
+#       one template, two rendered surfaces, so a fix to templates/coordinator.md.tmpl can never
+#       drift between them (multi-seat doctrine rule 2) and the ONLY permitted divergence is a
+#       capability token resolving per runtime.
 #   (D) PER-MACHINE DERIVED artifact: gitignored via .git/info/exclude (never the committed
 #       .gitignore), untracked after a commit, and carried in the shared derived-files list under a
 #       FIXED path (independent of COORDINATOR_CMD, like the /autopilot render).
@@ -22,6 +25,11 @@
 #       this tree's CURRENT bin/herd, produces a BYTE-IDENTICAL .claude/commands/coordinator.md —
 #       nothing about today's Claude behavior changed. Skips (never fails) if no such baseline is
 #       resolvable in this checkout.
+#   (F) HERD-758 (step 2) CAPABILITY TOKENS: templates/coordinator.md.tmpl names no VENDOR TOOL in
+#       its prescriptive prose — it carries {{CAP_*}} tokens that each render target resolves. The
+#       Claude render resolves {{CAP_ASK_USER}} back to the literal `AskUserQuestion`; the Codex
+#       render carries NO Claude tool name at all, only vendor-neutral prose (degrade, never guess an
+#       unverified Codex-native tool).
 #
 # Fully hermetic: temp git repos, no network, no gh, no herdr, no model.
 # Run:  bash tests/test-codex-skill-render.sh
@@ -93,12 +101,18 @@ grep -qx -- '---' <<< "$_fm_tail" || fail "B1: frontmatter does not close with a
 ok "B1 the Codex render carries a name + description frontmatter block, opened and closed with ---"
 
 # ── C. same canonical source: the body (past the frontmatter) matches the Claude render's body ─────
+# HERD-758: the ONE permitted divergence is a per-target CAPABILITY TOKEN (section F). Normalize the
+# Codex render's neutral phrasing back to the Claude literal and the two bodies must still match
+# byte-for-byte — anything else means the surfaces have drifted off their one canonical source.
+CAP_ASK_USER_CLAUDE="AskUserQuestion"
+CAP_ASK_USER_CODEX="a multiple-choice question to the user"
 _codex_body="$(awk '/^---$/{n++; next} n>=2' "$P/$CODEX_REL")"
 _claude_body="$(awk '/^---$/{n++; next} n>=2' "$P/$COORD_REL")"
 [ -n "$_codex_body" ] || fail "C1: the Codex render's body is empty"
-[ "$_codex_body" = "$_claude_body" ] \
-  || fail "C1: the Codex render's body diverges from the Claude render's body — they must share ONE canonical source"
-ok "C1 the Codex render's body is byte-identical to the Claude render's body (one canonical source)"
+_codex_body_norm="$(printf '%s\n' "$_codex_body" | sed "s/$CAP_ASK_USER_CODEX/$CAP_ASK_USER_CLAUDE/g")"
+[ "$_codex_body_norm" = "$_claude_body" ] \
+  || fail "C1: the Codex render's body diverges from the Claude render's body beyond capability-token resolution — they must share ONE canonical source"
+ok "C1 the Codex render's body matches the Claude render's body once capability tokens are normalized (one canonical source)"
 
 # ── D. per-machine derived artifact: gitignored, untracked, on the shared derived list ─────────────
 git -C "$P" check-ignore -q "$CODEX_REL" || fail "D1: the Codex render is not ignored"
@@ -132,12 +146,17 @@ BASE_REF="$(git -C "$ROOT" merge-base HEAD origin/main 2>/dev/null || true)"
 if [ -z "$BASE_REF" ] || ! git -C "$ROOT" cat-file -e "$BASE_REF:bin/herd" 2>/dev/null; then
   ok "E1 SKIPPED — no resolvable pre-change baseline in this checkout (origin/main unreachable)"
 else
-  OLD="$T/old-engine"; mkdir -p "$OLD/bin"
-  git -C "$ROOT" show "$BASE_REF:bin/herd" > "$OLD/bin/herd" || fail "E: could not extract the baseline bin/herd"
+  # HERD-758: materialize the WHOLE baseline tree (engine + templates + manifest), not just bin/herd
+  # with the current templates symlinked in. The Claude render is a function of all three, and this
+  # change edits templates/coordinator.md.tmpl as well as bin/herd — a baseline engine rendering the
+  # CURRENT template would die on the {{CAP_ASK_USER}} token it cannot bind, and would prove nothing
+  # about the before/after byte-identity anyway. Extracting the baseline commit makes this a true
+  # "everything before this change" vs "everything after" comparison.
+  OLD="$T/old-engine"; mkdir -p "$OLD"
+  git -C "$ROOT" archive "$BASE_REF" | tar -x -C "$OLD" \
+    || fail "E: could not materialize the baseline tree at $BASE_REF"  # pipe-ok: git archive|tar is the extraction itself; failure surfaces as the missing bin/herd checked next
+  [ -f "$OLD/bin/herd" ] || fail "E: the baseline tree carries no bin/herd"
   chmod +x "$OLD/bin/herd"
-  ln -s "$ROOT/templates" "$OLD/templates"
-  ln -s "$ROOT/scripts" "$OLD/scripts"
-  [ -d "$ROOT/pysrc" ] && ln -s "$ROOT/pysrc" "$OLD/pysrc"
 
   E="$T/before-after"; _mkrepo "$E"
   ( cd "$E" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$OLD/bin/herd" init ) >/dev/null 2>&1 \
@@ -162,5 +181,44 @@ else
     || fail "E1: the Claude render changed vs. before this change — diff: $(diff "$T/before.norm.md" "$T/after.norm.md" | head -10)"  # pipe-ok: diff|head feeds a bounded failure message inside a command substitution; pipeline status is not gated
   ok "E1 the Claude coordinator render is byte-identical to before this change (module install path aside)"
 fi
+
+# ── F. HERD-758 capability tokens: abstract in the template, resolved per render target ────────────
+TMPL="$ROOT/templates/coordinator.md.tmpl"
+[ -f "$TMPL" ] || fail "F: missing $TMPL"
+
+# F1 the SHARED template names no vendor tool prescriptively — the ratchet that keeps a new
+# Claude-only tool name from being hardcoded back into prose both runtimes read.
+grep -qF "$CAP_ASK_USER_CLAUDE" "$TMPL" \
+  && fail "F1: templates/coordinator.md.tmpl hardcodes the vendor tool name '$CAP_ASK_USER_CLAUDE' — use a {{CAP_*}} capability token so each render target resolves it"
+_cap_tokens="$(grep -oE '\{\{CAP_[A-Z0-9_]+\}\}' "$TMPL" | LC_ALL=C sort -u | tr '\n' ' ')"
+case "$_cap_tokens" in
+  *'{{CAP_ASK_USER}}'*) : ;;
+  *) fail "F1: the template carries no {{CAP_ASK_USER}} token (found: ${_cap_tokens:-<none>})" ;;
+esac
+ok "F1 the shared template names the ABSTRACT capability ({{CAP_*}}), never a vendor tool"
+
+# F2 the Claude render resolves it BACK to the literal tool name, once per token occurrence.
+_want="$(grep -c -F '{{CAP_ASK_USER}}' "$TMPL")"
+_got="$(grep -c -F "$CAP_ASK_USER_CLAUDE" "$P/$COORD_REL")"
+[ "$_want" -gt 0 ] || fail "F2: fixture assumption broken — the template has no {{CAP_ASK_USER}} occurrence to resolve"
+[ "$_got" = "$_want" ] \
+  || fail "F2: the Claude render resolved {{CAP_ASK_USER}} on $_got line(s), expected $_want — Claude's brief must keep naming its own tool"
+ok "F2 the Claude render resolves {{CAP_ASK_USER}} back to the literal '$CAP_ASK_USER_CLAUDE' ($_want occurrences)"
+
+# F3 the Codex render carries NO Claude tool name — not this one, and not any other tool the
+# harness prescribes by name. (Prose that merely NAMES the runtime — the driver-seam section's
+# "Claude Code" — is the {{DRIVER_*}} seam's business, not a tool instruction, and is not scanned.)
+for _tool in "$CAP_ASK_USER_CLAUDE" EnterPlanMode ExitPlanMode TodoWrite NotebookEdit SlashCommand; do
+  grep -qF "$_tool" "$P/$CODEX_REL" \
+    && fail "F3: the Codex render names the Claude-specific tool '$_tool' — it does not exist on that runtime"
+done
+ok "F3 the Codex render names no Claude-specific tool"
+
+# F4 …and it says the vendor-NEUTRAL thing instead, on every line the token appears on: degraded
+# safely, never a guessed Codex-native tool name (HERD-754's unverified-capability rule).
+_got="$(grep -c -F "$CAP_ASK_USER_CODEX" "$P/$CODEX_REL")"
+[ "$_got" = "$_want" ] \
+  || fail "F4: the Codex render carries the neutral phrasing on $_got line(s), expected $_want"
+ok "F4 the Codex render resolves {{CAP_ASK_USER}} to vendor-neutral prose ($_want occurrences)"
 
 echo "ALL PASS ($PASS checks)"

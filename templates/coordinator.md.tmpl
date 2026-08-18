@@ -39,7 +39,7 @@ in parallel.
        an undriveable `MODEL_REVIEW` driver) — the reason a gate is "mysteriously stuck". The full
        machine-readable snapshot is `$WORKTREES_DIR/.herd/config-viability.json`; run `herd doctor` to
        refresh every probe. Fix the config (or the external side) before spawning against that gate.
-3. Present the menu with **AskUserQuestion**, header "Backlog", options:
+3. Present the menu with **{{CAP_ASK_USER}}**, header "Backlog", options:
    - **Implement an item** — pick a 🔜 item and spin up a sub-agent for it
    - **Browse backlog** — summarize what's planned / in progress / shipped, grounded against the repo
    - **Add an item** — research the idea in the repo, then capture a grounded entry
@@ -107,7 +107,7 @@ stays free. **One exception:** for a tiny instant lookup you need *right now*, d
 
 ## Implement an item
 
-1. List the 🔜 items and let the user pick one (AskUserQuestion). **Before you offer an item, screen
+1. List the 🔜 items and let the user pick one ({{CAP_ASK_USER}}). **Before you offer an item, screen
    out what another operator has already taken or planned** (two operators now share this tracker):
    - **In flight** — skip anything already assigned / 🚧 in progress (the tracker's own state, and
      `git worktree list`). A pre-spawn **claim** (`CLAIM_REQUIRED`, below) is the hard guard here.
@@ -310,7 +310,7 @@ step-up being swallowed — switch first, confirm the model changed, then re-tas
 - **Add:** author it against the checklist below, THEN enqueue it — the scribe does the research +
   writes the grounded entry:
   `bash {{SCRIPTS_DIR}}/scribe.sh "Add a 🔜 item: <title> — <why>. Research the relevant code and write a grounded entry in the right section, matching the file's format."`
-- **Curate:** ground-truth via the research lane, interview the user (AskUserQuestion), propose a
+- **Curate:** ground-truth via the research lane, interview the user ({{CAP_ASK_USER}}), propose a
   Keep/Cut/Defer plan, get approval, THEN enqueue: `bash {{SCRIPTS_DIR}}/scribe.sh "Apply this approved curation: <the full plan>"`.
 
 ### Authoring a backlog item → run this SOP BEFORE you enqueue an Add
@@ -398,7 +398,7 @@ at **any** time — nothing is init-only. Drive it entirely through the validate
     herd config set <KEY> <VALUE> # change one key
 
 When the user picks **Workflow settings**, start with `herd config list` so they see the current
-state, then interview them (AskUserQuestion) for what to change and apply it with `herd config set`.
+state, then interview them ({{CAP_ASK_USER}}) for what to change and apply it with `herd config set`.
 Surface what the CLI guarantees so the user knows the change is safe and live:
 
 - **Validated keys** — `set` refuses any key not in the capabilities manifest, so a typo can't
@@ -845,7 +845,7 @@ the summary automatically, or run it anytime:
 
     herd config sync   # READ-ONLY: lists each engine key missing from .herd/config, its default + when to set it
 
-For **each missing key the operator cares about**, interview them with **AskUserQuestion** (show the
+For **each missing key the operator cares about**, interview them with **{{CAP_ASK_USER}}** (show the
 default and its when-to-surface guidance), then apply the chosen value with `herd config set <KEY>
 <VALUE>`. **Never auto-write** — `herd config sync` only reports; the operator decides, and only the
 validated `herd config set` ever changes `.herd/config`. A key they don't care about stays on its
