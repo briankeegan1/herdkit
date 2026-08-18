@@ -31,7 +31,9 @@
 # The rendered coordinator skill's basename follows COORDINATOR_CMD when the config is loaded; it
 # falls back to the shipped default (`coordinator`) so this library is safe to source with no config
 # in scope. The /autopilot skill (HERD-515) renders from the same machinery under a FIXED basename
-# (no config key selects it), and is derived for exactly the same reasons.
+# (no config key selects it), and is derived for exactly the same reasons. The Codex-discoverable
+# .agents/skills/herd-coordinator/SKILL.md (HERD-754 step 1) renders from that SAME machinery under
+# a FIXED path too, for the same reasons.
 #
 # Sourced by sweep.sh, agent-watch.sh, and stale-dup-gate.sh — each of which may source it more than
 # once through their own source graph, hence the idempotence guard.
@@ -49,6 +51,7 @@ herd_derived_paths() {
   printf '%s\n' \
     ".claude/commands/${_dp_name}.md" \
     ".claude/commands/autopilot.md" \
+    ".agents/skills/herd-coordinator/SKILL.md" \
     ".herd/config.local"
 }
 
