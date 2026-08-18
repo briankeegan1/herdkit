@@ -4877,13 +4877,41 @@ class TestHealthTrustBuilder(unittest.TestCase):
         self.assertEqual(prov, "builder-local")
         self.assertEqual(reason, "")
 
-    def test_non_clean_outcome_not_trusted(self):
+    def test_codeerror_outcome_not_trusted(self):
         epoch = self._commit_epoch() + 60
-        for outcome in ("CODEERROR", "DATAENV"):
-            self._plant(self.sha, self.wt_abs, "heavy", outcome, 1, "builder-local", "clean", epoch)
-            prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
-            self.assertEqual(prov, "")
-            self.assertIn("outcome=%s" % outcome, reason)
+        self._plant(self.sha, self.wt_abs, "heavy", "CODEERROR", 1, "builder-local", "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertIn("outcome=CODEERROR", reason)
+
+    def test_dataenv_heavy_record_from_clean_tree_is_trusted(self):
+        """DATAENV is the merge-gate pass (code clean, tolerated notes). With a
+        companion log it earns the same skip as CLEAN. Notes may sit in an
+        optional 11th field; they are observational, not a trust predicate."""
+        epoch = self._commit_epoch() + 60
+        digest = self._write_log(self.sha, "DATAENV\nnotes: visreg — no baseline")
+        self._plant(self.sha, self.wt_abs, "heavy", "DATAENV", 1234, "builder-local", "clean", epoch,
+                    digest)
+        # Append the optional notes field (11th) — a later reader can tell what
+        # was skipped. The trust decision does not key on it.
+        rec = self._rec_file(self.sha)
+        with open(rec, "r+", encoding="utf-8") as fh:
+            line = fh.readline().rstrip("\n")
+            fh.seek(0)
+            fh.write(line + "\tvisreg — no baseline\n")
+            fh.truncate()
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "builder-local")
+        self.assertEqual(reason, "")
+
+    def test_dataenv_without_companion_log_not_trusted(self):
+        """A DATAENV claim with digest='-' (the pre-policy shape) is still
+        refused — fail-closed on the companion log, not a silent green."""
+        epoch = self._commit_epoch() + 60
+        self._plant(self.sha, self.wt_abs, "heavy", "DATAENV", 1, "builder-local", "clean", epoch)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "no suite log for record")
 
     def test_light_profile_record_not_trusted(self):
         epoch = self._commit_epoch() + 60

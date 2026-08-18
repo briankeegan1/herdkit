@@ -12,7 +12,7 @@
 #   (2)  LEVER ON, a CLEAN heavy record for the EXACT sha from a CLEAN tree at that worktree → TRUSTED
 #        (and the printed token is the record's provenance).
 #   (3)  STALE SHA — a record for a DIFFERENT commit never trusts the current one.
-#   (4)  NON-CLEAN OUTCOME (CODEERROR, and the tolerated-but-noted DATAENV) → not trusted.
+#   (4)  CODEERROR → not trusted. DATAENV with a companion log → trusted (merge-gate pass).
 #   (5)  NON-HEAVY PROFILE — a light record proves nothing about the full suite.
 #   (6)  provenance=watcher → not trusted: trust must always trace back to a real builder-local heavy
 #        suite, never to another trusted (light) run. This is what stops trust compounding on itself.
@@ -167,8 +167,32 @@ try_reject() {
   esac
 }
 try_reject 4a heavy CODEERROR builder-local clean "$NOW" "$WTP" "outcome=CODEERROR"
-try_reject 4b heavy DATAENV   builder-local clean "$NOW" "$WTP" "outcome=DATAENV"
-ok "(4) a non-CLEAN outcome (CODEERROR, and the tolerated DATAENV) is never trusted"
+ok "(4) a CODEERROR outcome is never trusted"
+
+# DATAENV is the merge-gate pass (code clean, tolerated notes). With a companion log it
+# earns the same skip as CLEAN. Without a log it is still refused (fail-closed on digest).
+rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
+herd_health_trust_write "$TREES" "$SHA2" "$WT" heavy DATAENV 12 builder-local \
+  "DATAENV"$'\n'"notes: visreg — no baseline for hud_multires_design" \
+  "visreg — no baseline for hud_multires_design"
+[ -f "$(log_file "$SHA2")" ] || fail "(4) a DATAENV write must persist a companion suite log"
+IFS=$'\t' read -r R_VER R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH R_DIGEST R_NOTES \
+  < "$(rec_file "$SHA2")"
+[ "$R_OUT" = "DATAENV" ] || fail "(4) DATAENV write recorded outcome='$R_OUT'"
+[ -n "$R_DIGEST" ] && [ "$R_DIGEST" != "-" ] || fail "(4) DATAENV write must hash the companion log"
+case "$R_NOTES" in
+  *hud_multires_design*) ok "(4) DATAENV row records tolerated notes in field 11" ;;
+  *) fail "(4) DATAENV notes field missing or empty: '$R_NOTES'" ;;
+esac
+GOT="$(herd_health_trust_check "$TREES" "$SHA2" "$WT")" \
+  && [ "$GOT" = "builder-local" ] \
+  && ok "(4) shared reader TRUSTS a DATAENV heavy record with companion log" \
+  || fail "(4) DATAENV with companion log refused: $HERD_HEALTH_TRUST_REASON"
+# Planted DATAENV with no log (the pre-policy shape) is still refused — on the digest,
+# not on the outcome. Fail-closed: a DATAENV claim with nothing behind it is not evidence.
+rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
+try_reject 4b heavy DATAENV builder-local clean "$NOW" "$WTP" "no suite log"
+ok "(4) DATAENV without a companion log is refused (missing companion), not trusted"
 
 try_reject 5 light CLEAN builder-local clean "$NOW" "$WTP" "profile=light"
 ok "(5) a LIGHT record proves nothing about the full suite and is never trusted"
@@ -472,7 +496,7 @@ ok "(17) a record older than HEALTH_TRUST_MAX_AGE_SECS is refused regardless of 
 
 echo
 echo "ALL PASS ($PASS checks) — HERD-531/560 sha-matched builder-local trust: off is a hard no-op, only a"
-echo "CLEAN heavy builder-local VERSION 2 record of the EXACT sha from a CLEAN tree at the SAME worktree,"
-echo "digest-matched against its companion suite log and within the freshness window, earns a light"
-echo "smoke — every other case, including a pre-hardening or unrecognized-version record, falls back to"
-echo "the full re-run."
+echo "CLEAN or DATAENV heavy builder-local VERSION 2 record of the EXACT sha from a CLEAN tree at the"
+echo "SAME worktree, digest-matched against its companion suite log and within the freshness window,"
+echo "earns a light smoke — every other case, including CODEERROR, a pre-hardening or"
+echo "unrecognized-version record, falls back to the full re-run."

@@ -1124,11 +1124,11 @@ if [ "$MODE" = "heavy" ] && [ -z "$ONELINE" ] && [ -n "$HEALTHCHECK_CMD" ]; then
   _hc_prov_sha="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
   _hc_prov_now="$(date +%s 2>/dev/null || echo 0)"
   _hc_prov_dur=$(( _hc_prov_now - _HC_T0 )); [ "$_hc_prov_dur" -ge 0 ] 2>/dev/null || _hc_prov_dur=0
-  # HERD-560: the suite log a CLEAN record's digest is taken over is $MAIN_OUT itself — the exact
-  # bytes this run printed (header + the project health command's captured output). A non-CLEAN
-  # outcome passes no log at all; herd_health_trust_write only ever persists/hashes one for CLEAN.
+  # The suite log a CLEAN/DATAENV record's digest is taken over is $MAIN_OUT itself — the exact
+  # bytes this run printed (header + the project health command's captured output). CODEERROR
+  # passes no log; herd_health_trust_write only persists/hashes one for CLEAN or DATAENV.
   _hc_prov_log=""
-  [ "$_hc_prov_outcome" = "CLEAN" ] && _hc_prov_log="$MAIN_OUT"
+  case "$_hc_prov_outcome" in CLEAN|DATAENV) _hc_prov_log="$MAIN_OUT" ;; esac
   herd_health_trust_write "${WORKTREES_DIR:-}" "$_hc_prov_sha" "$DIR" heavy \
     "$_hc_prov_outcome" "$_hc_prov_dur" "${HERD_HEALTH_PROVENANCE:-builder-local}" "$_hc_prov_log" || true
 fi

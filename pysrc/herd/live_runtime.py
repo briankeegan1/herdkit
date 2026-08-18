@@ -2960,11 +2960,14 @@ class _GraphQLDiscovery:
 #
 # FORMAT VERSION 2 (HERD-560): the record grew a leading ``version`` field and a trailing
 # ``log_digest`` field (10 fields total, was 8) — see health-trust.sh's header for the full field
-# list and the companion ``.health-provenance-log-<sha>`` file the digest is verified against. A
-# pre-HERD-560 record (8 fields, no version) or an unrecognized version reads as ABSENT — never an
-# error — exactly as if this sha had no record at all. A well-formed record is ALSO refused when
-# stale: older than ``HEALTH_TRUST_MAX_AGE_SECS`` (default 21600s / 6h), written before the commit it
-# claims to attest existed, or its digest no longer matches the companion log's actual content.
+# list and the companion ``.health-provenance-log-<sha>`` file the digest is verified against. An
+# optional 11th field holds a single-line flattening of tolerated DATAENV notes; a 10-field row
+# is still valid. A pre-HERD-560 record (8 fields, no version) or an unrecognized version reads
+# as ABSENT — never an error — exactly as if this sha had no record at all. A well-formed record
+# is ALSO refused when stale: older than ``HEALTH_TRUST_MAX_AGE_SECS`` (default 21600s / 6h),
+# written before the commit it claims to attest existed, or its digest no longer matches the
+# companion log's actual content. Outcome CLEAN or DATAENV is trustworthy (merge already treats
+# both as pass); CODEERROR is never trusted.
 
 def _health_trust_on(config):
     """Port of ``herd_health_trust_on`` (health-trust.sh) — is HEALTH_TRUST_BUILDER on? An
@@ -3063,9 +3066,11 @@ def _health_trust_check(trees, sha, worktree):
         return "", "old-format record (absent)"
     # A truncated/garbled/interrupted-write record proves nothing — refuse it rather than guessing at
     # whichever fields happen to be present (mirrors the bash reader's own $_ht_epoch emptiness check).
-    if len(fields) != 10:
+    # 10 fields is the HERD-560 row. 11 fields is the same row plus an optional
+    # notes flattening (tolerated DATAENV notes). Anything else is garbled.
+    if len(fields) not in (10, 11):
         return "", "malformed record"
-    (version, r_sha, r_wt, r_prof, r_out, _r_dur, r_prov, r_state, r_epoch, r_digest) = fields
+    (version, r_sha, r_wt, r_prof, r_out, _r_dur, r_prov, r_state, r_epoch, r_digest) = fields[:10]
     if not r_epoch or not r_epoch.isdigit():
         return "", "malformed record"
     # An unrecognized version (a FUTURE format this engine build predates) reads as ABSENT too — the
@@ -3077,8 +3082,10 @@ def _health_trust_check(trees, sha, worktree):
         return "", "stale sha in record"
     if r_prof != "heavy":
         return "", "profile=%s (not heavy)" % r_prof
-    if r_out != "CLEAN":
-        return "", "outcome=%s (not CLEAN)" % r_out
+    # CLEAN = everything verified. DATAENV = code clean, some checks tolerated
+    # (the merge gate already treats this as a pass). CODEERROR is never trusted.
+    if r_out not in ("CLEAN", "DATAENV"):
+        return "", "outcome=%s (not CLEAN or DATAENV)" % r_out
     # provenance=watcher would let a trusted (light) run justify the NEXT trusted run — trust must
     # always trace back to a real builder-local heavy suite, never compound on itself.
     if r_prov != "builder-local":
