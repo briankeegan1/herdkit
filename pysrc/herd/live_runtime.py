@@ -2480,6 +2480,33 @@ def _reraise_gh_failure(exc, resource="core"):
 _GH_RATE_LIMIT_BUFFER_SECONDS = 30
 _GH_RATE_LIMIT_DEFAULT_COOLDOWN_SECONDS = 300
 
+# Keep candidate discovery inside the SAME hard availability budget as every bash-side ``gh`` call
+# on the watcher tick path (agent-watch.sh:_gh_timeout_secs). This is an inline safety bound, not an
+# operator policy lever: an unbounded network wait can stop the whole control loop. The environment
+# override is only the shared test seam already owned by that bash helper.
+_GH_TIMEOUT_DEFAULT_SECONDS = 15
+
+
+def _gh_timeout_seconds():
+    """The shared watcher ``gh`` deadline; malformed/zero values fail safe to the 15s default."""
+    raw = str(os.environ.get("HERD_GH_TIMEOUT_SECS", "") or "")
+    return int(raw) if raw.isdigit() and int(raw) > 0 else _GH_TIMEOUT_DEFAULT_SECONDS
+
+
+def _discovery_timeout_remaining(deadline, budget):
+    """Seconds left in ONE discovery deadline, raising TimeoutExpired once it is spent."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise subprocess.TimeoutExpired("gh discovery", budget)
+    return remaining
+
+
+def _journal_discovery_timeout(budget):
+    """Emit one bounded, non-red availability fact; journal failure is itself fail-soft."""
+    LiveJournal(LiveJournal.resolve_live_path()).append(
+        "gh_timeout", "component", "live_runtime", "site", "graphql_discovery",
+        "timeout_secs", budget)
+
 # HERD-670: at a rate-limit window's reset, every watcher whose backoff armed against the SAME
 # exhaustion event would otherwise wake on the exact same epoch and re-drain the fresh window together
 # (thundering herd — grounded live 2026-08-13, all four of this machine's watchers resumed
@@ -2621,7 +2648,10 @@ def discover_via_graphql(repo=None, limit=50):
     limit (HERD-582 — the caller treats this as BACKOFF, never a fault) or the raw
     ``subprocess.CalledProcessError`` / ``json.JSONDecodeError`` on any other transport/parse failure;
     the ``--tick`` entrypoint catches the latter and returns non-zero so the bash supervisor's fault
-    streak still trips for a genuine outage.
+    streak still trips for a genuine outage. A timeout is different: it consumes ONE shared
+    ``HERD_GH_TIMEOUT_SECS`` deadline across repository resolution and GraphQL, journals one
+    ``gh_timeout`` availability fact, and returns an empty result. That clean, fail-soft return keeps
+    the synchronous engine watchdog from multiplying one stalled discovery across all of its retries.
 
     Never called under ``--dry-run`` (that path uses :class:`FixtureDiscovery`), so a test never runs
     ``gh``.
@@ -2641,15 +2671,22 @@ def discover_via_graphql(repo=None, limit=50):
         "headRefOid baseRefName mergeable reviewDecision isDraft body author{login} "
         "assignees(first:10){nodes{login}} labels(first:20){nodes{name}}}}}}"
     )
-    owner, name = _repo_owner_name(repo)
+    budget = _gh_timeout_seconds()
+    deadline = time.monotonic() + budget
     try:
+        owner, name = _repo_owner_name(
+            repo, timeout=_discovery_timeout_remaining(deadline, budget))
         out = subprocess.run(
             ["gh", "api", "graphql", "-f", "query=%s" % query,
              "-F", "owner=%s" % owner, "-F", "name=%s" % name, "-F", "n=%d" % int(limit)],
             capture_output=True, text=True, check=True,
+            timeout=_discovery_timeout_remaining(deadline, budget),
         )
     except subprocess.CalledProcessError as exc:
         _reraise_gh_failure(exc, resource="graphql")  # HERD-670: gh api graphql draws the graphql bucket
+    except subprocess.TimeoutExpired:
+        _journal_discovery_timeout(budget)
+        return []
     data = json.loads(out.stdout)
     nodes = (((data.get("data") or {}).get("repository") or {})
              .get("pullRequests") or {}).get("nodes") or []
@@ -2900,7 +2937,7 @@ def _select_candidates(cands, config):
     return kept
 
 
-def _repo_owner_name(repo=None):
+def _repo_owner_name(repo=None, timeout=None):
     """``(owner, name)`` for the current repo — ``repo`` arg (``owner/name``) else ``gh repo view``
     (REST). A classified rate limit (HERD-582 — e.g. a 403 with ``X-RateLimit-Remaining: 0``) raises
     :class:`GhRateLimited`; any other failure raises the raw ``CalledProcessError`` unchanged."""
@@ -2911,7 +2948,7 @@ def _repo_owner_name(repo=None):
         out = subprocess.run(
             ["gh", "repo", "view", "--json", "owner,name",
              "-q", "[.owner.login,.name]|@tsv"],
-            capture_output=True, text=True, check=True,
+            capture_output=True, text=True, check=True, timeout=timeout,
         )
     except subprocess.CalledProcessError as exc:
         _reraise_gh_failure(exc)

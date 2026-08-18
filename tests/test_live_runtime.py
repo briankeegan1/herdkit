@@ -8763,6 +8763,79 @@ class TestGhRateLimitClassification(unittest.TestCase):
             LR.subprocess = orig
 
 
+class TestGraphqlDiscoveryTimeout(unittest.TestCase):
+    """HERD-764: one bounded discovery timeout fails soft without waking watchdog retries."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.jpath = os.path.join(self.tmp, "journal.jsonl")
+        self._saved = {k: os.environ.get(k) for k in
+                       ("JOURNAL_FILE", "HERD_GH_TIMEOUT_SECS")}
+        os.environ["JOURNAL_FILE"] = self.jpath
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def test_timeout_returns_empty_and_journals_once(self):
+        os.environ["HERD_GH_TIMEOUT_SECS"] = "7"
+
+        class _Stub:
+            CalledProcessError = subprocess.CalledProcessError
+            TimeoutExpired = subprocess.TimeoutExpired
+            seen_timeout = None
+
+            def run(self, argv, **kwargs):
+                self.seen_timeout = kwargs.get("timeout")
+                raise subprocess.TimeoutExpired(argv, self.seen_timeout)
+
+        stub = _Stub()
+        orig = LR.subprocess
+        LR.subprocess = stub
+        try:
+            self.assertEqual(LR.discover_via_graphql(repo="owner/name"), [])
+        finally:
+            LR.subprocess = orig
+
+        self.assertGreater(stub.seen_timeout, 0)
+        self.assertLessEqual(stub.seen_timeout, 7)
+        timed_out = [event for event in events(self.jpath)
+                     if event.get("event") == "gh_timeout"]
+        self.assertEqual(len(timed_out), 1)
+        self.assertEqual(timed_out[0]["component"], "live_runtime")
+        self.assertEqual(timed_out[0]["site"], "graphql_discovery")
+        self.assertEqual(timed_out[0]["timeout_secs"], 7)
+
+    def test_repo_lookup_and_graphql_share_one_deadline(self):
+        seen = []
+
+        class _Stub:
+            CalledProcessError = subprocess.CalledProcessError
+            TimeoutExpired = subprocess.TimeoutExpired
+
+            def run(self, argv, **kwargs):
+                seen.append(kwargs.get("timeout"))
+                if argv[1:3] == ["repo", "view"]:
+                    return mock.Mock(stdout="owner\tname\n")
+                return mock.Mock(stdout='{"data":{"repository":{"pullRequests":{"nodes":[]}}}}')
+
+        orig = LR.subprocess
+        LR.subprocess = _Stub()
+        try:
+            with mock.patch.object(LR.time, "monotonic", side_effect=[100.0, 100.0, 102.0]):
+                self.assertEqual(LR.discover_via_graphql(), [])
+        finally:
+            LR.subprocess = orig
+
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[0], 15)
+        self.assertEqual(seen[1], 13)
+
+
 class TestResumeJitter(unittest.TestCase):
     """HERD-670: the resume offset must be bounded, DETERMINISTIC (no random/Date — a rerun of the
     same tick must reproduce the same wakeup), and spread distinct workspaces apart so several
