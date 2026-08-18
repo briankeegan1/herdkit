@@ -65,7 +65,7 @@ from the cache without spawning anything. `herd doctor --probe` re-runs the prob
 | runtime | definition dir | by-name selector | mode | how it was established |
 |---|---|---|---|---|
 | **claude 2.1.229** (`herdr-claude`, `headless`) | `.claude/agents/*.md`, **repo scope** | none | ~~`native`~~ **`inject`** — see § 3a | verified on this machine |
-| **codex 0.147.0** | none | none | `inject` | verified on this machine |
+| **codex 0.147.0** | ~~none~~ `.codex/agents/*.toml`, **repo scope** | none | `inject` — see § 3b | verified on this machine |
 | **grok 1.0.3** | `~/.grok/agents/`, **user scope** | `--agent <name>` | `install` | **verified by report** — grok is not installed here |
 | **stub** (proof driver) | `$HOME/.stub-agent/agents` | `--agent <name>` | `install` | the hermetic test vehicle |
 
@@ -99,6 +99,46 @@ files nothing reads for this purpose. `DRIVER_AGENT_DEFINITION_DIR` stays bound 
 still true and may matter for a future Task-tool-delegation capability — only `DEFINITION_MODE`
 changed.
 
+### 3b. Correction (2026-08-18, HERD-761, epic HERD-754 step 5): codex's dir was `none`, and that was wrong too
+
+HERD-754 itself flagged the 2026-08-12 pre-audit as stale: "templates/drivers/codex.driver records
+Codex 0.147.0 as having no native project agent-definition surface, while current Codex documentation
+supports project-scoped custom agents under `.codex/agents/*.toml`." Re-verified live against the real
+binary (`/opt/homebrew/bin/codex`, codex-cli 0.147.0) rather than trusting either the ticket's claim or
+the driver's own prior audit:
+
+- **`.codex/agents/*.toml` is real and natively parsed — the pre-audit's "no dir" was wrong.**
+  Dropping a deliberately incomplete file there (`name` + `description`, no `developer_instructions`)
+  makes a plain `codex exec` turn in that workdir emit `Ignoring malformed agent role definition:
+  agent role file at <path> must define `developer_instructions`` — codex only produces that message
+  for a file it opened and tried to deserialize as an "agent role", so the directory is genuinely
+  scanned at startup, not absent. (`sentinel` is not a recognized field either — an early probe with
+  one got `unknown field `sentinel`` — the real, minimal valid shape is `name` + `description` +
+  `developer_instructions`, discovered by trial against the deserializer's own error messages, the
+  same "researched, not guessed" discipline the rest of this file's flags follow.)
+- **A by-name selector is still genuinely absent — the pre-audit's "no selector" was right.**
+  `codex exec --agent probe ...` fails immediately with clap's own `error: unexpected argument
+  '--agent' found`; neither `codex --help` nor `codex exec --help` lists one, and a string search of
+  the compiled binary for `--agent`/`agent_name`-shaped CLI flags found none.
+- **The directory is real but irrelevant to what HERD_AGENT needs — the exact T3 shape § 3a already
+  found for claude.** codex ships `multi_agent`/`multi_agent_v2` feature flags and
+  `SubagentStart`/`SubagentStop` hook event types (`codex features list`, and strings in the compiled
+  binary), consistent with `.codex/agents/*.toml` defining SUBAGENT roles codex's own internal
+  multi-agent machinery may dispatch to — never a MAIN session's own persona. Verified live: a fully
+  valid `.codex/agents/probe.toml` (unique sentinel in `developer_instructions`) produced **zero**
+  effect on a bare `codex exec` oneshot turn asked for that sentinel — it answered `NO-SENTINEL`,
+  exactly as if the file were not there. The roster's inject fallback was verified the same way, in
+  the same session: the SAME sentinel, delivered via `herd_roster_lane_spec_block`'s real injected
+  block instead, came back correctly. `tests/test-codex-agent-roster-live.sh` is the automated,
+  skip-if-`codex`-absent proof of both halves.
+
+So `DRIVER_AGENT_DEFINITION_DIR` moves from `@degrade:no-agent-definition-lookup-path-codex-0.147.0`
+to the real `.codex/agents` (mirroring claude's real-dir-but-inject-mode shape exactly), and
+`DRIVER_AGENT_SELECT_FLAG`'s `@degrade:` reason text is corrected to name the flag that is actually
+missing rather than the directory that, it turns out, is not. `DEFINITION_MODE` does not change: it
+was already `inject`, and re-verifying the runtime only confirmed that was the right mechanism all
+along — this correction is about `DEFINITION_DIR`'s *honesty*, not about which mechanism a lane uses.
+
 Notes that matter for the bindings:
 
 - **claude also has an `--agents <json>` spawn flag.** It passes *inline* definitions rather than
@@ -106,19 +146,39 @@ Notes that matter for the bindings:
   binds. The definition **dir** is the primary path (it needs no argv surgery and works for a TUI
   spawn as well as a headless one). `--agents` is noted here as the known alternative if a future
   need — e.g. passing a definition that is not on disk — makes it the better seam.
-- **codex has no named-agent selection at all.** This is why prompt injection is built as the
-  first-class portable fallback rather than a degraded path: it is the one mechanism that works on
-  *any* runtime, including one whose vendor never ships the feature. On codex the lane prepends the
-  definition body to the task spec, and `verify` probes exactly that mechanism — positive: body
-  injected, sentinel returns; negative control: nothing injected, sentinel must not return.
+- **codex has a real `.codex/agents/*.toml` dir but no named-agent selection** — see § 3b. This is
+  why prompt injection is built as the first-class portable fallback rather than a degraded path: it
+  is the one mechanism that works on *any* runtime, including one whose vendor's native definition
+  surface (real or not) does not reach the main session. On codex the lane prepends the definition
+  body to the task spec, and this is verified live in `tests/test-codex-agent-roster-live.sh` —
+  positive: body injected, sentinel returns; negative control: `.codex/agents/*.toml` alone, with no
+  injection, sentinel must not return.
 - **grok is not installed on this machine.** Its bindings ship **verified-by-report**, marked with
   the drivers' existing `@degrade:` convention for anything that was *not* reported, and
   `herd agents verify` fail-softs to `unverified — grok binary not present on this machine` rather
   than a red row. Post-merge live verification on a grok-equipped machine is owned by the second
   operator (operator decision, 2026-08-12).
-- **Every driver already binds `DRIVER_AGENT_ONESHOT_EXEC`**, which is the single seam the shared
-  verify helper rides. That is why verification needed no new exec surface: it reuses
-  `herd_driver_oneshot_exec_as`, the same one-shot path the advisor and the review panel use.
+- **Every driver already binds `DRIVER_AGENT_ONESHOT_EXEC`, but the shared verify helper's use of it
+  is BROKEN for codex (found 2026-08-18, HERD-761, not fixed here — out of this ticket's scope).**
+  `herd_driver_oneshot_exec_as` (`scripts/herd/driver.sh`) does not actually compose from a driver's
+  `DRIVER_AGENT_ONESHOT_EXEC` template; it extracts only the runtime binary name and then hardcodes
+  claude's own shape, `"$_rt" -p "$prompt" --model "$model" "$@"`. That shape happens to match
+  herdr-claude/headless/grok/stub's bindings (`<bin> -p "<prompt>" --model <model> …`) but NOT codex's
+  real one (`codex exec --model <model> --dangerously-bypass-approvals-and-sandbox "<prompt>"` — no
+  `-p` at all). Reproduced live: `codex -p "hello there" --model gpt-5.1-codex
+  --dangerously-bypass-approvals-and-sandbox` fails immediately with `error: invalid value 'hello
+  there' for '--profile <CONFIG_PROFILE_V2>'` — codex's top-level `-p` means `--profile`, a completely
+  different flag, so the "prompt" is consumed as a profile name and the real prompt is dropped. This
+  means `herd agents verify`/`herd doctor --probe`/`herd advise`/the review panel's codex dispatch are
+  all currently non-functional for codex specifically (every other shipped driver is unaffected — see
+  the audit for the `-p`-shaped bindings above). `tests/test-codex-agent-roster-live.sh` therefore
+  proves the roster's inject mechanism directly (composing the real `codex exec --model … "<prompt>"`
+  shape itself, matching `DRIVER_AGENT_ONESHOT_EXEC`'s own documented incantation) rather than through
+  `herd_roster_verify`/`herd_driver_oneshot_exec_as`, which would currently misreport it as
+  `unresolved`. Filed via `herd note` for the coordinator; fixing the shared composer to actually
+  read/substitute each driver's `DRIVER_AGENT_ONESHOT_EXEC` template (the way
+  `herd_driver_agent_spawn_argv` already does for `DRIVER_AGENT_INTERACTIVE_SPAWN`) is cross-cutting
+  work outside HERD-761's roster-binding scope.
 
 ## 4. What HERD-667 ships
 
