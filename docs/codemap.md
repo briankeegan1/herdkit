@@ -32,6 +32,7 @@ Role summarized from each file's top-of-file comment.
 - `changelog.sh` — journal-driven CHANGELOG + release-tag helper (HERD-256 / HERD-168 part 2/3).
 - `ci-repair.sh` — CI auto-repair for INHERITED reds (HERD-250).
 - `codemap.sh` — bespoke, native repo mapper behind `herd codemap`. Regenerates docs/codemap.md: a
+- `codex-durable-coordinator.sh` — a herd-owned DURABLE, STEERABLE, CANCELLABLE Codex session (HERD-766,
 - `codex-exec-adapter.sh` — a herd-owned adapter around `codex exec --json` for BOUNDED, ONE-SHOT
 - `commit-lint.sh` — reusable commit-walking helpers for the healthcheck lint gates (HERD-121).
 - `config-viability.sh` — EXTERNAL-CONSISTENCY PROBES (HERD-355): validate .herd/config against LIVE
@@ -175,6 +176,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `capacity-agent-lease-wait.sh` → `driver.sh`, `herd-config.sh`
 - `changelog.sh` → `herd-config.sh`
 - `codemap.sh` → `herd-config.sh`
+- `codex-durable-coordinator.sh` → `codex-exec-adapter.sh`
 - `coordinator.sh` → `driver.sh`, `herd-config.sh`, `herd-preflight.sh`, `layout-reconcile.sh`
 - `core-surface.sh` → `herd-config.sh`
 - `create-retry.sh` → `herd-config.sh`, `journal.sh`
