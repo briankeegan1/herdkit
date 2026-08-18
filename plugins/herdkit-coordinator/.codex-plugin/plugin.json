@@ -1,0 +1,39 @@
+{
+  "name": "herdkit-coordinator",
+  "version": "0.1.0",
+  "description": "Thin wrapper that launches the herdkit coordinator inside Codex. The herdkit CLI (bin/herd) stays the source of truth: on invocation this plugin renders and hands off to the CLI-generated coordinator skill rather than duplicating any coordinator logic.",
+  "author": {
+    "name": "Brian Keegan",
+    "url": "https://github.com/briankeegan1"
+  },
+  "homepage": "https://github.com/briankeegan1/herdkit",
+  "repository": "https://github.com/briankeegan1/herdkit",
+  "license": "MIT",
+  "keywords": [
+    "herdkit",
+    "coordinator",
+    "multi-agent",
+    "worktree",
+    "backlog",
+    "herdr"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "herdkit coordinator",
+    "shortDescription": "Launch the CLI-rendered herdkit coordinator",
+    "longDescription": "Packaging layer that exposes the herdkit coordinator to Codex. It ships no coordinator logic of its own: on invocation it verifies the herdkit CLI, runs `herd render`, and hands off to the CLI-rendered .agents/skills/herd-coordinator/SKILL.md, so the CLI and its templates stay the single source of truth.",
+    "developerName": "Brian Keegan",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/briankeegan1/herdkit",
+    "defaultPrompt": [
+      "Start the herdkit coordinator for this project",
+      "Show the herdkit backlog and pick the next item",
+      "Spawn a builder for the next backlog item"
+    ]
+  }
+}
