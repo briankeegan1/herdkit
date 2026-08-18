@@ -124,9 +124,10 @@ done
 ok; echo "PASS (3) HERD_CLAUDE_FLAGS override precedence preserved on both runtimes"
 
 # ── (4) source-level: no dispatch site left on the raw literal ─────────────────────────────────
-grep -n 'herd_driver_oneshot_exec_as' "$REVIEW" | grep -q '\$CLAUDE_FLAGS' \
+_sites="$(grep -n 'herd_driver_oneshot_exec_as' "$REVIEW" || true)"
+grep -q '\$CLAUDE_FLAGS' <<<"$_sites" \
   && fail "(4) a herd_driver_oneshot_exec_as site still appends the raw \$CLAUDE_FLAGS — route it through _review_runtime_flags"
-grep -n 'herd_driver_oneshot_exec_as' "$REVIEW" | grep -q -- '--output-format stream-json' \
+grep -q -- '--output-format stream-json' <<<"$_sites" \
   && fail "(4) a herd_driver_oneshot_exec_as site still hardcodes claude's stream-json output flags"
 n="$(grep -c '_review_runtime_flags "' "$REVIEW" || true)"
 [ "${n:-0}" -ge 3 ] || fail "(4) expected the panel, local and headless dispatch sites (>=3) to use _review_runtime_flags (found $n)"
