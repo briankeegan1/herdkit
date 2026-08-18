@@ -44,10 +44,19 @@ TREES="${RESEARCH_TREES:-$WORKTREES_DIR}"
 Q="${RESEARCH_QUEUE:-$TREES/research-queue}"
 REPORTS="${RESEARCH_REPORTS:-$TREES/research-reports}"
 REQ="${1:?usage: research.sh \"<question>\"}"
-CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 # Read-only repo research — fan-out Explore + concise synthesis. Default to the configured
 # research model (Sonnet); override with RESEARCH_MODEL=… for a specific run.
 RESEARCH_MODEL="${RESEARCH_MODEL:-$MODEL_RESEARCH}"
+# HERD-770: resolve the spawn's permission flag through the SHARED lane seam, keyed to the RUNTIME
+# the (optionally runtime-qualified) research model resolves to — NOT a hardcoded claude flag. An
+# eager CLAUDE_FLAGS=--dangerously-skip-permissions leaked the claude-only flag into a Codex spawn
+# (codex 0.147.0 rejects it) because a non-empty <flags> OVERRIDES the driver's own permission
+# binding in herd_driver_agent_spawn_argv. herd_driver_lane_permission_flags preserves EXPLICIT
+# HERD_CLAUDE_FLAGS override precedence, is byte-identical for herdr-claude/headless (their flag IS
+# --dangerously-skip-permissions), and yields the Codex bypass flag under the Codex runtime. A bad
+# ref falls soft to the active driver here; the launch below still loud-refuses and the durably
+# queued request survives.
+CLAUDE_FLAGS="$(herd_driver_lane_permission_flags "$(herd_model_driver_for "$RESEARCH_MODEL" 2>/dev/null || true)")"
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. Generate a short request id. Same stem as the queue filename so the drainer can derive the
