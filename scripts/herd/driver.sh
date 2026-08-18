@@ -1616,18 +1616,59 @@ herd_driver_oneshot_exec() {
 herd_driver_oneshot_exec_as() {
   local drv="${1:-}" prompt="${2:-}" model="${3:-}"
   shift 3 2>/dev/null || set --
-  # HERD-177 P6: run the RESOLVED driver's runtime, not a hardwired `claude`. herd_driver_agent_runtime
-  # resolves the runtime executable from the driver's DRIVER_AGENT_ONESHOT_EXEC binding; a non-Claude
-  # driver (stub/codex/grok) runs its own binary through the SAME arg composition. The default path is
-  # the drift-guarded, BYTE-IDENTICAL `claude -p …` literal — taken whenever the runtime is claude OR
-  # unresolvable (an absent binding degrades to today's behavior, never a crash). The compose proof +
-  # the audit drift guard (tests/test-oneshot-exec-seam.sh, tests/test-driver-agent-exec.sh) are the rail.
-  local _rt; _rt="$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)"
-  if [ -n "$_rt" ] && [ "$_rt" != "claude" ]; then
-    "$_rt" -p "$prompt" --model "$model" "$@"
-  else
+  # HERD-762: compose argv from the resolved driver's DRIVER_AGENT_ONESHOT_EXEC template, mirroring
+  # herd_driver_agent_spawn_argv's use of DRIVER_AGENT_INTERACTIVE_SPAWN — reuse that mechanism, do not
+  # invent a new one. The template substitution maps:
+  #   <model>    → the model value; if EMPTY, drop it AND the preceding --model flag
+  #   <prompt>   → the prompt value (one token, verbatim)
+  #   perm token → dropped; the caller's "$@" carries the permission flag + any extra runtime flags,
+  #                appended after the composed argv — this keeps claude's argv BYTE-IDENTICAL (rail:
+  #                tests/test-oneshot-exec-seam.sh compose proof + tests/test-driver-agent-exec.sh § 3).
+  # Fail-soft: absent/unresolvable binding or Python failure degrades to today's claude literal (the
+  # drift-guarded `claude -p "$prompt" --model "$model"` kept in the fallback path below). NOT-fail-soft
+  # exit-status contract preserved: runtime exit status returned unchanged, same as before.
+  local _binding _perm
+  _binding="$(herd_driver_agent_value DRIVER_AGENT_ONESHOT_EXEC "" "$drv" 2>/dev/null || true)"
+  _perm="$(herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG "--dangerously-skip-permissions" "$drv" 2>/dev/null || true)"
+  [ -n "$_perm" ] || _perm='--dangerously-skip-permissions'
+  if [ -z "$_binding" ]; then
     claude -p "$prompt" --model "$model" "$@"
+    return
   fi
+  local _argv=()
+  while IFS= read -r -d '' _t; do _argv+=("$_t"); done < <(
+    HERD_OE_BINDING="$_binding" HERD_OE_PERM="$_perm" \
+    HERD_OE_MODEL="$model" HERD_OE_PROMPT="$prompt" \
+    python3 -c '
+import os, shlex, sys
+model  = os.environ["HERD_OE_MODEL"]
+prompt = os.environ["HERD_OE_PROMPT"]
+perm   = os.environ["HERD_OE_PERM"]
+try:
+    toks = shlex.split(os.environ["HERD_OE_BINDING"])
+    out = []
+    for t in toks:
+        if t == "<model>":
+            if model:
+                out.append(model)
+            elif out and out[-1] == "--model":
+                out.pop()
+        elif t == "<prompt>":
+            out.append(prompt)
+        elif t == perm:
+            pass  # perm placeholder: caller'"'"'s "$@" appended in shell after compose
+        else:
+            out.append(t)
+    sys.stdout.write("".join(tok + "\0" for tok in out))
+except Exception:
+    pass
+'
+  )
+  if [ "${#_argv[@]}" -eq 0 ]; then
+    claude -p "$prompt" --model "$model" "$@"
+    return
+  fi
+  "${_argv[@]}" "$@"
 }
 
 # ── watcher wake surface (HERD-176 — HERD-150 P4: resume / limit / model-switch) ──────────────────
