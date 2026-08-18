@@ -877,14 +877,16 @@ _sweep_live_marker_sessions() {
 
 # _sweep_engine_home — this running copy of the engine's own install root (parent of scripts/herd),
 # so an engine SCRIPT path (scripts/herd/*.sh, pysrc/) can be excluded from project attribution below.
-# Prefers the exported HERDKIT_HOME (bin/herd's own computation, HERD-…); falls back to deriving it
-# from $HERE (every herd script's own dir, two levels up — agent-watch.sh sets this from
-# BASH_SOURCE[0], so it is correct regardless of who sourced it) so the guard still works when
-# HERDKIT_HOME was never exported into this process (e.g. a hermetic test sourcing agent-watch.sh
-# directly, or a lib-mode caller that skipped bin/herd).
+# Prefers the exported HERDKIT_HOME (bin/herd's own computation); falls back to deriving it from
+# sweep.sh's OWN BASH_SOURCE (never the inherited $HERE — sweep.sh does not assign HERE itself, so
+# reading it here trips the config-manifest's GHOST-key scanner: an undeclared, unassigned UPPER_CASE
+# read looks exactly like a forgotten config key). BASH_SOURCE[0] resolves to sweep.sh's own path
+# regardless of who sourced it, same discipline agent-watch.sh's own HERE computation uses.
 _sweep_engine_home() {
   if [ -n "${HERDKIT_HOME:-}" ]; then printf '%s' "$HERDKIT_HOME"; return 0; fi
-  [ -n "${HERE:-}" ] && printf '%s' "$(dirname "$(dirname "$HERE")")"
+  local _seh_here
+  _seh_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || return 1
+  printf '%s' "$(dirname "$_seh_here")"
 }
 
 # _sweep_owns_path <path> — success iff <path> lies inside this project's main checkout or worktrees
