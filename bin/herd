@@ -9866,7 +9866,7 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd ledger-report [--json | --alerts | --daily [--file PATH]]
                                       the OUTCOME LEDGER MVP reader (HERD-739): a per-tracker-ref
                                       VALUE record derived mechanically from the journal (merge, cost,
-                                      verdict_recorded, refix events joined via `reconcile`'s pr→ref
+                                      verdict_recorded, refix events joined via reconcile's pr→ref
                                       link) — disposition, spend, review verdicts, risk class, and the
                                       delayed +24h/+7d evaluation slots. --json prints the full derived
                                       model; --alerts prints only the loud rows (missing evals,

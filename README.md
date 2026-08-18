@@ -536,6 +536,21 @@ cd your-project
 herd init
 ```
 
+### As a herdr plugin
+
+herdkit is also a first-class [herdr plugin](https://herdr.dev/docs/plugins/), listed on the herdr
+plugin marketplace:
+
+```sh
+herdr plugin install briankeegan1/herdkit
+```
+
+herdr clones this repo into its plugin store — that clone **is** the engine — and the build step
+runs `install.sh` to wire `herd` onto your `PATH` + run the doctor. You then get `herdkit: init /
+launch / reload / status / backlog / doctor` in herdr's action menu (bindable as
+`plugin_action` → `herdkit.<verb>`), each opening a pane in the focused workspace's project. See
+[`packaging/herdr/README.md`](packaging/herdr/README.md).
+
 ### Manual — clone + wire PATH yourself
 
 ```sh
@@ -858,6 +873,8 @@ templates/                      coordinator.md.tmpl, config.example, capabilitie
 docs/                           codemap.md + symbol-index.md (committed engine maps) + reference docs
                                 (isolation-boundary.md — what the engine will and will not touch;
                                 multi-operator-ownership.md — whose work a seat may act on)
+herdr-plugin.toml               herdkit as a herdr plugin (marketplace manifest; helpers in packaging/herdr/)
+plugin/  plugins/  packaging/     the Claude Code plugin, the Codex plugin, homebrew/npm/herdr packaging
 tests/                          hermetic shell + python tests and a bats wrapper
 .herd/                          herdkit's OWN dogfood config + healthcheck + review checklist
   agents/                       its committed specialist agent definitions
