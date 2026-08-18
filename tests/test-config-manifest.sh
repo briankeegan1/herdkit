@@ -238,6 +238,11 @@ EXEMPT_NAMES = {
     "CODEX_EXEC_ADAPTER_KEEP_RAW",  # HERD-760: codex-exec-adapter.sh's debug flag to retain the raw
                   # codex exec --json output for inspection — same class as HEALTHCHECK_PROGRESS_LOG /
                   # GATE_SCALE_CORES_OVERRIDE above, a dev seam, not an operator-facing knob.
+    "CODEX_DURABLE_START_TIMEOUT",  # HERD-766: codex-durable-coordinator.sh's poll-bound (seconds) on
+                  # how long codex_durable_start waits for the thread.started event before giving up —
+                  # same class as CODEX_EXEC_ADAPTER_KEEP_RAW just above (a dev/tuning seam read
+                  # directly via `${VAR:-default}`, never routed through herd-config.sh's loader), not
+                  # a .herd/config knob.
     "CONSOLE_LEDGER_MAX",  # console-section.sh's bounded-ledger row cap. Its own header states these
                            # console constants are inline ON PURPOSE — "a legibility property of the
                            # console, not an operator knob (no config key, no manifest row)" — so
