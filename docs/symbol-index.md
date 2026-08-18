@@ -15,7 +15,7 @@
 > • Same-file calls are omitted by design — this indexes CROSS-file reach only.
 > Treat it as a navigation aid (jump to a def, find likely callers), never as ground truth.
 
-- Functions indexed: 2189 (defined in >1 file: 46) · with cross-file callers: 393
+- Functions indexed: 2205 (defined in >1 file: 46) · with cross-file callers: 396
 
 ## Functions (def → cross-file callers)
 
@@ -194,6 +194,14 @@ this scan cannot see).
 - `_cmd_report` — def `scripts/herd/oss-triage.sh:320` — callers: —
 - `_cmd_run` — def `scripts/herd/oss-triage.sh:328` — callers: —
 - `_codemap_auto` — def `scripts/herd/agent-watch.sh:993` — callers: —
+- `_codex_durable_cli` — def `scripts/herd/codex-durable-coordinator.sh:439` — callers: —
+- `_codex_durable_compose` — def `scripts/herd/codex-durable-coordinator.sh:308` — callers: —
+- `_codex_durable_descendants` — def `scripts/herd/codex-durable-coordinator.sh:131` — callers: —
+- `_codex_durable_launch` — def `scripts/herd/codex-durable-coordinator.sh:181` — callers: —
+- `_codex_durable_pid_alive` — def `scripts/herd/codex-durable-coordinator.sh:119` — callers: —
+- `_codex_durable_turn_number` — def `scripts/herd/codex-durable-coordinator.sh:149` — callers: —
+- `_codex_durable_turn_stem` — def `scripts/herd/codex-durable-coordinator.sh:154` — callers: —
+- `_codex_durable_wait_for_thread_id` — def `scripts/herd/codex-durable-coordinator.sh:217` — callers: —
 - `_codex_exec_adapter_cli` — def `scripts/herd/codex-exec-adapter.sh:195` — callers: —
 - `_collect_and_write_shortlist` — def `scripts/herd/oss-triage.sh:239` — callers: —
 - `_collect_main_health` — def `scripts/herd/agent-watch.sh:10973` — callers: —
@@ -1645,10 +1653,18 @@ this scan cannot see).
 - `cmd_upgrade` — def `bin/herd:1971` — callers: —
 - `cmd_watcher_resurrect` — def `bin/herd:8076` — callers: —
 - `cmd_why` — def `bin/herd:8770` — callers: —
-- `codex_exec_adapter_available` — def `scripts/herd/codex-exec-adapter.sh:82` — callers: —
-- `codex_exec_adapter_bin` — def `scripts/herd/codex-exec-adapter.sh:78` — callers: —
+- `codex_durable_available` — def `scripts/herd/codex-durable-coordinator.sh:117` — callers: —
+- `codex_durable_bin` — def `scripts/herd/codex-durable-coordinator.sh:116` — callers: —
+- `codex_durable_cancel` — def `scripts/herd/codex-durable-coordinator.sh:405` — callers: —
+- `codex_durable_init` — def `scripts/herd/codex-durable-coordinator.sh:161` — callers: —
+- `codex_durable_start` — def `scripts/herd/codex-durable-coordinator.sh:242` — callers: —
+- `codex_durable_status` — def `scripts/herd/codex-durable-coordinator.sh:360` — callers: —
+- `codex_durable_steer` — def `scripts/herd/codex-durable-coordinator.sh:272` — callers: —
+- `codex_durable_wait` — def `scripts/herd/codex-durable-coordinator.sh:375` — callers: —
+- `codex_exec_adapter_available` — def `scripts/herd/codex-exec-adapter.sh:82` — callers: `scripts/herd/codex-durable-coordinator.sh:117`
+- `codex_exec_adapter_bin` — def `scripts/herd/codex-exec-adapter.sh:78` — callers: `scripts/herd/codex-durable-coordinator.sh:116`
 - `codex_exec_adapter_event_state` — def `scripts/herd/codex-exec-adapter.sh:88` — callers: —
-- `codex_exec_adapter_parse_events` — def `scripts/herd/codex-exec-adapter.sh:101` — callers: —
+- `codex_exec_adapter_parse_events` — def `scripts/herd/codex-exec-adapter.sh:101` — callers: `scripts/herd/codex-durable-coordinator.sh:329`
 - `codex_exec_adapter_run` — def `scripts/herd/codex-exec-adapter.sh:149` — callers: `scripts/herd/runtime-conformance.sh:220`, `scripts/herd/runtime-conformance.sh:222`
 - `cost_day_total` — def `scripts/herd/cost.sh:329` — callers: `bin/herd:9171`, `scripts/herd/agent-watch.sh:16300`
 - `cost_emit_merge` — def `scripts/herd/cost.sh:502` — callers: `scripts/herd/agent-watch.sh:11958`, `scripts/herd/work-units/git-pr.sh:392`
