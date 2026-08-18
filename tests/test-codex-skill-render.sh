@@ -157,6 +157,15 @@ else
     || fail "E: could not materialize the baseline tree at $BASE_REF"  # pipe-ok: git archive|tar is the extraction itself; failure surfaces as the missing bin/herd checked next
   [ -f "$OLD/bin/herd" ] || fail "E: the baseline tree carries no bin/herd"
   chmod +x "$OLD/bin/herd"
+  # HERD-760: the coordinator skill legitimately renders a live capabilities-index summary (PR #157) —
+  # so a PR that adds a NEW capabilities.tsv row (documenting a new engine script, exactly as this
+  # test suite's own declare-or-exempt discipline requires) correctly changes the Claude render too.
+  # That's a real, wanted behavior change, not a capability-token regression — the two must not be
+  # conflated. Sync the CURRENT tree's manifest files onto the baseline copy before rendering it, so
+  # the ONLY variable left between before/after is code (capability-token handling), never manifest
+  # CONTENT — a true isolation of what this specific change actually claims to leave byte-identical.
+  cp "$ROOT/templates/capabilities.tsv" "$OLD/templates/capabilities.tsv"
+  cp "$ROOT/templates/conformance.tsv" "$OLD/templates/conformance.tsv"
 
   E="$T/before-after"; _mkrepo "$E"
   ( cd "$E" && HERD_NONINTERACTIVE=1 HERD_SKIP_DOCTOR=1 bash "$OLD/bin/herd" init ) >/dev/null 2>&1 \
