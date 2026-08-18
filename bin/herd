@@ -667,6 +667,28 @@ _On every invocation, read live state to surface what is configured:_
       _rs_emit "$ap_tmpl" "$out_dir/autopilot.md" "autopilot"
       _ensure_excluded "$root" ".claude/commands/autopilot.md" >&2
     fi
+
+    # HERD-754 step 1: ALSO render the SAME canonical coordinator policy — same template, same
+    # token machinery, same per-machine contract as the Claude render above — to Codex's
+    # project-scoped repository-skill discovery path: a directory holding SKILL.md. ADDITIVE ONLY:
+    # the Claude render above is untouched, so its output stays byte-identical to before this
+    # change. One canonical source, two rendered surfaces (multi-seat doctrine rule 2) — a fix to
+    # templates/coordinator.md.tmpl reaches both seats, and neither can drift from the other. The
+    # basename and directory are FIXED (`herd-coordinator`, no new config key), exactly like the
+    # autopilot skill's fixed name above. Codex's skill-discovery convention keys a skill by a
+    # `name:` frontmatter field (Claude's coordinator.md.tmpl only carries `description:`); rather
+    # than fork the template for that one line, splice `name: herd-coordinator` into the SAME
+    # rendered frontmatter after _rs_emit runs, so the body below it is identical either way.
+    local codex_skill_dir="$root/.agents/skills/herd-coordinator"
+    local codex_skill_out="$codex_skill_dir/SKILL.md"
+    mkdir -p "$codex_skill_dir"
+    _rs_emit "$TEMPLATES_DIR/coordinator.md.tmpl" "$codex_skill_out" "codex-skill"
+    { head -n 1 "$codex_skill_out"
+      printf 'name: herd-coordinator\n'
+      tail -n +2 "$codex_skill_out"
+    } > "$codex_skill_out.tmp" && mv "$codex_skill_out.tmp" "$codex_skill_out"
+    _ensure_excluded "$root" ".agents/skills/herd-coordinator/SKILL.md" >&2
+
     printf '%s' "$out"
   )
 }
