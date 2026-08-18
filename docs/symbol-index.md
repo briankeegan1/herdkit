@@ -15,7 +15,7 @@
 > • Same-file calls are omitted by design — this indexes CROSS-file reach only.
 > Treat it as a navigation aid (jump to a def, find likely callers), never as ground truth.
 
-- Functions indexed: 2162 (defined in >1 file: 46) · with cross-file callers: 389
+- Functions indexed: 2168 (defined in >1 file: 46) · with cross-file callers: 389
 
 ## Functions (def → cross-file callers)
 
@@ -194,6 +194,7 @@ this scan cannot see).
 - `_cmd_report` — def `scripts/herd/oss-triage.sh:320` — callers: —
 - `_cmd_run` — def `scripts/herd/oss-triage.sh:328` — callers: —
 - `_codemap_auto` — def `scripts/herd/agent-watch.sh:993` — callers: —
+- `_codex_exec_adapter_cli` — def `scripts/herd/codex-exec-adapter.sh:195` — callers: —
 - `_collect_and_write_shortlist` — def `scripts/herd/oss-triage.sh:239` — callers: —
 - `_collect_main_health` — def `scripts/herd/agent-watch.sh:10973` — callers: —
 - `_combine_verdicts` — def `scripts/herd/herd-review.sh:367` — callers: —
@@ -1635,6 +1636,11 @@ this scan cannot see).
 - `cmd_upgrade` — def `bin/herd:1971` — callers: —
 - `cmd_watcher_resurrect` — def `bin/herd:8049` — callers: —
 - `cmd_why` — def `bin/herd:8743` — callers: —
+- `codex_exec_adapter_available` — def `scripts/herd/codex-exec-adapter.sh:82` — callers: —
+- `codex_exec_adapter_bin` — def `scripts/herd/codex-exec-adapter.sh:78` — callers: —
+- `codex_exec_adapter_event_state` — def `scripts/herd/codex-exec-adapter.sh:88` — callers: —
+- `codex_exec_adapter_parse_events` — def `scripts/herd/codex-exec-adapter.sh:101` — callers: —
+- `codex_exec_adapter_run` — def `scripts/herd/codex-exec-adapter.sh:149` — callers: —
 - `cost_day_total` — def `scripts/herd/cost.sh:329` — callers: `bin/herd:9144`, `scripts/herd/agent-watch.sh:16300`
 - `cost_emit_merge` — def `scripts/herd/cost.sh:502` — callers: `scripts/herd/agent-watch.sh:11958`, `scripts/herd/work-units/git-pr.sh:392`
 - `cost_report_dir` — def `scripts/herd/cost.sh:294` — callers: `scripts/herd/agent-watch.sh:16353`
@@ -2145,7 +2151,7 @@ this scan cannot see).
 - `triggers_tick` — def `scripts/herd/triggers.sh:352` — callers: —
 - `triggers_validate` — def `scripts/herd/triggers.sh:132` — callers: —
 - `trim` — def `scripts/herd/codemap.sh:290` — callers: —
-- `usage` — def `bin/herd:9567` — callers: `scripts/herd/agent-watch.sh:14017`, `scripts/herd/agent-watch.sh:14021`, `scripts/herd/backlog-reconcile-sweep.sh:64`, `scripts/herd/changelog.sh:45`, `scripts/herd/driver.sh:1690`, `scripts/herd/fleet.sh:145`, `scripts/herd/fleet.sh:581`, `scripts/herd/fleet.sh:1330`, `scripts/herd/fleet.sh:1624`, `scripts/herd/fleet.sh:1707`, `scripts/herd/fleet.sh:1731`, `scripts/herd/fleet.sh:1863`, `scripts/herd/governance-drift-sweep.sh:52`, `scripts/herd/healthcheck.sh:85`, `scripts/herd/herd-approve.sh:233`, `scripts/herd/oss-triage.sh:44`, `scripts/herd/tracker-state-sweep.sh:121`
+- `usage` — def `bin/herd:9567` — callers: `scripts/herd/agent-watch.sh:14017`, `scripts/herd/agent-watch.sh:14021`, `scripts/herd/backlog-reconcile-sweep.sh:64`, `scripts/herd/changelog.sh:45`, `scripts/herd/codex-exec-adapter.sh:121`, `scripts/herd/driver.sh:1690`, `scripts/herd/fleet.sh:145`, `scripts/herd/fleet.sh:581`, `scripts/herd/fleet.sh:1330`, `scripts/herd/fleet.sh:1624`, `scripts/herd/fleet.sh:1707`, `scripts/herd/fleet.sh:1731`, `scripts/herd/fleet.sh:1863`, `scripts/herd/governance-drift-sweep.sh:52`, `scripts/herd/healthcheck.sh:85`, `scripts/herd/herd-approve.sh:233`, `scripts/herd/oss-triage.sh:44`, `scripts/herd/tracker-state-sweep.sh:121`
 - `valof` — def `bin/herd:3555` — callers: —
 - `warn` — def `bin/herd:152` — callers: `scripts/herd/agent-watch.sh:2009`, `scripts/herd/fleet.sh:226`, `scripts/herd/fleet.sh:279`, `scripts/herd/fleet.sh:281`, `scripts/herd/fleet.sh:287`, `scripts/herd/fleet.sh:299`, `scripts/herd/fleet.sh:302`, `scripts/herd/fleet.sh:305`, `scripts/herd/fleet.sh:394`, `scripts/herd/fleet.sh:666`, `scripts/herd/fleet.sh:667`, `scripts/herd/fleet.sh:1776`, `scripts/herd/herd-claim.sh:221`, `scripts/herd/herd-preflight.sh:707`, `scripts/herd/herd-preflight.sh:711`, `scripts/herd/herd-preflight.sh:714`, `scripts/herd/herd-preflight.sh:738`, `scripts/herd/herd-preflight.sh:742`, `scripts/herd/herd-preflight.sh:753`, `scripts/herd/herd-preflight.sh:759`, `scripts/herd/herd-preflight.sh:783`, `scripts/herd/herd-preflight.sh:797`, `scripts/herd/herd-preflight.sh:818`, `scripts/herd/herd-preflight.sh:821`, `scripts/herd/status.sh:1023`, `scripts/herd/steps.sh:109`, `scripts/herd/steps.sh:131`
 - `watch_wrapper_loop` — def `scripts/herd/herd-watch.sh:142` — callers: —
