@@ -125,4 +125,31 @@ _code_has "$SCRIPTS/driver.sh" 'claude -p "\$prompt" --model "\$model"' \
   || fail "(C) driver.sh seam no longer carries the claude -p one-shot incantation"
 pass
 
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# PART D — codex driver composes its real DRIVER_AGENT_ONESHOT_EXEC binding, not the -p shape.
+# Regression guard for HERD-762: before the fix, herd_driver_oneshot_exec_as used a hardcoded
+# `"$_rt" -p "$prompt" --model "$model"` for every non-claude runtime, so codex got `codex -p "hi"`,
+# which fails with "invalid value for --profile". The fix composes from the template, so codex gets
+# `codex exec --model <model> <prompt>` (the binding) instead of the broken -p shape.
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+cat > "$FAKEBIN/codex" <<'EOF'
+#!/usr/bin/env bash
+: "${CODEX_ARGV_LOG:=/dev/null}"
+for a in "$@"; do printf 'ARG:%s\n' "$a"; done | tee -a "$CODEX_ARGV_LOG"
+EOF
+chmod +x "$FAKEBIN/codex"
+
+LOG="$T/d.log"; : > "$LOG"
+PATH="$FAKEBIN:$PATH" CODEX_ARGV_LOG="$LOG" bash -c \
+  '. "'"$SCRIPTS"'/driver.sh"; herd_driver_oneshot_exec_as "codex" "hello there" "gpt-5.1-codex" --dangerously-bypass-approvals-and-sandbox' >/dev/null \
+  || fail "(D) herd_driver_oneshot_exec_as codex exited non-zero"
+# The composed command must use codex's real incantation (exec subcommand), not the broken -p shape.
+"$GREP" -q '^ARG:exec$' "$LOG"           || fail "(D) codex oneshot did not compose 'exec' subcommand (binding not used)"
+! "$GREP" -q '^ARG:-p$' "$LOG"           || fail "(D) codex oneshot still emits '-p' (binding not substituted — HERD-762 regression)"
+# Multi-word prompt preserved as a single arg.
+"$GREP" -q '^ARG:hello there$' "$LOG"    || fail "(D) codex oneshot: multi-word prompt did not stay a single arg"
+# Model value forwarded.
+"$GREP" -q '^ARG:gpt-5.1-codex$' "$LOG" || fail "(D) codex oneshot: model value not forwarded"
+pass
+
 echo "ALL PASS ($PASS checks)"
