@@ -103,6 +103,7 @@ Role summarized from each file's top-of-file comment.
 - `retirement.sh` — RETIREMENT AS A RECONCILED INVARIANT (HERD-164).
 - `review-panel.sh` — THE shared resolver for the MIXED-VENDOR review panel (HERD-276).
 - `review-pregate.sh` — THE shared MECHANICAL-RED PRE-GATE + SMALL-MECHANICAL-DIFF FLOOR (HERD-559).
+- `runtime-conformance.sh` — RUNTIME CONFORMANCE PROBES (HERD-763, step 6 of epic HERD-754): does the
 - `scope-escape.sh` — HERD-575 SCOPING-ESCAPE TELEMETRY: the shared detector both sides of a diff-scoped
 - `scribe-step.sh` — queue/git/report mechanics for the backlog drainer. The scribe Claude
 - `scribe.sh` — scribe.sh "<backlog change>" — ENQUEUE a backlog change and make sure exactly ONE async
@@ -162,7 +163,7 @@ Role summarized from each file's top-of-file comment.
 
 Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitted).
 
-- `bin/herd` → `agent-update.sh`, `agents.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `intent-queue.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
+- `bin/herd` → `agent-update.sh`, `agents.sh`, `codex-exec-adapter.sh`, `config-viability.sh`, `console-section.sh`, `context-guard.sh`, `cost.sh`, `deps-parse.sh`, `driver.sh`, `engine-version.sh`, `fleet.sh`, `governance.sh`, `herd-config.sh`, `herd-links.sh`, `herd-preflight.sh`, `intent-queue.sh`, `journal.sh`, `layout-reconcile.sh`, `merge-policy.sh`, `posture-lint.sh`, `review-panel.sh`, `runtime-conformance.sh`, `status.sh`, `theme.sh`, `watcher-exempt.sh`
 - `agent-update.sh` → `driver.sh`, `herd-config.sh`
 - `agent-watch.sh` → `aging-pr.sh`, `approvals.sh`, `capacity-ledger.sh`, `ci-repair.sh`, `console-section.sh`, `core-surface.sh`, `cost.sh`, `derived-files.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `git-pr.sh`, `health-trust.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-spawn-gate.sh`, `human-verify.sh`, `intent-queue.sh`, `journal.sh`, `lifecycle.sh`, `merge-policy.sh`, `pr-ref.sh`, `push-gate.sh`, `red-ledger.sh`, `resolver-claim.sh`, `resolver-pane.sh`, `retirement.sh`, `scope-escape.sh`, `stale-dup-gate.sh`, `steps.sh`, `suite-shard.sh`, `sweep.sh`, `tab-discipline.sh`, `team-presence-live.sh`, `theme.sh`, `watcher-exempt.sh`, `work-unit.sh`
 - `agents-pane-view.sh` → `agents.sh`, `driver.sh`, `herd-config.sh`, `theme.sh`
@@ -209,6 +210,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `research-step.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `research.sh` → `burst.sh`, `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `retirement.sh` → `agent-watch.sh`, `journal.sh`
+- `runtime-conformance.sh` → `agents.sh`, `codex-exec-adapter.sh`, `driver.sh`, `herd-config.sh`
 - `scribe-step.sh` → `create-retry.sh`, `drainer-liveness.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `spawn-step.sh` → `herd-config.sh`
@@ -368,7 +370,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `OSS_TRIAGE` → `bin/herd`, `oss-triage.sh`
 - `OUTCOME_LEDGER` → `bin/herd`, `outcome-ledger.sh`
 - `PROJECT_ARCHETYPE` → `bin/herd`
-- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `agents-pane-view.sh`, `agents.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `changelog.sh`, `codemap.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `gardener.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `oss-triage.sh`, `outcome-ledger.sh`, `posture-lint.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`, `watcher-resurrect.sh`
+- `PROJECT_ROOT` → `bin/herd`, `agent-watch.sh`, `agents-pane-view.sh`, `agents.sh`, `backlog-reconcile-sweep.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `changelog.sh`, `codemap.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `engine-version.sh`, `fleet.sh`, `gardener.sh`, `governance-drift-sweep.sh`, `herd-claim.sh`, `herd-links.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `new-feature.sh`, `oss-triage.sh`, `outcome-ledger.sh`, `posture-lint.sh`, `research.sh`, `runtime-conformance.sh`, `scribe-step.sh`, `scribe.sh`, `status.sh`, `steps.sh`, `theme.sh`, `tracker-state-sweep.sh`, `triggers.sh`, `watcher-resurrect.sh`
 - `PR_FETCH_UNIFY` → `git-pr.sh`
 - `PR_FLOW` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`, `posture-lint.sh`
 - `PR_READY_WHEN` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
@@ -445,5 +447,5 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `WEDGE_AUTOWAKE` → `agent-watch.sh`
 - `WEDGE_GRACE_MIN` → `agent-watch.sh`
 - `WORKSPACE_NAME` → `bin/herd`, `agent-watch.sh`, `agents-pane-view.sh`, `backlog-view.sh`, `context-guard.sh`, `coordinator.sh`, `dep-watcher.sh`, `herd-preflight.sh`, `herd-review.sh`, `herd-watch.sh`, `status.sh`, `sweep.sh`, `watcher-resurrect.sh`
-- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `agents-pane-view.sh`, `agents.sh`, `approvals.sh`, `capacity-ledger.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `cost.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `gardener.sh`, `healthcheck.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `herd-watch.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `outcome-ledger.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tab-discipline.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
+- `WORKTREES_DIR` → `bin/herd`, `agent-watch.sh`, `agents-pane-view.sh`, `agents.sh`, `approvals.sh`, `capacity-ledger.sh`, `changelog.sh`, `config-viability.sh`, `context-guard.sh`, `coordinator.sh`, `cost.sh`, `create-retry.sh`, `driver.sh`, `engine-seat.sh`, `engine-version.sh`, `gardener.sh`, `healthcheck.sh`, `herd-approve.sh`, `herd-feature.sh`, `herd-preflight.sh`, `herd-quick.sh`, `herd-resolve.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `herd-watch.sh`, `journal-audit.sh`, `journal.sh`, `ledger.sh`, `lifecycle.sh`, `new-feature.sh`, `oss-triage.sh`, `outcome-ledger.sh`, `push-gate.sh`, `research-get.sh`, `research-step.sh`, `research.sh`, `runtime-conformance.sh`, `scribe-step.sh`, `scribe.sh`, `spawn-step.sh`, `spawn.sh`, `status.sh`, `steps.sh`, `tab-discipline.sh`, `tracker-state-sweep.sh`, `watcher-exempt.sh`
 - `WORK_UNIT_KIND` → `agent-watch.sh`, `work-unit.sh`
