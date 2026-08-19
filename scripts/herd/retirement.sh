@@ -221,9 +221,10 @@ raise SystemExit(0 if any(a.get("name") == slug for a in ags) else 1)
 #     ever WAIT on a builder we can positively see is mid-work (a re-tasked builder still delivering).
 # Fail-soft: any parse/exec failure exits 1 (proceed). See decisions-parity note in live_runtime.py's reap.
 _reap_agent_working() {
-  local slug="$1" json="${AGENTS_JSON:-}"
+  local slug="$1" json="${AGENTS_JSON:-}" raw resolved
   [ -n "$json" ] || json="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
-  printf '%s' "$json" | SLUG="$slug" python3 -c '
+  # Extract the raw agent_status string for this slug. rc 1 = absent/unreadable → not working → proceed.
+  raw="$(printf '%s' "$json" | SLUG="$slug" python3 -c '
 import sys, json, os
 slug = os.environ["SLUG"]
 try:
@@ -233,9 +234,23 @@ except Exception:
 for a in ags:
     ident = a.get("name") or a.get("agent") or ""
     if ident == slug:
-        raise SystemExit(0 if a.get("agent_status") == "working" else 1)
+        print(a.get("agent_status", ""), end="")
+        raise SystemExit(0)
 raise SystemExit(1)
-' 2>/dev/null
+' 2>/dev/null)" || return 1   # absent / unreadable → not working → proceed with reap
+  [ -n "$raw" ] || return 1    # empty status → not working → proceed
+  # HERD-788: route through the resolved-ex seam so Codex hook markers (CODEX_STOP_HOOK=on) take
+  # precedence over the stale raw herdr working status. Defer only on RESOLVED working — a Codex
+  # pane at idle prompt whose stop hook fired resolves to "idle structured" and is correctly reaped
+  # even while raw herdr still reads "working" (pane process alive). When structured lifecycle evidence
+  # is absent (no hook dir, no codex-durable session) the resolved status equals the raw fallback,
+  # preserving the pre-HERD-788 behavior exactly (conservative: raw working → defer).
+  resolved="$(herd_driver_agent_status_resolved_ex "$slug" "$raw" "" 2>/dev/null)" \
+    || resolved="$raw fallback"   # fail-soft: if the resolver itself errors, keep raw behavior
+  case "${resolved%% *}" in
+    working) return 0 ;;   # positively working (structured or fallback) → defer reap
+    *)       return 1 ;;   # idle / done / unknown → proceed with reap
+  esac
 }
 
 # _retire_tail_ok <tail> — guard for the sha/pr-suffixed ledger globs. `.health-result-<slug>-<sha>`

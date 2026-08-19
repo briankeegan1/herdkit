@@ -1421,6 +1421,59 @@ _herd_headless_start_agent() {
   printf 'working\n' > "$adir/status" 2>/dev/null || true
   [ -s "$adir/pid" ]
 }
+# _herd_codex_stop_hook_argv_fragment <slug> — write the Codex interactive stop-hook scripts for <slug>
+# into <agent-dir>/hook/ and emit the codex argv elements (NUL-terminated, like herd_driver_agent_spawn_argv)
+# that inject them. Validated TOML shape (Codex 0.147.0, features.hooks=stable):
+#   hooks.Stop=[{hooks=[{type="command",command="PATH",timeout=3}]}]
+#   hooks.UserPromptSubmit=[{hooks=[{type="command",command="PATH",timeout=3}]}]
+#   --dangerously-bypass-hook-trust
+# Event names are Pascal-cased (Stop, UserPromptSubmit) — not snake_case. The caller inserts these
+# BEFORE the positional prompt so codex sees them as global options (prompt is always last in the
+# DRIVER_AGENT_INTERACTIVE_SPAWN template). Fail-soft: any mkdir/write failure emits nothing.
+_herd_codex_stop_hook_argv_fragment() {
+  local slug="${1:-}" hook_dir adir
+  [ -n "$slug" ] || return 0
+  adir="$(_herd_agent_dir "$slug")" || return 0
+  hook_dir="$adir/hook"
+  mkdir -p "$hook_dir" 2>/dev/null || return 0
+
+  # Stop hook: fires when Codex completes a turn (Stop event, stable in 0.147.0). Receives JSON on
+  # stdin ({turn_id, stop_hook_active, last_assistant_message}). Must print valid JSON to stdout.
+  cat > "$hook_dir/stop.sh" 2>/dev/null <<HOOKEOF
+#!/usr/bin/env bash
+input="\$(cat 2>/dev/null || true)"
+turn_id="\$(printf '%s' "\$input" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("turn_id",""))' 2>/dev/null || true)"
+if [ -n "\$turn_id" ]; then
+  printf '%s' "\$turn_id" > "$hook_dir/last-turn"
+  rm -f "$hook_dir/current-turn"
+fi
+printf '{}\n'
+exit 0
+HOOKEOF
+  chmod +x "$hook_dir/stop.sh" 2>/dev/null || return 0
+
+  # UserPromptSubmit hook: fires when the user submits a prompt (new turn started). Schema does not
+  # guarantee turn_id; hook invocation itself is structured evidence. Use a timestamp as the marker
+  # so _herd_codex_hook_lifecycle can distinguish in-flight (current-turn present) from idle.
+  cat > "$hook_dir/user-prompt-submit.sh" 2>/dev/null <<HOOKEOF
+#!/usr/bin/env bash
+ts="\$(date -u +%s 2>/dev/null || printf '%s' "\$\$")"
+printf '%s' "\$ts" > "$hook_dir/current-turn" 2>/dev/null || true
+printf '{}\n'
+exit 0
+HOOKEOF
+  chmod +x "$hook_dir/user-prompt-submit.sh" 2>/dev/null || return 0
+
+  # Emit NUL-terminated argv. TOML matcher-group array shape required by Codex 0.147.0.
+  # The command value is wrapped in TOML-escaped double quotes (\"...\") so that when Codex passes
+  # the command string to a shell, the double-quoted path survives spaces in WORKTREES_DIR.
+  # TOML escape: \"PATH\" → TOML string value "/foo bar/stop.sh" → shell: "/foo bar/stop.sh" (safe).
+  printf '%s\0%s\0%s\0%s\0%s\0' \
+    "-c" "hooks.Stop=[{hooks=[{type=\"command\",command=\"\\\"${hook_dir}/stop.sh\\\"\",timeout=3}]}]" \
+    "--dangerously-bypass-hook-trust" \
+    "-c" "hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"\\\"${hook_dir}/user-prompt-submit.sh\\\"\",timeout=3}]}]"
+}
+
 _herd_herdr_start_agent() {
   local slug="$1" wt="$2" model="$3" flags="$4" pointer="$5" split="$6" rt_driver="${7:-}"
   local wsid; wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
@@ -1435,6 +1488,22 @@ _herd_herdr_start_agent() {
   # Compose the agent-runtime argv (the part after `--`) from the resolved driver's P1 binding (P2).
   local -a rt=(); local t
   while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
+  # HERD-788: inject Codex stop-hook argv when CODEX_STOP_HOOK=on and the spawn driver is codex.
+  # Hook flags are global codex options and MUST precede the positional prompt (always the last
+  # element in DRIVER_AGENT_INTERACTIVE_SPAWN templates). Default-off and byte-identical for all
+  # non-codex drivers. Fail-soft: a write failure emits nothing (rt unchanged, spawn proceeds).
+  if [ "${CODEX_STOP_HOOK:-}" = "on" ]; then
+    local _rt_drv="${rt_driver:-$(herd_driver_name 2>/dev/null || true)}"
+    if [ "$_rt_drv" = "codex" ] && [ "${#rt[@]}" -gt 0 ]; then
+      local _hft=(); local _ht
+      while IFS= read -r -d '' _ht; do _hft+=("$_ht"); done < <(_herd_codex_stop_hook_argv_fragment "$slug" 2>/dev/null)
+      if [ "${#_hft[@]}" -gt 0 ]; then
+        # Insert before the last element (the prompt) so hook flags reach codex as global options.
+        local _rt_last="${rt[${#rt[@]}-1]}"
+        rt=("${rt[@]:0:$((${#rt[@]}-1))}" "${_hft[@]}" "$_rt_last")
+      fi
+    fi
+  fi
   # HERD-171: inject ANTHROPIC_BASE_URL when set (no-op / byte-identical when unset).
   local -a envkv=(); local _ep
   while IFS= read -r _ep; do [ -n "$_ep" ] && envkv+=("$_ep"); done < <(herd_driver_endpoint_env_lines)
@@ -1568,6 +1637,17 @@ herd_driver_launch_agent() {
   if [ "$sa_ws_set" = 1 ]; then ws="$sa_ws"; else ws="$(herd_resolve_workspace_id 2>/dev/null || true)"; fi
   local -a rt=(); local _t
   while IFS= read -r -d '' _t; do rt+=("$_t"); done < <(herd_driver_agent_spawn_argv "$sa_driver" "$sa_model" "$sa_flags" "$sa_pointer")
+  # HERD-788: inject Codex stop-hook argv when CODEX_STOP_HOOK=on and the spawn driver is codex.
+  # This is the PRIMARY interactive builder spawn seam (herd-quick.sh → herd_driver_launch_agent).
+  # Default-off and byte-identical for all non-codex drivers. Fail-soft.
+  if [ "${CODEX_STOP_HOOK:-}" = "on" ] && [ "$sa_driver" = "codex" ] && [ "${#rt[@]}" -gt 0 ]; then
+    local _la_hft=(); local _la_ht
+    while IFS= read -r -d '' _la_ht; do _la_hft+=("$_la_ht"); done < <(_herd_codex_stop_hook_argv_fragment "$sa_name" 2>/dev/null)
+    if [ "${#_la_hft[@]}" -gt 0 ]; then
+      local _la_last="${rt[${#rt[@]}-1]}"
+      rt=("${rt[@]:0:$((${#rt[@]}-1))}" "${_la_hft[@]}" "$_la_last")
+    fi
+  fi
   if _herd_herdr_attach_cli; then
     local -a envkv=(); local _l
     if [ -n "$sa_env" ]; then while IFS= read -r _l; do [ -n "$_l" ] && envkv+=("$_l"); done <<< "$sa_env"; fi
@@ -2048,6 +2128,40 @@ _herd_codex_durable_lifecycle() {
   esac
 }
 
+# _herd_codex_hook_lifecycle <slug> — structured status word from the Codex INTERACTIVE LANE's per-slug
+# stop-hook marker directory (<agent-dir>/hook/), written by the hooks injected at spawn time when
+# CODEX_STOP_HOOK=on (HERD-788). Vocabulary maps to the same words every caller expects:
+#   hook/current-turn present                          → working (turn in progress)
+#   hook/current-turn absent + hook/last-turn present  → idle    (builder at idle prompt)
+#   hook/ absent OR neither marker file present        → rc 1    (no evidence — caller falls through)
+# Fail-soft: any I/O error returns rc 1 (never a guess). Default-off: when CODEX_STOP_HOOK is not on
+# the hook dir is never created, so the function always returns rc 1 with zero side effects — byte-
+# identical to the pre-HERD-788 path for every non-Codex driver and every Codex spawn without the lever.
+# SAFETY GUARD: two conditions must BOTH hold before hook markers are trusted —
+#   (a) CODEX_STOP_HOOK=on (the lever is active), AND
+#   (b) the persisted spawn driver for this slug is "codex".
+# Without (a): turning the lever off after markers were written would otherwise let stale markers
+#   falsely reap a Claude/grok builder. Without (b): a re-tasked builder spawned on a non-codex
+#   driver (herdr-claude, grok) after the codex run would inherit stale hook markers and be
+#   misclassified as idle. Both guards together ensure markers only influence the builder they
+#   were written for.
+_herd_codex_hook_lifecycle() {
+  local slug="${1:-}" hook_dir spawn_drv
+  [ -n "$slug" ] || return 1
+  [ "${CODEX_STOP_HOOK:-}" = "on" ] || return 1
+  spawn_drv="$(herd_driver_agent_spawn_driver "$slug" 2>/dev/null || true)"
+  [ "$spawn_drv" = "codex" ] || return 1
+  hook_dir="$(_herd_agent_dir "$slug")/hook"
+  [ -d "$hook_dir" ] || return 1
+  if [ -f "$hook_dir/current-turn" ]; then
+    printf 'working'
+  elif [ -f "$hook_dir/last-turn" ]; then
+    printf 'idle'
+  else
+    return 1
+  fi
+}
+
 # herd_driver_agent_status_resolved_ex <slug> <raw-status> [pane] — like herd_driver_agent_status_resolved
 # above, but ALSO names which KIND of evidence backed the answer, so a caller can tell structured-source
 # from fallback-source apart instead of the two being indistinguishable (HERD-768 acceptance criterion
@@ -2058,6 +2172,14 @@ _herd_codex_durable_lifecycle() {
 # itself stays untouched; this is a strictly ADDITIVE entry point.
 herd_driver_agent_status_resolved_ex() {
   local slug="${1:-}" raw="${2:-}" pane="${3:-}" structured
+  # HERD-788: check the interactive Codex lane's stop-hook markers first (CODEX_STOP_HOOK=on path).
+  # Default-off: when the hook dir does not exist _herd_codex_hook_lifecycle returns rc 1 silently.
+  structured="$(_herd_codex_hook_lifecycle "$slug" 2>/dev/null)"
+  if [ -n "$structured" ]; then
+    printf '%s structured' "$structured"
+    return 0
+  fi
+  # Existing codex-durable session seam (HERD-768).
   structured="$(_herd_codex_durable_lifecycle "$slug" 2>/dev/null)"
   if [ -n "$structured" ]; then
     printf '%s structured' "$structured"

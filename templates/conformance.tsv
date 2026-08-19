@@ -196,6 +196,9 @@ JOURNAL_AUDIT_PUSHED_GRACE	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_ACT	unit	tests/test-journal-audit-act.sh
 JOURNAL_AUDIT_ESCALATE_AFTER	unit	tests/test-journal-audit-act.sh
 journal-act.sh	unit	tests/test-journal-audit-act.sh
+CODEX_STOP_HOOK	unit	tests/test-codex-stop-hook.sh
+CODEX_STOP_HOOK	unit	tests/test-retirement-invariant.sh
+CODEX_STOP_HOOK	sim	scripts/herd/sim/retirement-invariant-sim.sh
 LIFECYCLE_CONTRACTS	unit	tests/test-lifecycle-contracts.sh
 LIFECYCLE_CONTRACTS	unit	tests/test-lifecycle-lane-workers.sh
 agent-watch.sh	unit	tests/test-human-verify-hold.sh
