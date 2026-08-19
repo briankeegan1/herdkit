@@ -1865,6 +1865,10 @@ _fmt_age() {
 #   • PR match pending · retrying        — the HERD's move; open-PR roster fetch failed this tick
 #                                          (HERD-224). Neutral/degraded — never the definitive
 #                                          "awaiting task" claim from a lookup FAILURE.
+#   • runtime live · activity unknown     — the HERD's move; the driver positively sees the runtime
+#                                          process while its roster row is transiently absent
+#                                          (HERD-780). Neutral — process existence distinguishes
+#                                          live from dead, but cannot distinguish working from spare.
 #   • retiring… · <leftovers> · <age>    — the HERD's move; a merged/closed slug whose teardown is
 #                                          converging this tick (see retirement.sh). Calm — it clears
 #                                          itself, usually within one tick.
@@ -1889,6 +1893,16 @@ _row_awaiting_task() {
   _age="$(_fmt_age "$(( $(_now_epoch) - _born ))")"
   printf '    %s💤%s %s%s%s %sawaiting task · assign or retire · %s%s' \
     "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_age" "$C_RESET"
+}
+
+# _row_live_roster_unknown <slug-cell> — neutral row for a positively-live runtime whose roster row
+# is absent this tick. The process-signature probe proves only that the builder session exists; it
+# cannot tell whether the agent is actively working or waiting. Never route this ambiguity to the
+# definitive awaiting-task/retire surface. The next roster-bearing tick resumes normal classification.
+_row_live_roster_unknown() {
+  local _sl="$1"
+  printf '    %s⏳%s %s%s%s %sruntime live · activity unknown · roster syncing%s' \
+    "$C_CYAN" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_CYAN" "$C_RESET"
 }
 
 # _row_wedged <slug-cell> <age> [woken] — the console row for a WEDGED builder (HERD-278): an agent
@@ -14663,10 +14677,11 @@ _classify_builder() {
 # respawn-loop edge cases are a noted follow-up); it paints a distinct 💀 row + fires one notification.
 #
 # FALSE-POSITIVE GUARDS: a present agent record (ANY status — the agent is still listed) is a
-# liveness signal, so a builder that finished and went 'done' is ALIVE, not dead; an open PR is a
-# liveness signal (a builder that legitimately opened its PR is ALIVE); a growing transcript vetoes
-# death; and the grace window + cross-tick persistence keep a just-spawned builder (agent not yet
-# registered) or a one-tick blip in `herdr agent list` from ever being falsely reaped.
+# liveness signal, so a builder that finished and went 'done' is ALIVE, not dead; positive process
+# liveness through the driver seam is authoritative even when the roster transiently omits the agent;
+# an open PR is a liveness signal (a builder that legitimately opened its PR is ALIVE); a growing
+# transcript vetoes death; and the grace window + cross-tick persistence keep a just-spawned builder
+# (agent not yet registered) or a one-tick blip in `herdr agent list` from ever being falsely reaped.
 
 # _dead_grace_secs — how long the DEAD signature must persist before a slug is surfaced as dead.
 # Configurable via DEAD_GRACE_MIN (minutes); non-numeric/unset falls back to 2 minutes — long enough
@@ -14850,13 +14865,16 @@ _maybe_release_claim() {
 }
 
 # _reconcile_dead_builder <slug> <worktree> <agent-status> — drive the ledger + notification for ONE
-# PR-less, non-working builder and echo the verdict (ALIVE | PENDING | DEAD | a retirement state token
-# — retiring | held | deferred | stuck). Called from the tick's no-PR/non-working branch: an EMPTY
-# agent-status means the slug has NO agent record at all (the dead signature); a non-empty status means
-# the agent is still listed (idle/done) and therefore alive. has_pr is 0 here by construction (the
-# caller only reaches this on a PR-less slug). Records the first-seen anchor on the first sighting,
-# clears it the instant any liveness signal returns, and fires exactly one 💀 notification (+ journal
-# event) when a slug crosses into DEAD.
+# PR-less, non-working builder and echo the verdict (ALIVE | ALIVE_UNKNOWN | PENDING | DEAD | a
+# retirement state token — retiring | held | deferred | stuck). Called from the tick's
+# no-PR/non-working branch: an EMPTY agent-status means the slug has NO agent record at all (normally
+# the dead signature); a non-empty
+# status means the agent is still listed (idle/done) and therefore alive. A positive driver-aware
+# liveness='alive' probe vetoes the dead signature even if that roster status is empty, returning
+# ALIVE_UNKNOWN so the renderer preserves the unknown working/spare distinction. has_pr is 0 here by
+# construction (the caller only reaches this on a PR-less slug). Records the first-seen anchor on the
+# first sighting, clears it the instant any liveness signal returns, and fires exactly one 💀 notification
+# (+ journal event) when a slug crosses into DEAD.
 #
 # HERD-646 leg 1 — ROW TRUTH: resolve the worktree's PR state BEFORE ever choosing a remedy. A slug
 # retirement.sh has already classified non-'active' (its PR resolved MERGED/CLOSED — retiring, held,
@@ -14875,23 +14893,29 @@ _reconcile_dead_builder() {
   fi
   _rd_now="$(_now)"
   _rd_grace="$(_dead_grace_secs)"
-  # A present agent record (any status) means the agent is still listed ⇒ normally alive. But a herdr
-  # crash can leave the agent LISTED with a stale status while its PROCESS is dead (HERD-114); a
-  # POSITIVE liveness='dead' probe (pane exists but runs no claude) overrides the listing and counts as
-  # NO live agent, so a listed-but-unwakeable builder crosses into DEAD just like a vanished one. Only
-  # a positive 'dead' overrides; 'unknown'/'alive'/empty preserve the prior listing-based signal.
-  if [ "$_rd_liveness" = "dead" ]; then
-    _rd_has_agent=0
-  else
-    [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0
-  fi
+  # Roster presence is the fallback signal. Positive process evidence from the driver-aware labelled-
+  # pane/signature seam is authoritative in BOTH directions: 'dead' overrides a stale listing
+  # (HERD-114), while 'alive' overrides a transiently missing roster row (HERD-780). missing, unknown,
+  # and empty preserve the prior roster-based behavior; in particular an arbitrary process merely
+  # holding the worktree never reaches this seam as 'alive'.
+  case "$_rd_liveness" in
+    alive) _rd_has_agent=1 ;;
+    dead)  _rd_has_agent=0 ;;
+    *)     [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0 ;;
+  esac
   # Transcript growth is a one-way liveness veto (mirrors the stall ladder); a dead agent's
   # transcript is flat. Reuses the shared cache; "yes" only ever rescues, never fabricates a death.
   _rd_tgrow="$(_transcript_growing "$_rd_slug" "$(_transcript_obs "$_rd_wt")" "$_rd_now" "$_rd_grace")"
   _rd_first="$(dead_first_seen "$_rd_slug")"
   _rd_verdict="$(_classify_dead_builder "$_rd_has_agent" 0 "$_rd_tgrow" "${_rd_first:-}" "$_rd_now" "$_rd_grace")"
+  # Preserve the only ambiguity the boolean classifier cannot carry: the runtime process is
+  # positively alive, but the roster omitted the status that distinguishes working from spare.
+  # This remains an ALIVE-class verdict for ledger cleanup, with a distinct token for row truth.
+  if [ "$_rd_verdict" = "ALIVE" ] && [ "$_rd_liveness" = "alive" ] && [ -z "$_rd_astatus" ]; then
+    _rd_verdict="ALIVE_UNKNOWN"
+  fi
   case "$_rd_verdict" in
-    ALIVE)
+    ALIVE|ALIVE_UNKNOWN)
       [ -n "$_rd_first" ] && clear_dead "$_rd_slug" ;;
     PENDING)
       [ -n "$_rd_first" ] || record_dead_seen "$_rd_slug" "$_rd_now" ;;
@@ -19442,6 +19466,13 @@ EOF
                 DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}"
               fi
               FLAIR_STATE[i]="dead" ;;
+            ALIVE_UNKNOWN)
+              # HERD-780: the labelled-pane/process-signature seam positively sees the runtime, but
+              # the roster row that says working vs idle/done is absent. Process existence vetoes
+              # death; it does NOT prove the builder is a spare. Keep a neutral herd-owned row until
+              # the roster resynchronizes, never inviting an unsafe re-task or retirement.
+              DISPLAY[i]="$(_row_live_roster_unknown "$sl")"
+              FLAIR_STATE[i]="busy" ;;
             *)
               # ALIVE (or still PENDING death): the agent is listed. HERD-392: check the finish-line
               # watchdog FIRST — ship-dormant (OFF unless FINISH_STALL_MIN is set), so with it unset
