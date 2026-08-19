@@ -14663,10 +14663,11 @@ _classify_builder() {
 # respawn-loop edge cases are a noted follow-up); it paints a distinct 💀 row + fires one notification.
 #
 # FALSE-POSITIVE GUARDS: a present agent record (ANY status — the agent is still listed) is a
-# liveness signal, so a builder that finished and went 'done' is ALIVE, not dead; an open PR is a
-# liveness signal (a builder that legitimately opened its PR is ALIVE); a growing transcript vetoes
-# death; and the grace window + cross-tick persistence keep a just-spawned builder (agent not yet
-# registered) or a one-tick blip in `herdr agent list` from ever being falsely reaped.
+# liveness signal, so a builder that finished and went 'done' is ALIVE, not dead; positive process
+# liveness through the driver seam is authoritative even when the roster transiently omits the agent;
+# an open PR is a liveness signal (a builder that legitimately opened its PR is ALIVE); a growing
+# transcript vetoes death; and the grace window + cross-tick persistence keep a just-spawned builder
+# (agent not yet registered) or a one-tick blip in `herdr agent list` from ever being falsely reaped.
 
 # _dead_grace_secs — how long the DEAD signature must persist before a slug is surfaced as dead.
 # Configurable via DEAD_GRACE_MIN (minutes); non-numeric/unset falls back to 2 minutes — long enough
@@ -14852,11 +14853,12 @@ _maybe_release_claim() {
 # _reconcile_dead_builder <slug> <worktree> <agent-status> — drive the ledger + notification for ONE
 # PR-less, non-working builder and echo the verdict (ALIVE | PENDING | DEAD | a retirement state token
 # — retiring | held | deferred | stuck). Called from the tick's no-PR/non-working branch: an EMPTY
-# agent-status means the slug has NO agent record at all (the dead signature); a non-empty status means
-# the agent is still listed (idle/done) and therefore alive. has_pr is 0 here by construction (the
-# caller only reaches this on a PR-less slug). Records the first-seen anchor on the first sighting,
-# clears it the instant any liveness signal returns, and fires exactly one 💀 notification (+ journal
-# event) when a slug crosses into DEAD.
+# agent-status means the slug has NO agent record at all (normally the dead signature); a non-empty
+# status means the agent is still listed (idle/done) and therefore alive. A positive driver-aware
+# liveness='alive' probe vetoes the dead signature even if that roster status is empty. has_pr is 0
+# here by construction (the caller only reaches this on a PR-less slug). Records the first-seen anchor
+# on the first sighting, clears it the instant any liveness signal returns, and fires exactly one 💀
+# notification (+ journal event) when a slug crosses into DEAD.
 #
 # HERD-646 leg 1 — ROW TRUTH: resolve the worktree's PR state BEFORE ever choosing a remedy. A slug
 # retirement.sh has already classified non-'active' (its PR resolved MERGED/CLOSED — retiring, held,
@@ -14875,16 +14877,16 @@ _reconcile_dead_builder() {
   fi
   _rd_now="$(_now)"
   _rd_grace="$(_dead_grace_secs)"
-  # A present agent record (any status) means the agent is still listed ⇒ normally alive. But a herdr
-  # crash can leave the agent LISTED with a stale status while its PROCESS is dead (HERD-114); a
-  # POSITIVE liveness='dead' probe (pane exists but runs no claude) overrides the listing and counts as
-  # NO live agent, so a listed-but-unwakeable builder crosses into DEAD just like a vanished one. Only
-  # a positive 'dead' overrides; 'unknown'/'alive'/empty preserve the prior listing-based signal.
-  if [ "$_rd_liveness" = "dead" ]; then
-    _rd_has_agent=0
-  else
-    [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0
-  fi
+  # Roster presence is the fallback signal. Positive process evidence from the driver-aware labelled-
+  # pane/signature seam is authoritative in BOTH directions: 'dead' overrides a stale listing
+  # (HERD-114), while 'alive' overrides a transiently missing roster row (HERD-780). missing, unknown,
+  # and empty preserve the prior roster-based behavior; in particular an arbitrary process merely
+  # holding the worktree never reaches this seam as 'alive'.
+  case "$_rd_liveness" in
+    alive) _rd_has_agent=1 ;;
+    dead)  _rd_has_agent=0 ;;
+    *)     [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0 ;;
+  esac
   # Transcript growth is a one-way liveness veto (mirrors the stall ladder); a dead agent's
   # transcript is flat. Reuses the shared cache; "yes" only ever rescues, never fabricates a death.
   _rd_tgrow="$(_transcript_growing "$_rd_slug" "$(_transcript_obs "$_rd_wt")" "$_rd_now" "$_rd_grace")"
