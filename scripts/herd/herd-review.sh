@@ -357,9 +357,15 @@ for line in sys.stdin:
     if not line: continue
     try: obj = json.loads(line)
     except Exception: print(line, flush=True); continue
+    # Codex may emit JSON scalar frames (for example a JSON string) on its
+    # interactive/exec stream.  Those are display data, not protocol objects;
+    # preserve them and keep consuming the stream instead of aborting on .get.
+    if not isinstance(obj, dict): print(line, flush=True); continue
     t = obj.get("type", "")
     if t == "assistant":
-        for b in obj.get("message", {}).get("content", []):
+        message = obj.get("message") or {}
+        for b in (message.get("content") or []) if isinstance(message, dict) else []:
+            if not isinstance(b, dict): continue
             if b.get("type") == "text":
                 txt = b.get("text", "").strip()
                 if txt: print("  " + txt.split("\n")[0][:100], flush=True)
@@ -841,7 +847,10 @@ name = os.environ["NAME"]
 try:
     agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
     for a in agents:
-        if a.get("name") == name:
+        # Foreign runtimes register through the report-agent surface, whose roster
+        # identity is `agent` rather than `name`.  This is the same identity contract as
+        # the shared driver pane/liveness resolver.
+        if (a.get("name") or a.get("agent")) == name:
             print(a.get("pane_id", ""), end="")
             break
 except Exception:

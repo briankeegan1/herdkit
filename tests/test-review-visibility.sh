@@ -160,9 +160,12 @@ for line in sys.stdin:
     if not line: continue
     try: obj = json.loads(line)
     except Exception: print(line, flush=True); continue
+    if not isinstance(obj, dict): print(line, flush=True); continue
     t = obj.get("type", "")
     if t == "assistant":
-        for b in obj.get("message", {}).get("content", []):
+        message = obj.get("message") or {}
+        for b in (message.get("content") or []) if isinstance(message, dict) else []:
+            if not isinstance(b, dict): continue
             if b.get("type") == "text":
                 txt = b.get("text", "").strip()
                 if txt: print("  " + txt.split("\n")[0][:100], flush=True)
@@ -192,6 +195,11 @@ out2="$(printf 'plain text line\n{"type":"result","result":"REVIEW: BLOCK — re
 grep -q "plain text line" <<< "$out2" || fail "formatter: non-JSON should pass through"
 ok
 grep -q "REVIEW: BLOCK" <<< "$out2" || fail "formatter: result with BLOCK should be printed"
+ok
+
+# Codex may emit JSON scalar frames; they are valid JSON but not protocol objects.
+out3="$(printf '"codex progress frame"\n' | python3 -uc "$FORMATTER")"
+grep -q "codex progress frame" <<< "$out3" || fail "formatter: JSON scalar must pass through without crashing"
 ok
 
 # ── herd-review.sh: log RETENTION (rolling window) ───────────────────────────

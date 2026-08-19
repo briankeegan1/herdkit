@@ -560,7 +560,11 @@ except Exception: prs = []
 try: agents = (json.loads(os.environ.get("AGENTS_JSON") or "{}").get("result") or {}).get("agents") or []
 except Exception: agents = []
 pr_by_branch = {p.get("headRefName"): p for p in prs}
-ag_status = {a.get("name"): a.get("agent_status") for a in agents if a.get("name")}
+# Native Claude registrations use `name`, while report-agent registrations for
+# foreign runtimes (notably Codex) use `agent`.  Treat the two as one roster identity;
+# a live foreign builder must never look absent merely because its registration shape differs.
+ag_status = {(a.get("name") or a.get("agent")): a.get("agent_status")
+             for a in agents if (a.get("name") or a.get("agent"))}
 # Parse porcelain into (wt, branch, is_first). The FIRST worktree entry is ALWAYS the main checkout;
 # exclude it both by position and by realpath match to MAIN (symlink-safe, e.g. /var → /private/var),
 # so the main checkout is never misclassified as a DEAD builder (a false-red we must avoid).

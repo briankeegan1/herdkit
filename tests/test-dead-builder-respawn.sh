@@ -248,8 +248,25 @@ v="$(HERDR_AGENT_START_FAIL=1 DEAD_BUILDER_AUTORESPAWN=on HERD_NOW_EPOCH="$NOW" 
 grep -q "agent start taken-slug" "$HERDR_AGENT_LOG"    || fail "(6) the respawn must have ATTEMPTED an agent start"
 grep -q "tab-fake" "$HERDR_TAB_CLOSE_LOG"              || fail "(6) a failed agent start MUST close the just-created tab (no corpse tab)"
 grep -q "builder_respawn_tab_reaped" "$JOURNAL_FILE"  || fail "(6) the corpse-tab cleanup must be journaled"
+grep -q '^taken-slug tab-fake builder$' "$TREES/.herd-tabs" \
+  && fail "(6) a failed respawn must remove its own allowlist row with the closed tab"
 respawn_recorded taken-slug                            && fail "(6) a failed respawn must NOT spend the at-most-once budget"
 grep -q "auto-respawn failed: taken-slug" "$HERDR_NOTIFY_LOG" || fail "(6) a failed respawn should still escalate"
+ok
+
+# Repeated failed launches must not accumulate builder rows; a later success owns exactly one.
+reset
+mkrepo "$T/wt-repeat" clean; printf 'spec\n' > "$TREES/repeat-slug.task.md"
+HERDR_AGENT_START_FAIL=1 _respawn_builder_in_worktree repeat-slug "$T/wt-repeat" >/dev/null 2>&1 \
+  && fail "(6b) first forced launch failure unexpectedly succeeded"
+HERDR_AGENT_START_FAIL=1 _respawn_builder_in_worktree repeat-slug "$T/wt-repeat" >/dev/null 2>&1 \
+  && fail "(6b) second forced launch failure unexpectedly succeeded"
+grep -q '^repeat-slug ' "$TREES/.herd-tabs" \
+  && fail "(6b) repeated failed launches leaked allowlist rows"
+_respawn_builder_in_worktree repeat-slug "$T/wt-repeat" >/dev/null \
+  || fail "(6b) launch after failures should succeed"
+[ "$(awk '$1=="repeat-slug" && $3=="builder" {n++} END {print n+0}' "$TREES/.herd-tabs")" = "1" ] \
+  || fail "(6b) successful retry must leave exactly one canonical builder row"
 ok
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
