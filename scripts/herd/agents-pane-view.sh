@@ -117,15 +117,19 @@ _verdict_glyph() {
 # absent/empty → rendered "general" by the caller). Empty when nothing is in flight or the registry
 # is absent (a brand-new control room with no builders yet).
 _in_flight_builders() {
-  local tabs="$WORKTREES_DIR/.herd-tabs" slug rest agent
+  local tabs="$WORKTREES_DIR/.herd-tabs" slug rest agent rows=""
   [ -f "$tabs" ] || return 0
   while read -r slug rest; do
     [ -n "$slug" ] || continue
     case "$rest" in *builder*) : ;; *) continue ;; esac
     agent=""
     [ -f "$WORKTREES_DIR/.herd-agent-$slug" ] && agent="$(cat "$WORKTREES_DIR/.herd-agent-$slug" 2>/dev/null || true)"
-    printf '%s\t%s\n' "$slug" "$agent"
+    rows="${rows}${slug}"$'\t'"${agent}"$'\n'
   done < "$tabs"
+  # The registry is best-effort and may contain stale historical rows after an interrupted
+  # respawn.  One canonical builder identity gets one visual row; retain the first observed row
+  # so normal, byte-identical registries are unchanged.
+  printf '%s' "$rows" | awk -F '\t' 'NF && !seen[$1]++'
 }
 
 # _state_hash — a cheap fingerprint of everything render_frame reads, so the frame-latch below only
