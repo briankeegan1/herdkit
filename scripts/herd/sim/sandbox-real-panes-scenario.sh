@@ -1267,7 +1267,9 @@ print(pi.get("foreground_process_group_id") or "")
   if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ]; then
     step bannerdriver "Codex banner runtime matches the real pane foreground runtime"
     CB_BIN="$ART/bannerbin"; mkdir -p "$CB_BIN"
-    printf '#!/usr/bin/env bash\nsleep 3600\n' > "$CB_BIN/codex"; chmod +x "$CB_BIN/codex"
+    # `exec -a` keeps the process argv runtime-named instead of letting bash optimize the final
+    # `sleep` and turn the observed foreground into `sleep 3600` on some hosts.
+    printf '#!/usr/bin/env bash\nexec -a codex sleep 3600\n' > "$CB_BIN/codex"; chmod +x "$CB_BIN/codex"
     CB_DESC="$(herd_driver_agent_argv_description codex gpt-5.6-sol --dangerously-bypass-approvals-and-sandbox)"
     CB_RUNTIME="${CB_DESC%% *}"
     CB_SPLIT="$(herdr pane split "$BUILD_PANE" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"

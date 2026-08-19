@@ -165,18 +165,17 @@ Repeat this loop:
      request into exactly ONE of these, then run the matching verb — NEVER file a new issue for a
      request that is not actually a new backlog item (that mis-file is the junk-issue bug):
        – ADD / create / file a NEW backlog item →
-           The backend takes the FIRST LINE of the text as the tracker title and keeps the WHOLE
-           text as the description. So make sure the text STARTS WITH A SHORT ONE-LINE TITLE
-           (< 80 chars). If the request is a run-on paragraph with no title line, SYNTHESIZE one:
-           write a concise title as the first line, then the full request as the body beneath it —
-           never pass a whole paragraph as the first line (that files a giant title duplicated in
-           the description).
+           The backend derives a SHORT tracker title from the request first line and keeps the
+           WHOLE request as the description. The claimed queue file is the multiline transport; do
+           not copy the request into argv and do not replace newlines with backslash-n text.
            If the request carries NO verification plan (how the change will be proven — a named
            sandbox sim scenario for a gate/merge/concurrency/limit-park/pane seam, or the test
            surface otherwise), file it AS-IS — never block or synthesize one — but append a
            "⚠️ no verification plan" marker line to the body so the flag rides into the item AND
-           its scribe report line, and the coordinator sees which items shipped unplanned. Then run:
-           bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
+           its scribe report line, and the coordinator sees which items shipped unplanned. Pass
+           --no-verification-plan after the claim path to have the transport append that marker.
+           When the request already has a verification plan, omit the flag. Then run:
+           bash $HERE/scribe-step.sh add-item "<claimed_path>"
        – Mark an EXISTING item done / in-progress / canceled — INCLUDING the watcher
          "Reconcile: PR #N merged — find the backlog item…" and any reap/close request →
            bash $HERE/scribe-step.sh update-state "<claimed_path>" "<ref>" "<state>"

@@ -223,8 +223,10 @@ print(" ".join(x for x in (str(code), str(msg)) if x).replace("\n", " ").strip()
 _backend_add_item() {
     # $1 = claimed queue file path (REQ_ID, unused here); $2 = item text / summary.
     # Title = a SHORT summary derived from the request (HERD-77 — never the whole first line as an
-    # essay); description = the FULL text. Sets _BACKEND_RESULT=DONE on a created issue (and surfaces
-    # its URL), NOCHANGE if Linear declines or no team is available.
+    # essay); description = the FULL text. The caller may have loaded that text from its claimed-file
+    # transport, so this seam must preserve real newlines and must never reinterpret the two literal
+    # characters `\n`. Sets _BACKEND_RESULT=DONE on a created issue (and surfaces its URL), NOCHANGE
+    # if Linear declines or no team is available.
     # HERD-267: on NOCHANGE it ALSO sets _BACKEND_ERROR to the reason Linear gave, so the caller's
     # durable retry queue can tell a permanent wall (issue cap, bad key) from a retryable hiccup.
     local text="$2" title team mut vars resp parsed ok ident url
