@@ -12503,14 +12503,39 @@ _pane_progress_mark() {
 
 _wait_agent_working() {
   local _waw_slug="$1" _waw_window="$2" _waw_pane="${3:-}" _waw_before="${4:-}" _waw_status_before="${5:-}" _waw_deadline _waw_int=1
+  local _waw_saw_sl_nonworking=0   # tracks structured lifecycle cycle across _waw_progressed calls (HERD-789)
   _waw_progressed() {
     # With a delivery baseline, require evidence produced after the send. A real
     # done/idle→working transition is a driver-neutral consumption signal even when
     # a terminal read is static (as in a mux that exposes no repaint); unchanged
-    # working→working still needs a visible-pane delta, so stale Codex status never
-    # fabricates delivery. Without a baseline retain the historical non-bounce path.
+    # working→working requires either a structured lifecycle cycle (Codex stop-hook /
+    # durable session) or the cksum-delta fallback for unstructured drivers — the delta
+    # path is byte-identical for non-Codex/default-off. Without a baseline retain the
+    # historical non-bounce path.
     [ -n "$_waw_before" ] || return 0
     [ "$_waw_status_before" != "working" ] && return 0
+    # working→working: when a structured lifecycle source is available (Codex stop-hook
+    # or durable session), require proof that the structured lifecycle cycled through a
+    # non-working state before accepting "working" as delivery evidence.  The structured
+    # state is read directly here — independently of the raw herdr status word — because
+    # herd_driver_agent_status_resolved only overrides "idle" raw words, so a Codex
+    # pane's structured "idle" (hook: last-turn present) is invisible to the outer loop's
+    # _agent_status call when herdr keeps reporting "working".  _waw_saw_sl_nonworking
+    # persists across calls (parent-scope variable, no subshell) so the cycle is tracked
+    # across the full poll window.  A cksum delta that could be spinner/repaint motion is
+    # never accepted when a structured source is live.  When no structured source is
+    # present fall through to the cksum-delta path, preserving the pre-HERD-789 behavior
+    # byte-identically for non-Codex/default-off drivers.
+    local _waw_sl=""
+    _waw_sl="$(_herd_codex_hook_lifecycle "$_waw_slug" 2>/dev/null || true)"
+    [ -z "$_waw_sl" ] && _waw_sl="$(_herd_codex_durable_lifecycle "$_waw_slug" 2>/dev/null || true)"
+    if [ -n "$_waw_sl" ]; then
+      # Structured source live: accumulate non-working observations, then accept working.
+      [ "$_waw_sl" != "working" ] && _waw_saw_sl_nonworking=1
+      [ "$_waw_saw_sl_nonworking" = "1" ] && [ "$_waw_sl" = "working" ] && return 0
+      return 1
+    fi
+    # No structured source: cksum delta (non-Codex / default-off — byte-identical).
     local _waw_now; _waw_now="$(_pane_progress_mark "$_waw_pane")"
     [ -n "$_waw_now" ] && [ "$_waw_now" != "$_waw_before" ]
   }
