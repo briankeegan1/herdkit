@@ -21,7 +21,8 @@
 #       a LIVE agent falls straight through to the normal refix (a pane run IS attempted).
 #   (D) _reconcile_dead_builder — positive driver-aware liveness is authoritative in both directions:
 #       a listed-but-dead agent crosses into DEAD, while a live Codex/Claude process vetoes death even
-#       when the roster is empty, clears stale dead state, and never notifies or autorespawns.
+#       when the roster is empty, clears stale dead state, never notifies/autorespawns, and returns the
+#       explicit ALIVE_UNKNOWN verdict the watcher uses for its neutral roster-syncing row.
 #   (E) layout_stale_agent_tabs — flags a single-pane drainer/reviewer tab left BARE by a crash; never
 #       a live (claude) agent tab, a multi-pane control room, or a non-engine label.
 #
@@ -376,7 +377,7 @@ live="$(_agent_liveness codex-live)"
 [ "$live" = "alive" ] || fail "D4: delisted labelled Codex pane must provide positive alive evidence (got $live)"
 v="$(DEAD_BUILDER_AUTORESPAWN=on HERD_NOW_EPOCH="$((NOW+GRACE+1))" \
       _reconcile_dead_builder codex-live "$T/wt-codex" "" "$live")"
-[ "$v" = "ALIVE" ] || fail "D4: positive Codex liveness must veto DEAD beyond grace (got $v)"
+[ "$v" = "ALIVE_UNKNOWN" ] || fail "D4: positive Codex liveness must preserve unknown roster status beyond grace (got $v)"
 [ -z "$(dead_first_seen codex-live)" ] || fail "D4: positive alive must clear a stale pending record"
 [ ! -s "$NOTIFY_CALLS" ] || fail "D4: positive alive must suppress the skull notification"
 [ ! -s "$RESPAWN_CALLS" ] || fail "D4: positive alive must prevent autorespawn"
@@ -392,7 +393,7 @@ for at in "$NOW" "$((NOW+GRACE+10))"; do
   live="$(_agent_liveness claude-live)"
   v="$(DEAD_BUILDER_AUTORESPAWN=on HERD_NOW_EPOCH="$at" \
         _reconcile_dead_builder claude-live "$T/wt-claude" "" "$live")"
-  [ "$v" = "ALIVE" ] || fail "D5: positive Claude liveness must remain ALIVE at $at (got $v)"
+  [ "$v" = "ALIVE_UNKNOWN" ] || fail "D5: positive Claude liveness must remain ALIVE_UNKNOWN at $at (got $v)"
 done
 [ -z "$(dead_first_seen claude-live)" ] || fail "D5: positive alive must clear a stale notified record"
 [ ! -s "$NOTIFY_CALLS" ] || fail "D5: positive alive must not notify"

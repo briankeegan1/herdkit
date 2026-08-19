@@ -11,6 +11,8 @@
 #   (D) CLOSED-VOCABULARY GUARD — no operator-facing DISPLAY[…] assignment in agent-watch.sh contains
 #       the banned 'idle' word; the internal FLAIR_STATE enum (glyph feed, never operator text) is
 #       exempt so the pasture frame stays byte-identical.
+#   (E) a positively-live runtime with an absent roster status renders a neutral roster-syncing row,
+#       never the definitive awaiting-task/retire spare row or a claim that it is working.
 #
 # Sources agent-watch.sh in lib mode (AGENT_WATCH_LIB=1 → helpers only, no loop). NETWORK-FREE.
 # Run:  bash tests/test-console-vocabulary.sh
@@ -74,6 +76,21 @@ ok
 leaked="$(grep -nE 'DISPLAY\[[^]]*\][+]?=' "$WATCH" | grep -iw 'idle' || true)"
 [ -z "$leaked" ] || fail "(D) operator-facing DISPLAY row leaked the banned 'idle' word:
 $leaked"
+ok
+
+# ── (E) live runtime + absent roster status stays neutral, never a spare or a working claim ──────
+out_unknown="$(_row_live_roster_unknown "codex-live")"
+grep -q 'runtime live · activity unknown · roster syncing' <<< "$out_unknown" \
+  || fail "(E) live/roster-unknown row lost its neutral status, got: $out_unknown"
+grep -q 'codex-live' <<< "$out_unknown" \
+  || fail "(E) live/roster-unknown row dropped the slug, got: $out_unknown"
+grep -qE 'awaiting task|assign or retire|working|needs.you|💀|⚠️' <<< "$out_unknown" \
+  && fail "(E) live/roster-unknown row made an unsupported action/state claim, got: $out_unknown"
+tick_body="$(declare -f _tick_render_reconcile)"
+grep -q 'ALIVE_UNKNOWN)' <<< "$tick_body" \
+  || fail "(E) tick renderer does not handle the ALIVE_UNKNOWN reconcile verdict"
+grep -q 'DISPLAY\[i\].*_row_live_roster_unknown' <<< "$tick_body" \
+  || fail "(E) ALIVE_UNKNOWN is not wired to the neutral rendered row"
 ok
 
 echo "ALL PASS ($pass checks)"
