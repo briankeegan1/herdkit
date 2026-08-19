@@ -141,7 +141,8 @@ ok "D3 the shared derived-files list carries the Codex render"
   || fail "D4: a renamed coordinator command must not move the Codex render off the derived list"
 ok "D4 the Codex render path is fixed, independent of COORDINATOR_CMD"
 
-# ── E. hard constraint: the Claude render stays byte-identical to before this change ────────────────
+# ── E. hard constraint: outside the explicit HERD-773 runtime-neutral prose, the default render is
+# byte-identical to before this change ──────────────────────────────────────────────────────────────
 BASE_REF="$(git -C "$ROOT" merge-base HEAD origin/main 2>/dev/null || true)"
 if [ -z "$BASE_REF" ] || ! git -C "$ROOT" cat-file -e "$BASE_REF:bin/herd" 2>/dev/null; then
   ok "E1 SKIPPED — no resolvable pre-change baseline in this checkout (origin/main unreachable)"
@@ -183,12 +184,35 @@ else
   # $OLD (a throwaway copy so its own SCRIPTS_DIR/TEMPLATES_DIR substitute to a temp path), while the
   # current bin/herd's HERDKIT_HOME is $ROOT — an absolute-install-path difference that exists
   # because the baseline copy lives elsewhere on disk, not because of anything this change did. Every
-  # OTHER byte must match exactly.
+  # OTHER byte must match exactly. HERD-773 deliberately makes the shared coordinator prose
+  # runtime-neutral; normalize those exact old phrases in the baseline before comparison so this
+  # remains a byte-for-byte rail for every unrelated rendered byte.
   sed "s#$OLD#<HERDKIT_HOME>#g" "$T/before.md" > "$T/before.norm.md"
   sed "s#$ROOT#<HERDKIT_HOME>#g" "$E/$COORD_REL" > "$T/after.norm.md"
+  python3 - "$T/before.norm.md" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+repls = {
+  "## Driver commands (herdr + Claude Code)": "## Driver commands (active multiplexer + agent runtime)",
+  "tabs / panes / agents) and the **agent runtime** (Claude Code, controlled by `/`-commands sent into": "tabs / panes / agents) and the **agent runtime** (controlled by runtime commands sent into",
+  "The incantations below are the **only** places this skill is bound to the herdr + Claude Code": "The incantations below are the **only** places this skill is bound to the active control",
+  "where text vanishes and the agent never wakes. **If you (the coordinator) run under Claude Code's": "where text vanishes and the agent never wakes. **If your runtime's",
+  'what it is. Pre-approve it — see "send-text under Claude Code\'s own permission classifier" in': 'what it is. Pre-approve it — see "send-text under the runtime\'s own permission classifier" in',
+  "`docs/driver-abstraction.md` for the exact `.claude/settings.json` allow rule (GH #564).": "`docs/driver-abstraction.md` for the runtime-specific permission rule (GH #564).",
+  "- **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the Claude Code\n  runtime's model mid-session": "- **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the agent runtime\n  model mid-session",
+  "(no Claude quota)": "(no runtime quota)",
+  '<!-- DRIVER:switch-model + DRIVER:send-text + DRIVER:list-agents — see "Driver commands (herdr + Claude Code)" -->': '<!-- DRIVER:switch-model + DRIVER:send-text + DRIVER:list-agents — see "Driver commands" -->',
+  "judgment-heavy work than the lane was spawned for — step its model up in the same breath. Claude\nCode switches model": "judgment-heavy work than the lane was spawned for — step its model up in the same breath. The agent\nruntime switches model",
+  "a mid-review Claude death": "a mid-review runtime death",
+}
+for old, new in repls.items():
+    s = s.replace(old, new)
+p.write_text(s)
+PY
   cmp -s "$T/before.norm.md" "$T/after.norm.md" \
     || fail "E1: the Claude render changed vs. before this change — diff: $(diff "$T/before.norm.md" "$T/after.norm.md" | head -10)"  # pipe-ok: diff|head feeds a bounded failure message inside a command substitution; pipeline status is not gated
-  ok "E1 the Claude coordinator render is byte-identical to before this change (module install path aside)"
+  ok "E1 the default coordinator render is byte-identical outside the explicit runtime-neutral prose"
 fi
 
 # ── F. HERD-758 capability tokens: abstract in the template, resolved per render target ────────────

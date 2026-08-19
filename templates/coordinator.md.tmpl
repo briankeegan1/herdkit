@@ -49,14 +49,14 @@ in parallel.
 
 After completing any action, return to this menu until the user chooses to stop.
 
-## Driver commands (herdr + Claude Code)
+## Driver commands (active multiplexer + agent runtime)
 
 This skill drives two **runtime-specific** surfaces: the **multiplexer** (`herdr`, which owns
-tabs / panes / agents) and the **agent runtime** (Claude Code, controlled by `/`-commands sent into
+tabs / panes / agents) and the **agent runtime** (controlled by runtime commands sent into
 a pane). Everything else the coordinator runs — `herd …`, `gh …`, the lane scripts under
 `{{SCRIPTS_DIR}}` — is runtime-independent and stays the same regardless of driver.
 
-The incantations below are the **only** places this skill is bound to the herdr + Claude Code
+The incantations below are the **only** places this skill is bound to the active control
 driver. They are the single source for that surface: every driver use elsewhere in this skill
 carries a matching `DRIVER:<capability>` marker, so the whole surface is greppable in one pass
 (`grep DRIVER:`). Each incantation is **rendered from the active driver definition** — the
@@ -76,13 +76,13 @@ Capabilities this skill uses directly:
   builder's **agent** pane and **submit** it (type the text, then an explicit Enter keystroke —
   HERD-186: `pane run` alone can leave text sitting in the agent prompt buffer). Always target the
   agent pane — the `herdr agent list` entry whose name == slug — never the tab's root shell pane,
-  where text vanishes and the agent never wakes. **If you (the coordinator) run under Claude Code's
+  where text vanishes and the agent never wakes. **If your runtime's
   default auto permission mode and this is refused `Blocked by classifier`**: that mode's permission
   classifier reads `herdr pane run` as "execute arbitrary text in a shell I don't control," which is
-  what it is. Pre-approve it — see "send-text under Claude Code's own permission classifier" in
-  `docs/driver-abstraction.md` for the exact `.claude/settings.json` allow rule (GH #564).
-- **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the Claude Code
-  runtime's model mid-session (the escalate / step-up flow).
+  what it is. Pre-approve it — see "send-text under the runtime's own permission classifier" in
+  `docs/driver-abstraction.md` for the runtime-specific permission rule (GH #564).
+- **`DRIVER:switch-model`** — send `/model <value>` via `DRIVER:send-text` — switch the agent runtime
+  model mid-session (the escalate / step-up flow).
 
 Adjacent driver capabilities the *workflow* uses but this skill does not invoke inline — the lane
 scripts spawn builders (**start-agent** / **create-tab**) and the watcher reads panes
@@ -233,7 +233,7 @@ candidate item's file surface **overlaps** work already underway, so you can *se
 items instead of spawning them into a merge conflict. This is the **coordinator-side third leg** of
 the graphify integration: `CONTEXT_PROVISION=codemap` grounds each *builder* in the committed
 `docs/codemap.md`, `MCP_PROVISION=graphify-mcp` gives a *builder* the graphify MCP tools, and this
-move gives *you* the pre-spawn overlap read. It runs entirely LLM-free (no Claude quota).
+move gives *you* the pre-spawn overlap read. It runs entirely LLM-free (no runtime quota).
 
 1. **Resolve the binary, fail soft.** graphify is machine-local (PyPI `graphifyy`, usually at
    `~/.local/bin/graphify`). Resolve it from `GRAPHIFY_BIN` in `.herd/config` — a **machine-scoped**
@@ -286,12 +286,12 @@ Never run more than the user wants in parallel — call out if 4+ agents are alr
 (review bandwidth, not spawn capacity, is the real limit).
 
 ### Step up a builder mid-flight
-<!-- DRIVER:switch-model + DRIVER:send-text + DRIVER:list-agents — see "Driver commands (herdr + Claude Code)" -->
+<!-- DRIVER:switch-model + DRIVER:send-text + DRIVER:list-agents — see "Driver commands" -->
 
 `MODEL_ESCALATE_GLOB` only sees the task text at spawn time — it can't know about scope you add
 later. So whenever you **expand a running builder's scope** — sending it addenda that pull in more
-judgment-heavy work than the lane was spawned for — step its model up in the same breath. Claude
-Code switches model mid-session and keeps the builder's context, so send a `/model` line for the
+judgment-heavy work than the lane was spawned for — step its model up in the same breath. The agent
+runtime switches model mid-session and keeps the builder's context, so send a `/model` line for the
 `MODEL_FEATURE` value from `.herd/config` into the builder's live agent pane BEFORE the new
 instructions:
 
@@ -484,7 +484,7 @@ herd log --pr <n>   # the raw event stream for that PR; add --tail to watch gate
 
 The journal (`{{PROJECT_ROOT}}`'s worktree pool → `.herd/journal.jsonl`) is the append-only record
 every engine component writes as it acts. It is authoritative for post-mortems: it captures the
-things that used to vanish — a mid-review Claude death (`infra_event`), a verdict's provenance
+things that used to vanish — a mid-review runtime death (`infra_event`), a verdict's provenance
 (`verdict_recorded` source=`reviewer|gate_default|infra`), each healthcheck attempt/retry before a red
 row, and an auto-refix bounce that silently failed to wake the builder (`refix_wake_result`
 escalated=true). Read `herd why <pr>` before deciding whether to re-task a builder, override a block,
