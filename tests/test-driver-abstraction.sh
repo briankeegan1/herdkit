@@ -92,11 +92,20 @@ grep -qF 'herdr pane run <builder-agent-pane> "/model <MODEL_FEATURE value>"' "$
 grep -qE '/scribe\.sh "Mark'    "$SK" || fail "scribe.sh enqueue incantation changed"
 grep -qE '/herd-quick\.sh <slug>' "$SK" || fail "herd-quick.sh spawn incantation changed"
 # 1e. the phase-1 driver surface is still greppable (markers + single-source section preserved).
-grep -q "## Driver commands (herdr + Claude Code)" "$SK" || fail "lost the Driver commands section"
+# HERD-773 deliberately made this heading/prose runtime-neutral. Require the new contract on BOTH
+# render targets and forbid the legacy vendor-coupled heading from silently returning.
+NEUTRAL_DRIVER_HEADING='## Driver commands (active multiplexer + agent runtime)'
+CODEX_SK="$P/.agents/skills/herd-coordinator/SKILL.md"
+for rendered in "$SK" "$CODEX_SK"; do
+  [ -f "$rendered" ] || fail "missing coordinator render target: $rendered"
+  grep -qF "$NEUTRAL_DRIVER_HEADING" "$rendered" || fail "lost the runtime-neutral Driver commands section: $rendered"
+  grep -qF '## Driver commands (herdr + Claude Code)' "$rendered" \
+    && fail "legacy vendor-coupled Driver commands heading survived: $rendered" || true
+done
 for cap in list-agents focus-agent send-text switch-model; do
   grep -q "DRIVER:$cap" "$SK" || fail "lost DRIVER:$cap marker"
 done
-ok; echo "PASS (1) default render: incantations verbatim, zero leftover tokens, surface intact"
+ok; echo "PASS (1) default + Codex renders: neutral heading, incantations verbatim, zero leftover tokens, surface intact"
 
 # ── 2. Setting HERD_DRIVER=herdr-claude explicitly is byte-identical to leaving it unset. ─────────
 Q="$T/explicit"; mkdir -p "$Q"; seed_repo "$Q" 'HERD_DRIVER="herdr-claude"'

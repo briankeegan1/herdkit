@@ -12502,11 +12502,15 @@ _pane_progress_mark() {
 }
 
 _wait_agent_working() {
-  local _waw_slug="$1" _waw_window="$2" _waw_pane="${3:-}" _waw_before="${4:-}" _waw_deadline _waw_int=1
+  local _waw_slug="$1" _waw_window="$2" _waw_pane="${3:-}" _waw_before="${4:-}" _waw_status_before="${5:-}" _waw_deadline _waw_int=1
   _waw_progressed() {
-    # With a delivery baseline, require evidence produced after the send.  Without
-    # one retain the historical status-only contract for non-bounce callers.
+    # With a delivery baseline, require evidence produced after the send. A real
+    # done/idle→working transition is a driver-neutral consumption signal even when
+    # a terminal read is static (as in a mux that exposes no repaint); unchanged
+    # working→working still needs a visible-pane delta, so stale Codex status never
+    # fabricates delivery. Without a baseline retain the historical non-bounce path.
     [ -n "$_waw_before" ] || return 0
+    [ "$_waw_status_before" != "working" ] && return 0
     local _waw_now; _waw_now="$(_pane_progress_mark "$_waw_pane")"
     [ -n "$_waw_now" ] && [ "$_waw_now" != "$_waw_before" ]
   }
@@ -12744,14 +12748,14 @@ Fix every finding above, run the healthcheck, and push. The review runs automati
         local _hbv_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
         # Submit via the driver send-text seam (pane run + send-keys Enter), then verify wake over a
         # backed-off window; if the first window expires, re-send once and verify again.
-        local _hbv_mark; _hbv_mark="$(_pane_progress_mark "$_hbv_pane_id")"
+        local _hbv_mark _hbv_status_mark; _hbv_mark="$(_pane_progress_mark "$_hbv_pane_id")"; _hbv_status_mark="$(_agent_status "$_hbv_slug")"
         herd_driver_send_text "$_hbv_pane_id" "$_hbv_prompt"
-        if _wait_agent_working "$_hbv_slug" "$_hbv_wait" "$_hbv_pane_id" "$_hbv_mark"; then
+        if _wait_agent_working "$_hbv_slug" "$_hbv_wait" "$_hbv_pane_id" "$_hbv_mark" "$_hbv_status_mark"; then
           _hbv_woke=1
         else
-          _hbv_mark="$(_pane_progress_mark "$_hbv_pane_id")"
+          _hbv_mark="$(_pane_progress_mark "$_hbv_pane_id")"; _hbv_status_mark="$(_agent_status "$_hbv_slug")"
           herd_driver_send_text "$_hbv_pane_id" "$_hbv_prompt"
-          if _wait_agent_working "$_hbv_slug" "$_hbv_wait" "$_hbv_pane_id" "$_hbv_mark"; then
+          if _wait_agent_working "$_hbv_slug" "$_hbv_wait" "$_hbv_pane_id" "$_hbv_mark" "$_hbv_status_mark"; then
             _hbv_woke=1
           else
             DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · check pane${C_RESET}"
@@ -13234,14 +13238,14 @@ Fix the failure, re-run until clean, then push."
   local _cfb_t0; _cfb_t0="$(_now_epoch)"    # HERD-496: bounce→wake wall-clock starts at the FIRST send
   if [ -n "$_cfb_pane_id" ]; then
     local _cfb_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
-    local _cfb_mark; _cfb_mark="$(_pane_progress_mark "$_cfb_pane_id")"
+    local _cfb_mark _cfb_status_mark; _cfb_mark="$(_pane_progress_mark "$_cfb_pane_id")"; _cfb_status_mark="$(_agent_status "$_cfb_slug")"
     herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
-    if _wait_agent_working "$_cfb_slug" "$_cfb_wait" "$_cfb_pane_id" "$_cfb_mark"; then
+    if _wait_agent_working "$_cfb_slug" "$_cfb_wait" "$_cfb_pane_id" "$_cfb_mark" "$_cfb_status_mark"; then
       _cfb_woke=1
     else
-      _cfb_mark="$(_pane_progress_mark "$_cfb_pane_id")"
+      _cfb_mark="$(_pane_progress_mark "$_cfb_pane_id")"; _cfb_status_mark="$(_agent_status "$_cfb_slug")"
       herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
-      if _wait_agent_working "$_cfb_slug" "$_cfb_wait" "$_cfb_pane_id" "$_cfb_mark"; then
+      if _wait_agent_working "$_cfb_slug" "$_cfb_wait" "$_cfb_pane_id" "$_cfb_mark" "$_cfb_status_mark"; then
         _cfb_woke=1
       else
         DISPLAY[_cfb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_RED}needs you · CI fast-bounce failed · check pane${C_RESET}"
@@ -13520,14 +13524,14 @@ Why: ${_hsd_reason}"
     local _hsd_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
     # Submit via the driver send-text seam (DRIVER_SEND_TEXT: pane run + Enter for herdr) — same
     # wake path as the review refix (HERD-176 / HERD-186); never a raw herdr pane run alone.
-    local _hsd_mark; _hsd_mark="$(_pane_progress_mark "$_hsd_pane_id")"
+    local _hsd_mark _hsd_status_mark; _hsd_mark="$(_pane_progress_mark "$_hsd_pane_id")"; _hsd_status_mark="$(_agent_status "$_hsd_slug")"
     herd_driver_send_text "$_hsd_pane_id" "$_hsd_prompt"
-    if _wait_agent_working "$_hsd_slug" "$_hsd_wait" "$_hsd_pane_id" "$_hsd_mark"; then
+    if _wait_agent_working "$_hsd_slug" "$_hsd_wait" "$_hsd_pane_id" "$_hsd_mark" "$_hsd_status_mark"; then
       _hsd_woke=1
     else
-      _hsd_mark="$(_pane_progress_mark "$_hsd_pane_id")"
+      _hsd_mark="$(_pane_progress_mark "$_hsd_pane_id")"; _hsd_status_mark="$(_agent_status "$_hsd_slug")"
       herd_driver_send_text "$_hsd_pane_id" "$_hsd_prompt"
-      if _wait_agent_working "$_hsd_slug" "$_hsd_wait" "$_hsd_pane_id" "$_hsd_mark"; then
+      if _wait_agent_working "$_hsd_slug" "$_hsd_wait" "$_hsd_pane_id" "$_hsd_mark" "$_hsd_status_mark"; then
         _hsd_woke=1
       else
         _escalate_refix_stuck "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "the builder never woke (prompt delivered twice)"
@@ -13834,14 +13838,14 @@ Fix the failure, re-run until the healthcheck is green, then push."
     local _hhc_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
     # Submit via the driver send-text seam (DRIVER_SEND_TEXT) — same wake path as review/stale refix
     # (HERD-176 / HERD-186); never a raw herdr pane run alone.
-    local _hhc_mark; _hhc_mark="$(_pane_progress_mark "$_hhc_pane_id")"
+    local _hhc_mark _hhc_status_mark; _hhc_mark="$(_pane_progress_mark "$_hhc_pane_id")"; _hhc_status_mark="$(_agent_status "$_hhc_slug")"
     herd_driver_send_text "$_hhc_pane_id" "$_hhc_prompt"
-    if _wait_agent_working "$_hhc_slug" "$_hhc_wait" "$_hhc_pane_id" "$_hhc_mark"; then
+    if _wait_agent_working "$_hhc_slug" "$_hhc_wait" "$_hhc_pane_id" "$_hhc_mark" "$_hhc_status_mark"; then
       _hhc_woke=1
     else
-      _hhc_mark="$(_pane_progress_mark "$_hhc_pane_id")"
+      _hhc_mark="$(_pane_progress_mark "$_hhc_pane_id")"; _hhc_status_mark="$(_agent_status "$_hhc_slug")"
       herd_driver_send_text "$_hhc_pane_id" "$_hhc_prompt"
-      if _wait_agent_working "$_hhc_slug" "$_hhc_wait" "$_hhc_pane_id" "$_hhc_mark"; then
+      if _wait_agent_working "$_hhc_slug" "$_hhc_wait" "$_hhc_pane_id" "$_hhc_mark" "$_hhc_status_mark"; then
         _hhc_woke=1
       else
         DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · health autofix failed · check pane${C_RESET}"

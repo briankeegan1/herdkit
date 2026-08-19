@@ -25,3 +25,6 @@ claude-fable-5	judgment	premium long-form / creative reasoning; specialized judg
 claude-sonnet-5	balanced	strong balanced tier for feature build and pre-merge review	2026-07-08
 claude-sonnet-4-6	balanced	default feature / review / scribe / research tier; balanced cost/quality	2026-07-08
 claude-haiku-4-5	cheap	quick + resolver lanes; also the docs-tier reviewer (REVIEW_MODEL_DOCS)	2026-07-08
+gpt-5.6-sol	judgment	Codex coordinator, advisor, escalation, and repeated-failure review tier	2026-08-18
+gpt-5.6-terra	balanced	Codex feature, review, resolver, scribe, and research tier	2026-08-18
+gpt-5.6-luna	cheap	Codex quick lane and docs-tier reviewer	2026-08-18

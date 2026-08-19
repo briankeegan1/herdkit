@@ -870,3 +870,23 @@ than a red row); `stub` binds the select-flag shape so the hermetic test can dri
 probe against a fake runtime.
 
 Proof: `tests/test-agent-roster.sh`.
+
+---
+
+## Atomic runtime switching (HERD-773)
+
+`herd runtime switch <herdr-claude|codex> [--dry-run]` is the explicit operator surface for moving
+one seat between the two production agent runtimes. It computes the complete runtime preset —
+`HERD_DRIVER`, every `MODEL_*` execution role, and every `REVIEW_MODEL_*` tier — and displays the
+effective current-to-target delta before mutation.
+
+The preflight reuses the driver catalog as its source of truth. It requires the selected runtime
+binary and its read-only login-status check, parses both `DRIVER_AGENT_INTERACTIVE_SPAWN` and
+`DRIVER_AGENT_ONESHOT_EXEC`, and proves their executable, model, prompt, and permission tokens form
+driveable argument vectors. Any failure and `--dry-run` leave the filesystem untouched.
+
+A successful switch stages the full preset beside `.herd/config.local` and publishes it with one
+rename. It never changes committed `.herd/config` or `.herd/secrets`, then invokes the existing
+reload path exactly once so the watcher environment and rendered coordinator agree. The command
+prints the reverse runtime command as the rollback path. No implicit caller reaches this surface;
+when the command is unused all existing defaults, argv, output, and rendering remain unchanged.

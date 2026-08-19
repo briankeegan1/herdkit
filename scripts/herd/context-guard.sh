@@ -23,6 +23,7 @@
 #
 # WHAT IS GUARDED (the actuator set, enumerated deliberately)
 #   herd config set        edits .herd/config, then restarts the watcher / re-renders the skill
+#   herd runtime switch    atomically edits machine-local runtime config, then reloads the room
 #   herd theme set         delegates to `herd config set HERD_THEME` — restarts the watcher
 #   herd governance apply  proposes each key through the same validated `herd config set`
 #   herd posture apply     applies a whole posture bundle through that same setter, then reloads
@@ -105,6 +106,7 @@ _herd_context_is_actuator() {
   case "$cmd" in
     reload|sweep|pane|update|upgrade|agent-update) printf '%s' "$cmd"; return 0 ;;
     config)     [ "$sub" = "set" ]    && { printf 'config set';       return 0; } ;;
+    runtime)    [ "$sub" = "switch" ] && { printf 'runtime switch';   return 0; } ;;
     theme)      [ "$sub" = "set" ]    && { printf 'theme set';        return 0; } ;;
     governance) [ "$sub" = "apply" ]  && { printf 'governance apply'; return 0; } ;;
     posture)    [ "$sub" = "apply" ]  && { printf 'posture apply';    return 0; } ;;
