@@ -358,12 +358,12 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MERGE_RESULT_GATE` → —
 - `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`
-- `MODEL_ESCALATE` → `driver.sh`
+- `MODEL_ESCALATE` → `bin/herd`, `driver.sh`
 - `MODEL_ESCALATE_GLOB` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `MODEL_FEATURE` → `bin/herd`, `agent-watch.sh`, `driver.sh`, `herd-feature.sh`
 - `MODEL_QUICK` → `bin/herd`, `agents.sh`, `herd-quick.sh`
 - `MODEL_RESEARCH` → `bin/herd`, `research.sh`
-- `MODEL_RESOLVER` → `herd-resolve.sh`
+- `MODEL_RESOLVER` → `bin/herd`, `herd-resolve.sh`
 - `MODEL_REVIEW` → `bin/herd`, `agent-watch.sh`, `config-viability.sh`, `herd-review.sh`
 - `MODEL_SCRIBE` → `bin/herd`, `scribe.sh`
 - `NATIVE_BURST` → `burst.sh`
@@ -399,9 +399,9 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_MECH_FLOOR` → `agent-watch.sh`, `review-pregate.sh`
 - `REVIEW_MECH_FLOOR_MAXFILES` → `review-pregate.sh`
 - `REVIEW_MECH_FLOOR_MAXLINES` → `review-pregate.sh`
-- `REVIEW_MODEL_CHEAP` → `agent-watch.sh`, `posture-lint.sh`
-- `REVIEW_MODEL_DOCS` → `agent-watch.sh`, `posture-lint.sh`
-- `REVIEW_MODEL_ESCALATED` → `agent-watch.sh`
+- `REVIEW_MODEL_CHEAP` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`
+- `REVIEW_MODEL_DOCS` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`
+- `REVIEW_MODEL_ESCALATED` → `bin/herd`, `agent-watch.sh`
 - `REVIEW_PANEL` → `herd-review.sh`
 - `REVIEW_PANEL_MODELS` → `bin/herd`, `herd-review.sh`, `review-panel.sh`
 - `REVIEW_PANEL_POLICY` → `herd-review.sh`, `review-panel.sh`
