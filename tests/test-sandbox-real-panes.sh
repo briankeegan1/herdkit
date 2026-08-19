@@ -316,7 +316,7 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCR" || fail "(B) r
 # kill flow, and by `agent start` for the claude-as-ROOT pane where shell_pid == the claude pid — the
 # PR #260 false-death shape). alive→dead on kill, →missing on pane removal, and claude-as-root ⇒ alive.
 for cpn in workspace_created control_room agents_pane_off_byte_identical agents_pane_on_present builder_tab pane_labels_on_spawn agent_idle agent_working \
-           agent_done builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
+           agent_done builder_agent_alive_claude_root builder_banner_runtime_matches_foreground builder_retask_wakes_on_enter builder_agent_dead \
            builder_refix_escalates_on_dead builder_agent_missing context_guard_refuses_real_teardown teardown_clean; do
   [ "$(cp_status "$SCR" "$cpn")" = "pass" ] || fail "(B) checkpoint $cpn not pass"
 done
@@ -339,13 +339,14 @@ done
 # split-placement checkpoint's pane (split INTO the builder tab — no new tab), the HERD-568 fallback
 # checkpoint's pane (its own new tab, counted above), the HERD-569 review-viewer split (the whole point
 # of the conversion: a viewer costs a PANE, not a tab), the HERD-668 AGENTS_PANE=on checkpoint's split
-# off the watch pane, and the claude-as-root pane for the alive checkpoint. All but the ESCALATE
+# off the watch pane, the claude-as-root pane for the alive checkpoint, and the Codex foreground pane
+# for the driver-accurate banner checkpoint. All but the ESCALATE
 # resolver pane (and the AGENTS_PANE split, which stays open by design like the control room's other
 # panes) are closed again within their own steps — those two stay open and go with the workspace at
 # stays open BY DESIGN and goes with the workspace at teardown.
 [ "$(sc "$SCR" tabs_created)" -eq 10 ]  || fail "(B) tabs_created should be 10 (got $(sc "$SCR" tabs_created))"
-# +1 vs the pre-HERD-668 baseline: the AGENTS_PANE=on checkpoint splits one pane off the watch pane.
-[ "$(sc "$SCR" panes_created)" -eq 13 ] || fail "(B) panes_created should be 13 (got $(sc "$SCR" panes_created))"
+# +2 vs the pre-HERD-668 baseline: AGENTS_PANE=on and the Codex banner/foreground proof each split one.
+[ "$(sc "$SCR" panes_created)" -eq 14 ] || fail "(B) panes_created should be 14 (got $(sc "$SCR" panes_created))"
 # The reviewer pane is retired on verdict consumption (HERD-113).
 [ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # The resolver pane retires on a consumed DONE and SURVIVES an ESCALATE (HERD-280).

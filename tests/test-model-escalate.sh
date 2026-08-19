@@ -75,6 +75,7 @@ git -C "$REPO" push -q -u origin main 2>/dev/null
 export HOME="$T"                  # herd_pretrust_worktree writes $HOME/.claude.json — keep it in the sandbox
 export WORKSPACE_NAME="herdkit"   # matches the herdr stub's workspace label
 export HERD_SKIP_PREFLIGHT=1      # no real herdr contract to probe
+export HERD_SKIP_MODEL_PREFLIGHT=1 # runtime binaries are stubs; model routing is asserted via argv
 CFG="$T/config"
 export HERD_CONFIG_FILE="$CFG"
 
@@ -143,6 +144,10 @@ mkconfig ""
 ( unset HERD_QUICK_MODEL HERD_FEATURE_MODEL; run_lane "$QUICK" "esc-quick-empty" "$MATCH_TASK"
   m="$(resolved_model esc-quick-empty)"
   [ "$m" = "$Q_MODEL" ] || fail "quick lane: empty glob changed model resolution (got '$m', want '$Q_MODEL')"
+  grep -qF "Quick sub-agent 'esc-quick-empty' running (claude --model $Q_MODEL --dangerously-skip-permissions)" "$OUT" \
+    || fail "quick lane: default Claude banner changed"$'\n'"$(cat "$OUT")"
+  grep -qF "Start an agent here:   cd $T/trees/esc-quick-empty && claude" "$OUT" \
+    || fail "new-feature.sh default Claude handoff changed"$'\n'"$(cat "$OUT")"
   grep -qE "MODEL_ESCALATE_GLOB matched" "$OUT" && fail "quick lane: notice printed with empty glob" || true
 ) || exit 1
 
@@ -166,6 +171,26 @@ mkconfig ""
 ( unset HERD_QUICK_MODEL HERD_FEATURE_MODEL; run_lane "$FEATURE" "esc-feat-empty" "$PLAIN_TASK"
   m="$(resolved_model esc-feat-empty)"
   [ "$m" = "$F_MODEL" ] || fail "feature lane: empty glob changed model resolution (got '$m', want '$F_MODEL')"
+  grep -qF "Sub-agent 'esc-feat-empty' running (claude --model $F_MODEL --dangerously-skip-permissions)" "$OUT" \
+    || fail "feature lane: default Claude banner changed"$'\n'"$(cat "$OUT")"
+) || exit 1
+
+# Runtime-qualified Codex refs: the operator banner must describe the exact runtime/model/permission
+# posture present in the captured foreground argv, never the active mux driver's native Claude shape.
+CODEX_MODEL="gpt-5.6-sol"
+( export HERD_QUICK_MODEL="codex:$CODEX_MODEL"; mkconfig ""; run_lane "$QUICK" "banner-quick-codex" "$PLAIN_TASK"
+  grep -qF -- "-- codex --model $CODEX_MODEL --dangerously-bypass-approvals-and-sandbox" "$HERDR_CALL_LOG" \
+    || fail "quick lane: Codex-qualified model did not launch Codex"$'\n'"$(cat "$HERDR_CALL_LOG")"
+  grep -qF "Quick sub-agent 'banner-quick-codex' running (codex --model $CODEX_MODEL --dangerously-bypass-approvals-and-sandbox)" "$OUT" \
+    || fail "quick lane: Codex banner does not match launched argv"$'\n'"$(cat "$OUT")"
+  grep -qF "Start an agent here:   cd $T/trees/banner-quick-codex && codex" "$OUT" \
+    || fail "new-feature.sh handoff does not name the resolved Codex runtime"$'\n'"$(cat "$OUT")"
+) || exit 1
+( export HERD_FEATURE_MODEL="codex:$CODEX_MODEL"; mkconfig ""; run_lane "$FEATURE" "banner-feat-codex" "$PLAIN_TASK"
+  grep -qF -- "-- codex --model $CODEX_MODEL --dangerously-bypass-approvals-and-sandbox" "$HERDR_CALL_LOG" \
+    || fail "feature lane: Codex-qualified model did not launch Codex"$'\n'"$(cat "$HERDR_CALL_LOG")"
+  grep -qF "Sub-agent 'banner-feat-codex' running (codex --model $CODEX_MODEL --dangerously-bypass-approvals-and-sandbox)" "$OUT" \
+    || fail "feature lane: Codex banner does not match launched argv"$'\n'"$(cat "$OUT")"
 ) || exit 1
 
 # ── (d) MODEL_ESCALATE set: a matched glob forces MODEL_ESCALATE, NOT MODEL_FEATURE ─────────────

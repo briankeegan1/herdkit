@@ -160,9 +160,12 @@ for line in sys.stdin:
     if not line: continue
     try: obj = json.loads(line)
     except Exception: print(line, flush=True); continue
+    if not isinstance(obj, dict): print(line, flush=True); continue
     t = obj.get("type", "")
     if t == "assistant":
-        for b in obj.get("message", {}).get("content", []):
+        message = obj.get("message") or {}
+        for b in (message.get("content") or []) if isinstance(message, dict) else []:
+            if not isinstance(b, dict): continue
             if b.get("type") == "text":
                 txt = b.get("text", "").strip()
                 if txt: print("  " + txt.split("\n")[0][:100], flush=True)
@@ -171,6 +174,11 @@ for line in sys.stdin:
     elif t == "result":
         r = obj.get("result", "")
         if r: print(r, flush=True)
+    elif t == "item.completed":
+        item = obj.get("item") or {}
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text", "")
+            if text: print(text, flush=True)
 '
 
 INPUT='{"type":"system","subtype":"init"}
@@ -192,6 +200,20 @@ out2="$(printf 'plain text line\n{"type":"result","result":"REVIEW: BLOCK — re
 grep -q "plain text line" <<< "$out2" || fail "formatter: non-JSON should pass through"
 ok
 grep -q "REVIEW: BLOCK" <<< "$out2" || fail "formatter: result with BLOCK should be printed"
+ok
+
+# Codex may emit JSON scalar frames; they are valid JSON but not protocol objects.
+out3="$(printf '"codex progress frame"\n' | python3 -uc "$FORMATTER")"
+grep -q "codex progress frame" <<< "$out3" || fail "formatter: JSON scalar must pass through without crashing"
+ok
+
+# Codex exec --json reports its terminal answer in an item.completed agent_message.
+out4="$(printf '%s\n' \
+  '{"type":"item.completed","item":{"type":"agent_message","text":"REVIEW: PASS"}}' \
+  '{"type":"item.completed","item":{"type":"agent_message","text":"REVIEW: BLOCK — finding"}}' \
+  | python3 -uc "$FORMATTER")"
+grep -q '^REVIEW: PASS$' <<< "$out4" || fail "formatter: Codex item.completed PASS was lost"
+grep -q '^REVIEW: BLOCK' <<< "$out4" || fail "formatter: Codex item.completed BLOCK was lost"
 ok
 
 # ── herd-review.sh: log RETENTION (rolling window) ───────────────────────────

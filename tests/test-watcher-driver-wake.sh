@@ -161,6 +161,17 @@ export JOURNAL_FILE="$T/journal.jsonl"
 # shellcheck source=/dev/null
 . "$WATCH" || fail "sourcing agent-watch.sh (lib mode) failed"
 
+# A static `working` word is not delivery evidence for runtimes that can show working
+# while paused at a prompt. A real non-working→working transition is sufficient even
+# when the mux's visible-pane snapshot does not repaint; working→working is not.
+_agent_status() { printf 'working'; }
+_pane_progress_mark() { printf 'static-pane-checksum'; }
+_wait_agent_working wake-proof 0 pane-proof static-pane-checksum working \
+  && fail "(F0) stale working→working with an unchanged pane must not prove prompt consumption"
+_wait_agent_working wake-proof 0 pane-proof static-pane-checksum done \
+  || fail "(F0) done→working must count as driver-neutral post-send consumption evidence"
+pass
+
 STUB_WAIT_FILE="$T/wait-codes.txt"
 _wait_agent_working() {
   local _c; _c="$(head -1 "$STUB_WAIT_FILE" 2>/dev/null || true)"
