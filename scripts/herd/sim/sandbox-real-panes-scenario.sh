@@ -227,7 +227,7 @@ else
             context_guard_refuses_real_teardown \
             resolver_pane_retired_on_done resolver_pane_kept_on_escalate \
             health_pane_retired_on_outcome \
-            builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
+            builder_agent_alive_claude_root builder_banner_runtime_matches_foreground builder_retask_wakes_on_enter builder_agent_dead \
             builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
@@ -1258,6 +1258,48 @@ print(pi.get("foreground_process_group_id") or "")
     # Cleanup: kill the detached claude process GROUP + close its pane (never leak a sleep or a pane).
     [ -n "$_cr_pgid" ] && kill -TERM -"$_cr_pgid" >/dev/null 2>&1 || true
     [ -n "$CR_PANE" ] && herdr pane close "$CR_PANE" >/dev/null 2>&1 || true
+  fi
+
+  # ── DRIVER-ACCURATE BANNER (HERD-784): render the Codex lane banner from the resolved driver and
+  # compare its runtime token with a REAL pane foreground process. The pane uses a resident binary
+  # named `codex`; no model/network call occurs. Prompt/context are absent from the description by
+  # construction, while model + permission posture remain operator-visible.
+  if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ]; then
+    step bannerdriver "Codex banner runtime matches the real pane foreground runtime"
+    CB_BIN="$ART/bannerbin"; mkdir -p "$CB_BIN"
+    printf '#!/usr/bin/env bash\nsleep 3600\n' > "$CB_BIN/codex"; chmod +x "$CB_BIN/codex"
+    CB_DESC="$(herd_driver_agent_argv_description codex gpt-5.6-sol --dangerously-bypass-approvals-and-sandbox)"
+    CB_RUNTIME="${CB_DESC%% *}"
+    CB_SPLIT="$(herdr pane split "$BUILD_PANE" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"
+    CB_PANE="$(printf '%s' "$CB_SPLIT" | hj 'd["result"]["pane"]["pane_id"]')"
+    if [ -n "$CB_PANE" ]; then
+      PANES_CREATED=$((PANES_CREATED+1))
+      herdr pane run "$CB_PANE" "exec $CB_BIN/codex" >/dev/null 2>&1 || true
+    fi
+    CB_CMD=""; CB_PGID=""; _i=0
+    while [ "$_i" -lt 25 ] && [ -n "$CB_PANE" ]; do
+      IFS=$'\t' read -r CB_CMD CB_PGID < <(herdr pane process-info --pane "$CB_PANE" 2>/dev/null | python3 -c '
+import sys,json
+try:
+    pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+    fps=pi.get("foreground_processes") or []
+    print((fps[0].get("cmdline") if fps else "") or "-", pi.get("foreground_process_group_id") or "-", sep="\t")
+except Exception:
+    print("-\t-")
+' 2>/dev/null)
+      case "$CB_CMD" in *"/codex"*) break ;; esac
+      _i=$((_i+1)); sleep 0.2
+    done
+    if [ "$CB_RUNTIME" = codex ] && [[ "$CB_CMD" == *"/codex"* ]] \
+       && [ "$CB_DESC" = "codex --model gpt-5.6-sol --dangerously-bypass-approvals-and-sandbox" ]; then
+      checkpoint builder_banner_runtime_matches_foreground pass \
+        "banner '$CB_DESC' names the live pane foreground runtime '$CB_CMD'"
+    else
+      checkpoint builder_banner_runtime_matches_foreground fail \
+        "banner/foreground mismatch (banner='$CB_DESC' runtime='$CB_RUNTIME' foreground='$CB_CMD' pane='$CB_PANE')"
+    fi
+    [ "$CB_PGID" != "-" ] && kill -TERM -"$CB_PGID" >/dev/null 2>&1 || true
+    [ -n "$CB_PANE" ] && herdr pane close "$CB_PANE" >/dev/null 2>&1 || true
   fi
 
   # ── RE-TASK WAKE (HERD-186): a live 'done' builder must WAKE when the auto-refix bounce types the

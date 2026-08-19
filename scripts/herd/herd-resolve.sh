@@ -44,10 +44,14 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/driver.sh"
 SLUG="${1:?usage: herd-resolve.sh <slug>   (slug = the existing worktree under the worktrees dir)}"
 DIR="$WORKTREES_DIR/$SLUG"
-CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 # Resolver work is mechanical merge-conflict fixing, not creative — default to the configured
 # resolver model (Sonnet); override with RESOLVER_MODEL=… for a specific run.
 RESOLVER_MODEL="${RESOLVER_MODEL:-$MODEL_RESOLVER}"
+_RESOLVER_MODEL_REF="$RESOLVER_MODEL"
+RESOLVER_MODEL="$(herd_model_for_spawn "$_RESOLVER_MODEL_REF")" || exit 1
+_RESOLVER_DRIVER="$(herd_model_driver_for "$_RESOLVER_MODEL_REF" 2>/dev/null || true)"
+[ -n "$_RESOLVER_DRIVER" ] || _RESOLVER_DRIVER="$(herd_driver_name)"
+CLAUDE_FLAGS="$(herd_driver_lane_permission_flags "$_RESOLVER_DRIVER")"
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. The worktree must already exist — herd-resolve.sh resolves IN PLACE, it never creates one.
@@ -183,7 +187,7 @@ if [ -n "$_BUILDER_TAB" ]; then
   # behavior. Routed through the same driver seam the reviewer pane uses.
   if herd_driver_launch_agent \
     name="resolve·$SLUG" workspace="$_WS_ID" cwd="$DIR" tab="$_BUILDER_TAB" split=down \
-    model="$RESOLVER_MODEL" flags="$CLAUDE_FLAGS" pointer="$TASK" >/dev/null 2>&1; then
+    driver="$_RESOLVER_DRIVER" model="$RESOLVER_MODEL" flags="$CLAUDE_FLAGS" pointer="$TASK" >/dev/null 2>&1; then
     TAB="$_BUILDER_TAB"; PLACEMENT="split"
   else
     command -v journal_append >/dev/null 2>&1 && journal_append infra_event component resolver agent "resolve·$SLUG" reason split_start_failed tab "$_BUILDER_TAB" dispatch_id "${HERD_RESOLVE_DISPATCH_ID:--}"
@@ -207,7 +211,7 @@ if [ -z "$PLACEMENT" ]; then
   # just above as an empty corpse tab that nothing reaps. Close it on the failure path before bailing.
   if ! herd_driver_launch_agent \
     name="resolve·$SLUG" workspace="$_WS_ID" cwd="$DIR" tab="$TAB" split=right \
-    model="$RESOLVER_MODEL" flags="$CLAUDE_FLAGS" pointer="$TASK"; then
+    driver="$_RESOLVER_DRIVER" model="$RESOLVER_MODEL" flags="$CLAUDE_FLAGS" pointer="$TASK"; then
     herdr tab close "$TAB" >/dev/null 2>&1 || true
     command -v journal_append >/dev/null 2>&1 && journal_append infra_event component resolver agent "resolve·$SLUG" reason spawn_agent_failed tab "$TAB" dispatch_id "${HERD_RESOLVE_DISPATCH_ID:--}"
     echo "❌ herdr: could not start the resolver agent for '$SLUG' — closed the empty tab; worktree is at $DIR." >&2
@@ -276,7 +280,8 @@ PY
   fi
 fi
 
-echo "🔀 Resolver agent 'resolve·$SLUG' running (claude $CLAUDE_FLAGS) in herdr tab $TAB   dir: $DIR"
+_AGENT_RUNTIME="$(herd_driver_agent_runtime "$_RESOLVER_DRIVER" 2>/dev/null || true)"
+echo "🔀 Resolver agent 'resolve·$SLUG' running (${_AGENT_RUNTIME:-claude} $CLAUDE_FLAGS) in herdr tab $TAB   dir: $DIR"
 [ "$PLACEMENT" = "split" ] && echo "   placement: split pane inside the builder's tab — retired as soon as its DONE verdict is consumed"
 echo "   task: merge $DEFAULT_BRANCH → resolve mechanical conflicts → smoke + healthcheck → push (never force/default branch)"
 [ -n "$PORT" ] && echo "   🌐 app preview: http://localhost:$PORT   (hot-reloads as the agent resolves)"

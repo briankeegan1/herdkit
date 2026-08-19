@@ -66,8 +66,23 @@ grep -qE 'agent start .*-- claude --model SENTINEL-COORD-MODEL' "$HERDR_CALL_LOG
 # ── (2) herd-resolve.sh wires MODEL_RESOLVER ──────────────────────────────────
 export HERDR_CALL_LOG="$T/resolve.log"; : > "$HERDR_CALL_LOG"
 SLUG="demo-slug"; mkdir -p "$T/trees/$SLUG"; : > "$T/trees/$SLUG/.git"   # look like a worktree
-HERD_NO_APP=1 bash "$RESOLVE" "$SLUG" >/dev/null 2>&1 || fail "herd-resolve.sh exited non-zero under stubs"
+RESOLVE_OUT="$T/resolve.out"
+HERD_NO_APP=1 bash "$RESOLVE" "$SLUG" >"$RESOLVE_OUT" 2>&1 || fail "herd-resolve.sh exited non-zero under stubs"
 grep -qE 'agent start .*-- claude --model SENTINEL-RESOLVER-MODEL' "$HERDR_CALL_LOG" \
   || fail "herd-resolve.sh did not pass --model MODEL_RESOLVER to claude"$'\n'"$(cat "$HERDR_CALL_LOG")"
+grep -qF "Resolver agent 'resolve·$SLUG' running (claude --dangerously-skip-permissions)" "$RESOLVE_OUT" \
+  || fail "herd-resolve.sh default Claude banner changed"$'\n'"$(cat "$RESOLVE_OUT")"
+
+# Active Codex driver + bare model: resolver launch and banner must agree on runtime and permission
+# flag. The task/prompt remains only in the herdr call log and is never repeated in the banner.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/codex"; chmod +x "$BIN/codex"
+export HERDR_CALL_LOG="$T/resolve-codex.log"; : > "$HERDR_CALL_LOG"
+CODEX_OUT="$T/resolve-codex.out"
+HERD_DRIVER=codex HERD_SKIP_MODEL_PREFLIGHT=1 HERD_NO_APP=1 bash "$RESOLVE" "$SLUG" >"$CODEX_OUT" 2>&1 \
+  || fail "herd-resolve.sh exited non-zero for active Codex driver"$'\n'"$(cat "$CODEX_OUT")"
+grep -qE 'agent start .*-- codex --model SENTINEL-RESOLVER-MODEL --dangerously-bypass-approvals-and-sandbox' "$HERDR_CALL_LOG" \
+  || fail "herd-resolve.sh active Codex driver launched the wrong argv"$'\n'"$(cat "$HERDR_CALL_LOG")"
+grep -qF "Resolver agent 'resolve·$SLUG' running (codex --dangerously-bypass-approvals-and-sandbox)" "$CODEX_OUT" \
+  || fail "herd-resolve.sh Codex banner does not match launched runtime"$'\n'"$(cat "$CODEX_OUT")"
 
 echo "ALL PASS"
