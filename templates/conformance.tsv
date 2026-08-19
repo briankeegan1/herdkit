@@ -271,6 +271,7 @@ WORKSPACE_NAME	unit	tests/test-launch-binding-guard.sh
 BACKLOG_FILE	unit	tests/test-backend-file.sh
 BACKLOG_FILE	unit	tests/test-backend-changelog.sh
 SCRIBE_BACKEND	unit	tests/test-scribe-backend-flip.sh
+SCRIBE_DIRECTIVE_PREFIXES	unit	tests/test-scribe-directive-prefixes.sh
 LINEAR_TEAM_ID	unit	tests/test-backend-linear.sh
 SCRIBE_LINGER_SECS	unit	tests/test-scribe-linger.sh
 DRAINER_HEARTBEAT_TIMEOUT	unit	tests/test-drainer-liveness.sh

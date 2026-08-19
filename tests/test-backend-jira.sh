@@ -129,6 +129,21 @@ grep -q '"key": "ENG"' "$APILOG" || fail "add_item did not target the configured
 grep -q '"issuetype"' "$APILOG" || fail "add_item did not set an issuetype"
 pass
 
+# 1a. HERD-787 explicit-title seam: normalized summary is separate from the full ADF description.
+: > "$APILOG"
+DIRECTIVE="Add a planned item: Reap merged Codex builders — close their tabs after merge."
+run _backend_add_item REQ1A "$DIRECTIVE" "Reap merged Codex builders" >/dev/null
+python3 - "$APILOG" "$DIRECTIVE" <<'PY' || fail "explicit Jira summary replaced or changed the full description"
+import json, re, sys
+rows = [json.loads(x)["fields"] for x in re.findall(r"B<<(.*?)>>\n", open(sys.argv[1]).read(), re.S) if '"summary"' in x]
+assert rows, "no create body"
+v = rows[-1]
+desc = "".join(c["content"][0]["text"] for c in v["description"]["content"])
+assert v["summary"] == "Reap merged Codex builders", v
+assert desc == sys.argv[2], v
+PY
+pass
+
 # 1b. HERD-77 (short titles): a long single-line add must yield a SHORT summary (<=100 chars) but keep
 #     the FULL text as the description.
 : > "$APILOG"

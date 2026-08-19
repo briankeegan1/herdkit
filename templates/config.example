@@ -39,6 +39,11 @@ PROJECT_ARCHETYPE="code"             # code (default) | research-lab | docs
 
 BACKLOG_FILE="BACKLOG.md"            # repo-relative; the scribe's single shared file
 SCRIBE_BACKEND="file"               # work-tracker backend: file (default) | changelog
+# SCRIBE_DIRECTIVE_PREFIXES — the exact shipped "Add a planned item:" / "Add a 🔜 item:" prefixes
+# always produce a concise API-tracker title while retaining the full request as its description (a
+# correctness repair for the documented default workflow). on additionally accepts case/article
+# variants from custom prompts. off keeps every NONCANONICAL request's legacy argv/title bytes exact.
+# SCRIBE_DIRECTIVE_PREFIXES="on"
 # SCRIBE_LINGER_SECS — drainer linger window (HERD-88). After the scribe empties the queue, the
 # drainer keeps polling this many extra seconds before its session exits, so a burst of backlog
 # updates arriving with short idle gaps is drained by ONE scribe session instead of paying a fresh

@@ -241,6 +241,65 @@ _scribe_add_text_from_claim() {
   [ -n "$_SCRIBE_ADD_TEXT" ]
 }
 
+# _scribe_directive_title <full-request> — HERD-787: derive the tracker TITLE from the documented
+# coordinator directives without changing the request that becomes its description. This is a
+# narrow correctness repair: the two exact directive prefixes shipped in coordinator instructions —
+# `Add a planned item:` (older renders) and `Add a 🔜 item:` (current template) — always normalize,
+# because leaving the default documented workflow malformed is not a viable default-off posture.
+# SCRIBE_DIRECTIVE_PREFIXES=on widens recognition to case/article variants; while it is off, EVERY
+# noncanonical/title-first request still reaches the backend through the historical two arguments
+# byte-for-byte. On a match, accept either a title on the directive line or the next non-empty REAL
+# line. A literal `\n` is never decoded: it may delimit the title view while the description keeps
+# those original two bytes. The coordinator's `<title> — <why>` form yields only `<title>`; long
+# candidates keep the established 100-character title bound.
+_scribe_directive_title() {
+  local widen=0
+  case "${SCRIBE_DIRECTIVE_PREFIXES:-off}" in on) widen=1 ;; esac
+  SCRIBE_PREFIX_WIDEN="$widen" printf '%s' "$1" | SCRIBE_PREFIX_WIDEN="$widen" python3 -c '
+import os, re, sys
+
+text = sys.stdin.read()
+lines = text.splitlines()
+if not lines:
+    raise SystemExit
+match = re.match(r"^(?:Add a planned item|Add a 🔜 item):\s*(.*)$", lines[0])
+if not match and os.environ.get("SCRIBE_PREFIX_WIDEN") == "1":
+    match = re.match(r"^\s*Add\s+(?:a\s+)?(?:planned|🔜)\s+item\s*:\s*(.*)$", lines[0], re.I)
+if not match:
+    raise SystemExit
+candidate = match.group(1).strip()
+if not candidate:
+    candidate = next((line.strip() for line in lines[1:] if line.strip()), "")
+if not candidate:
+    raise SystemExit
+# Do not turn the two literal characters backslash+n into a newline. They are only a safe boundary
+# for the derived title; the full request passed as the description is untouched.
+candidate = candidate.split(r"\n", 1)[0].strip()
+for delimiter in (" — ", ". "):
+    if delimiter in candidate:
+        candidate = candidate.split(delimiter, 1)[0].strip()
+if not candidate:
+    raise SystemExit
+if len(candidate) > 100:
+    candidate = candidate[:99].rstrip() + "…"
+sys.stdout.write(candidate)
+' 2>/dev/null || true
+}
+
+# _scribe_dispatch_add <claim> <full-request> — call the active backend with an OPTIONAL explicit
+# title. Keeping the conditional here proves the noncanonical/off and unmatched paths' argv are
+# byte-identical: the backend still sees exactly (<claim>, <request>) unless a canonical directive
+# (or an opt-in grammar expansion) matched.
+_scribe_dispatch_add() {
+  local mine="$1" text="$2" title
+  title="$(_scribe_directive_title "$text")"
+  if [ -n "$title" ]; then
+    _backend_add_item "$mine" "$text" "$title"
+  else
+    _backend_add_item "$mine" "$text"
+  fi
+}
+
 # _scribe_retry_close <claimed-path> — a re-injected request reached a TERMINAL, SUCCESSFUL outcome:
 # the drainer decided it is not an add after all (skip), or the backend confirmed the transition it
 # routed to (update-state / amend → DONE). Drop its durable entry so it stops being re-injected.
@@ -479,7 +538,7 @@ case "$cmd" in
       git checkout -- "$BACKLOG_FILE" 2>/dev/null || true
       _stale_text="$(cat "$mine" 2>/dev/null)"; [ -n "$_stale_text" ] || _stale_text="$sum"
       _BACKEND_ERROR=""
-      _backend_add_item "$mine" "$_stale_text"
+      _scribe_dispatch_add "$mine" "$_stale_text"
       _scribe_post_add "$mine" "$_stale_text"
     fi
     ;;
@@ -529,13 +588,13 @@ case "$cmd" in
       # subshell and lose it); we replay the captured stdout verbatim so the drainer's output is
       # unchanged.
       _add_out="$TREES/.scribe-add-out.$$"
-      _backend_add_item "$mine" "$text" > "$_add_out"
+      _scribe_dispatch_add "$mine" "$text" > "$_add_out"
       cat "$_add_out"
       [ -n "$_seq_blocker" ] && _scribe_auto_marker "$SCRIBE_BACKEND" "$_BACKEND_RESULT" "$_add_out" "$_seq_blocker"
       [ -n "$_ship_pr" ] && _scribe_auto_ship "$SCRIBE_BACKEND" "$_BACKEND_RESULT" "$_add_out" "$_ship_pr"
       rm -f "$_add_out"
     else
-      _backend_add_item "$mine" "$text"
+      _scribe_dispatch_add "$mine" "$text"
     fi
     _scribe_post_add "$mine" "$text"
     ;;

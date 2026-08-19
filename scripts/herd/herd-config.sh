@@ -410,6 +410,7 @@ esac
 
 : "${BACKLOG_FILE:="BACKLOG.md"}"
 : "${SCRIBE_BACKEND:="file"}"
+: "${SCRIBE_DIRECTIVE_PREFIXES:="off"}" # HERD-787: off keeps noncanonical requests exact; on widens beyond the two always-corrected shipped Add directive prefixes
 : "${SHARE_LINKS:=""}"            # dirs symlinked into each worktree (e.g. "data .venv")
 
 # SCRIBE_LINGER_SECS — drainer linger window (HERD-88). After the backlog drainer empties the queue
