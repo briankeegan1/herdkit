@@ -162,9 +162,9 @@ REVIEW_MODEL="${HERD_REVIEW_MODEL:-$MODEL_REVIEW}"
 #                        claude --dangerously-skip-permissions);
 #   • output flags     → claude's `--output-format stream-json --verbose` ONLY when the driver's runtime
 #                        is the native Claude runtime (herd_driver_agent_runtime_native); a non-native
-#                        runtime gets NONE — codex exec prints the final message on stdout, which
-#                        REVIEW_STREAM_FORMATTER passes through raw, so the `REVIEW: PASS|BLOCK` line
-#                        the gate parses still lands in the log.
+#                        runtime gets its own stream contract: Codex receives `--json`, whose
+#                        item.completed/agent_message event is normalized by REVIEW_STREAM_FORMATTER
+#                        so the final `REVIEW: PASS|BLOCK` line reaches the machine verdict parser.
 # BYTE-IDENTICAL for herdr-claude / headless: same tokens, same order as the old inline literal
 # ($CLAUDE_FLAGS then the two output flags), so the compose proofs in tests/test-oneshot-exec-seam.sh
 # and every stub-claude review test see the exact argv they saw before. Word-split by the caller
@@ -175,6 +175,8 @@ _review_runtime_flags() {
   [ -n "$perm" ] || perm="$CLAUDE_FLAGS"
   if herd_driver_agent_runtime_native "$drv" 2>/dev/null; then
     printf '%s --output-format stream-json --verbose' "$perm"
+  elif [ "$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)" = "codex" ]; then
+    printf '%s --json' "$perm"
   else
     printf '%s' "$perm"
   fi
@@ -388,6 +390,11 @@ for line in sys.stdin:
     elif t == "result":
         r = obj.get("result", "")
         if r: print(r, flush=True)
+    elif t == "item.completed":
+        item = obj.get("item") or {}
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text", "")
+            if text: print(text, flush=True)
 '
 
 # ── Review panel (HERD-107 native-burst; HERD-276 mixed-vendor) ──────────────────────────────────
