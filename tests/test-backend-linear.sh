@@ -106,6 +106,19 @@ grep -q "add a dark-mode toggle" "$GQLLOG" || fail "add_item did not pass the re
 grep -q "team_xyz" "$GQLLOG" || fail "add_item did not target the configured team (teamId)"
 pass
 
+# 1a. HERD-787 explicit-title seam: scribe-step may supply a normalized directive title as arg 3;
+# the original request remains the complete Linear description.
+: > "$GQLLOG"
+DIRECTIVE="Add a planned item: Reap merged Codex builders — close their tabs after merge."
+run _backend_add_item REQ1A "$DIRECTIVE" "Reap merged Codex builders" >/dev/null
+python3 - "$GQLLOG" "$DIRECTIVE" <<'PY' || fail "explicit Linear title replaced or changed the full description"
+import json, re, sys
+v = json.loads(re.findall(r"VARS<<(.*?)>>", open(sys.argv[1]).read(), re.S)[-1])
+assert v["title"] == "Reap merged Codex builders", v
+assert v["description"] == sys.argv[2], v
+PY
+pass
+
 # 1b. HERD-77 (short titles): a long single-line add must yield a SHORT title (<=100 chars) but keep
 #     the FULL text as the description — never the old "first-line-as-essay" where a one-paragraph
 #     request became a giant title duplicated in the body (user complaint 2026-07-07; 7 hand-renames).

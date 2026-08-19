@@ -303,9 +303,9 @@ _backend_add_item() {
     # Summary = a SHORT title derived from the request (HERD-77 — never the whole first line as an
     # essay); description = the FULL text as an ADF paragraph. Sets _BACKEND_RESULT=DONE on a created
     # issue (and surfaces its browse URL), NOCHANGE if Jira declines or no project is available.
-    local text="$2" title project issuetype body resp parsed ok key url
+    local text="$2" title="${3:-}" project issuetype body resp parsed ok key url
     _jira_require_key
-    title="$(_jira_short_title "$text")"
+    [ -n "$title" ] || title="$(_jira_short_title "$text")"
     project="$(_jira_project_key)"
     if [ -z "$project" ]; then
         echo "jira backend: no project available to create the issue in (set JIRA_PROJECT_KEY in .herd/secrets)" >&2

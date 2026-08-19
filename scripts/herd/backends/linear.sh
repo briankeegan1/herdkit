@@ -229,10 +229,10 @@ _backend_add_item() {
     # if Linear declines or no team is available.
     # HERD-267: on NOCHANGE it ALSO sets _BACKEND_ERROR to the reason Linear gave, so the caller's
     # durable retry queue can tell a permanent wall (issue cap, bad key) from a retryable hiccup.
-    local text="$2" title team mut vars resp parsed ok ident url
+    local text="$2" title="${3:-}" team mut vars resp parsed ok ident url
     _BACKEND_ERROR=""
     _linear_require_key
-    title="$(_linear_short_title "$text")"
+    [ -n "$title" ] || title="$(_linear_short_title "$text")"
     team="$(_linear_team_id)"
     if [ -z "$team" ]; then
         echo "linear backend: no team available to create the issue in (set LINEAR_TEAM_ID in .herd/secrets)" >&2
