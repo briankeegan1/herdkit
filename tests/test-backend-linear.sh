@@ -143,6 +143,26 @@ assert len(t) <= 100, "clause title too long: %d chars" % len(t)
 PY
 pass
 
+# 1d. HERD-783: real newlines stay real across the add seam: the first line is the short title and
+#     the complete multiline text is the description. A literal backslash-n is NOT decoded — it is
+#     ordinary intentional title/body text unless the transport contains an actual newline.
+: > "$GQLLOG"
+MULTILINE=$'Preserve multiline scribe arguments\n\nThe body stays separate from the title.\n- prove Codex\n- prove Claude'
+run _backend_add_item REQ4 "$MULTILINE" >/dev/null
+LITERAL='Keep literal \n text when intended'
+run _backend_add_item REQ5 "$LITERAL" >/dev/null
+python3 - "$GQLLOG" "$MULTILINE" "$LITERAL" <<'PY' || fail "HERD-783 newline/literal transport changed Linear variables"
+import json, re, sys
+rows = [json.loads(x) for x in re.findall(r"VARS<<(.*?)>>", open(sys.argv[1]).read(), re.S)]
+assert len(rows) == 2, rows
+assert rows[0]["title"] == "Preserve multiline scribe arguments", rows[0]
+assert rows[0]["description"] == sys.argv[2], rows[0]
+assert rows[1]["title"] == sys.argv[3], rows[1]
+assert rows[1]["description"] == sys.argv[3], rows[1]
+assert "\\n" in rows[1]["title"], rows[1]
+PY
+pass
+
 # 2. list_open (team scoped ON) → an issues() query filtered to the configured team, parsed to
 #    "#<identifier> <title>" lines. Privacy: the team filter MUST be present so other teams' issues
 #    can't leak in.

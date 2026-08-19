@@ -11,8 +11,11 @@
 #   commit <path> "<sum>"  file backend: add/commit/push $BACKLOG_FILE (pull-rebase retry on
 #                          reject), write the live-view receipt, append to the inbox, fire a
 #                          herdr notification, remove the claimed file.
-#   add-item <path> "<t>"  API/changelog backend: dispatch a NEW item to the backend (no file
-#                          edit by the agent), then the same receipt/inbox/notify/cleanup.
+#   add-item <path> ["<t>"|--no-verification-plan]
+#                          API/changelog backend: dispatch a NEW item to the backend (no file
+#                          edit by the agent), then the same receipt/inbox/notify/cleanup. With no
+#                          text argv, read the request bytes from the claimed queue file; this is the
+#                          runtime-neutral transport for multiline tracker bodies.
 #   update-state <path> <ref> <state>
 #                          API backend: transition an EXISTING item (done/in-progress/canceled)
 #                          via _backend_update_state instead of filing a new issue — the second
@@ -212,6 +215,30 @@ _scribe_post_add() {
 # never feed the retry queue.
 _scribe_backend_dispatches_creates() {
   case "$SCRIBE_BACKEND" in file|changelog) return 1 ;; *) return 0 ;; esac
+}
+
+# _scribe_add_text_from_claim <claimed-path> — load a new item's multiline text without putting it in
+# argv. The claimed request file is already the scribe queue's durable byte transport, so making the
+# agent quote the same bytes into a shell argument bought nothing and broke on runtimes whose command
+# boundary rejects literal newlines. A follow-up attempt using the two characters `\n` was worse:
+# Linear correctly treated them literally and filed the would-be body as part of the title.
+#
+# Accept ONLY a regular, non-symlink `<queue>/*.req.mine` whose physical parent is exactly $Q. This
+# prevents a malformed/model-produced path from turning add-item into an arbitrary file reader (most
+# importantly, it can never read .herd/secrets). Failure is deliberately soft and generic: do not
+# echo the supplied path or file bytes, and leave a legitimate claim in place for normal reclaim.
+# Sets _SCRIBE_ADD_TEXT on success; returns non-zero on malformed/unreadable/empty transport.
+_scribe_add_text_from_claim() {
+  local mine="$1" parent qparent base
+  _SCRIBE_ADD_TEXT=""
+  [ -f "$mine" ] && [ ! -L "$mine" ] || return 1
+  base="${mine##*/}"
+  case "$base" in *.req.mine) ;; *) return 1 ;; esac
+  parent="$(cd "$(dirname "$mine")" 2>/dev/null && pwd -P)" || return 1
+  qparent="$(cd "$Q" 2>/dev/null && pwd -P)" || return 1
+  [ "$parent" = "$qparent" ] || return 1
+  _SCRIBE_ADD_TEXT="$(cat -- "$mine" 2>/dev/null)" || return 1
+  [ -n "$_SCRIBE_ADD_TEXT" ]
 }
 
 # _scribe_retry_close <claimed-path> — a re-injected request reached a TERMINAL, SUCCESSFUL outcome:
@@ -458,7 +485,25 @@ case "$cmd" in
     ;;
   add-item)
     # API/changelog path: the agent did NOT edit any file — dispatch the text to the backend.
-    mine="${2:?claimed path}"; text="${3:?item text}"
+    mine="${2:?claimed path}"
+    if [ "${3:-}" = "--no-verification-plan" ]; then
+      if _scribe_add_text_from_claim "$mine"; then
+        text="${_SCRIBE_ADD_TEXT}"$'\n\n''⚠️ no verification plan'
+      else
+        echo "scribe-step: malformed or unreadable add-item transport — item not filed" >&2
+        exit 0
+      fi
+    elif [ "$#" -ge 3 ]; then
+      # Compatibility seam for existing/manual callers. Keeping this path byte-identical also lets a
+      # literal backslash-n remain intentional literal text; only REAL newlines in the file transport
+      # split a title from its body.
+      text="$3"
+    elif _scribe_add_text_from_claim "$mine"; then
+      text="$_SCRIBE_ADD_TEXT"
+    else
+      echo "scribe-step: malformed or unreadable add-item transport — item not filed" >&2
+      exit 0
+    fi
     cd "$REPO" || exit 1
     if [ "$SCRIBE_BACKEND" = "file" ]; then
       # Reverse of the #139 flip: a non-file drainer (spawned before a flip TO 'file') is draining.
