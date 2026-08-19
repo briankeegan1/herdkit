@@ -383,6 +383,19 @@ LINE="$(sweep_advice_line 2 1 0)"
 [ "$(sweep_advice_line 1 0 1)" = "🧹 sweep recommended: 1 stale tab · 1 orphan proc" ] || fail "(2) singular form wrong"
 ok; echo "PASS (2) cheap detection counts the mess; advisory row renders (and stays empty when clean)"
 
+# ── HERD-788 fixture: seed merged-clean with codex driver + hook-idle evidence ─────────────────────
+# _reap_agent_working must route through _herd_codex_hook_lifecycle so that a Codex builder whose raw
+# herdr status is "working" (pane at a blank prompt, herdr hasn't updated yet) is correctly reaped
+# once the Stop hook fires. Plant the evidence now and inject "working" via AGENTS_JSON so the
+# existing "reap worktree merged-clean" assertion in test (3) becomes the HERD-788 regression proof:
+# without the fix, _reap_agent_working would defer on raw "working" and the assertion would FAIL.
+mkdir -p "$TREESDIR/.herd/agents/merged-clean/hook"
+printf 'codex' > "$TREESDIR/.herd/agents/merged-clean/driver"
+printf 'idle-turn-788' > "$TREESDIR/.herd/agents/merged-clean/hook/last-turn"
+# No hook/current-turn → idle lifecycle evidence
+export CODEX_STOP_HOOK=on
+export AGENTS_JSON='{"result":{"agents":[{"name":"merged-clean","agent_status":"working"}]}}'
+
 # ── (3) dry-run is inert ─────────────────────────────────────────────────────
 PLAN="$(cd "$T" && sweep_main --dry-run 2>&1)" || fail "(3) dry-run exited non-zero"
 grep -q "reap worktree merged-clean" <<< "$PLAN" || fail "(3) plan omits the merged worktree reap"
@@ -398,7 +411,10 @@ grep -q "close stale resolve tab tabRESOLVE" <<< "$PLAN" \
 kill -0 "$VICTIM" 2>/dev/null   || fail "(3) DRY-RUN killed the orphan process"
 [ ! -s "$TAB_CLOSED" ]          || fail "(3) DRY-RUN closed a tab"
 [ "$(jcount '"event":"reap"')" = "0" ] || fail "(3) DRY-RUN journaled a reap"
-ok; echo "PASS (3) --dry-run prints the full plan and touches nothing"
+ok; echo "PASS (3) --dry-run prints the full plan and touches nothing (HERD-788: merged-clean reap proves hook-idle override of raw working)"
+# Restore: subsequent legs fetch AGENTS_JSON fresh from herdr (which returns empty for our fixtures).
+unset AGENTS_JSON
+CODEX_STOP_HOOK=off
 
 # ── (5a) judgment legs under AUTO: flagged, never deleted ────────────────────
 : > "$JOURNAL_FILE"

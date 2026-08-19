@@ -15201,6 +15201,16 @@ _respawn_builder_in_worktree() {
   herd_driver_agent_spawn_driver_write "$_rw_slug" "$_rw_driver"
   local -a _rw_rt=(); local _rw_t
   while IFS= read -r -d '' _rw_t; do _rw_rt+=("$_rw_t"); done < <(herd_driver_agent_spawn_argv "$_rw_driver" "$_rw_model" "$_rw_flags" "$_rw_ptr")
+  # HERD-788: inject Codex stop-hook argv when CODEX_STOP_HOOK=on and respawning a codex builder.
+  # Mirrors the primary launch seam injection in herd_driver_launch_agent. Default-off/fail-soft.
+  if [ "${CODEX_STOP_HOOK:-}" = "on" ] && [ "$_rw_driver" = "codex" ] && [ "${#_rw_rt[@]}" -gt 0 ]; then
+    local _rw_hft=(); local _rw_ht
+    while IFS= read -r -d '' _rw_ht; do _rw_hft+=("$_rw_ht"); done < <(_herd_codex_stop_hook_argv_fragment "$_rw_slug" 2>/dev/null)
+    if [ "${#_rw_hft[@]}" -gt 0 ]; then
+      local _rw_last="${_rw_rt[${#_rw_rt[@]}-1]}"
+      _rw_rt=("${_rw_rt[@]:0:$((${#_rw_rt[@]}-1))}" "${_rw_hft[@]}" "$_rw_last")
+    fi
+  fi
   # Launch through the shared herdr CLI bridge (issue #514): the attach CLI splits the fresh tab's
   # root and attaches (same one-pane-right layout); pre-0.7.5 keeps the byte-identical argv.
   # shellcheck disable=SC2086  # $_rw_wsid intentionally word-splits (mirrors the lane's args).

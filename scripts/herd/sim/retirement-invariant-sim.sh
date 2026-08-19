@@ -495,6 +495,63 @@ else
   ok "tick 3: the row no longer reads deferred once the bound is crossed"
 fi
 
+# ── PART 6: HERD-788 — hook lifecycle evidence + bounded defer safety ──────────────────────────────
+# Two cases:
+#   a) stale raw working + stop-hook idle evidence (last-turn present, no current-turn) + codex
+#      spawn driver → the watcher consults structured evidence and REAPS, not defers.
+#   b) stop-hook current-turn present (turn in flight) + raw working → still DEFERS (safety countercase:
+#      an actively-prompted Codex builder must never be reaped while its hook says it is working).
+#
+# The hook marker directory is at $scn/trees/.herd/agents/<slug>/hook/. The tick child sees
+# WORKTREES_DIR="$scn/trees" (passed via the env prefix below, preserved by herd-config.sh's
+# := defaulting: it only sets WORKTREES_DIR when unset/empty, not when already set from the parent).
+step hook "HERD-788: stale raw working + hook idle → reaps; hook current-turn present → defers"
+SLUG_HOOK=retiree-hook-idle
+SLUG_HWORK=retiree-hook-work
+scn_hook="$ART/scn-hook-idle"; rm -rf "$scn_hook"; mkdir -p "$scn_hook"
+scn_hwork="$ART/scn-hook-work"; rm -rf "$scn_hwork"; mkdir -p "$scn_hwork"
+fixture "$scn_hook" "$SLUG_HOOK" merged
+fixture "$scn_hwork" "$SLUG_HWORK" merged
+
+# Set up hook markers for the idle case:
+# last-turn present (stop hook fired, turn ended), no current-turn, spawn driver = codex.
+hook_dir_idle="$scn_hook/trees/.herd/agents/$SLUG_HOOK/hook"
+mkdir -p "$hook_dir_idle"
+printf 'codex' > "$scn_hook/trees/.herd/agents/$SLUG_HOOK/driver"
+printf 'sim-turn-idle' > "$hook_dir_idle/last-turn"
+
+# Set up hook markers for the in-flight case:
+# current-turn present (turn in flight), no last-turn, spawn driver = codex.
+hook_dir_work="$scn_hwork/trees/.herd/agents/$SLUG_HWORK/hook"
+mkdir -p "$hook_dir_work"
+printf 'codex' > "$scn_hwork/trees/.herd/agents/$SLUG_HWORK/driver"
+printf '1753977600' > "$hook_dir_work/current-turn"
+
+# Tick for the idle case: raw working + hook idle + CODEX_STOP_HOOK=on → must REAP (not defer).
+rep_idle="$(SIM_AGENT_STATUS=working CODEX_STOP_HOOK=on WORKTREES_DIR="$scn_hook/trees" tick "$scn_hook" "$SLUG_HOOK" none)"
+state_idle="$(printf '%s' "$rep_idle" | sed -n "s/^STATE $SLUG_HOOK //p" | cut -d' ' -f1)"
+left_idle="$(printf '%s' "$rep_idle" | sed -n 's/^LEFT //p')"
+res_idle="$(residue "$scn_hook" "$SLUG_HOOK")"
+if [ -z "$left_idle" ] && [ -z "$res_idle" ]; then
+  ok "stale raw working + hook idle: merged worktree reaped in one sweep (HERD-788 regression test)"
+elif [ "$state_idle" = retiring ] || [ "$state_idle" = stuck ]; then
+  ok "stale raw working + hook idle: classified as '${state_idle}' (teardown in progress)"
+elif [ "$state_idle" = deferred ]; then
+  bad "stale raw working + hook idle: got deferred — HERD-788 fix not applied; retirement still using raw status alone"
+else
+  bad "stale raw working + hook idle: unexpected state='${state_idle:-<none>}' left='${left_idle:-}' res='${res_idle:-}'"
+fi
+
+# Tick for the in-flight case: raw working + hook current-turn → must DEFER (safety countercase).
+rep_hwork="$(SIM_AGENT_STATUS=working CODEX_STOP_HOOK=on WORKTREES_DIR="$scn_hwork/trees" tick "$scn_hwork" "$SLUG_HWORK" none)"
+state_hwork="$(printf '%s' "$rep_hwork" | sed -n "s/^STATE $SLUG_HWORK //p" | cut -d' ' -f1)"
+[ "$state_hwork" = deferred ] \
+  && ok "hook current-turn present + raw working: correctly deferred (in-flight turn safety countercase)" \
+  || bad "hook current-turn present + raw working: expected deferred, got '${state_hwork:-<none>}' — in-flight builder protection broken"
+[ -d "$scn_hwork/trees/$SLUG_HWORK" ] \
+  && ok "in-flight builder's worktree survives (not reaped mid-turn)" \
+  || bad "in-flight builder's worktree was reaped — work in flight LOST"
+
 step done "scorecard"
 info "artifacts: $ART"
 printf '  %s%s passed%s · %s%s failed%s\n' "$c_grn" "$PASS" "$c_rst" \

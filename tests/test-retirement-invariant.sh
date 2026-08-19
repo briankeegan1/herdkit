@@ -160,6 +160,51 @@ cold; [ "$(AGENTS_JSON="$IDLE_JSON" retire_classify merged-clean "$WTREES/merged
   || fail "(4b) MERGED + clean + an IDLE builder must still REAP (idle is done, not working)"
 ok
 
+# ── (4c) HERD-788: MERGED + raw working + hook idle + codex spawn driver → retiring ────────────────
+# Regression case: after a Codex builder finishes its last turn, herdr keeps reporting working because
+# the pane process stays alive. With stop-hook markers on disk and spawn driver=codex, _reap_agent_working
+# must consult structured lifecycle evidence and reap.
+_HOOK_DIR_4C="$WTREES/.herd/agents/merged-clean/hook"
+mkdir -p "$_HOOK_DIR_4C"
+printf 'codex' > "$WTREES/.herd/agents/merged-clean/driver"  # persisted spawn driver
+printf 'test-turn-1' > "$_HOOK_DIR_4C/last-turn"   # stop-hook fired: turn ended
+rm -f "$_HOOK_DIR_4C/current-turn"                   # no in-flight turn
+cold; [ "$(AGENTS_JSON="$WORKING_JSON" WORKTREES_DIR="$WTREES" CODEX_STOP_HOOK=on retire_classify merged-clean "$WTREES/merged-clean" feat/merged-clean 0 | cut -d"$RS" -f1)" = retiring ] \
+  || fail "(4c) MERGED + raw working + hook idle + codex driver must REAP (HERD-788 regression)"
+rm -rf "$_HOOK_DIR_4C" "$WTREES/.herd/agents/merged-clean/driver"
+ok
+
+# ── (4d) HERD-788: MERGED + raw working + no hook dir → deferred (conservative fallback) ──────────
+# When no hook markers exist (default-off, or non-Codex driver), _reap_agent_working must fall back
+# conservatively to the raw herdr status and defer, same as before HERD-788.
+cold; [ "$(AGENTS_JSON="$WORKING_JSON" WORKTREES_DIR="$WTREES" CODEX_STOP_HOOK=on retire_classify merged-clean "$WTREES/merged-clean" feat/merged-clean 0 | cut -d"$RS" -f1)" = deferred ] \
+  || fail "(4d) MERGED + raw working + no hook dir must DEFER (conservative fallback)"
+ok
+
+# ── (4e) HERD-788: stale hook markers + CODEX_STOP_HOOK=off → deferred (lever-off safety) ─────────
+# When the lever is off, stale hook markers must NOT influence retirement — a turned-off CODEX_STOP_HOOK
+# must be byte-identical to before HERD-788. Ensures a Claude builder with leftover markers is not reaped.
+_HOOK_DIR_4E="$WTREES/.herd/agents/merged-clean/hook"
+mkdir -p "$_HOOK_DIR_4E"
+printf 'codex' > "$WTREES/.herd/agents/merged-clean/driver"
+printf 'stale-turn' > "$_HOOK_DIR_4E/last-turn"
+cold; [ "$(AGENTS_JSON="$WORKING_JSON" WORKTREES_DIR="$WTREES" CODEX_STOP_HOOK=off retire_classify merged-clean "$WTREES/merged-clean" feat/merged-clean 0 | cut -d"$RS" -f1)" = deferred ] \
+  || fail "(4e) stale hook markers + CODEX_STOP_HOOK=off must DEFER (lever-off safety)"
+rm -rf "$_HOOK_DIR_4E" "$WTREES/.herd/agents/merged-clean/driver"
+ok
+
+# ── (4f) HERD-788: hook markers + spawn driver = herdr-claude → deferred (driver-switch safety) ────
+# When the persisted spawn driver is not codex, hook markers must be ignored — a re-tasked
+# herdr-claude builder must not be falsely reaped by the previous codex run's stale markers.
+_HOOK_DIR_4F="$WTREES/.herd/agents/merged-clean/hook"
+mkdir -p "$_HOOK_DIR_4F"
+printf 'herdr-claude' > "$WTREES/.herd/agents/merged-clean/driver"  # driver switch
+printf 'stale-turn' > "$_HOOK_DIR_4F/last-turn"
+cold; [ "$(AGENTS_JSON="$WORKING_JSON" WORKTREES_DIR="$WTREES" CODEX_STOP_HOOK=on retire_classify merged-clean "$WTREES/merged-clean" feat/merged-clean 0 | cut -d"$RS" -f1)" = deferred ] \
+  || fail "(4f) stale hook markers + non-codex spawn driver must DEFER (driver-switch safety)"
+rm -rf "$_HOOK_DIR_4F" "$WTREES/.herd/agents/merged-clean/driver"
+ok
+
 # ── (5) MERGED + regenerable dirt → still retiring (droppings, not work) ─────────────────────────
 sha_d="$(mkwt merged-dropping)"
 gh_says "feat/merged-dropping" MERGED "$sha_d" 14
