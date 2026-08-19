@@ -98,6 +98,7 @@ pass; echo "PASS (4) no in-flight builders renders an explicit '(none in flight)
 # ── (5) in-flight builders paired with their specialist agent (or 'general' when unmarked) ────────
 P5="$T/p5"; _project "$P5"
 printf 'with-agent %s builder\n' t1  > "$P5/.worktrees/.herd-tabs"
+printf 'with-agent %s builder\n' stale-t1 >> "$P5/.worktrees/.herd-tabs"
 printf 'no-agent %s builder\n'  t2 >> "$P5/.worktrees/.herd-tabs"
 printf 'tester\n' > "$P5/.worktrees/.herd-agent-with-agent"
 out="$(_render "$P5")"
@@ -105,6 +106,8 @@ case "$out" in *"with-agent"*) : ;; *) fail "(5) builder slug 'with-agent' not r
 case "$out" in *"no-agent"*)   : ;; *) fail "(5) builder slug 'no-agent' not rendered: [$out]" ;; esac
 case "$out" in *tester*) : ;; *) fail "(5) specialist agent 'tester' not rendered for with-agent: [$out]" ;; esac
 case "$out" in *general*) : ;; *) fail "(5) unmarked builder did not fall back to 'general': [$out]" ;; esac
+[ "$(grep -o 'with-agent' <<< "$out" | wc -l | tr -d ' ')" = "1" ] \
+  || fail "(5) duplicate registry rows must render one canonical builder: [$out]"
 pass; echo "PASS (5) in-flight builders render slug + specialist agent (or 'general' when unmarked)"
 
 echo "ALL PASS ($PASS checks)"

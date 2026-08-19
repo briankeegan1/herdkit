@@ -96,6 +96,8 @@ _argv_has "$REVIEW_CALLS.codex" "--dangerously-bypass-approvals-and-sandbox" \
 for bad in --dangerously-skip-permissions --output-format stream-json --verbose; do
   _argv_has "$REVIEW_CALLS.codex" "$bad" && fail "(1) claude-only flag '$bad' leaked into the codex reviewer argv: $(tr '\n' ' ' < "$REVIEW_CALLS.codex")"
 done
+[ "$(grep -cx -- '--json' "$REVIEW_CALLS.codex" || true)" = "1" ] \
+  || fail "(1) Codex reviewer must request its documented JSON event stream"
 [ "$RC" -eq 0 ] || fail "(1) codex reviewer printed 'REVIEW: PASS' on stdout — the gate must parse it as PASS (rc=$RC, out: $REVIEW_OUT)"
 ok; echo "PASS (1) codex-resolved reviewer gets codex flags only and its verdict is parsed"
 
