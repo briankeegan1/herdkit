@@ -63,5 +63,6 @@ herd_write_ratelimit_hook "$DIR"
 herd_write_mcp_servers "$DIR"
 
 echo "✅ Worktree ready: $DIR   (branch $BRANCH, off $DEFAULT_BRANCH @ $(git -C "$REPO" rev-parse --short "$DEFAULT_BRANCH"))"
-echo "   Start an agent here:   cd $DIR && claude"
+_AGENT_RUNTIME="$(herd_driver_agent_runtime "${HERD_LANE_DRIVER:-}" 2>/dev/null || true)"
+echo "   Start an agent here:   cd $DIR && ${_AGENT_RUNTIME:-claude}"
 echo "   When done:             gh pr create   # then the watcher reviews & merges"

@@ -359,6 +359,50 @@ sys.stdout.write("".join(tok + "\0" for tok in out))
 '
 }
 
+# herd_driver_agent_argv_description <driver> <model> <flags> — render the operator-facing portion
+# of the interactive runtime argv from the SAME resolved driver binding used by the spawn composer.
+# The opening prompt and runtime-specific rules/context payloads are deliberately omitted: banners
+# identify the executable, model, and permission posture without echoing task text or injected repo
+# conventions. BYTE-IDENTICAL for the default driver: `claude --model <model> <flags>`.
+# FAIL-SOFT: a missing or malformed binding falls back to today's Claude-shaped description.
+herd_driver_agent_argv_description() {
+  local drv="${1:-}" model="${2:-}" flags="${3:-}" binding perm
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  binding="$(herd_driver_agent_value DRIVER_AGENT_INTERACTIVE_SPAWN "" "$drv")"
+  perm="$(herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG "" "$drv")"
+  [ -n "$binding" ] || binding='claude --model <model> --dangerously-skip-permissions "<prompt>"'
+  [ -n "$perm" ]    || perm='--dangerously-skip-permissions'
+  HERD_DESC_BINDING="$binding" HERD_DESC_PERM="$perm" HERD_DESC_MODEL="$model" \
+  HERD_DESC_FLAGS="$flags" python3 -c '
+import os, shlex
+try:
+    toks = shlex.split(os.environ["HERD_DESC_BINDING"])
+    model = os.environ["HERD_DESC_MODEL"]
+    flags = os.environ["HERD_DESC_FLAGS"].split()
+    perm = os.environ["HERD_DESC_PERM"]
+    out = []
+    for t in toks:
+        if t == "<prompt>":
+            continue
+        if t == "<agents-rules>":
+            if out:
+                out.pop()
+            continue
+        if t == "<model>":
+            if model:
+                out.append(model)
+            elif out and out[-1] == "--model":
+                out.pop()
+        elif t == perm:
+            out.extend(flags)
+        else:
+            out.append(t)
+except Exception:
+    out = ["claude"] + (["--model", os.environ["HERD_DESC_MODEL"]] if os.environ["HERD_DESC_MODEL"] else []) + os.environ["HERD_DESC_FLAGS"].split()
+print(" ".join(out), end="")
+'
+}
+
 # herd_driver_lane_permission_flags <driver> — the permission FLAGS a builder LANE passes as the spawn's
 # <flags> (which herd_driver_agent_spawn_argv substitutes for <driver>'s DRIVER_AGENT_PERMISSION_FLAG
 # token). HERD-201: the lanes previously hardcoded CLAUDE_FLAGS to claude's --dangerously-skip-permissions
