@@ -267,6 +267,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `CLAIM_RELEASE` → `herd-claim.sh`
 - `CLAIM_REQUIRED` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
+- `CODEX_STOP_HOOK` → `agent-watch.sh`, `driver.sh`
 - `COMMIT_CONVENTION` → `bin/herd`, `healthcheck.sh`
 - `CONTEXT_PROVISION` → `bin/herd`
 - `COORDINATOR_AUTONOMY` → `bin/herd`
