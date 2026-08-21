@@ -30,9 +30,18 @@
 # command. RE-AUDITED 2026-08-18 (HERD-767, epic HERD-754 step 8) against those three pages: this pass
 # found and fixed one real drift (see the CONTEXT-INJECTION note on DRIVER_AGENT_INTERACTIVE_SPAWN
 # below) and tightened DRIVER_AGENT_RESUME to the one prompt-delivery shape every fetched doc example
-# actually demonstrates. The grok binary itself remains NOT INSTALLED on this dev machine (`command -v
-# grok` fails here) — every claim below is a documentation claim, not a live-verified one; see each
-# binding's comment for exactly what is confirmed by docs vs. still only an assumption.
+# actually demonstrates.
+#
+# LIVE-GROUNDED 2026-08-21 (HERD-800, epic HERD-782 ph1-2): grok is now INSTALLED here — grok 1.0.5
+# (5115b46bc909) at ~/.local/bin/grok — so the earlier "grok is NOT INSTALLED on this dev machine" note
+# is STALE and removed. The binary is installed but NOT authenticated (`grok models` prints "You are not
+# authenticated"), so anything needing a completed model turn is still unverifiable — but a lot is now
+# live-verified regardless of sign-in: the headless flag surface (`grok --help`), that the exec adapter's
+# argv is ACCEPTED (not an argv/usage rejection), the `--output-format streaming-messages-json` wire
+# shape (Anthropic Messages format — captured, see scripts/herd/grok-exec-adapter.sh + HERD-800), and
+# `grok inspect`'s project rule/agent discovery. Those live facts are proven by
+# scripts/herd/runtime-conformance.sh's grok probes and recorded in docs/grok-compat-program.md. Each
+# binding's comment still marks what is confirmed-live vs. documentation-only vs. still an assumption.
 
 # ── MUX capabilities (herdr) — IDENTICAL to herdr-claude: this driver swaps the RUNTIME, not the
 #    multiplexer, so every herdr incantation below is byte-for-byte the default's. ──────────────────
@@ -88,14 +97,19 @@ DRIVER_AGENT_INTERACTIVE_SPAWN='grok --model <model> --always-approve --rules <a
 # one-shot-exec — headless, prints and exits. `-p,--single` is Grok Build's `claude -p` analog. Every
 # headless example on docs.x.ai/build/cli/headless-scripting and .../reference sends its prompt via
 # `-p`, never as a bare positional argument, so this shape is the best-grounded one documented.
-# STRUCTURED-OUTPUT FINDING (hunted for per HERD-767's audit): grok DOES have a `codex exec --json`
-# analog — `--output-format {plain|json|streaming-json}` is real and documented ("one JSON object at
-# the end" / "newline-delimited JSON events"). EXISTENCE is confirmed; the actual event/object SCHEMA
-# is not — no example payload is shown on either docs page, and the binary is not installed here to
-# observe one. Building a grok-exec-adapter (the analog of scripts/herd/codex-exec-adapter.sh) on a
-# guessed schema would be exactly the fabrication this driver avoids everywhere else, so this binding
-# stays plain-text (no --output-format bound) rather than guess at the JSON shape; that adapter is
-# left for a future step once a machine with `grok` installed can observe a real stream.
+# STRUCTURED-OUTPUT FINDING — RESOLVED 2026-08-21 (HERD-800, epic HERD-782 ph1-2). The HERD-767 audit
+# left this open: grok's `--output-format` EXISTED per docs but its event SCHEMA had never been observed,
+# so no grok-exec-adapter was built. That caveat is now closed with OBSERVED evidence. grok 1.0.5's
+# `--help` documents four formats — plain | json | streaming-json (agent-native ACP updates) |
+# **streaming-messages-json (NDJSON in the Anthropic Messages API wire format)** — and the last was
+# captured live: `{"type":"system","subtype":"init",…}` then a terminal `{"type":"result",
+# "is_error":<bool>,…}`, the Claude-Code stream-json envelope. That is a documented, stable wire
+# contract, so scripts/herd/grok-exec-adapter.sh now parses it for BOUNDED, structured one-shot work —
+# the analog of scripts/herd/codex-exec-adapter.sh, verified in tests/test-grok-exec-adapter.sh and by
+# runtime-conformance.sh's grok-structured-output probe. This routing/interactive binding INTENTIONALLY
+# stays plain-text (no --output-format): it is the human-/pane-facing headless spawn (like codex.driver's
+# own ONESHOT_EXEC), whereas the structured, machine-parsed path is the adapter — the same split codex
+# uses. Every headless example on docs.x.ai sends its prompt via `-p`, never a bare positional.
 DRIVER_AGENT_ONESHOT_EXEC='grok -p "<prompt>" --model <model> --always-approve'
 # resume — continue the most recent session in the cwd with full context. `-c,--continue` ("continue
 # the most recent session for the current directory") is confirmed genuinely documented, not an
@@ -141,15 +155,21 @@ DRIVER_AGENT_COST_USAGE_KEYS='@degrade:no-verified-grok-usage-token-schema'
 DRIVER_AGENT_PROCESS_SIGNATURE='grok'
 
 # ── Specialist-agent ROSTER bindings (HERD-667, epic HERD-666) ────────────────────────────────────
-# VERIFIED-BY-REPORT, not on this machine. The grok binary is NOT installed here (HERD-666 pre-audit),
-# so these two bindings come from the operator's hand-prototype on grok 1.0.3 rather than a local
-# probe, and post-merge live verification is owned by the second operator. What was reported, and why
-# each binding is shaped this way:
-#   • ~/.grok/agents/ (USER scope) is honored; a repo-local ./.grok/agents/ is IGNORED. That is trap
-#     T1 of the epic and the reason DEFINITION_MODE is `install`: the committed source in
-#     .herd/agents/ must be PUBLISHED to the user-scope dir (`herd agents install`) or the runtime
-#     never sees it. $HERD_AGENT_DEFINITION_ROOT rebinds the root (the hermetic-test / non-standard
-#     -home knob), exactly as $HERD_TRANSCRIPT_ROOT rebinds DRIVER_AGENT_SESSION_ID above.
+# PARTLY LIVE now (updated 2026-08-21, HERD-800). These bindings originally came from the operator's
+# hand-prototype on grok 1.0.3 (grok was not installed here at the time); grok 1.0.5 is now installed
+# but unauthenticated, so DISCOVERY is live-checkable while SELECTION/GOVERNANCE (which needs a completed
+# turn) is not. What was reported, why each binding is shaped this way, and what re-checking found:
+#   • 1.0.3 report: ~/.grok/agents/ (USER scope) is honored; a repo-local ./.grok/agents/ is IGNORED —
+#     trap T1, the reason DEFINITION_MODE is `install`: the committed source in .herd/agents/ must be
+#     PUBLISHED to the user-scope dir (`herd agents install`) or the runtime never sees it.
+#     $HERD_AGENT_DEFINITION_ROOT rebinds the root (the hermetic-test / non-standard -home knob), exactly
+#     as $HERD_TRANSCRIPT_ROOT rebinds DRIVER_AGENT_SESSION_ID above.
+#   • 1.0.5 LIVE RE-CHECK (runtime-conformance.sh grok-agent-discovery): `grok inspect` NOW surfaces a
+#     repo-local ./.grok/agents/<name>.md as a `project`-scope agent — a change from the 1.0.3
+#     install-only finding. This is a DISCOVERY observation only: whether `--agent <name>` then selects
+#     and lets that definition GOVERN a turn needs an authenticated run, so DEFINITION_MODE stays
+#     `install` here (the safe, verified-both-ways binding) and the selection/governance question is
+#     carried by HERD-802 (interactive parity). See docs/grok-compat-program.md.
 #   • `--agent <name>` selects a definition by name, and an UNKNOWN name is SILENTLY IGNORED — the
 #     runtime just runs as a plain agent. That is trap T2, and it is why `herd agents verify` is
 #     empirical and carries a negative control: on this runtime a probe without one cannot fail.
