@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # HERD-773: atomic, complete, reversible Claude Code <-> Codex runtime switching.
+# HERD-801: extends the same contract to the Grok runtime (grok-4.6 judgment / grok-4.5 cheap roles).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,11 +28,19 @@ MODEL_QUICK="old-quick"
 EOF
 cp "$P/.herd/config" "$T/baseline.before"
 
-for rt in claude codex; do
+for rt in claude codex grok; do
   cat > "$T/bin/$rt" <<'EOF'
 #!/usr/bin/env bash
+# Fake runtime: the login-status surface each driver's preflight probes. claude/codex use a two-word
+# read-only status command whose EXIT CODE signals login. grok's `grok models` probe reports login
+# state in its OUTPUT and exits 0 regardless (verified on grok 1.0.5) — so the fake mirrors that: it
+# prints "You are not authenticated." only when RUNTIME_AUTH_RC is set, and always exits 0.
 case "$1 $2" in
   "auth status"|"login status") exit "${RUNTIME_AUTH_RC:-0}" ;;
+  "models ")
+    [ "${RUNTIME_AUTH_RC:-0}" != 0 ] && echo "You are not authenticated."
+    echo "Available models:"; echo "  * grok-4.6 (default)"; echo "  - grok-4.5"
+    exit 0 ;;
 esac
 exit 0
 EOF
@@ -106,5 +115,62 @@ if rg -n 'Claude Code|Claude quota|Claude death' "$ROOT/templates/coordinator.md
   fail "coordinator template retains vendor-prescriptive prose: $(cat "$T/vendor.out")"
 fi
 ok "coordinator template prose is runtime-neutral"
+
+# ── Grok arm (HERD-801): identical atomic / complete / reversible contract as the codex arm. ──────
+# State on entry: config.local on herdr-claude, reload log at 2 (the refusals above wrote nothing and
+# never reloaded). Grok's preflight authenticates via the read-only `grok models` probe.
+before="$(shasum "$P/.herd/config.local")"
+out="$(cd "$P" && cmd_runtime_switch grok --dry-run)"
+[ "$before" = "$(shasum "$P/.herd/config.local")" ] || fail "grok dry-run changed config.local"
+[ "$(wc -l < "$HERD_RS_RELOAD_LOG" | tr -d ' ')" = 2 ] || fail "grok dry-run reloaded"
+for k in HERD_DRIVER MODEL_COORDINATOR MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH \
+  MODEL_REVIEW MODEL_RESOLVER MODEL_ADVISE MODEL_ESCALATE REVIEW_MODEL_CHEAP REVIEW_MODEL_DOCS \
+  REVIEW_MODEL_ESCALATED; do
+  grep -q "${k}" <<<"$out" || fail "grok dry-run omitted role $k"
+done
+grep -q 'grok-4.6' <<<"$out" || fail "grok dry-run omitted the grok-4.6 judgment model"
+grep -q 'grok-4.5' <<<"$out" || fail "grok dry-run omitted the grok-4.5 cheap-role model"
+grep -q 'NOTHING was written' <<<"$out" || fail "grok dry-run did not state no-write"
+ok "grok dry-run is complete and write-free"
+
+# Claude -> Grok: one atomic overlay with the complete preset and exactly one more reload.
+( cd "$P" && cmd_runtime_switch grok ) >"$T/grok.out"
+[ "$(wc -l < "$HERD_RS_RELOAD_LOG" | tr -d ' ')" = 3 ] || fail "Grok switch did not reload exactly once"
+[ "$( _config_file_value "$P/.herd/config.local" HERD_DRIVER )" = grok ] || fail "driver not switched to grok"
+while IFS=$'\t' read -r k v; do
+  [ "$( _config_file_value "$P/.herd/config.local" "$k" )" = "$v" ] || fail "Grok map mismatch: $k"
+done < <(_runtime_switch_pairs grok)
+# grok-4.6 lands on exactly the four judgment roles; every other role is grok-4.5.
+for k in MODEL_COORDINATOR MODEL_ADVISE MODEL_ESCALATE REVIEW_MODEL_ESCALATED; do
+  [ "$( _config_file_value "$P/.herd/config.local" "$k" )" = grok-4.6 ] || fail "grok judgment role $k is not grok-4.6"
+done
+for k in MODEL_FEATURE MODEL_QUICK MODEL_SCRIBE MODEL_RESEARCH MODEL_REVIEW MODEL_RESOLVER \
+  REVIEW_MODEL_CHEAP REVIEW_MODEL_DOCS; do
+  [ "$( _config_file_value "$P/.herd/config.local" "$k" )" = grok-4.5 ] || fail "grok cheap role $k is not grok-4.5"
+done
+cmp -s "$P/.herd/config" "$T/baseline.before" || fail "grok switch mutated shared .herd/config"
+[ ! -e "$P/.herd/secrets" ] || fail "grok switch created/touched secrets"
+grep -q 'runtime switch herdr-claude' "$T/grok.out" || fail "Grok switch omitted rollback path"
+ok "Claude to Grok map is complete, local, and reloads once"
+
+# Grok -> Claude: complete inverse preset and one more (not per-key) reload — fully reversible.
+( cd "$P" && cmd_runtime_switch herdr-claude ) >"$T/grok-back.out"
+[ "$(wc -l < "$HERD_RS_RELOAD_LOG" | tr -d ' ')" = 4 ] || fail "Grok->Claude switch did not add exactly one reload"
+while IFS=$'\t' read -r k v; do
+  [ "$( _config_file_value "$P/.herd/config.local" "$k" )" = "$v" ] || fail "Claude-from-grok map mismatch: $k"
+done < <(_runtime_switch_pairs herdr-claude)
+grep -q 'runtime switch grok' "$T/grok-back.out" || fail "Grok->Claude switch omitted switch-back path"
+ok "Grok to Claude map is complete and reversible"
+
+# Unauthenticated grok (grok present on PATH but `grok models` non-zero — this machine's real state):
+# a hard, pre-write refusal that writes nothing and never reloads. This is the grounding scenario.
+before="$(shasum "$P/.herd/config.local")"; set +e
+( cd "$P" && export RUNTIME_AUTH_RC=1; cmd_runtime_switch grok --dry-run ) >"$T/grok-auth.out" 2>&1; rc=$?
+set -e
+[ "$rc" -ne 0 ] || fail "unauthenticated grok was accepted"
+[ "$before" = "$(shasum "$P/.herd/config.local")" ] || fail "grok auth refusal wrote config"
+[ "$(wc -l < "$HERD_RS_RELOAD_LOG" | tr -d ' ')" = 4 ] || fail "grok auth refusal reloaded"
+grep -qi 'not authenticated' "$T/grok-auth.out" || fail "grok auth refusal message missing"
+ok "unauthenticated grok refuses atomically (grounding: grok installed, not logged in)"
 
 echo "PASS: atomic runtime switch"

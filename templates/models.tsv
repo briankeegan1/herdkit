@@ -28,3 +28,5 @@ claude-haiku-4-5	cheap	quick + resolver lanes; also the docs-tier reviewer (REVI
 gpt-5.6-sol	judgment	Codex coordinator, advisor, escalation, and repeated-failure review tier	2026-08-18
 gpt-5.6-terra	balanced	Codex feature, review, resolver, scribe, and research tier	2026-08-18
 gpt-5.6-luna	cheap	Codex quick lane and docs-tier reviewer	2026-08-18
+grok-4.6	judgment	Grok coordinator, advisor, escalation, and repeated-failure review tier	2026-08-21
+grok-4.5	balanced	Grok feature, review, resolver, scribe, research, quick, and docs tier	2026-08-21
