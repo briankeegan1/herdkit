@@ -3462,6 +3462,23 @@ REVIEW_MODEL_DOCS	gpt-5.6-luna
 REVIEW_MODEL_ESCALATED	gpt-5.6-sol
 EOF
       ;;
+    grok)
+      cat <<'EOF'
+HERD_DRIVER	grok
+MODEL_COORDINATOR	grok-4.6
+MODEL_FEATURE	grok-4.5
+MODEL_QUICK	grok-4.5
+MODEL_SCRIBE	grok-4.5
+MODEL_RESEARCH	grok-4.5
+MODEL_REVIEW	grok-4.5
+MODEL_RESOLVER	grok-4.5
+MODEL_ADVISE	grok-4.6
+MODEL_ESCALATE	grok-4.6
+REVIEW_MODEL_CHEAP	grok-4.5
+REVIEW_MODEL_DOCS	grok-4.5
+REVIEW_MODEL_ESCALATED	grok-4.6
+EOF
+      ;;
     *) return 1 ;;
   esac
 }
@@ -3480,6 +3497,18 @@ _runtime_switch_preflight() {
       || die "runtime switch preflight failed: Claude Code is not logged in ('claude auth status'); run 'claude auth login', then retry — NOTHING was written" ;;
     codex) "$binary" login status >/dev/null 2>&1 \
       || die "runtime switch preflight failed: Codex is not logged in ('codex login status'); run 'codex login', then retry — NOTHING was written" ;;
+    grok)
+      # Grok's read-only `grok models` probe reports login state in its OUTPUT, not its exit code: it
+      # prints "You are not authenticated." and STILL exits 0 (verified on grok 1.0.5), so gating on rc
+      # would wrongly accept a logged-out runtime. Refuse when the probe declares itself unauthenticated
+      # (or when the probe cannot be run at all).
+      local grok_probe
+      grok_probe="$("$binary" models 2>&1)" \
+        || die "runtime switch preflight failed: 'grok models' probe could not run; run 'grok' and sign in, then retry — NOTHING was written"
+      if grep -qi 'not authenticated' <<<"$grok_probe"; then
+        die "runtime switch preflight failed: Grok is not authenticated ('grok models' reports 'not authenticated'); run 'grok' and sign in, then retry — NOTHING was written"
+      fi
+      ;;
   esac
 
   ib="$(herd_driver_agent_value DRIVER_AGENT_INTERACTIVE_SPAWN '' "$target")"
@@ -3519,11 +3548,11 @@ cmd_runtime_switch() {
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --dry-run) dry_run=1 ;;
-      *) die "usage: herd runtime switch <herdr-claude|codex> [--dry-run]" ;;
+      *) die "usage: herd runtime switch <herdr-claude|codex|grok> [--dry-run]" ;;
     esac
     shift
   done
-  case "$target" in herdr-claude|codex) ;; *) die "usage: herd runtime switch <herdr-claude|codex> [--dry-run]" ;; esac
+  case "$target" in herdr-claude|codex|grok) ;; *) die "usage: herd runtime switch <herdr-claude|codex|grok> [--dry-run]" ;; esac
 
   local root cfg local_cfg caps current previous pairs rec key val cur changed=0
   root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
@@ -3580,7 +3609,7 @@ cmd_runtime() {
   local sub="${1:-}"; [ "$#" -gt 0 ] && shift
   case "$sub" in
     switch) cmd_runtime_switch "$@" ;;
-    *) die "usage: herd runtime switch <herdr-claude|codex> [--dry-run]" ;;
+    *) die "usage: herd runtime switch <herdr-claude|codex|grok> [--dry-run]" ;;
   esac
 }
 
@@ -9886,7 +9915,7 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
-  herd runtime switch <herdr-claude|codex> [--dry-run]
+  herd runtime switch <herdr-claude|codex|grok> [--dry-run]
                                       atomically switch this machine's driver + complete model-role
                                       map after binary/login/argv preflight; writes only gitignored
                                       .herd/config.local, reloads once, and prints the switch-back path
