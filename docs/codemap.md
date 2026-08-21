@@ -58,6 +58,7 @@ Role summarized from each file's top-of-file comment.
 - `governance-drift-sweep.sh` — periodic, ADVISORY governance-DRIFT sweep (HERD-125).
 - `governance-hook.sh` — governance-hook.sh <target> — the SESSION-TIME governance enforcer rendered into a project's
 - `governance.sh` — the SHARED, read-only governance EXTRACTION + MAPPING helpers (HERD-119 / HERD-125).
+- `grok-exec-adapter.sh` — a herd-owned adapter around `grok -p --output-format streaming-messages-json`
 - `handoff.sh` — the shared format + emitter for the BUILDER HANDOFF SUMMARY (HERD-106, research G4).
 - `health-pane-view.sh` — health-pane-view.sh <log-path> [inflight-marker] — the HEALTH_PANE (HERD-313/HERD-568) view command:
 - `health-trust.sh` — THE shared SHA-MATCHED BUILDER-LOCAL HEALTH TRUST library (HERD-531).
@@ -212,7 +213,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `research-step.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `research.sh` → `burst.sh`, `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `retirement.sh` → `agent-watch.sh`, `journal.sh`
-- `runtime-conformance.sh` → `agents.sh`, `codex-exec-adapter.sh`, `driver.sh`, `herd-config.sh`
+- `runtime-conformance.sh` → `agents.sh`, `codex-exec-adapter.sh`, `driver.sh`, `grok-exec-adapter.sh`, `herd-config.sh`
 - `scribe-step.sh` → `create-retry.sh`, `drainer-liveness.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `spawn-step.sh` → `herd-config.sh`
