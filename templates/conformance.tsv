@@ -634,6 +634,7 @@ OUTCOME_LEDGER	unit	tests/test-outcome-ledger.sh
 herd ledger-report [--json | --alerts | --daily [--file PATH]]	unit	tests/test-outcome-ledger.sh
 herd intervene <ref> <safety|product|infra-recovery|convenience> "<note>"	unit	tests/test-outcome-ledger.sh
 codex-exec-adapter.sh	unit	tests/test-codex-exec-adapter.sh
+grok-exec-adapter.sh	unit	tests/test-grok-exec-adapter.sh
 codex-durable-coordinator.sh	unit	tests/test-codex-durable-coordinator.sh
 runtime-conformance.sh	unit	tests/test-runtime-conformance.sh
 plugins/herdkit-coordinator	unit	tests/test-codex-plugin-manifest.sh
