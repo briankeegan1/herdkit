@@ -394,9 +394,10 @@ concept at all — the abstraction is additive, not a rewrite of the supported p
 the project's shared configuration:
 
 ```sh
-herd runtime switch codex --dry-run   # show the proposed HERD_DRIVER + MODEL_* map, write nothing
-herd runtime switch codex             # apply it: verify binary + login + argv composition, then write
-herd runtime switch herdr-claude      # reverse
+herd runtime switch codex --dry-run     # show the proposed HERD_DRIVER + MODEL_* map, write nothing
+herd runtime switch codex               # apply it: verify binary + login + argv composition, then write
+herd runtime switch grok                # or: switch to grok
+herd runtime switch herdr-claude        # reverse to default
 ```
 
 The switch shows every proposed value first (`HERD_DRIVER`, all `MODEL_*` runtime roles, all
@@ -409,6 +410,7 @@ runtime is logged out:
 ```sh
 claude auth login    # Claude Code
 codex login          # Codex
+grok auth login      # Grok
 ```
 
 **Codex permission modes.** When `HERD_DRIVER=codex` the lanes default to
@@ -417,6 +419,14 @@ worktree. A safer alternative that allows only filesystem writes inside the work
 prompts for approval is `--sandbox workspace-write --ask-for-approval never`. Per-machine permission
 flag overrides are accepted by every lane script and take the driver's exact flag string verbatim.
 Note that `--dangerously-skip-permissions` is Claude Code's flag and is not accepted by the Codex
+CLI.
+
+**Grok permission modes.** When `HERD_DRIVER=grok` the lanes default to `--always-approve` (alias
+`--yolo`) — full autonomy in an isolated worktree with auto-approval of tool executions. This is
+Grok Build's hands-off mode for unattended builders. Per-machine permission flag overrides are
+accepted by every lane script and take the driver's exact flag string verbatim; there is no Grok
+equivalent to Codex's granular sandbox modes — `--always-approve` is the canonical autonomy flag.
+Note that `--dangerously-skip-permissions` is Claude Code's flag and is not accepted by the Grok
 CLI.
 
 **Adversarial review panes.** In the default single-reviewer path the reviewer agent opens a visible

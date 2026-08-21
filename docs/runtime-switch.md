@@ -1,11 +1,12 @@
 # Switching the agent runtime
 
-Use the explicit switch command to move one machine between Claude Code and Codex without changing
-the project's shared configuration:
+Use the explicit switch command to move one machine between Claude Code, Codex, and Grok without
+changing the project's shared configuration:
 
 ```sh
 herd runtime switch codex --dry-run
 herd runtime switch codex
+herd runtime switch grok              # or switch to Grok
 ```
 
 The command shows every proposed value first: `HERD_DRIVER`, all `MODEL_*` runtime roles, and all
@@ -26,6 +27,7 @@ If preflight reports that the runtime is logged out, authenticate directly and r
 ```sh
 claude auth login    # Claude Code
 codex login          # Codex
+grok auth login      # Grok
 ```
 
 Model suggestions are a complete role preset, not a migration of credentials or shared policy.
