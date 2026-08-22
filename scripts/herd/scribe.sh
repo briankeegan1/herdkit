@@ -85,6 +85,7 @@ fi
 #    filter client-side via the workspace_id field each agent record already carries. Capture the
 #    roster ONCE so the liveness corroboration below reads the SAME snapshot (no second call / TOCTOU).
 HEARTBEAT="$TREES/.scribe.heartbeat"
+PROGRESS="$TREES/.scribe.progress"
 AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 if printf '%s' "$AGENTS_JSON" | NAME="$HERD_AGENT_SCRIBE" WS="$_WS_ID" python3 -c '
 import sys,json,os
@@ -97,6 +98,15 @@ sys.exit(0 if any(
   x.get("name")==os.environ["NAME"] and (not ws or x.get("workspace_id","")==ws)
   for x in agents
 ) else 1)'; then
+  # A live pane is not proof that it is draining. When pending work has seen no claim/completion for
+  # the established timeout, send one safe wake through the driver seam. A live owner of a .req.mine
+  # suppresses this: slow real work is not a no-progress wedge.
+  if herd_drainer_queue_stalled "$Q" "$PROGRESS" "$DRAINER_HEARTBEAT_TIMEOUT" "$HEARTBEAT"; then
+    herd_driver_send_text "$HERD_AGENT_SCRIBE" "The backlog queue has pending work with no recent claim or completion. Please run: bash $HERE/scribe-step.sh next --linger $SCRIBE_LINGER_SECS"
+    echo "✍️  scribe already running but queue progress is stale — sent it a safe wake."
+    journal_append drainer_woken component scribe agent "$HERD_AGENT_SCRIBE" timeout "$DRAINER_HEARTBEAT_TIMEOUT"
+    exit 0
+  fi
   # A drainer of this name is LISTED. Normally we short-circuit (it will drain this). But a listed
   # drainer can be HUNG: its heartbeat ($HEARTBEAT, written by scribe-step.sh on every drain step)
   # goes stale. HERD-109 reclaimed on stale-heartbeat alone — but that FALSE-POSITIVED a fresh,
