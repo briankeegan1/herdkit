@@ -363,8 +363,8 @@ _baseline_base_set() {
   # not a second HEAD lookup after the suite returns. `run_profile` is captured in a command
   # substitution, so this explicit sidecar survives that subshell without polluting suite output.
   # Best-effort: no attestation means DATAENV trust is refused later, never fabricated.
-  if [ -n "${HEALTH_TRUST_BASELINE_ATTESTATION_FILE:-}" ]; then
-    printf '%s\n' "$_bl_base_sha" > "$HEALTH_TRUST_BASELINE_ATTESTATION_FILE" 2>/dev/null || true
+  if [ -n "${HERD_HEALTH_TRUST_BASELINE_ATTESTATION_FILE:-}" ]; then
+    printf '%s\n' "$_bl_base_sha" > "$HERD_HEALTH_TRUST_BASELINE_ATTESTATION_FILE" 2>/dev/null || true
   fi
 
   # Cache hit → return the memoized set with NO suite run at all (so no sandbox is even created).
@@ -1101,7 +1101,7 @@ _hc_baseline_attest=""
 if [ "$MODE" = "heavy" ] && [ -z "$ONELINE" ] && command -v herd_health_trust_on >/dev/null 2>&1 \
    && herd_health_trust_on; then
   _hc_baseline_attest="$(mktemp "${TMPDIR:-/tmp}/herd-baseline-attest.XXXXXX" 2>/dev/null || true)"
-  [ -n "$_hc_baseline_attest" ] && export HEALTH_TRUST_BASELINE_ATTESTATION_FILE="$_hc_baseline_attest"
+  [ -n "$_hc_baseline_attest" ] && export HERD_HEALTH_TRUST_BASELINE_ATTESTATION_FILE="$_hc_baseline_attest"
 fi
 MAIN_OUT="$(run_profile)"; MAIN_RC=$?
 
