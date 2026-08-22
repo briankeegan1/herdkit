@@ -317,7 +317,9 @@ python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$SCR" || fail "(B) r
 # PR #260 false-death shape). alive→dead on kill, →missing on pane removal, and claude-as-root ⇒ alive.
 for cpn in workspace_created control_room agents_pane_off_byte_identical agents_pane_on_present builder_tab pane_labels_on_spawn agent_idle agent_working \
            agent_done builder_agent_alive_claude_root builder_banner_runtime_matches_foreground builder_retask_wakes_on_enter builder_agent_dead \
-           builder_refix_escalates_on_dead builder_agent_missing context_guard_refuses_real_teardown teardown_clean; do
+           builder_refix_escalates_on_dead builder_agent_missing context_guard_refuses_real_teardown \
+           grok_banner_runtime_matches_foreground grok_builder_agent_alive_grok_root grok_roster_identity_working \
+           teardown_clean; do
   [ "$(cp_status "$SCR" "$cpn")" = "pass" ] || fail "(B) checkpoint $cpn not pass"
 done
 # HERD-310: the context-guard checkpoint proves a WORKTREE-context herd_teardown_slug against the live
@@ -327,7 +329,7 @@ done
 # The observed transitions are exactly idle → working → done.
 [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_transitions"])' "$SCR")" = "['idle', 'working', 'done']" ] \
   || fail "(B) agent_transitions should be idle,working,done"
-# Ten tabs and twelve panes. Tabs: the control room, the builder, the disposable `health·<slug>` TAB
+# Ten tabs and fifteen panes. Tabs: the control room, the builder, the disposable `health·<slug>` TAB
 # the HERD-554 reconcile MINTS for an observed in-flight suite with NO live builder tab to split into
 # (the create-half checkpoint's fixture never registers one), the HERD-568 fallback checkpoint's OWN
 # standalone tab (its .herd-tabs row names a tab that no longer exists, so it too must mint a fresh
@@ -339,14 +341,14 @@ done
 # split-placement checkpoint's pane (split INTO the builder tab — no new tab), the HERD-568 fallback
 # checkpoint's pane (its own new tab, counted above), the HERD-569 review-viewer split (the whole point
 # of the conversion: a viewer costs a PANE, not a tab), the HERD-668 AGENTS_PANE=on checkpoint's split
-# off the watch pane, the claude-as-root pane for the alive checkpoint, and the Codex foreground pane
-# for the driver-accurate banner checkpoint. All but the ESCALATE
-# resolver pane (and the AGENTS_PANE split, which stays open by design like the control room's other
-# panes) are closed again within their own steps — those two stay open and go with the workspace at
-# stays open BY DESIGN and goes with the workspace at teardown.
+# off the watch pane, the claude-as-root pane for the alive checkpoint, the Codex foreground pane
+# for the driver-accurate banner checkpoint, and the Grok foreground pane for the HERD-802 grok
+# banner/liveness checkpoint. All but the ESCALATE resolver pane (and the AGENTS_PANE split, which
+# stays open by design like the control room's other panes) are closed again within their own steps —
+# those two stay open and go with the workspace at teardown.
 [ "$(sc "$SCR" tabs_created)" -eq 10 ]  || fail "(B) tabs_created should be 10 (got $(sc "$SCR" tabs_created))"
-# +2 vs the pre-HERD-668 baseline: AGENTS_PANE=on and the Codex banner/foreground proof each split one.
-[ "$(sc "$SCR" panes_created)" -eq 14 ] || fail "(B) panes_created should be 14 (got $(sc "$SCR" panes_created))"
+# +3 vs the pre-HERD-668 baseline: AGENTS_PANE=on, the Codex banner proof, and the Grok banner proof each split one.
+[ "$(sc "$SCR" panes_created)" -eq 15 ] || fail "(B) panes_created should be 15 (got $(sc "$SCR" panes_created))"
 # The reviewer pane is retired on verdict consumption (HERD-113).
 [ "$(cp_status "$SCR" reviewer_pane_retired_on_verdict)" = "pass" ] || fail "(B) reviewer_pane_retired_on_verdict not pass"
 # The resolver pane retires on a consumed DONE and SURVIVES an ESCALATE (HERD-280).
