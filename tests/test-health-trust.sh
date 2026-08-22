@@ -343,6 +343,44 @@ env HERD_CONFIG_FILE="$T/no-such-config" HEALTHCHECK_CMD="" HEALTHCHECK_HEAVY_GL
   || fail "(11) --heavy with no HEALTHCHECK_CMD (which delegates to light) must author no record"
 ok "(11) healthcheck.sh authors an honest VERSION 2 heavy record (sha/profile/outcome/duration/provenance/tree_state/log_digest + companion log on CLEAN); --oneline and --light author none"
 
+# The baseline SHA in a DATAENV record must be the one _baseline_base_set actually compared. This
+# stub advances MAIN during that base-suite invocation: resolving MAIN again after the comparison
+# would incorrectly stamp the new SHA and let the stale inherited-failure claim through.
+AT_BASE="$T/attest-main"; AT_WT="$T/attest-pr"; AT_TREES="$T/attest-trees"; mkdir -p "$AT_TREES"
+git clone -q "$WT" "$AT_BASE"; git clone -q "$WT" "$AT_WT"
+git -C "$AT_WT" -c user.email=t@t -c user.name=t commit --allow-empty -qm candidate
+AT_SHA="$(git -C "$AT_WT" rev-parse HEAD)"
+AT_OLD_BASE="$(git -C "$AT_BASE" rev-parse HEAD)"
+AT_COUNT="$T/attest-count"
+AT_STUB="$T/attest-health.sh"
+cat > "$AT_STUB" <<'STUB'
+#!/usr/bin/env bash
+n="$(cat "$ADVANCE_COUNT" 2>/dev/null || echo 0)"; n=$((n + 1)); printf '%s\n' "$n" > "$ADVANCE_COUNT"
+if [ "$n" -eq 2 ]; then
+  git -C "$ADVANCE_BASE" -c user.email=t@t -c user.name=t commit --allow-empty -qm base-advanced
+fi
+printf 'not ok 1 inherited failure\n'
+exit 1
+STUB
+chmod +x "$AT_STUB"
+AT_OUT="$(env HERD_CONFIG_FILE="$T/no-such-config" HEALTHCHECK_CMD="$AT_STUB" HEALTHCHECK_HEAVY_GLOB="" \
+  DEFAULT_BRANCH=main BASELINE_AWARE_GATE=on WORKTREES_DIR="$AT_TREES" HEALTH_TRUST_BUILDER=on \
+  HERD_BASELINE_DIR="$AT_BASE" HERD_BASELINE_CACHE="$AT_TREES" ADVANCE_BASE="$AT_BASE" ADVANCE_COUNT="$AT_COUNT" \
+  bash "$HC" "$AT_WT" --heavy 2>&1)"; AT_RC=$?
+[ "$AT_RC" -eq 0 ] || fail "(11b) inherited baseline fixture should tolerate the first run: $AT_OUT"
+AT_NEW_BASE="$(git -C "$AT_BASE" rev-parse HEAD)"
+[ "$AT_NEW_BASE" != "$AT_OLD_BASE" ] || fail "(11b) fixture did not advance main during baseline comparison"
+# Read the separate fixture's pool directly, so this timing proof cannot accidentally consume an
+# earlier record from the primary fixture.
+IFS=$'\t' read -r _ _ _ _ AT_OUTCOME _ _ _ _ _ _ AT_RECORDED_BASE < "$AT_TREES/.health-provenance-$AT_SHA"
+[ "$AT_OUTCOME" = "DATAENV" ] || fail "(11b) inherited run must record DATAENV, got '$AT_OUTCOME'"
+[ "$AT_RECORDED_BASE" = "$AT_OLD_BASE" ] || fail "(11b) record must attest compared base, got '$AT_RECORDED_BASE'"
+herd_health_trust_check "$AT_TREES" "$AT_SHA" "$AT_WT" "$AT_BASE" >/dev/null \
+  && fail "(11b) a base that advanced after comparison must refuse DATAENV trust"
+[ "$HERD_HEALTH_TRUST_REASON" = "DATAENV baseline advanced" ] \
+  || fail "(11b) unexpected post-advance reason: '$HERD_HEALTH_TRUST_REASON'"
+ok "(11b) healthcheck attests the compared baseline; a change before record emission forces heavy"
+
 # ── (12) BYTE-IDENTICAL when off ───────────────────────────────────────────────────────────────────
 rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
 run_hc off; OFF_OUT="$OUT"; OFF_RC="$RC"

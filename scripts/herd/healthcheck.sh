@@ -359,6 +359,14 @@ _baseline_base_set() {
     return 0
   fi
 
+  # The DATAENV trust record must attest the SAME base whose failure set this invocation compares,
+  # not a second HEAD lookup after the suite returns. `run_profile` is captured in a command
+  # substitution, so this explicit sidecar survives that subshell without polluting suite output.
+  # Best-effort: no attestation means DATAENV trust is refused later, never fabricated.
+  if [ -n "${HEALTH_TRUST_BASELINE_ATTESTATION_FILE:-}" ]; then
+    printf '%s\n' "$_bl_base_sha" > "$HEALTH_TRUST_BASELINE_ATTESTATION_FILE" 2>/dev/null || true
+  fi
+
   # Cache hit → return the memoized set with NO suite run at all (so no sandbox is even created).
   _bl_cache_dir="${HERD_BASELINE_CACHE:-${TMPDIR:-/tmp}}"
   _bl_cache="$_bl_cache_dir/.herd-baseline-notok-$_bl_base_sha"
@@ -1085,6 +1093,16 @@ run_profile() {
     light) run_light ;;
   esac
 }
+# A provenance sidecar is needed only when the opt-in trust writer is armed. Its content is written
+# by _baseline_base_set at the instant it resolves the base used for inherited-failure comparison;
+# this avoids a later HEAD lookup racing a main advance. With the lever off no file is created, so
+# the legacy healthcheck stays byte-identical.
+_hc_baseline_attest=""
+if [ "$MODE" = "heavy" ] && [ -z "$ONELINE" ] && command -v herd_health_trust_on >/dev/null 2>&1 \
+   && herd_health_trust_on; then
+  _hc_baseline_attest="$(mktemp "${TMPDIR:-/tmp}/herd-baseline-attest.XXXXXX" 2>/dev/null || true)"
+  [ -n "$_hc_baseline_attest" ] && export HEALTH_TRUST_BASELINE_ATTESTATION_FILE="$_hc_baseline_attest"
+fi
 MAIN_OUT="$(run_profile)"; MAIN_RC=$?
 
 run_interaction_gate
@@ -1130,16 +1148,17 @@ if [ "$MODE" = "heavy" ] && [ -z "$ONELINE" ] && [ -n "$HEALTHCHECK_CMD" ]; then
   _hc_prov_log=""
   case "$_hc_prov_outcome" in CLEAN|DATAENV) _hc_prov_log="$MAIN_OUT" ;; esac
   # DATAENV means the baseline-aware gate observed only failures inherited from a particular main
-  # state. Bind that state into the evidence: if main advances before the watcher consumes it, an
-  # inherited failure may have become introduced and the reader must force a fresh heavy run.
+  # state. Use the SHA captured BY that comparison, not a fresh lookup after it: main can advance
+  # during the suite, and only the compared state is valid evidence. Missing sidecar is fail-closed.
   _hc_prov_base=""
   if [ "$_hc_prov_outcome" = "DATAENV" ]; then
-    _hc_prov_base="$(herd_health_trust_baseline_sha "$DIR" "${HERD_BASELINE_DIR:-}")"
+    [ -n "$_hc_baseline_attest" ] && _hc_prov_base="$(cat "$_hc_baseline_attest" 2>/dev/null || true)"
   fi
   herd_health_trust_write "${WORKTREES_DIR:-}" "$_hc_prov_sha" "$DIR" heavy \
     "$_hc_prov_outcome" "$_hc_prov_dur" "${HERD_HEALTH_PROVENANCE:-builder-local}" "$_hc_prov_log" \
     "" "$_hc_prov_base" || true
 fi
+rm -f "${_hc_baseline_attest:-}" 2>/dev/null || true
 
 if [ -n "$ONELINE" ]; then
   # Exactly ONE line — the watcher paints healthcheck --oneline as a single status row.
