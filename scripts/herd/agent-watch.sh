@@ -4790,8 +4790,11 @@ _review_retry_count() {
 }
 
 # record_review_retry <pr#> <headSha> — note one transient failure (never a verdict).
+# The journal record is the durable completion signal for an INFRA attempt: unlike optional
+# review_latency telemetry, it is always present when the watcher accounts for a retry.
 record_review_retry() {
   printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$REVIEW_RETRIES"
+  journal_append review_retry pr "$1" sha "$2"
 }
 
 # _reviewer_registry_live <pr#> <headSha> — success iff the dispatch registry records a still-LIVE

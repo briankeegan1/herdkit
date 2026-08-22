@@ -167,9 +167,9 @@ def has_work_identity(ev):
     return bool(ev.get("pr")) or bool(ev.get("slug"))
 
 TERMINALS = {
-    # review_latency is emitted only when _review_gate_step collects an attempt, including
-    # non-verdict INFRA attempts that are retried instead of becoming verdict_recorded.
-    "review_dispatched": {"verdict_recorded", "review_skipped", "review_carried_forward", "review_latency"},
+    # review_retry is the unconditional accounting record for non-verdict INFRA attempts;
+    # review_latency is supplementary telemetry when REVIEW_LATENCY is enabled.
+    "review_dispatched": {"verdict_recorded", "review_skipped", "review_carried_forward", "review_retry", "review_latency"},
 }
 
 dispatches = [e for e in events if is_dispatched(e.get("event")) and has_work_identity(e)]
