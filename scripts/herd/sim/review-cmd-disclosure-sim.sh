@@ -37,6 +37,11 @@ fail() { echo "SIM FAIL: $1" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || fail "python3 required"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# herd-review.sh allocates its retained log as mktemp "${TMPDIR:-/tmp}/herd-review-<pr>-XXXXXX". These
+# runs reuse REAL PR numbers, so a shared TMPDIR would drop fixture-replay logs beside the live gate's
+# own retained logs for that PR (it did: a stale #863 verdict leaked into #864's review trail). Keep
+# every log this run creates inside the sandbox.
+export TMPDIR="$T"
 BIN="$T/bin"; mkdir -p "$BIN"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/git";   chmod +x "$BIN/git"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$BIN/herdr"; chmod +x "$BIN/herdr"
@@ -139,7 +144,8 @@ assert len(parsed) == 1 and parsed[0]["kind"] == "rejected" and "rm -rf" in pars
 assert len(rows) == 1, "expected exactly ONE sha-keyed review_cmd_unexecuted row (the gate's), got %d" % len(rows)
 r = rows[0]
 assert str(r["count"]) == "1" and r["kinds"] == "rejected" and "rm -rf" in r["first_cmd"], r
-assert "log" in r and "commands" not in r, "the surviving row must be the GATE's (carries log, not a core commands field): %r" % r
+assert "log" in r, "the surviving row must be the GATE's (it carries the retained-log path): %r" % r
+assert json.loads(r["commands"]) == parsed, "the gate row must carry EVERY command as JSON, matching the core's parse: %r" % r
 PY
 [ "$(gate_events)" = "1" ] || fail "B: the shared journal must hold exactly 1 event after the core collect (single writer), got $(gate_events)"
 printf '%-28s %s\n' "B. ON + BLOCK" "verdict BLOCK preserved · UNEXECUTED in result+log+comment · ONE journal row (gate) ✓"
@@ -161,6 +167,25 @@ gate 863 clean-on "$BLOCK_LINE" REVIEW_CMD_DISCLOSURE=on
 [ "$(tail -3 "$LOG")" = "$OFF_TAIL" ] || fail "D: ON with nothing refused must produce the OFF log tail"
 [ "$(gate_events)" = "2" ] || fail "D: no new gate event for a clean stream"
 printf '%-28s %s\n' "D. ON + nothing refused" "result file + log tail byte-identical to OFF · no event                          ✓"
+
+# ── F. MULTI-COMMAND refusal — every command survives in the ONE durable journal row ──────────────
+cat > "$T/stream-863.txt" <<'MULTI'
+ERROR codex_core::tools::router: error=exec_command failed for `rm -rf /tmp/scratch-a`: CreateProcess { message: "Rejected(\"rm -f style commands are not permitted\")" }
+ERROR codex_core::tools::router: error=exec_command failed for `bash tests/x.sh`: CreateProcess { message: "spawn failed" }
+ERROR codex_core::tools::router: error=exec_command failed for `git push origin main`: CreateProcess { message: "Rejected(\"no\")" }
+MULTI
+gate 863 multi "$BLOCK_LINE" REVIEW_CMD_DISCLOSURE=on
+[ "$(grep -c '^UNEXECUTED: ' "$RES")" -eq 3 ] || fail "F: result file should carry 3 disclosure lines"
+IFS=$'\t' read -r v parsed rows <<< "$(collect 863 multi "$RES")"
+PARSED="$parsed" ROWS="$rows" python3 - <<'PY' || fail "F: a multi-command refusal must be fully reconstructible from the single journal row"
+import json, os
+parsed = json.loads(os.environ["PARSED"]); rows = json.loads(os.environ["ROWS"])
+assert [p["cmd"] for p in parsed] == ["rm -rf /tmp/scratch-a", "bash tests/x.sh", "git push origin main"], parsed
+assert len(rows) == 1 and str(rows[0]["count"]) == "3" and rows[0]["kinds"] == "failed,rejected", rows
+assert json.loads(rows[0]["commands"]) == parsed, rows[0]
+PY
+[ "$(gate_events)" = "3" ] || fail "F: exactly one new event for the multi-command review (3 total), got $(gate_events)"
+printf '%-28s %s\n' "F. ON + 3 refused commands" "ONE journal row carries all 3 (count/kinds/commands JSON) · core parse agrees        ✓"
 
 # ── E. FAIL-CLOSED provenance — the resolver over a vanished stream ───────────────────────────────
 line="$(bash "$REPO/scripts/herd/review-cmd-disclosure.sh" "$T/vanished-stream")"

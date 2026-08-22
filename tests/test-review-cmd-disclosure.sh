@@ -25,6 +25,7 @@
 #         watcher's existing advisory surface journals it), result file carries the UNEXECUTED line
 #     (9) ON + a clean stream (nothing refused): byte-identical to OFF — stdout, result file, log tail
 #    (10) ON + RUBRIC lines present: result-file order is rubric lines, disclosure line, verdict
+#    (12) ON + three refused commands: the ONE journal event carries every command (commands JSON)
 #   PART 3 (herd-review.sh --local mode):
 #    (11) ON: the builder sees a stderr warning and an advisory-annotated PASS on stdout; OFF: bare PASS
 #
@@ -38,6 +39,11 @@ LIB="$REPO/scripts/herd/review-cmd-disclosure.sh"
 FIX="$REPO/tests/fixtures/review-cmd-disclosure/codex-rejected-863.txt"
 
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+# herd-review.sh allocates its retained log as mktemp "${TMPDIR:-/tmp}/herd-review-<pr>-XXXXXX". These
+# runs reuse REAL PR numbers, so a shared TMPDIR would drop fixture-replay logs beside the live gate's
+# own retained logs for that PR (it did: a stale #863 verdict leaked into #864's review trail). Keep
+# every log this run creates inside the sandbox.
+export TMPDIR="$T"
 pass=0
 fail() { echo "FAIL: $1" >&2; exit 1; }
 ok()   { pass=$((pass+1)); }
@@ -197,6 +203,11 @@ grep -q '"count": *"1"\|"count": *1' <<< "$ev" || fail "(7) ON: event should car
 grep -q '"kinds": *"rejected"' <<< "$ev" || fail "(7) ON: event should carry kinds=rejected, got: $ev"
 grep -q '"first_cmd": *"/bin/zsh -lc' <<< "$ev" || fail "(7) ON: event should carry the first command, got: $ev"
 grep -q '"pr": *"863"\|"pr": *863' <<< "$ev" || fail "(7) ON: event should be keyed to the PR, got: $ev"
+EV="$ev" python3 -c '
+import json, os, sys
+e = json.loads(os.environ["EV"]); cmds = json.loads(e["commands"])
+sys.exit(0 if len(cmds) == 1 and cmds[0]["kind"] == "rejected" and "rm -rf" in cmds[0]["cmd"] else 1)' \
+  || fail "(7) ON: event must carry the full commands JSON list, got: $ev"
 grep -q 'pr comment 863 --body' "$GH_LOG" || fail "(7) ON: a qualifying gh comment should be posted"
 grep -q 'Reviewer verification NOT executed' "$GH_LOG" || fail "(7) ON: the comment should say the verification was not executed"
 ok
@@ -236,6 +247,28 @@ run_review 867 slug-rubric "$T/stream-rubric.txt" "$BLOCK_LINE" REVIEW_CMD_DISCL
 [ "$(sed -n 1p "$REV_RES")" = "RUBRIC: scoped | PASS | tight diff" ] || fail "(10) line 1 should be the rubric line, got: $(sed -n 1p "$REV_RES")"
 [ "$(sed -n 2p "$REV_RES")" = "UNEXECUTED: rejected | $REJECTED_CMD" ] || fail "(10) line 2 should be the disclosure line, got: $(sed -n 2p "$REV_RES")"
 [ "$(sed -n 3p "$REV_RES")" = "$BLOCK_LINE" ] || fail "(10) line 3 should be the verdict"
+ok
+
+# ── (12) ON + THREE refused commands: the ONE journal event carries EVERY command (PR #864 review) ──
+cat > "$T/stream-multi.txt" <<'MULTI'
+ERROR codex_core::tools::router: error=exec_command failed for `rm -rf /tmp/scratch-a`: CreateProcess { message: "Rejected(\"rm -f style commands are not permitted\")" }
+ERROR codex_core::tools::router: error=exec_command failed for `bash tests/x.sh`: CreateProcess { message: "spawn failed" }
+ERROR codex_core::tools::router: error=exec_command failed for `git push origin main`: CreateProcess { message: "Rejected(\"no\")" }
+MULTI
+run_review 868 slug-multi "$T/stream-multi.txt" "$BLOCK_LINE" REVIEW_CMD_DISCLOSURE=on
+[ "$(grep -c '^UNEXECUTED: ' "$REV_RES")" -eq 3 ] || fail "(12) result file should carry 3 disclosure lines"
+ev="$(grep '"review_cmd_unexecuted"' "$JOURNAL_FILE" | tail -1)"
+grep -q '"sha": *"[^"]*"' <<< "$ev" || true
+EV="$ev" python3 - <<'PY' || fail "(12) the single event must carry all 3 commands in order with count/kinds, got: $ev"
+import json, os
+e = json.loads(os.environ["EV"])
+assert str(e["count"]) == "3" and e["kinds"] == "failed,rejected", e
+cmds = json.loads(e["commands"])
+assert [c["cmd"] for c in cmds] == ["rm -rf /tmp/scratch-a", "bash tests/x.sh", "git push origin main"], cmds
+assert [c["kind"] for c in cmds] == ["rejected", "failed", "rejected"], cmds
+assert e["first_cmd"] == "rm -rf /tmp/scratch-a", e
+PY
+[ "$(grep -c '"review_cmd_unexecuted"' "$JOURNAL_FILE")" -eq 5 ] || fail "(12) exactly one event per disclosed review (5 so far), got $(grep -c '"review_cmd_unexecuted"' "$JOURNAL_FILE")"
 ok
 
 ################################################################################

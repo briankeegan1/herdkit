@@ -796,6 +796,16 @@ def _terminate_worker(path):
     return _worker_gone(pid, sess, use_session)
 
 
+def _marker_pid(path):
+    """The dispatch pid an inflight marker records (its first line), or "" when unreadable/absent —
+    agent-watch.sh:_marker_pid. Pure read; never raises."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        return ""
+    return lines[0].strip() if lines else ""
+
+
 def _marker_live(path):
     """True iff the marker's pid is alive AND (recycling guard) its start-time still matches
     (agent-watch.sh:_marker_live). No recorded start-time → a bare kill -0 (fail toward NOT reaping)."""
@@ -4355,6 +4365,16 @@ class LiveGates:
                 self.unexecuted_cmds = parse_unexecuted_cmds(text)
                 st.rm(result, inflight, st.review_registry_file(cand))
                 return verdict
+            # INFRA collect TERMINAL (HERD-810 follow-up; the live-core half of PR #863). The audit
+            # replay closes a `review_dispatched` chain on review_retry / review_latency (among the
+            # verdict terminals). bash's _review_gate_step journals review_retry UNCONDITIONALLY for a
+            # non-verdict collect; this core journaled only infra_event + the OPTIONAL review_latency —
+            # so with REVIEW_LATENCY=off a collected INFRA review had NO terminal and replay reported
+            # it `dispatch_no_outcome`: optional telemetry was the sole terminal. Same row bash writes
+            # (pr, sha, attempt=<dispatch pid from the inflight marker>) so replay pairs it to exactly
+            # one attempt; read BEFORE the marker is dropped below. Never gated on telemetry.
+            self.journal.append("review_retry", "pr", cand.pr, "sha", cand.sha,
+                                "attempt", _marker_pid(inflight) if inflight else "")
             st.rm(result, inflight, st.review_registry_file(cand))
             return "INFRA"          # infra death — a transient the caller escalates, never a cached BLOCK
         # 3. IN FLIGHT: a live reviewer poller (marker) OR its pane (registry) → dispatch-and-wait.

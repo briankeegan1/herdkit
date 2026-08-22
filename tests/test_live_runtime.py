@@ -8290,6 +8290,43 @@ class TestReviewFastPath(LiveCase):
                     self.assertGreaterEqual(int(lat[0]["secs"]), 0)
 
 
+    # ── INFRA collect TERMINAL (the live-core half of PR #863; HERD-810 follow-up) ────────────────
+    def test_infra_collect_journals_review_retry_regardless_of_latency_telemetry(self):
+        """An INFRA collect must leave an audit-visible TERMINAL that does not depend on the optional
+        review_latency telemetry: with REVIEW_LATENCY=off the core used to journal only infra-side
+        noise and the audit replay reported the collected review as `dispatch_no_outcome`."""
+        for config in ({"REVIEW_LATENCY": "off"}, {}):
+            with self.subTest(config=config):
+                self.setUp()
+                gates, state, sub = self._gates(config, {})
+                cand = self._cand()
+                with open(state.review_result_file(cand), "w") as fh:
+                    fh.write("reviewer died before a verdict\n")          # no REVIEW: line → INFRA
+                _marker_write(state.review_inflight_file(cand), 4242)      # the dispatch pid
+                self.assertEqual(self._review(gates, sub, cand), "INFRA")
+                ev = events(self.jpath) if os.path.exists(self.jpath) else []
+                rt = [o for o in ev if o["event"] == "review_retry"]
+                self.assertEqual(len(rt), 1, ev)
+                self.assertEqual(str(rt[0]["pr"]), str(cand.pr))
+                self.assertEqual(rt[0]["sha"], cand.sha)
+                self.assertEqual(str(rt[0]["attempt"]), "4242")             # pairs to exactly this dispatch
+                lat = [o for o in ev if o["event"] == "review_latency"]
+                self.assertEqual(len(lat), 0 if config else 1)             # telemetry stays optional
+                self.assertFalse(os.path.exists(state.review_result_file(cand)))   # still collected + dropped
+                self.assertIsNone(state.recorded_review(cand.pr, cand.sha))        # never cached as a verdict
+
+    def test_verdict_collect_journals_no_review_retry(self):
+        # A real PASS/BLOCK is its own terminal (verdict_recorded) — byte-identical: no review_retry row.
+        gates, state, sub = self._gates({"REVIEW_LATENCY": "off"}, {})
+        cand = self._cand()
+        with open(state.review_result_file(cand), "w") as fh:
+            fh.write("REVIEW: PASS\n")
+        _marker_write(state.review_inflight_file(cand), 4242)
+        self.assertEqual(self._review(gates, sub, cand), "PASS")
+        ev = events(self.jpath) if os.path.exists(self.jpath) else []
+        self.assertEqual([o for o in ev if o["event"] == "review_retry"], [])
+
+
 def _make_delta_review_repo(tmp, name, authored_after_merge=False):
     """A repo where `feat` branches off `main`, `main` then advances, and `feat` merges `main` back in —
     a pure integration merge unless `authored_after_merge` amends it with a post-merge edit. Returns

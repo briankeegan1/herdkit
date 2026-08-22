@@ -296,7 +296,8 @@ _emit_verdict() {
 #   • the RETAINED log  — a `─── reviewer verification NOT EXECUTED ───` block appended before the
 #                         completion banner (PR mode; local mode's log is transient, so it goes to
 #                         stderr where the builder is watching);
-#   • the journal       — one review_cmd_unexecuted event (pr, slug, sha, count, kinds, first cmd).
+#   • the journal       — ONE review_cmd_unexecuted event (pr, slug, sha, count, kinds, first cmd, and
+#                         `commands`: the FULL [{kind,cmd}] list — the durable record of every refusal).
 # Multiple files are concatenated (a local PANEL's per-member files); PR-mode panel members are already
 # folded into $LOG. A SECOND, independent pass: it never touches $verdict_line, so a BLOCK that is
 # independently supported by reading the diff stays a BLOCK verbatim (see _disclose_verdict). Hard
@@ -316,6 +317,21 @@ _disclose_unexecuted() {
   _n="$(printf '%s\n' "$_DISCLOSE_LINES" | grep -c '^UNEXECUTED: ' 2>/dev/null || true)"; _n="${_n:-0}"
   _kinds="$(printf '%s\n' "$_DISCLOSE_LINES" | sed -n 's/^UNEXECUTED: \([a-z]*\) | .*/\1/p' | sort -u | paste -sd, - 2>/dev/null)"  # pipe-ok: bounded disclosure block, one short line per refused command
   _first="$(printf '%s\n' "$_DISCLOSE_LINES" | sed -n '1s/^UNEXECUTED: [a-z]* | //p' | cut -c1-200)"
+  # EVERY disclosed command rides the event as a JSON list (PR #864 review: first_cmd alone dropped
+  # command 2..n from the only DURABLE record — the retained log is a rolling window and the result
+  # file is consumed on collect — so a multi-command refusal could never be reconstructed). Same
+  # [{kind,cmd}] shape parse_unexecuted_cmds yields, so journal readers and the core agree.
+  _cmds_json="$(printf '%s\n' "$_DISCLOSE_LINES" | python3 -c '
+import json, sys
+out = []
+for line in sys.stdin:
+    s = line.strip()
+    if not s.startswith("UNEXECUTED:"): continue
+    body = s.split(":", 1)[1]
+    if "|" not in body: continue
+    kind, cmd = body.split("|", 1)
+    out.append({"kind": kind.strip(), "cmd": cmd.strip()})
+print(json.dumps(out, separators=(",", ":")))' 2>/dev/null || printf '[]')"  # pipe-ok: bounded disclosure block, one short line per refused command
   if [ -n "${LOG:-}" ] && [ "${REVIEW_MODE:-}" != "local" ]; then
     {
       printf '\n─── reviewer verification NOT EXECUTED (%s) — the verdict below is NOT backed by these commands ───\n' "$_n"
@@ -328,7 +344,7 @@ _disclose_unexecuted() {
     } >&2
   fi
   journal_append review_cmd_unexecuted pr "${PR:-}" slug "${SLUG:-}" sha "${_REVIEW_SHA:-}" \
-    count "$_n" kinds "${_kinds:-}" first_cmd "${_first:-}" log "${LOG:-}"
+    count "$_n" kinds "${_kinds:-}" first_cmd "${_first:-}" commands "${_cmds_json:-[]}" log "${LOG:-}"
   # PR mode: one best-effort, NON-authoritative comment so a human reading the PR sees the same thing
   # the watcher does (the single headless reviewer already posted its own comment — this one qualifies
   # it). Never a gate: gh missing/unauthenticated simply skips it.
