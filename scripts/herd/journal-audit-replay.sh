@@ -115,7 +115,8 @@ try:
 except OSError:
     sys.exit(0)
 
-# Sort chronologically (window may span rotations only if live file is contiguous — fine).
+# Sort chronologically; Python's stable sort retains append order for same-second events.
+# The latter is the journal's only reliable ordering at whole-second timestamp precision.
 events.sort(key=lambda o: o["_ts"])
 
 findings = []  # (kind, key, summary, ctx)
@@ -155,7 +156,7 @@ for m in merges:
         findings.append(("merge_without_reap", key, summary, ctx(pr=pr, sha=m.get("sha"), slug=slug)))
 
 # ── (b) *_dispatched with no terminal past family TTL ───────────────────────
-# Terminal map: review_dispatched → verdict_recorded (same pr + sha when present).
+# Terminal map: review_dispatched → a collected review outcome (same pr + sha when present).
 # Any event whose name ends with _dispatched is considered; unknown families use a
 # generic "any later same-pr event other than dispatch" is NOT enough — only known terminals.
 def is_dispatched(name):
@@ -167,11 +168,43 @@ def has_work_identity(ev):
     return bool(ev.get("pr")) or bool(ev.get("slug"))
 
 TERMINALS = {
-    "review_dispatched": {"verdict_recorded", "review_skipped", "review_carried_forward"},
+    # review_retry is the unconditional accounting record for non-verdict INFRA attempts;
+    # review_latency is supplementary telemetry when REVIEW_LATENCY is enabled.
+    "review_dispatched": {"verdict_recorded", "review_skipped", "review_carried_forward", "review_retry", "review_latency"},
 }
 
-dispatches = [e for e in events if is_dispatched(e.get("event")) and has_work_identity(e)]
-for d in dispatches:
+# REVIEW ATTEMPT PAIRING. A terminal must consume at most one prior review dispatch. In particular,
+# an old review_retry that is delayed until after a same-PR/SHA re-dispatch must close its originating
+# attempt, not silently clear both attempts. New retry records carry the dispatch pid as `attempt`;
+# legacy terminal rows without it use FIFO journal order, the only sound association available.
+def same_review_identity(dispatch, terminal):
+    dpr, tpr = dispatch.get("pr"), terminal.get("pr")
+    if dpr is not None and tpr is not None and str(dpr) != str(tpr):
+        return False
+    dsha, tsha = str(dispatch.get("sha") or ""), str(terminal.get("sha") or "")
+    return not (dsha and tsha and dsha != tsha)
+
+review_open = []
+review_completed = set()
+review_terminals = TERMINALS["review_dispatched"]
+for i, e in enumerate(events):
+    en = str(e.get("event") or "")
+    if en == "review_dispatched" and has_work_identity(e):
+        review_open.append(i)
+        continue
+    if en not in review_terminals:
+        continue
+    candidates = [j for j in review_open
+                  if j not in review_completed and same_review_identity(events[j], e)]
+    attempt = str(e.get("attempt") or "")
+    if attempt:
+        candidates = [j for j in candidates if str(events[j].get("pid") or "") == attempt]
+    if candidates:
+        review_completed.add(candidates[0])
+
+for d_i, d in enumerate(events):
+    if not (is_dispatched(d.get("event")) and has_work_identity(d)):
+        continue
     if age_secs(now, d["_ts"]) < dispatch_ttl:
         continue
     ev = str(d.get("event") or "")
@@ -182,10 +215,11 @@ for d in dispatches:
     # without a known terminal set, require a later event with event ending in a known outcome token.
     if not terminals:
         terminals = {"verdict_recorded", "outcome", "completed", "done"}
-    ok = False
-    for e in events:
-        if e["_ts"] <= d["_ts"]:
-            continue
+    ok = d_i in review_completed if ev == "review_dispatched" else False
+    # Journal timestamps have whole-second resolution. Scan only events appended AFTER this
+    # dispatch, rather than requiring a later clock value: an immediate review_retry can share
+    # the dispatch's timestamp, while a same-second terminal written before it must not clear it.
+    for e in ([] if ev == "review_dispatched" else events[d_i + 1:]):
         en = str(e.get("event") or "")
         if en in terminals or any(en.endswith("_" + t) or en == t for t in terminals):
             if pr is not None and e.get("pr") is not None and str(e.get("pr")) != str(pr):

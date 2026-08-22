@@ -4789,9 +4789,14 @@ _review_retry_count() {
   awk -v p="$1" -v s="$2" '$2==p && $3==s{n++} END{print n+0}' "$REVIEW_RETRIES" 2>/dev/null || printf '0'
 }
 
-# record_review_retry <pr#> <headSha> — note one transient failure (never a verdict).
+# record_review_retry <pr#> <headSha> [attempt-pid] — note one transient failure (never a verdict).
+# The journal record is the durable completion signal for an INFRA attempt: unlike optional
+# review_latency telemetry, it is always present when the watcher accounts for a retry. When the
+# inflight marker is available, carry its dispatch pid so replay can pair this retry to exactly one
+# attempt even if a same-PR/SHA re-dispatch is already in the journal.
 record_review_retry() {
   printf '%s %s %s\n' "$(date +%s)" "$1" "$2" >> "$REVIEW_RETRIES"
+  journal_append review_retry pr "$1" sha "$2" attempt "${3:-}"
 }
 
 # _reviewer_registry_live <pr#> <headSha> — success iff the dispatch registry records a still-LIVE
@@ -5408,7 +5413,7 @@ _review_gate_step() {
         # INFRA-FAIL, EMPTY capture, or rc0-no-verdict: an infrastructural death, NOT a refused
         # verdict — never cached to the ledger, retried next poll with a cap. Counts against the
         # global INFRA circuit breaker (HERD-110): a run of these across PRs means the env is dead.
-        record_review_retry "$pr" "$sha"
+        record_review_retry "$pr" "$sha" "$(_marker_pid "$inflight")"
         _breaker_record_infra
         if [ "$(_review_retry_count "$pr" "$sha")" -ge "$_REVIEW_RETRY_MAX" ]; then _rgs_echo=FAILED; else _rgs_echo=RETRY; fi
         ;;
@@ -5455,7 +5460,7 @@ _review_gate_step() {
     # below never runs alongside a still-live reviewer (HERD-113). No-op if the pane is already
     # gone; drops the registry row either way so the fresh dispatch starts clean.
     _retire_reviewer_pane "$pr" "$sha" orphaned-poller-dead
-    record_review_retry "$pr" "$sha"
+    record_review_retry "$pr" "$sha" "$(_marker_pid "$inflight")"
     _breaker_record_infra
   fi
 
@@ -18051,22 +18056,22 @@ _sweep_gate_corpses() {
     [ -n "$pr" ] && [ -n "$sha" ] || continue
     # A finished reviewer's verdict is waiting — leave it for the gate step to collect + record.
     [ -f "$(_review_result_file "$pr" "$sha")" ] && continue
+    pid="$(_marker_pid "$f")"
     if _marker_live "$f"; then
       age="$(_marker_age "$f")"
       case "$age" in ''|-1|*[!0-9]*) continue ;; esac         # no deadline recorded → let it run
       [ "$age" -lt "${REVIEW_INFLIGHT_TIMEOUT:-1800}" ] 2>/dev/null && continue
-      pid="$(_marker_pid "$f")"
       [ "$pid" = "$$" ] && continue                            # never TERM the watcher itself
       [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
       _retire_reviewer_pane "$pr" "$sha" timeout-term
       rm -f "$f" "$(_review_registry_file "$pr" "$sha")" 2>/dev/null || true
       journal_append infra_event component agent-watch reason review_timeout pr "$pr" sha "$sha" age "$age"
-      record_review_retry "$pr" "$sha"; _breaker_record_infra
+      record_review_retry "$pr" "$sha" "$pid"; _breaker_record_infra
     else
       _retire_reviewer_pane "$pr" "$sha" corpse-swept
       rm -f "$f" "$(_review_registry_file "$pr" "$sha")" 2>/dev/null || true
       journal_append infra_event component agent-watch reason review_died pr "$pr" sha "$sha"
-      record_review_retry "$pr" "$sha"; _breaker_record_infra
+      record_review_retry "$pr" "$sha" "$pid"; _breaker_record_infra
     fi
   done
   # ── health family: .health-inflight-<key>  (key = <pr>-<sha> | main-<sha> | a planted probe token) ──

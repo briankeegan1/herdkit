@@ -221,6 +221,71 @@ out="$(run_audit on)" || fail "(2b) audit exited non-zero: $out"
 pass
 echo "PASS (2b) review_dispatched with no terminal → finding"
 
+# ── (2b0) a collected INFRA review attempt is a terminal, not an orphan ──────────────────────────
+# INFRA is deliberately never stored as verdict_recorded: it is a completed attempt whose retry
+# is durably recorded as review_retry. review_latency is supplemental telemetry only. Replay must
+# consume that exact pr+sha attempt, including successive dispatch/INFRA pairs, without letting an
+# unrelated terminal mask a real orphan.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":71,"sha":"infra71","slug":"infra-review"'
+jline "2026-07-09T12:01:00Z" '"event":"review_latency","pr":71,"sha":"infra71","slug":"infra-review","secs":60,"verdict":"INFRA"'
+out="$(run_audit on)" || fail "(2b0) INFRA-terminal audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b0) a matching INFRA review_latency must close its dispatch; $(cat "$JOURNAL_FILE")"
+
+# REVIEW_LATENCY=off must suppress telemetry without losing the retry's audit-visible completion
+# record. This fixture is the journal shape produced by an INFRA collection in that configuration.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":70,"sha":"off70","slug":"latency-off-review","pid":700'
+jline "2026-07-09T12:01:00Z" '"event":"review_retry","pr":70,"sha":"off70","attempt":"700"'
+out="$(REVIEW_LATENCY=off run_audit on)" || fail "(2b0) latency-off INFRA-terminal audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b0) a latency-off matching review_retry must close its dispatch; $(cat "$JOURNAL_FILE")"
+grep -q '"event":"review_latency"' "$JOURNAL_FILE" && fail "(2b0) latency-off fixture must not rely on review_latency"
+
+# Journal timestamps are whole-second, so a collected INFRA retry may land in the SAME second as
+# its dispatch. File order is authoritative: a following retry closes it, but a prior retry cannot
+# retroactively close a newly appended dispatch for the same PR/SHA.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":70,"sha":"same70","slug":"same-second-review"'
+jline "2026-07-09T12:00:00Z" '"event":"review_retry","pr":70,"sha":"same70"'
+out="$(run_audit on)" || fail "(2b0) same-second retry audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b0) a same-second following review_retry must close its dispatch; $(cat "$JOURNAL_FILE")"
+
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_retry","pr":70,"sha":"ordered70"'
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":70,"sha":"ordered70","slug":"ordered-review"'
+out="$(run_audit on)" || fail "(2b0) ordered same-second audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b0) a same-second preceding retry must not close a later dispatch; $(cat "$JOURNAL_FILE")"
+
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":72,"sha":"infra72","slug":"retry-review","pid":7201'
+jline "2026-07-09T12:01:00Z" '"event":"review_retry","pr":72,"sha":"infra72","attempt":7201'
+jline "2026-07-09T12:02:00Z" '"event":"review_dispatched","pr":72,"sha":"infra72","slug":"retry-review","pid":7202'
+jline "2026-07-09T12:03:00Z" '"event":"review_retry","pr":72,"sha":"infra72","attempt":7202'
+out="$(run_audit on)" || fail "(2b0) repeated-INFRA audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b0) repeated matching dispatch/INFRA attempts must not file; $(cat "$JOURNAL_FILE")"
+
+# A delayed retry for the first attempt must not leap across a newer dispatch with the same PR/SHA.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":721,"sha":"race721","slug":"attempt-race","pid":7211'
+jline "2026-07-09T12:01:00Z" '"event":"review_dispatched","pr":721,"sha":"race721","slug":"attempt-race","pid":7212'
+jline "2026-07-09T12:02:00Z" '"event":"review_retry","pr":721,"sha":"race721","attempt":7211'
+out="$(run_audit on)" || fail "(2b0) delayed-old-retry audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b0) a delayed old retry must leave the newer dispatch stranded; $(cat "$JOURNAL_FILE")"
+
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":73,"sha":"orphan73","slug":"orphan-review"'
+out="$(run_audit on)" || fail "(2b0) true-orphan audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b0) a review dispatch with no terminal must still file; $(cat "$JOURNAL_FILE")"
+
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":74,"sha":"match74","slug":"identity-review"'
+jline "2026-07-09T12:01:00Z" '"event":"review_retry","pr":75,"sha":"match74"'
+jline "2026-07-09T12:02:00Z" '"event":"review_retry","pr":74,"sha":"other74"'
+out="$(run_audit on)" || fail "(2b0) mismatched-terminal audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b0) a mismatched pr/sha INFRA terminal must not close the dispatch; $(cat "$JOURNAL_FILE")"
+pass
+echo "PASS (2b0) matching INFRA review_latency closes only its completed review dispatch"
+
 # ── (2b') HERD-607: engine_live_dispatched heartbeat (no pr, no slug) is exempt ──────────────────
 reset_surfaces
 jline "2026-07-09T12:00:00Z" '"event":"engine_live_dispatched","surface":"python","engine_level":3,"engine_min":3'
