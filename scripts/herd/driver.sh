@@ -2181,13 +2181,13 @@ _herd_codex_hook_lifecycle() {
 # _herd_grok_sessions_file — path to ~/.grok/active_sessions.json; GROK_SESSIONS_FILE overrides
 # for hermetic tests. Always prints a path (may not exist); callers check with [ -f ... ].
 _herd_grok_sessions_file() {
-  printf '%s' "${GROK_SESSIONS_FILE:-${HOME:-}/.grok/active_sessions.json}"
+  printf '%s' "${GROK_SESSIONS_FILE:-$HOME/.grok/active_sessions.json}"
 }
 
 # _herd_grok_session_db — path to ~/.grok/sessions/session_search.sqlite; GROK_SESSION_DB
 # overrides for hermetic tests.
 _herd_grok_session_db() {
-  printf '%s' "${GROK_SESSION_DB:-${HOME:-}/.grok/sessions/session_search.sqlite}"
+  printf '%s' "${GROK_SESSION_DB:-$HOME/.grok/sessions/session_search.sqlite}"
 }
 
 # _herd_grok_session_id_write <slug> <session_id> — persist the grok session UUID to

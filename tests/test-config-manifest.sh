@@ -262,6 +262,12 @@ EXEMPT_NAMES = {
     "GROK_EXEC_ADAPTER_KEEP_RAW",  # HERD-800: grok-exec-adapter.sh's debug flag to retain the raw
                  # streaming-messages-json output for inspection — same class as CODEX_EXEC_ADAPTER_KEEP_RAW
                  # above, a dev seam read directly via `${VAR:-}`, not an operator-facing knob.
+    "GROK_SESSIONS_FILE",  # HERD-803: driver.sh's hermetic-test seam for the grok active_sessions.json
+                 # path (defaults to ~/.grok/active_sessions.json) — same class as GROK_BIN/CODEX_BIN
+                 # above, a stub-swap seam for the unit test, never a .herd/config knob.
+    "GROK_SESSION_DB",  # HERD-803: driver.sh's hermetic-test seam for the grok session_search.sqlite
+                 # path (defaults to ~/.grok/sessions/session_search.sqlite) — same class as
+                 # GROK_SESSIONS_FILE above, a stub-swap seam for the unit test, never a .herd/config knob.
     "HEALTHCHECK_PROGRESS_LOG",  # HERD-494: set by agent-watch.sh's health worker as an env prefix
                                  # around its healthcheck.sh invocation (a dogfood-only knob, same
                                  # framing as HEALTHCHECK_BATS_FILTER/HEALTHCHECK_SUITE_WORKERS —
