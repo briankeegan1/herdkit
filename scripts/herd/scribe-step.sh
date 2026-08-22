@@ -507,10 +507,9 @@ case "$cmd" in
         [ -n "$f" ] || continue
         if mv "$f" "$f.mine" 2>/dev/null; then
           claimed="$f.mine"
-          # The command's parent is the drainer-side shell in normal operation. Tests/integrations
-          # may provide SCRIBE_CLAIM_OWNER_PID explicitly; invalid values leave an ownerless claim,
-          # which the age fallback above handles safely.
-          owner_pid="${SCRIBE_CLAIM_OWNER_PID:-$PPID}"
+          # The command's parent is the drainer-side shell in normal operation. If it cannot be
+          # resolved, the claim remains ownerless and the age fallback above handles it safely.
+          owner_pid="$PPID"
           case "$owner_pid" in ''|*[!0-9]*) ;; *) printf '%s\n' "$owner_pid" > "${claimed%.req.mine}.owner" 2>/dev/null || true ;; esac
           herd_drainer_progress "$PROGRESS"
           break

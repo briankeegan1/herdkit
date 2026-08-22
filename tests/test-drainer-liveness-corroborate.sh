@@ -270,9 +270,9 @@ rm -f "$Q"/*.req "$Q"/*.req.mine "$Q"/*.owner
 printf 'orphaned work\n' > "$Q/300.req.mine"
 printf '999999\n' > "$Q/300.owner"
 touch -t "$ANCIENT" "$Q/300.req.mine"
-out="$(HERD_CONFIG_FILE="$T/config" SCRIBE_POLL=0 SCRIBE_CLAIM_OWNER_PID="$$" bash "$ROOT/scripts/herd/scribe-step.sh" next 2>/dev/null)"
+out="$(HERD_CONFIG_FILE="$T/config" SCRIBE_POLL=0 bash "$ROOT/scripts/herd/scribe-step.sh" next 2>/dev/null)"
 grep -q 'CLAIMED .*300.req.mine' <<< "$out" || fail "(5c) dead-owner claim was not reclaimed and re-claimed (got: $out)"
-[ "$(head -1 "$Q/300.owner")" = "$$" ] || fail "(5c) dead owner sidecar was not replaced"
+[ "$(head -1 "$Q/300.owner")" != "999999" ] || fail "(5c) dead owner sidecar was not replaced"
 pass; echo "PASS (5c) aged dead-owner .req.mine → reclaimed with fresh owner"
 
 echo
