@@ -1036,7 +1036,7 @@ FLAIR_STATE=()         # HERD-147 flair: one state-token per DISPLAY row (parall
 # the printf succeeded). Empty until the first repaint — build_header never fabricates a "stale" claim
 # before a real paint has happened to measure against.
 _LAST_PAINT_EPOCH=""
-# Internal tuning, not an operator knob (mirrors _ANOMALY_MIN_SAMPLES/_ANOMALY_THRESHOLD_PCT): roughly
+# Internal tuning, not an operator knob (mirrors _ANOMALY_MIN_SAMPLES/_ANOMALY_SUSPEND_MULT): roughly
 # N=5 ticks at the ~4s outer-loop cadence. A header older than this names its own staleness instead of
 # silently claiming "live".
 _RENDER_STALE_AGE_SECS=20
@@ -9537,22 +9537,37 @@ _anomaly_baselines_enabled() {
 # Inline constants (mirrors _MAIN_HEALTH_DIED_MAX / _MAIN_CI_SCAN_INTERVAL) — internal tuning, not
 # operator knobs: no config key, no manifest row.
 _ANOMALY_MIN_SAMPLES=5        # never judge a phase off a baseline that has not learned enough yet
-_ANOMALY_THRESHOLD_PCT=150    # an instance must exceed 1.5x its own LEARNED p95 to count as anomalous
-                              # (HERD-645: lowered from 2x now that the absolute floor below covers the
-                              # tight-distribution case a pure multiplier misjudges on its own).
-_ANOMALY_FLOOR_MARGIN_SECS=30 # HERD-645: absolute floor composed with the pct multiplier above — the
-                              # class-default filing bar for every phase is max(1.5x p95, p95 + this
-                              # many seconds), never just 1.5x p95 alone. GROUNDED: tick_cadence's
-                              # learned p95 (~47-53s) sits within ordinary jitter of the nominal 60s
-                              # tick, so a pure multiplier let ordinary jitter clear the bar and file 4
-                              # marginal items in 2 days; a p95 within jitter of the nominal period must
-                              # not alarm on jitter. Internal tuning, not an operator knob: no config
-                              # key, no manifest row (mirrors _ANOMALY_THRESHOLD_PCT).
+# HERD-807: the pct multiplier and the absolute floor are now VALIDATED OPERATOR CONFIG KEYS
+# (ANOMALY_THRESHOLD_PCT / ANOMALY_FLOOR_MARGIN_SECS), resolved through the two helpers just below with
+# these exact numbers as their unset defaults, so the filing bar is byte-identical when neither key is
+# set. GROUNDED: the two hardcoded 150/30 constants tuned well for tick_cadence but an operator whose
+# render/review phases have a fatter tail had no way to widen the bar short of editing the engine.
+_ANOMALY_THRESHOLD_PCT_DEFAULT=150  # 1.5x its own LEARNED p95 to count as anomalous (HERD-645 floor covers
+                              # the tight-distribution case a pure multiplier misjudges on its own).
+_ANOMALY_FLOOR_MARGIN_SECS_DEFAULT=30  # HERD-645: absolute floor composed with the pct multiplier — the
+                              # class-default filing bar for every phase is max(1.5x p95, p95 + this many
+                              # seconds), never just 1.5x p95 alone; a p95 within jitter of the nominal
+                              # period must not alarm on jitter.
+_ANOMALY_SUSPEND_MULT=20      # HERD-807: a reading past this many TIMES its learned p95 is so far out of
+                              # distribution that, WHEN it also coincides with a matching gap in the
+                              # engine journal's own tick stream (_anomaly_reading_is_suspend_artifact),
+                              # it is treated as a wall-clock suspend artifact the sysctl wake probe
+                              # missed (non-darwin, or a boundary that already advanced past this
+                              # interval) — journaled result=suspend-artifact, never filed, never learned.
 _ANOMALY_LOAD_MARGIN_PCT=200  # HERD-618: under load, the FILING bar widens to 2x the (HERD-645-floored)
                               # normal threshold — an exceedance short of that still journals/paints,
                               # tagged load_qualified, but withholds the tracker filing. Composes on top
                               # of the HERD-645 floor, not the other way round. Ship-dormant with the
                               # rest of ANOMALY_BASELINES; internal tuning, not an operator knob.
+
+# _anomaly_threshold_pct — the configured ANOMALY_THRESHOLD_PCT (percent of the learned p95 an instance
+# must exceed to count as anomalous), default 150. A non-numeric value falls soft to the default via
+# herd_numeric (warns once) — same discipline as every other ANOMALY_* numeric key.
+_anomaly_threshold_pct() { herd_numeric ANOMALY_THRESHOLD_PCT "$_ANOMALY_THRESHOLD_PCT_DEFAULT"; }
+
+# _anomaly_floor_margin_secs — the configured ANOMALY_FLOOR_MARGIN_SECS (absolute seconds added to p95
+# for the HERD-645 floor), default 30. Same fail-soft-to-default contract as _anomaly_threshold_pct.
+_anomaly_floor_margin_secs() { herd_numeric ANOMALY_FLOOR_MARGIN_SECS "$_ANOMALY_FLOOR_MARGIN_SECS_DEFAULT"; }
 
 # _anomaly_load_high — true iff this box's loadavg1m is at/above HEALTH_LOAD_THRESHOLD (default 4)
 # right now. Reuses the SAME probe + config key ENV_SUSPECT_TIMEOUT (HERD-546) already ships
@@ -9582,6 +9597,21 @@ _phase_duration_observe() {
   command -v python3 >/dev/null 2>&1 || return 1
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_pdo_pyp" WORKTREES_DIR="${TREES:-}" \
     python3 -m herd.store --phase-duration-observe "$_pdo_phase" "$_pdo_secs" 2>/dev/null
+}
+
+# _phase_duration_peek <phase> — the READ-ONLY twin of _phase_duration_observe (HERD-807): print the
+# current rolling baseline "<median>\t<p95>\t<n>" for <phase> WITHOUT recording anything. Same empty-on-
+# error contract. Lets the anomaly leg judge a just-completed instance against the LEARNED window and
+# then record it only when it is a normal (below-bar) reading — so an above-bar / suspend-inflated
+# sample never gets folded into the p95 the very rail that flagged it is judged against (observed:
+# render-pass p95 crept 44s→37m once anomalies were being learned back in).
+_phase_duration_peek() {
+  local _pdp_phase="$1" _pdp_pyp
+  _pdp_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_pdp_pyp" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_pdp_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --phase-duration-peek "$_pdp_phase" 2>/dev/null
 }
 
 # _phase_anomaly_row <ledger-line> — render ONE anomaly ledger line ("<epoch>\t<phase>\t<seconds>\t
@@ -9749,19 +9779,103 @@ _anomaly_file_stamp() {
   printf '%s\n' "$(_now_epoch)" > "$(_anomaly_file_stamp_path "${1:-}")" 2>/dev/null || true
 }
 
+# ── HERD-807: SUSPEND SANITY CLASSIFIER ────────────────────────────────────────────────────────────
+# HERD-512's wake guards read the darwin `kern.waketime/sleeptime` sysctls — the moment that probe is
+# unavailable (a non-darwin box) or has already advanced past the interval a reading spans, a suspend-
+# inflated sample sails through as a genuine anomaly, files a bogus tracker item, and (pre-HERD-807)
+# poisoned the p95. This is the fully-independent corroboration: the engine journal ITSELF ticks
+# steadily while the watcher is alive (every loop writes events), so a sleep leaves a matching hole in
+# the journal's own timestamp stream. A reading >_ANOMALY_SUSPEND_MULT x its learned p95 that ALSO
+# lines up with such a hole is a wall-clock artifact, not work — journaled result=suspend-artifact and
+# dropped. Fail-soft in every direction (no python3, unreadable journal, no matching gap) reads as
+# "not a suspend artifact", so a genuine massive regression is never silenced on a blind guess.
+
+# _anomaly_journal_max_gap_secs <reading-secs> — the largest gap, in whole seconds, between consecutive
+# engine-journal event timestamps whose LATER edge falls inside [now - reading-secs, now] (now itself
+# is included as the trailing edge, so a hole that runs right up to the present counts). Empty + rc 1
+# when python3 is missing, the journal is absent/unreadable, or the bound is not a sane integer — the
+# caller then treats it as "no gap". Reads the SAME journal path builder-notes consume (JOURNAL_FILE
+# test seam honored), and pins "now" to _now_epoch so a hermetic test drives it with HERD_FAKE_NOW.
+_anomaly_journal_max_gap_secs() {
+  local _ajg_secs="${1:-}" _ajg_now _ajg_jf
+  case "$_ajg_secs" in ''|*[!0-9]*) return 1 ;; esac
+  command -v python3 >/dev/null 2>&1 || return 1
+  _ajg_jf="$(_builder_notes_journal 2>/dev/null)" || return 1
+  [ -n "$_ajg_jf" ] && [ -f "$_ajg_jf" ] || return 1
+  _ajg_now="$(_now_epoch)"
+  case "$_ajg_now" in ''|*[!0-9]*) return 1 ;; esac
+  HERD_AJG_NOW="$_ajg_now" HERD_AJG_SECS="$_ajg_secs" HERD_AJG_JF="$_ajg_jf" python3 -c '
+import os, sys
+from datetime import datetime, timezone
+now = int(os.environ["HERD_AJG_NOW"]); secs = int(os.environ["HERD_AJG_SECS"]); jf = os.environ["HERD_AJG_JF"]
+eps = []
+try:
+    with open(jf, encoding="utf-8") as fh:
+        for line in fh:
+            i = line.find("\"ts\":\"")
+            if i < 0:
+                continue
+            j = line.find("\"", i + 6)
+            if j < 0:
+                continue
+            try:
+                dt = datetime.strptime(line[i + 6:j], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            e = int(dt.timestamp())
+            if e <= now:
+                eps.append(e)
+except Exception:
+    sys.exit(1)
+eps.append(now)
+eps = sorted(set(eps))
+lo = now - secs
+maxgap = 0
+for a, b in zip(eps, eps[1:]):
+    if b >= lo and (b - a) > maxgap:
+        maxgap = b - a
+sys.stdout.write(str(maxgap))
+' 2>/dev/null || return 1
+}
+
+# _anomaly_reading_is_suspend_artifact <secs> <p95> — true iff <secs> is BOTH far out of distribution
+# (past _ANOMALY_SUSPEND_MULT x the learned p95) AND coincides with a matching journal tick gap (a
+# hole at least half the reading wide — the watcher demonstrably wrote nothing for most of the window
+# it claims to have spent working). A genuine 2x-degraded (or even a 25x-degraded-but-busy) phase keeps
+# the journal ticking, so its max gap stays small and this reads false — it files as normal. Fail-soft:
+# a bad arg, or no gap probe, reads false.
+_anomaly_reading_is_suspend_artifact() {
+  local _sa_secs="${1:-}" _sa_p95="${2:-}" _sa_gap
+  case "$_sa_secs" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_sa_p95"  in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_sa_p95" -gt 0 ] || return 1
+  [ "$_sa_secs" -gt $(( _sa_p95 * _ANOMALY_SUSPEND_MULT )) ] || return 1
+  _sa_gap="$(_anomaly_journal_max_gap_secs "$_sa_secs")" || return 1
+  case "$_sa_gap" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_sa_gap" -ge $(( _sa_secs / 2 )) ]
+}
+
 # _phase_anomaly_observe <phase-key> <human-label> <duration-secs> — the ONE shared call every one of
 # HERD-496's 5 measurement points calls once it knows how long its own instance just took. Ship-
 # dormant: returns immediately (no store touch, no journal, no row) unless ANOMALY_BASELINES is on.
 #
-# On enable: records <duration-secs> against <phase-key>'s rolling baseline; below the filing
-# threshold (HERD-645: max(_ANOMALY_THRESHOLD_PCT of the LEARNED p95, p95 + _ANOMALY_FLOOR_MARGIN_SECS)
-# — see below) or before _ANOMALY_MIN_SAMPLES have accrued is SILENT — no journal, no row, no filing,
-# exactly the mutation-prove's "below threshold" case. Past it:
-# journals `phase_anomaly`, appends one calm advisory row to $ANOMALY_LEDGER, and FILES ONCE via the
-# SAME shared-pool dedup marker MAIN_HEALTH_AUTOFIX's filing leg uses (_main_health_fix_mark /
-# _main_health_scribe, HERD-371) — an HONEST identity of phase+THIS measurement+the baseline it beat,
-# so a re-observed IDENTICAL reading dedups (journaled result=dedup) while a worse or different
-# reading of the same phase files fresh. Fully fail-soft; always returns 0.
+# On enable: PEEKS <phase-key>'s rolling baseline read-only, judges <duration-secs> against it, and
+# then RECORDS the sample into that baseline (HERD-807: judge-before-learn) ONLY when it is below the
+# filing threshold (HERD-645: max(ANOMALY_THRESHOLD_PCT of the LEARNED p95, p95 + ANOMALY_FLOOR_MARGIN_SECS)
+# — both now VALIDATED CONFIG KEYS defaulting to 150/30, see below) or before _ANOMALY_MIN_SAMPLES have
+# accrued; either case is SILENT — no journal, no row, no filing. An ABOVE-BAR reading is judged but
+# NEVER folded into the learning window, so the outliers the rail flags can no longer poison the p95 it
+# is judged against. Past the threshold it journals `phase_anomaly`, appends one calm advisory row to
+# $ANOMALY_LEDGER, and FILES ONCE via the SAME shared-pool dedup marker MAIN_HEALTH_AUTOFIX's filing leg
+# uses (_main_health_fix_mark / _main_health_scribe, HERD-371) — an HONEST identity of phase+THIS
+# measurement+the baseline it beat, so a re-observed IDENTICAL reading dedups (journaled result=dedup)
+# while a worse or different reading of the same phase files fresh. Fully fail-soft; always returns 0.
+#
+# HERD-807 adds a suspend sanity classifier at this chokepoint: an above-bar reading past
+# _ANOMALY_SUSPEND_MULT x the learned p95 that ALSO coincides with a matching gap in the engine
+# journal's own tick stream is a wall-clock suspend artifact the darwin wake probe missed — journaled
+# result=suspend-artifact and dropped (no row, no filing, no sample), the negative control being a
+# genuine large-but-busy degradation whose journal never went quiet, which still files.
 #
 # HERD-512 adds two guards here, both at this ONE chokepoint so all 5 measurement points inherit them:
 #   (a) an interval a machine SUSPEND/WAKE boundary falls inside is dropped whole — before the store
@@ -9772,7 +9886,7 @@ _anomaly_file_stamp() {
 # close to its nominal period (e.g. tick_cadence's p95 of ~47-53s against a 60s nominal tick) has a
 # pure pct multiplier fall WITHIN ordinary jitter of that period, so ordinary 60s ticks cleared 2x
 # p95's old bar and filed 4 marginal items in 2 days. The class-default bar for every phase is now
-# max(_ANOMALY_THRESHOLD_PCT of p95, p95 + _ANOMALY_FLOOR_MARGIN_SECS) — a p95 within jitter of the
+# max(ANOMALY_THRESHOLD_PCT of p95, p95 + ANOMALY_FLOOR_MARGIN_SECS) — a p95 within jitter of the
 # nominal period must not alarm on jitter — and this is the ONE base threshold every guard below
 # composes on top of.
 # HERD-618 adds a third guard, same chokepoint, same shape: this box's own p95 baselines skew toward the
@@ -9788,7 +9902,7 @@ _anomaly_file_stamp() {
 _phase_anomaly_observe() {
   local _pa_phase="$1" _pa_label="$2" _pa_secs="$3"
   local _pa_stats _pa_median _pa_p95 _pa_n _pa_threshold _pa_floor _pa_id _pa_mark_rc _pa_now
-  local _pa_load_qualified=0 _pa_widened _pa_tag=""
+  local _pa_load_qualified=0 _pa_widened _pa_tag="" _pa_pct _pa_fmargin
   _anomaly_baselines_enabled || return 0
   case "$_pa_secs" in ''|*[!0-9]*) return 0 ;; esac
   # HERD-512(a): a measured interval that a machine suspend/wake boundary falls inside is wall clock,
@@ -9804,20 +9918,48 @@ _phase_anomaly_observe() {
       return 0
     fi
   fi
-  _pa_stats="$(_phase_duration_observe "$_pa_phase" "$_pa_secs")" || return 0
+  # HERD-807: PEEK the learned baseline (read-only) and judge THIS instance against it FIRST, then
+  # record it (fold it into the rolling window) ONLY when it turns out to be a normal, below-bar
+  # reading. An above-bar reading — a genuine anomaly, a suspend artifact, a load-qualified exceedance —
+  # is NEVER learned from, so the p95 the rail judges against can no longer be dragged up by the very
+  # outliers it flagged (observed: render-pass p95 crept 44s→37m in .agent-watch-phase-anomalies once
+  # anomalous samples were being folded back in). Wake/settle-suppressed samples above are already
+  # excluded — they return before this point, so they were never learned either.
+  _pa_stats="$(_phase_duration_peek "$_pa_phase")" || return 0
   IFS=$'\t' read -r _pa_median _pa_p95 _pa_n <<EOF
 $_pa_stats
 EOF
   case "${_pa_n:-}" in ''|*[!0-9]*) return 0 ;; esac
   case "${_pa_p95:-}" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$_pa_n" -ge "$_ANOMALY_MIN_SAMPLES" ] || return 0      # baseline not learned yet — never judge
-  [ "$_pa_p95" -gt 0 ] || return 0
-  _pa_threshold=$(( _pa_p95 * _ANOMALY_THRESHOLD_PCT / 100 ))
-  # HERD-645: the class-default filing bar is never lower than p95 + _ANOMALY_FLOOR_MARGIN_SECS, even
+  # Baseline not learned yet, or a degenerate all-zero p95: never judge — but DO record so the window
+  # keeps growing toward _ANOMALY_MIN_SAMPLES exactly as the pre-HERD-807 unconditional observe did.
+  if [ "$_pa_n" -lt "$_ANOMALY_MIN_SAMPLES" ] || [ "$_pa_p95" -le 0 ]; then
+    _phase_duration_observe "$_pa_phase" "$_pa_secs" >/dev/null 2>&1 || true
+    return 0
+  fi
+  _pa_pct="$(_anomaly_threshold_pct)"
+  _pa_fmargin="$(_anomaly_floor_margin_secs)"
+  _pa_threshold=$(( _pa_p95 * _pa_pct / 100 ))
+  # HERD-645: the class-default filing bar is never lower than p95 + ANOMALY_FLOOR_MARGIN_SECS, even
   # when the pct multiplier alone would fall inside ordinary jitter of a tight-distribution phase.
-  _pa_floor=$(( _pa_p95 + _ANOMALY_FLOOR_MARGIN_SECS ))
+  _pa_floor=$(( _pa_p95 + _pa_fmargin ))
   [ "$_pa_floor" -gt "$_pa_threshold" ] && _pa_threshold="$_pa_floor"
-  [ "$_pa_secs" -gt "$_pa_threshold" ] || return 0          # under threshold — silent, byte-inert
+  if [ "$_pa_secs" -le "$_pa_threshold" ]; then             # under threshold — silent, byte-inert
+    # A NORMAL reading: this is exactly what the baseline SHOULD learn from — record it and stay quiet.
+    _phase_duration_observe "$_pa_phase" "$_pa_secs" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # ── ABOVE BAR from here: judged anomalous, so it is NOT folded into the learning window. ──
+  # HERD-807: suspend sanity — a reading so far out of distribution that it ALSO coincides with a
+  # matching hole in the engine journal's own tick stream is a wall-clock suspend artifact the darwin
+  # wake probe missed (non-darwin, or a boundary already advanced past this interval). Journal it once
+  # for forensics (result=suspend-artifact) and DROP it: no console row, no tracker filing, no sample.
+  if _anomaly_reading_is_suspend_artifact "$_pa_secs" "$_pa_p95"; then
+    journal_append phase_anomaly phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" \
+      median "${_pa_median:-0}" n "$_pa_n" result suspend-artifact
+    return 0
+  fi
 
   # HERD-618: an exceedance that clears the normal threshold but falls short of the WIDENED under-load
   # threshold, while the box is contended right now, is "load-qualified" — journaled and painted, but
