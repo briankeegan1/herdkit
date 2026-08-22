@@ -796,6 +796,16 @@ def _terminate_worker(path):
     return _worker_gone(pid, sess, use_session)
 
 
+def _marker_pid(path):
+    """The dispatch pid an inflight marker records (its first line), or "" when unreadable/absent —
+    agent-watch.sh:_marker_pid. Pure read; never raises."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except Exception:
+        return ""
+    return lines[0].strip() if lines else ""
+
+
 def _marker_live(path):
     """True iff the marker's pid is alive AND (recycling guard) its start-time still matches
     (agent-watch.sh:_marker_live). No recorded start-time → a bare kill -0 (fail toward NOT reaping)."""
@@ -4295,6 +4305,7 @@ class LiveGates:
     def review(self, cand):
         st = self.state
         self.reused_review = False
+        self.unexecuted_cmds = []      # HERD-810: reset per collect; non-empty only when the gate disclosed
         # 1. REVIEW-ONCE: a recorded PASS/BLOCK for this exact (pr, sha) is reused — no reviewer runs.
         rec = st.recorded_review(cand.pr, cand.sha)
         if rec in ("PASS", "BLOCK"):
@@ -4341,8 +4352,29 @@ class LiveGates:
                     self.journal.append("rubric_verdicts", "pr", cand.pr, "sha", cand.sha,
                                         "verdict", verdict, "criteria_count", len(rubric),
                                         "criteria", json.dumps(rubric, separators=(",", ":")))
+                # REVIEW_CMD_DISCLOSURE (HERD-810): the reviewer's UNEXECUTED: disclosure lines — the
+                # verification commands its runtime REFUSED or failed to launch. SINGLE-WRITER: the
+                # `review_cmd_unexecuted` journal event is produced ONCE, by the gate (herd-review.sh)
+                # that observed the refusal — it writes the same shared journal this core does, so a
+                # second append here DUPLICATED every disclosure row (PR #864 review). The collect side
+                # only PARSES the lines and exposes them on the rail (`unexecuted_cmds`) so the tick
+                # can qualify the `verdict_recorded` row it already writes; it never re-emits them.
+                # Same discipline as the rubric pass: independent, never able to change the verdict
+                # recorded above, and an empty list (every lever-off review) leaves everything
+                # byte-identical.
+                self.unexecuted_cmds = parse_unexecuted_cmds(text)
                 st.rm(result, inflight, st.review_registry_file(cand))
                 return verdict
+            # INFRA collect TERMINAL (HERD-810 follow-up; the live-core half of PR #863). The audit
+            # replay closes a `review_dispatched` chain on review_retry / review_latency (among the
+            # verdict terminals). bash's _review_gate_step journals review_retry UNCONDITIONALLY for a
+            # non-verdict collect; this core journaled only infra_event + the OPTIONAL review_latency —
+            # so with REVIEW_LATENCY=off a collected INFRA review had NO terminal and replay reported
+            # it `dispatch_no_outcome`: optional telemetry was the sole terminal. Same row bash writes
+            # (pr, sha, attempt=<dispatch pid from the inflight marker>) so replay pairs it to exactly
+            # one attempt; read BEFORE the marker is dropped below. Never gated on telemetry.
+            self.journal.append("review_retry", "pr", cand.pr, "sha", cand.sha,
+                                "attempt", _marker_pid(inflight) if inflight else "")
             st.rm(result, inflight, st.review_registry_file(cand))
             return "INFRA"          # infra death — a transient the caller escalates, never a cached BLOCK
         # 3. IN FLIGHT: a live reviewer poller (marker) OR its pane (registry) → dispatch-and-wait.
@@ -4743,6 +4775,34 @@ def parse_rubric_verdicts(text):
         if not cid or verdict not in ("PASS", "FAIL"):
             continue
         out.append({"id": cid, "verdict": verdict, "reason": reason})
+    return out
+
+
+def parse_unexecuted_cmds(text):
+    """Extract ``UNEXECUTED: <kind> | <cmd>`` disclosure lines (HERD-810, REVIEW_CMD_DISCLOSURE).
+
+    The consumer-side twin of scripts/herd/review-cmd-disclosure.sh's ``herd_review_disclosure_lines``:
+    the gate writes one such line per reviewer verification command its runtime REJECTED (command
+    policy refused it) or FAILED to launch — or a single ``unknown`` line when the reviewer's output
+    could not be read at all (fail-closed provenance). Like :func:`parse_rubric_verdicts` this is a
+    SECOND, independent pass over the exact text :func:`parse_review_verdict` reads — never consulted
+    by it, never able to change PASS/BLOCK/INFRA. Returns an ordered list of ``{"kind", "cmd"}`` dicts;
+    ``kind`` is lower-cased and must be one of ``rejected`` / ``failed`` / ``unknown`` — any other
+    shape (no ``|`` separator, an unrecognized kind, an empty command) is SILENTLY SKIPPED. Never raises.
+    """
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.upper().startswith("UNEXECUTED:"):
+            continue
+        body = s.split(":", 1)[1]
+        if "|" not in body:
+            continue
+        kind, cmd = body.split("|", 1)
+        kind, cmd = kind.strip().lower(), cmd.strip()
+        if kind not in ("rejected", "failed", "unknown") or not cmd:
+            continue
+        out.append({"kind": kind, "cmd": cmd})
     return out
 
 
@@ -7290,6 +7350,15 @@ class LiveTick:
             _vreason = self.state.recorded_review_reason(cand.pr, cand.sha)
             if _vreason:
                 _vfields += ["reason", _vreason]
+            # HERD-810: a verdict the gate disclosed as NOT backed by its intended verification carries
+            # that qualification on the SAME row (count + kinds), so a `herd why` reader sees it next
+            # to the value. The full per-command detail is the gate's own single `review_cmd_unexecuted`
+            # event — this core never re-emits it. Appended ONLY when non-empty: every undisclosed
+            # verdict (and every fixture/sim rail, which has no such attribute) journals byte-identically.
+            _vunexec = getattr(self.gates, "unexecuted_cmds", None) or []
+            if _vunexec:
+                _vfields += ["unexecuted", len(_vunexec),
+                             "unexecuted_kinds", ",".join(sorted({u["kind"] for u in _vunexec}))]
             self.journal.append("verdict_recorded", *_vfields)
             # INFRA circuit breaker RECORD (HERD-110, restored HERD-447; agent-watch.sh:_review_gate_step
             # PASS/BLOCK branches): a REAL verdict proves the env is alive — reset + close the breaker.

@@ -129,6 +129,18 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # single-model on $REVIEW_MODEL, byte-identical to before.
 # shellcheck source=/dev/null
 . "$HERE/review-panel.sh"
+# Reviewer verification-command DISCLOSURE seam (HERD-810): the resolver that turns a runtime's
+# "command rejected / failed to launch" stream lines into durable UNEXECUTED: disclosure lines, so an
+# intended-but-never-run verification (PR #863: a Codex reviewer's rm -rf-bearing checkout command was
+# refused by Codex's own policy and the final verdict never said so) can never be mistaken for
+# evidence. Sourced ONLY under REVIEW_CMD_DISCLOSURE=on — off (default), nothing here is loaded and
+# every output below is byte-identical to before the key existed. Missing file under on → skipped
+# silently (fail-soft for an optional library), the review proceeds exactly as today.
+_CMD_DISCLOSE=0
+if [ "${REVIEW_CMD_DISCLOSURE:-off}" = "on" ] && [ -f "$HERE/review-cmd-disclosure.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HERE/review-cmd-disclosure.sh" && _CMD_DISCLOSE=1
+fi
 MAIN="$PROJECT_ROOT"
 # Mode: default PR review (<pr> <slug>); --local reviews the worktree's LOCAL diff (<slug>) BEFORE any
 # PR exists. Local mode reuses the SAME adversarial prompt + PASS/BLOCK/INFRA-FAIL contract below, but
@@ -273,6 +285,113 @@ _emit_verdict() {
       mv -f "$_rf_tmp" "$HERD_REVIEW_RESULT_FILE" 2>/dev/null || rm -f "$_rf_tmp" 2>/dev/null || true
     fi
   fi
+}
+
+# ── HERD-810: reviewer verification-command disclosure ──────────────────────────────────────────
+# _disclose_unexecuted <captured-output-file>… — run the shared resolver over the reviewer's captured
+# stream(s) and make every REJECTED / FAILED-TO-LAUNCH verification command DURABLE and VISIBLE:
+#   • $_DISCLOSE_LINES  — the `UNEXECUTED: <kind> | <cmd>` lines, written into the sha-keyed result
+#                         file ahead of the verdict (the RUBRIC: slot) so the watcher/live core and
+#                         `herd why` read them next to the verdict they qualify;
+#   • the RETAINED log  — a `─── reviewer verification NOT EXECUTED ───` block appended before the
+#                         completion banner (PR mode; local mode's log is transient, so it goes to
+#                         stderr where the builder is watching);
+#   • the journal       — ONE review_cmd_unexecuted event (pr, slug, sha, count, kinds, first cmd, and
+#                         `commands`: the FULL [{kind,cmd}] list — the durable record of every refusal).
+# Multiple files are concatenated (a local PANEL's per-member files); PR-mode panel members are already
+# folded into $LOG. A SECOND, independent pass: it never touches $verdict_line, so a BLOCK that is
+# independently supported by reading the diff stays a BLOCK verbatim (see _disclose_verdict). Hard
+# no-op unless the lever loaded the resolver above. Best-effort throughout: nothing here can abort
+# the gate — a failure to disclose is itself surfaced by the resolver's fail-closed `unknown` line.
+_DISCLOSE_LINES=""
+_disclose_unexecuted() {
+  [ "${_CMD_DISCLOSE:-0}" = "1" ] || return 0
+  local _src="${1:-}" _n _kinds _first
+  if [ "$#" -gt 1 ]; then
+    _src="$(mktemp "${TMPDIR:-/tmp}/herd-review-disclose-XXXXXX" 2>/dev/null || true)"
+    [ -n "$_src" ] && cat "$@" > "$_src" 2>/dev/null || _src=""
+  fi
+  _DISCLOSE_LINES="$(herd_review_disclosure_lines "$_src" 2>/dev/null || true)"
+  [ "$#" -gt 1 ] && [ -n "$_src" ] && rm -f "$_src" 2>/dev/null || true
+  [ -n "$_DISCLOSE_LINES" ] || return 0
+  _n="$(printf '%s\n' "$_DISCLOSE_LINES" | grep -c '^UNEXECUTED: ' 2>/dev/null || true)"; _n="${_n:-0}"
+  _kinds="$(printf '%s\n' "$_DISCLOSE_LINES" | sed -n 's/^UNEXECUTED: \([a-z]*\) | .*/\1/p' | sort -u | paste -sd, - 2>/dev/null)"  # pipe-ok: bounded disclosure block, one short line per refused command
+  _first="$(printf '%s\n' "$_DISCLOSE_LINES" | sed -n '1s/^UNEXECUTED: [a-z]* | //p' | cut -c1-200)"
+  # EVERY disclosed command rides the event as a JSON list (PR #864 review: first_cmd alone dropped
+  # command 2..n from the only DURABLE record — the retained log is a rolling window and the result
+  # file is consumed on collect — so a multi-command refusal could never be reconstructed). Same
+  # [{kind,cmd}] shape parse_unexecuted_cmds yields, so journal readers and the core agree.
+  _cmds_json="$(printf '%s\n' "$_DISCLOSE_LINES" | python3 -c '
+import json, sys
+out = []
+for line in sys.stdin:
+    s = line.strip()
+    if not s.startswith("UNEXECUTED:"): continue
+    body = s.split(":", 1)[1]
+    if "|" not in body: continue
+    kind, cmd = body.split("|", 1)
+    out.append({"kind": kind.strip(), "cmd": cmd.strip()})
+print(json.dumps(out, separators=(",", ":")))' 2>/dev/null || printf '[]')"  # pipe-ok: bounded disclosure block, one short line per refused command
+  if [ -n "${LOG:-}" ] && [ "${REVIEW_MODE:-}" != "local" ]; then
+    {
+      printf '\n─── reviewer verification NOT EXECUTED (%s) — the verdict below is NOT backed by these commands ───\n' "$_n"
+      printf '%s\n' "$_DISCLOSE_LINES"
+    } >> "$LOG" 2>/dev/null || true
+  else
+    {
+      printf '⚠️  reviewer verification NOT EXECUTED (%s) — the verdict is NOT backed by these commands:\n' "$_n"
+      printf '%s\n' "$_DISCLOSE_LINES"
+    } >&2
+  fi
+  journal_append review_cmd_unexecuted pr "${PR:-}" slug "${SLUG:-}" sha "${_REVIEW_SHA:-}" \
+    count "$_n" kinds "${_kinds:-}" first_cmd "${_first:-}" commands "${_cmds_json:-[]}" log "${LOG:-}"
+  # PR mode: one best-effort, NON-authoritative comment so a human reading the PR sees the same thing
+  # the watcher does (the single headless reviewer already posted its own comment — this one qualifies
+  # it). Never a gate: gh missing/unauthenticated simply skips it.
+  if [ -n "${PR:-}" ] && [ "${REVIEW_MODE:-}" != "local" ] && command -v gh >/dev/null 2>&1; then
+    gh pr comment "$PR" --body "⚠️ **Reviewer verification NOT executed** (${_n}) — the review verdict for this commit is NOT backed by the following command(s) the reviewer intended to run; the runtime's command policy refused them or they failed to launch:
+
+\`\`\`
+${_DISCLOSE_LINES}
+\`\`\`
+
+Treat the verdict as a READ-ONLY diff review, not as a test-backed one." >/dev/null 2>&1 || true
+  fi
+}
+
+# _disclose_verdict <verdict-line> — the verdict line the gate emits, QUALIFIED by the disclosure:
+#   • a PASS gains one ' advisory:' segment per unexecuted command (HERD-105 grammar, so the watcher's
+#     existing _record_advisory_notes journals a review_advisory per command with NO new consumer
+#     code) — a PASS whose verification never ran is still a PASS of the diff read, but it is now
+#     labelled as exactly that;
+#   • a BLOCK is returned VERBATIM — the block is independently supported (the reviewer read the diff
+#     and found the defect; the unexecuted command was its attempt to CONFIRM, not its only ground),
+#     and the structured rule/why/location fields the refix bounce parses must not be disturbed. The
+#     disclosure still travels in the result file + log + journal alongside it.
+# Prints the input unchanged when the lever is off or nothing was disclosed.
+_disclose_verdict() {
+  local _v="${1:-}" _adv
+  [ "${_CMD_DISCLOSE:-0}" = "1" ] && [ -n "$_DISCLOSE_LINES" ] || { printf '%s' "$_v"; return 0; }
+  case "$_v" in
+    "REVIEW: PASS"|"REVIEW: PASS "*)
+      _adv="$(herd_review_disclosure_advisory "$_DISCLOSE_LINES" 2>/dev/null || true)"
+      [ -n "$_adv" ] || { printf '%s' "$_v"; return 0; }
+      case "$_v" in
+        *" advisory: "*) printf '%s | %s' "$_v" "$_adv" ;;
+        *)               printf '%s — %s' "$_v" "$_adv" ;;
+      esac ;;
+    *) printf '%s' "$_v" ;;
+  esac
+}
+
+# _disclose_extra_lines <rubric-lines> — the result-file lines that precede the verdict: the rubric
+# lines (HERD-400) followed by the disclosure lines. Byte-identical to the rubric lines alone when
+# nothing was disclosed (the lever-off case included), so _emit_verdict's second argument is unchanged.
+_disclose_extra_lines() {
+  local _r="${1:-}"
+  [ -n "$_DISCLOSE_LINES" ] || { printf '%s' "$_r"; return 0; }
+  printf '%s' "${_r:+$_r
+}$_DISCLOSE_LINES"
 }
 
 # _teardown_reviewer — called on every non-success exit path when in agent-pane mode.
@@ -612,6 +731,7 @@ if [ "$REVIEW_MODE" = "local" ]; then
     verdict_line="$(_combine_verdicts "$_PANEL_DIR"/m.* 2>/dev/null || true)"
     [ -n "$verdict_line" ] \
       || emit_infra_fail "$(_panel_infra_reason "local panel review produced no verdict from any of ${_PANEL_N} panelists — infrastructure failure, not a block")"
+    _disclose_unexecuted "$_PANEL_DIR"/m.*
   else
     echo "🔬 Local pre-PR review of '${SLUG}' on ${REVIEW_MODEL} — adversarial correctness/data-integrity pass (${_local_diff_cmd})…" >&2
 
@@ -632,13 +752,16 @@ if [ "$REVIEW_MODE" = "local" ]; then
     fi
 
     verdict_line="$(grep -E '^[[:space:]]*REVIEW: (PASS|BLOCK)' "$LLOG" 2>/dev/null | tail -1 | sed -E 's/^[[:space:]]+//')"
+    _disclose_unexecuted "$LLOG"
   fi
+  # HERD-810: qualify the verdict (PASS → advisory-annotated; BLOCK verbatim). Inert when off.
+  [ "${_CMD_DISCLOSE:-0}" = "1" ] && verdict_line="$(_disclose_verdict "$verdict_line")"
   case "$verdict_line" in
     # PASS, with or without a HERD-105 'advisory:' tail (' — advisory: …'). A bare 'REVIEW: PASS'
     # is emitted verbatim (byte-identical to before); a PASS carrying advisory notes is passed
     # through unchanged so the non-blocking findings survive to the builder.
-    "REVIEW: PASS"|"REVIEW: PASS "*) _emit_verdict "$verdict_line"; exit 0 ;;
-    "REVIEW: BLOCK"*) _emit_verdict "$verdict_line"; exit 1 ;;
+    "REVIEW: PASS"|"REVIEW: PASS "*) _emit_verdict "$verdict_line" "$_DISCLOSE_LINES"; exit 0 ;;
+    "REVIEW: BLOCK"*) _emit_verdict "$verdict_line" "$_DISCLOSE_LINES"; exit 1 ;;
     *) emit_infra_fail "local reviewer produced no parseable verdict (no REVIEW line) — infrastructure failure, not a block" ;;
   esac
 fi
@@ -1134,6 +1257,22 @@ if [ -n "$_rubric_path" ]; then
   else
     _RUBRIC_LINES="$(grep -E '^[[:space:]]*RUBRIC: ' "$LOG" 2>/dev/null || true)"
   fi
+fi
+
+# HERD-810: reviewer verification-command disclosure over wherever the reviewer's stream landed —
+# $LOG for the headless single reviewer AND the panel (whose member files were cat'd into $LOG above).
+# Agent-pane mode has NO captured stream (the reviewer ran in the TUI and wrote only its verdict), so
+# the scan covers its result file and, absent any signature, discloses nothing — the lever's coverage
+# is the headless/panel/local paths, where the PR #863 incident lived. Placed AFTER the rubric pull so
+# the result-file order is rubric lines, disclosure lines, verdict. Hard no-op when the lever is off.
+if [ "${_CMD_DISCLOSE:-0}" = "1" ]; then
+  if [ "$_AGENT_PANE_MODE" = "1" ]; then
+    _disclose_unexecuted "${_nearmiss_path:-$_agent_result_file}"
+  else
+    _disclose_unexecuted "$LOG"
+  fi
+  verdict_line="$(_disclose_verdict "$verdict_line")"
+  _RUBRIC_LINES="$(_disclose_extra_lines "$_RUBRIC_LINES")"
 fi
 
 # Common verdict handling — same exit contract regardless of whether we used agent-pane or headless.

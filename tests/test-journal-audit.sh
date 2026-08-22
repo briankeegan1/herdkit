@@ -241,6 +241,32 @@ out="$(REVIEW_LATENCY=off run_audit on)" || fail "(2b0) latency-off INFRA-termin
 [ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b0) a latency-off matching review_retry must close its dispatch; $(cat "$JOURNAL_FILE")"
 grep -q '"event":"review_latency"' "$JOURNAL_FILE" && fail "(2b0) latency-off fixture must not rely on review_latency"
 
+# (2b0-live) The SAME invariant driven by the LIVE CORE's real collect rather than a hand-written
+# fixture (HERD-810 follow-up — the live-core half of the #863 fix): pysrc/herd/live_runtime.py's
+# LiveGates.review consumes a verdict-less result file under REVIEW_LATENCY=off, and whatever it
+# journals must close the review_dispatched chain on replay. Before the fix the core journaled only
+# the OPTIONAL review_latency as the INFRA terminal, so telemetry-off left the dispatch orphaned.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":72,"sha":"live72","slug":"live-infra","pid":7200'
+HERD_JOURNAL_NOW="2026-07-09T12:01:00Z" REVIEW_LATENCY=off PYTHONPATH="$REPO/pysrc" JOURNAL="$JOURNAL_FILE" TREES="$T/live72" \
+  python3 - <<'PY' || fail "(2b0-live) live-core INFRA collect failed"
+import os
+from herd.live_runtime import LiveState, LiveJournal, LiveGates, LiveCandidate, _marker_write
+os.makedirs(os.environ["TREES"], exist_ok=True)
+st = LiveState(os.environ["TREES"]); jn = LiveJournal(os.environ["JOURNAL"])
+c = LiveCandidate(pr="72", sha="live72", slug="live-infra")
+with open(st.review_result_file(c), "w") as fh:
+    fh.write("reviewer died before a verdict\n")
+_marker_write(st.review_inflight_file(c), 7200)
+class G(LiveGates):
+    def _dispatch_review(self, cand, tier_model=""): raise AssertionError("must not re-dispatch")
+assert G("/home", st, jn, config={"REVIEW_LATENCY": "off"}).review(c) == "INFRA"
+PY
+grep -q '"event": *"review_retry"' "$JOURNAL_FILE" || fail "(2b0-live) the live core must journal review_retry on an INFRA collect; $(cat "$JOURNAL_FILE")"
+grep -q '"event": *"review_latency"' "$JOURNAL_FILE" && fail "(2b0-live) REVIEW_LATENCY=off must journal no review_latency"
+out="$(REVIEW_LATENCY=off run_audit on)" || fail "(2b0-live) audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b0-live) the live core's INFRA collect must be a terminal under REVIEW_LATENCY=off; $(cat "$JOURNAL_FILE")"
+
 # Journal timestamps are whole-second, so a collected INFRA retry may land in the SAME second as
 # its dispatch. File order is authoritative: a following retry closes it, but a prior retry cannot
 # retroactively close a newly appended dispatch for the same PR/SHA.

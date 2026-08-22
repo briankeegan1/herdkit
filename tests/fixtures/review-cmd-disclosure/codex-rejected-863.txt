@@ -1,0 +1,8 @@
+I’ll inspect only the pinned commit-range diff, trace the affected behavior enough to validate its invariants, then leave a single PR comment with the review outcome.
+I found a concrete audit-integrity flaw: the new terminal exists only when optional latency telemetry is enabled, so an already-collected INFRA review is misreported as orphaned when that telemetry is disabled. I’m validating the configuration path and then will post the blocking note.
+2026-08-22T16:33:32.195876Z ERROR codex_core::tools::router: error=exec_command failed for `/bin/zsh -lc 'tmpdir="$(mktemp -d)"; trap '"'rm -rf \""'$tmpdir"'"' EXIT; cp -R /home/op/src/herdkit/. \""'$tmpdir/repo"; cd "$tmpdir/repo" && git checkout -q d126b9b974c0a714d063329f370568c19d2cf754 && REVIEW_LATENCY=off bash tests/test-journal-audit.sh'`: CreateProcess { message: "Rejected(\"`/bin/zsh -lc 'tmpdir=\\\"$(mktemp -d)\\\"; trap '\\\"'rm -rf \\\\\\\"\\\"'$tmpdir\\\"'\\\"' EXIT; cp -R /home/op/src/herdkit/. \\\\\\\"\\\"'$tmpdir/repo\\\"; cd \\\"$tmpdir/repo\\\" && git checkout -q d126b9b974c0a714d063329f370568c19d2cf754 && REVIEW_LATENCY=off bash tests/test-journal-audit.sh'` rejected: rm -f style commands are not permitted. Use a safer approach\")" }
+REVIEW: BLOCK — rule: silently wrong watcher/audit state | why: optional telemetry suppresses the sole INFRA collection terminal, falsely reporting completed attempts as orphaned | location: scripts/herd/journal-audit-replay.sh:172
+
+
+─── review complete: ⛔ BLOCKED ───
+Next: push a fix commit (auto re-reviews) · or: herd-approve.sh override 863
