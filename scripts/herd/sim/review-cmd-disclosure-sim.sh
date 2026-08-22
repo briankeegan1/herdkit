@@ -9,16 +9,16 @@
 #            temporary-checkout test replay — and then prints the same BLOCK the live reviewer printed;
 #   stage 2  the sha-keyed result file that gate wrote is COLLECTED by the live Python engine core
 #            (pysrc/herd/live_runtime.py LiveGates.review — the watcher's actual collect path), which
-#            must record the verdict to the review ledger and, when disclosure lines are present,
-#            journal review_cmd_unexecuted next to it;
+#            must record the verdict to the review ledger and PARSE the disclosure lines — without
+#            re-emitting the gate's review_cmd_unexecuted event into the shared journal (single writer);
 #   stage 3  the retained review log is read back the way a human / `herd why` would.
 #
 # Invariants proven:
 #   • OFF (default): result file, stdout and retained-log tail are byte-identical to the pre-HERD-810
 #     shape — verdict only, no disclosure, no review_cmd_unexecuted event from either side;
 #   • ON + BLOCK: the BLOCK verdict is PRESERVED verbatim and recorded as BLOCK (an independently
-#     supported block is still a block), while the result file, the retained log, the gate's journal
-#     AND the collecting core's journal all carry the refused command;
+#     supported block is still a block), while the result file, the retained log and the shared
+#     journal carry the refused command — EXACTLY ONCE (the gate writes it; the core never re-appends);
 #   • ON + PASS: the PASS is recorded as PASS but the verdict line now carries the advisory naming
 #     the refused command — the merge proceeds, labelled as a diff-read-only PASS;
 #   • FAIL-CLOSED provenance: a reviewer whose stream vanished discloses `UNEXECUTED: unknown`.
@@ -74,10 +74,13 @@ gate() {
   [ -n "$LOG" ] && [ -f "$LOG" ] || fail "$slug: retained log not tracked"
 }
 
-# collect <pr> <slug> <result-file> <journal> — stage 2: the live Python core collects the result file
-# exactly as the watcher does, prints "<recorded-verdict>\t<review_cmd_unexecuted rows as json>".
+# collect <pr> <slug> <result-file> — stage 2: the live Python core collects the result file exactly as
+# the watcher does, writing the SAME shared journal the gate wrote (production: one journal per
+# workspace). Prints "<recorded-verdict>\t<parsed disclosure json>\t<sha-keyed review_cmd_unexecuted
+# rows in the shared journal>". SINGLE-WRITER regression (PR #864 review): the gate is the only
+# producer of review_cmd_unexecuted — the core collect must leave that count untouched.
 collect() {
-  PYTHONPATH="$REPO/pysrc" PR="$1" SLUG="$2" RESULT="$3" JOURNAL="$4" TREES="$T/core-$2" python3 - <<'PY'
+  PYTHONPATH="$REPO/pysrc" PR="$1" SLUG="$2" RESULT="$3" JOURNAL="$JOURNAL_FILE" TREES="$T/core-$2" python3 - <<'PY'
 import json, os, shutil
 from herd.live_runtime import LiveState, LiveJournal, LiveGates, LiveCandidate
 trees = os.environ["TREES"]; os.makedirs(trees, exist_ok=True)
@@ -95,9 +98,9 @@ if os.path.exists(jn.path):
         line = line.strip()
         if not line: continue
         e = json.loads(line)
-        if e.get("event") == "review_cmd_unexecuted": rows.append(e)
+        if e.get("event") == "review_cmd_unexecuted" and e.get("sha") == c.sha: rows.append(e)
 assert st.recorded_review(c.pr, c.sha) == v, "ledger row must match the collected verdict"
-print("%s\t%s" % (v, json.dumps(rows)))
+print("%s\t%s\t%s" % (v, json.dumps(g.unexecuted_cmds), json.dumps(rows)))
 PY
 }
 gate_events() { grep -c '"review_cmd_unexecuted"' "$JOURNAL_FILE" 2>/dev/null || true; }
@@ -109,9 +112,10 @@ gate 863 off "$BLOCK_LINE"
 grep -q 'exec_command failed for' "$LOG" || fail "A: the raw refusal is in the retained log (it always was — buried)"
 grep -q 'UNEXECUTED' "$LOG" && fail "A: OFF must add no disclosure block"
 [ "$(gate_events)" = "0" ] || fail "A: OFF must journal no review_cmd_unexecuted"
-IFS=$'\t' read -r v rows <<< "$(collect 863 off "$RES" "$T/core-off.jsonl")"
+IFS=$'\t' read -r v parsed rows <<< "$(collect 863 off "$RES")"
 [ "$v" = "BLOCK" ] || fail "A: core should record BLOCK, got $v"
-[ "$rows" = "[]" ] || fail "A: core must journal no review_cmd_unexecuted when the lever is off, got $rows"
+[ "$parsed" = "[]" ] && [ "$rows" = "[]" ] || fail "A: nothing disclosed, nothing journaled (parsed=$parsed rows=$rows)"
+[ "$(gate_events)" = "0" ] || fail "A: the shared journal must still hold 0 events after the core collect"
 OFF_RES="$(cat "$RES")"; OFF_TAIL="$(tail -3 "$LOG")"
 printf '%-28s %s\n' "A. OFF + BLOCK" "verdict BLOCK recorded · result file = verdict only · refusal buried in log · 0 events   ✓"
 
@@ -126,25 +130,29 @@ d="$(awk '/reviewer verification NOT EXECUTED/ {print NR; exit}' "$LOG")"; b="$(
 [ "$(gate_events)" = "1" ] || fail "B: gate must journal exactly one review_cmd_unexecuted"
 grep -E '"review_cmd_unexecuted".*"sha": *"sha-on-block"' "$JOURNAL_FILE" >/dev/null || fail "B: gate event must be sha-keyed"
 grep -q 'Reviewer verification NOT executed' "$GH_LOG" || fail "B: a qualifying PR comment must be posted"
-IFS=$'\t' read -r v rows <<< "$(collect 863 on-block "$RES" "$T/core-on-block.jsonl")"
+IFS=$'\t' read -r v parsed rows <<< "$(collect 863 on-block "$RES")"
 [ "$v" = "BLOCK" ] || fail "B: core must still record BLOCK (disclosure never changes a verdict), got $v"
-ROWS="$rows" python3 - <<'PY' || fail "B: core review_cmd_unexecuted event malformed"
+PARSED="$parsed" ROWS="$rows" python3 - <<'PY' || fail "B: single-writer regression — the core re-journaled (or mis-parsed) the disclosure"
 import json, os
-rows = json.loads(os.environ["ROWS"]); assert len(rows) == 1, rows
+parsed = json.loads(os.environ["PARSED"]); rows = json.loads(os.environ["ROWS"])
+assert len(parsed) == 1 and parsed[0]["kind"] == "rejected" and "rm -rf" in parsed[0]["cmd"], parsed
+assert len(rows) == 1, "expected exactly ONE sha-keyed review_cmd_unexecuted row (the gate's), got %d" % len(rows)
 r = rows[0]
-assert r["verdict"] == "BLOCK" and r["count"] == 1 and r["kinds"] == "rejected", r
-assert "rm -rf" in r["first_cmd"] and json.loads(r["commands"])[0]["kind"] == "rejected", r
+assert str(r["count"]) == "1" and r["kinds"] == "rejected" and "rm -rf" in r["first_cmd"], r
+assert "log" in r and "commands" not in r, "the surviving row must be the GATE's (carries log, not a core commands field): %r" % r
 PY
-printf '%-28s %s\n' "B. ON + BLOCK" "verdict BLOCK preserved · UNEXECUTED in result+log+comment · gate+core journaled      ✓"
+[ "$(gate_events)" = "1" ] || fail "B: the shared journal must hold exactly 1 event after the core collect (single writer), got $(gate_events)"
+printf '%-28s %s\n' "B. ON + BLOCK" "verdict BLOCK preserved · UNEXECUTED in result+log+comment · ONE journal row (gate) ✓"
 
 # ── C. ON + PASS — merge proceeds, but labelled as not test-backed ────────────────────────────────
 gate 864 on-pass "REVIEW: PASS" REVIEW_CMD_DISCLOSURE=on
 [ "$RC" -eq 0 ] || fail "C: a PASS stays exit 0, got $RC"
 grep -q '^REVIEW: PASS — advisory: reviewer verification command rejected — NOT executed' <<< "$OUT" || fail "C: PASS must carry the advisory: $OUT"
-IFS=$'\t' read -r v rows <<< "$(collect 864 on-pass "$RES" "$T/core-on-pass.jsonl")"
+IFS=$'\t' read -r v parsed rows <<< "$(collect 864 on-pass "$RES")"
 [ "$v" = "PASS" ] || fail "C: core must record PASS, got $v"
-[ "$rows" != "[]" ] || fail "C: core must journal the disclosure alongside the PASS"
-printf '%-28s %s\n' "C. ON + PASS" "verdict PASS recorded · advisory names the refused command · core journaled           ✓"
+[ "$parsed" != "[]" ] || fail "C: core must parse the disclosure alongside the PASS"
+[ "$(gate_events)" = "2" ] || fail "C: exactly one new event (the gate's) — got $(gate_events)"
+printf '%-28s %s\n' "C. ON + PASS" "verdict PASS recorded · advisory names the refused command · ONE journal row (gate) ✓"
 
 # ── D. ON + clean stream — byte-identical to OFF ──────────────────────────────────────────────────
 : > "$T/stream-863.txt"
@@ -160,4 +168,4 @@ grep -q '^UNEXECUTED: unknown | ' <<< "$line" || fail "E: an unreadable stream m
 printf '%-28s %s\n' "E. unreadable stream" "UNEXECUTED: unknown — provenance never silently assumed                            ✓"
 
 echo
-echo "SIM PASS — an unexecuted reviewer check is now durable in the result file, the retained log, the PR and both journals; BLOCK stays BLOCK; OFF stays byte-identical."
+echo "SIM PASS — an unexecuted reviewer check is durable in the result file, the retained log, the PR and the journal (once); BLOCK stays BLOCK; OFF stays byte-identical."

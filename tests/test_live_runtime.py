@@ -3114,7 +3114,15 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
         ])
 
     # ── REVIEW_CMD_DISCLOSURE (HERD-810): UNEXECUTED: lines through the review-collect gate ──
-    def test_collect_block_with_unexecuted_cmds_journals_event_and_keeps_block(self):
+    # SINGLE-WRITER (PR #864 review): the gate (herd-review.sh) is the ONLY producer of the
+    # review_cmd_unexecuted event. The collect side parses the lines onto the rail and must never
+    # re-append them to the shared journal — that duplicated every disclosure row.
+    def _unexecuted_rows(self):
+        if not os.path.exists(self.journal.path):
+            return []
+        return [e for e in events(self.journal.path) if e["event"] == "review_cmd_unexecuted"]
+
+    def test_collect_block_with_unexecuted_cmds_keeps_block_and_exposes_them_without_journaling(self):
         c = self.cand()
         cmd = "/bin/zsh -lc 'tmpdir=$(mktemp -d); trap rm -rf EXIT; bash tests/test-journal-audit.sh'"
         with open(self.state.review_result_file(c), "w") as fh:
@@ -3122,35 +3130,38 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
         g, dr, _ = self._gates()
         self.assertEqual(g.review(c), "BLOCK")          # the BLOCK is preserved — disclosure never changes it
         self.assertEqual(self.state.recorded_review(c.pr, c.sha), "BLOCK")
-        rows = [e for e in events(self.journal.path) if e["event"] == "review_cmd_unexecuted"]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["pr"], 1)
-        self.assertEqual(rows[0]["verdict"], "BLOCK")
-        self.assertEqual(rows[0]["count"], 1)
-        self.assertEqual(rows[0]["kinds"], "rejected")
-        self.assertEqual(rows[0]["first_cmd"], cmd)
-        self.assertEqual(json.loads(rows[0]["commands"]), [{"kind": "rejected", "cmd": cmd}])
+        self.assertEqual(g.unexecuted_cmds, [{"kind": "rejected", "cmd": cmd}])
+        self.assertEqual(self._unexecuted_rows(), [])   # REGRESSION: the core is not a second writer
 
-    def test_collect_pass_with_unexecuted_unknown_journals_fail_closed_line(self):
+    def test_collect_pass_with_unexecuted_unknown_exposes_fail_closed_line(self):
         c = self.cand()
         with open(self.state.review_result_file(c), "w") as fh:
             fh.write("UNEXECUTED: unknown | reviewer output at /x could not be read\nREVIEW: PASS — advisory: reviewer verification command unknown\n")
         g, dr, _ = self._gates()
         self.assertEqual(g.review(c), "PASS")
-        rows = [e for e in events(self.journal.path) if e["event"] == "review_cmd_unexecuted"]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["kinds"], "unknown")
+        self.assertEqual([u["kind"] for u in g.unexecuted_cmds], ["unknown"])
+        self.assertEqual(self._unexecuted_rows(), [])
 
-    def test_collect_without_unexecuted_lines_journals_nothing(self):
-        # Lever off (or nothing refused): byte-identical journal — no review_cmd_unexecuted row.
+    def test_collect_without_unexecuted_lines_exposes_nothing(self):
+        # Lever off (or nothing refused): an empty list, and a byte-identical journal.
         c = self.cand()
         with open(self.state.review_result_file(c), "w") as fh:
             fh.write("REVIEW: PASS\n")
         g, dr, _ = self._gates()
         self.assertEqual(g.review(c), "PASS")
-        rows = [e for e in events(self.journal.path) if e["event"] == "review_cmd_unexecuted"] \
-            if os.path.exists(self.journal.path) else []
-        self.assertEqual(rows, [])
+        self.assertEqual(g.unexecuted_cmds, [])
+        self.assertEqual(self._unexecuted_rows(), [])
+
+    def test_unexecuted_is_reset_per_collect(self):
+        # A disclosed collect must not leak onto the next candidate's (undisclosed) collect.
+        c1, c2 = self.cand(1, "s1"), self.cand(2, "s2")
+        with open(self.state.review_result_file(c1), "w") as fh:
+            fh.write("UNEXECUTED: failed | bash tests/x.sh\nREVIEW: PASS\n")
+        with open(self.state.review_result_file(c2), "w") as fh:
+            fh.write("REVIEW: PASS\n")
+        g, dr, _ = self._gates()
+        g.review(c1); self.assertEqual(len(g.unexecuted_cmds), 1)
+        g.review(c2); self.assertEqual(g.unexecuted_cmds, [])
 
     def test_collect_pass_no_rubric_lines_journals_nothing(self):
         # RUBRIC_FILE-unset (or a rubric-blind reviewer): byte-identical to before the primitive existed.
@@ -7957,6 +7968,47 @@ class TestBlockReasonJournal(LiveCase):
         res, ev = self.tick([self.one(1, review="PASS", health="CLEAN")])
         vr = [o for o in ev if o["event"] == "verdict_recorded"]
         self.assertNotIn("reason", vr[0])
+
+
+class TestUnexecutedOnVerdictRecorded(LiveCase):
+    """HERD-810 (single-writer fix, PR #864 review): the tick qualifies the `verdict_recorded` row it
+    already writes with the rail's parsed disclosure — count + kinds — instead of the core emitting a
+    second `review_cmd_unexecuted` event (the gate owns that one). Byte-identical when undisclosed."""
+
+    def _tick_with_rail_attr(self, unexecuted):
+        scenario = {"candidates": [self.one(1, review="BLOCK", health="CLEAN", agent_status="idle")],
+                    "config": {"MERGE_POLICY": "auto"}}
+        journal = LiveJournal(self.jpath)
+
+        class Rail(FixtureGates):
+            pass
+        rail = Rail(scenario)
+        if unexecuted is not None:
+            rail.unexecuted_cmds = unexecuted
+        t = LiveTick(scenario["config"], FixtureDiscovery(scenario), rail,
+                     DryRunActuator(journal), journal, state=LiveState(self.tmp))
+        t.run()
+        return events(self.jpath) if os.path.exists(self.jpath) else []
+
+    def test_disclosed_verdict_row_carries_count_and_kinds(self):
+        ev = self._tick_with_rail_attr([{"kind": "rejected", "cmd": "rm -rf x"},
+                                        {"kind": "failed", "cmd": "bash t.sh"}])
+        vr = [o for o in ev if o["event"] == "verdict_recorded"]
+        self.assertEqual(len(vr), 1)
+        self.assertEqual(vr[0]["unexecuted"], 2)
+        self.assertEqual(vr[0]["unexecuted_kinds"], "failed,rejected")
+        # REGRESSION: the core never produces the gate's event.
+        self.assertEqual([o for o in ev if o["event"] == "review_cmd_unexecuted"], [])
+
+    def test_undisclosed_verdict_row_is_byte_identical(self):
+        for attr in (None, []):
+            ev = self._tick_with_rail_attr(attr)
+            vr = [o for o in ev if o["event"] == "verdict_recorded"]
+            self.assertEqual(len(vr), 1)
+            self.assertNotIn("unexecuted", vr[0])
+            self.assertNotIn("unexecuted_kinds", vr[0])
+            os.remove(self.jpath)
+            shutil.rmtree(self.tmp); self.tmp = tempfile.mkdtemp(); self.jpath = os.path.join(self.tmp, "live-test.jsonl")
 
 
 class TestBlockReasonComment(LiveCase):

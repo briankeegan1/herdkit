@@ -4295,6 +4295,7 @@ class LiveGates:
     def review(self, cand):
         st = self.state
         self.reused_review = False
+        self.unexecuted_cmds = []      # HERD-810: reset per collect; non-empty only when the gate disclosed
         # 1. REVIEW-ONCE: a recorded PASS/BLOCK for this exact (pr, sha) is reused — no reviewer runs.
         rec = st.recorded_review(cand.pr, cand.sha)
         if rec in ("PASS", "BLOCK"):
@@ -4342,19 +4343,16 @@ class LiveGates:
                                         "verdict", verdict, "criteria_count", len(rubric),
                                         "criteria", json.dumps(rubric, separators=(",", ":")))
                 # REVIEW_CMD_DISCLOSURE (HERD-810): the reviewer's UNEXECUTED: disclosure lines — the
-                # verification commands its runtime REFUSED or failed to launch — journaled NEXT TO the
-                # verdict they qualify, so `herd why` / the coordinator see a verdict that is not
-                # test-backed for what it is. Same discipline as the rubric pass: independent, never
-                # able to change the verdict recorded above, silent (byte-identical) when the gate
-                # wrote no such line — which is every review with the lever off.
-                unexecuted = parse_unexecuted_cmds(text)
-                if unexecuted:
-                    self.journal.append("review_cmd_unexecuted", "pr", cand.pr, "sha", cand.sha,
-                                        "slug", cand.slug, "verdict", verdict,
-                                        "count", len(unexecuted),
-                                        "kinds", ",".join(sorted({u["kind"] for u in unexecuted})),
-                                        "first_cmd", unexecuted[0]["cmd"][:200],
-                                        "commands", json.dumps(unexecuted, separators=(",", ":")))
+                # verification commands its runtime REFUSED or failed to launch. SINGLE-WRITER: the
+                # `review_cmd_unexecuted` journal event is produced ONCE, by the gate (herd-review.sh)
+                # that observed the refusal — it writes the same shared journal this core does, so a
+                # second append here DUPLICATED every disclosure row (PR #864 review). The collect side
+                # only PARSES the lines and exposes them on the rail (`unexecuted_cmds`) so the tick
+                # can qualify the `verdict_recorded` row it already writes; it never re-emits them.
+                # Same discipline as the rubric pass: independent, never able to change the verdict
+                # recorded above, and an empty list (every lever-off review) leaves everything
+                # byte-identical.
+                self.unexecuted_cmds = parse_unexecuted_cmds(text)
                 st.rm(result, inflight, st.review_registry_file(cand))
                 return verdict
             st.rm(result, inflight, st.review_registry_file(cand))
@@ -7332,6 +7330,15 @@ class LiveTick:
             _vreason = self.state.recorded_review_reason(cand.pr, cand.sha)
             if _vreason:
                 _vfields += ["reason", _vreason]
+            # HERD-810: a verdict the gate disclosed as NOT backed by its intended verification carries
+            # that qualification on the SAME row (count + kinds), so a `herd why` reader sees it next
+            # to the value. The full per-command detail is the gate's own single `review_cmd_unexecuted`
+            # event — this core never re-emits it. Appended ONLY when non-empty: every undisclosed
+            # verdict (and every fixture/sim rail, which has no such attribute) journals byte-identically.
+            _vunexec = getattr(self.gates, "unexecuted_cmds", None) or []
+            if _vunexec:
+                _vfields += ["unexecuted", len(_vunexec),
+                             "unexecuted_kinds", ",".join(sorted({u["kind"] for u in _vunexec}))]
             self.journal.append("verdict_recorded", *_vfields)
             # INFRA circuit breaker RECORD (HERD-110, restored HERD-447; agent-watch.sh:_review_gate_step
             # PASS/BLOCK branches): a REAL verdict proves the env is alive — reset + close the breaker.

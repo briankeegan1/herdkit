@@ -28,7 +28,10 @@
 # existing advisory surface carries the disclosure — while a BLOCK is left VERBATIM: a BLOCK that is
 # independently supported by reading the diff is still a BLOCK, and this pass can NEVER change a
 # verdict (it only explains what the verdict is NOT backed by). pysrc/herd/live_runtime.py's
-# parse_unexecuted_cmds is the consumer-side twin of herd_review_unexecuted_cmds.
+# parse_unexecuted_cmds is the consumer-side twin of herd_review_unexecuted_cmds: the live core PARSES
+# the lines on collect and qualifies its verdict_recorded row (count + kinds) — it NEVER re-emits the
+# review_cmd_unexecuted event. herd-review.sh is that event's SINGLE writer (PR #864 review: a second
+# append from the core duplicated every row in the shared journal).
 #
 # FAIL-CLOSED FOR PROVENANCE: when the log the reviewer wrote to cannot be read at all, the resolver
 # does NOT answer "nothing was rejected" (an absence of evidence it cannot actually vouch for); it

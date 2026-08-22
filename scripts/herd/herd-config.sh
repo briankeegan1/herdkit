@@ -708,7 +708,8 @@ fi
 # one. on → herd-review.sh runs the shared resolver (scripts/herd/review-cmd-disclosure.sh) over the
 # reviewer's captured stream after the verdict is parsed and makes every rejected / failed-to-launch
 # command DURABLE: `UNEXECUTED: <kind> | <cmd>` lines in the sha-keyed result file ahead of the
-# verdict, a block in the retained review log, one review_cmd_unexecuted journal event, a best-effort
+# verdict, a block in the retained review log, ONE review_cmd_unexecuted journal event (the gate is
+# its single writer; the live core only qualifies its verdict_recorded row on collect), a best-effort
 # qualifying PR comment, and — for a PASS only — an ' advisory:' segment per command on the verdict
 # line itself (so the existing review_advisory surface carries it). A BLOCK is left VERBATIM: it is
 # independently supported by the diff read, and this pass can never change a verdict. Fail-closed
