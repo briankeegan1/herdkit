@@ -138,6 +138,11 @@ git -C "$WT" add -A >/dev/null 2>&1
 git -C "$WT" -c user.email=t@t -c user.name=t commit -qm two >/dev/null 2>&1
 SHA2="$(git -C "$WT" rev-parse HEAD)"
 [ "$SHA2" != "$SHA" ] || fail "(3) fixture did not advance the head sha"
+# Records below model a suite that ran after this commit existed.  Do not reuse NOW
+# (captured before the commit): on a slow CI runner it can fall in the previous
+# second and make the freshness guard mask the predicate each case is meant to prove.
+FRESH_EPOCH="$(git -C "$WT" show -s --format=%ct "$SHA2")"
+[ -n "$FRESH_EPOCH" ] || fail "(3) fixture cannot resolve the new commit timestamp"
 herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
   && fail "(3) a record for the PREVIOUS sha must never trust the new head"
 [ "$HERD_HEALTH_TRUST_REASON" = "no record for sha" ] \
@@ -166,7 +171,7 @@ try_reject() {
     *) fail "($label) wrong reason: '$HERD_HEALTH_TRUST_REASON' (want *$want*)" ;;
   esac
 }
-try_reject 4a heavy CODEERROR builder-local clean "$NOW" "$WTP" "outcome=CODEERROR"
+try_reject 4a heavy CODEERROR builder-local clean "$FRESH_EPOCH" "$WTP" "outcome=CODEERROR"
 ok "(4) a CODEERROR outcome is never trusted"
 
 # DATAENV is the merge-gate pass (code clean, tolerated notes). With a companion log it
@@ -191,19 +196,19 @@ GOT="$(herd_health_trust_check "$TREES" "$SHA2" "$WT")" \
 # Planted DATAENV with no log (the pre-policy shape) is still refused — on the digest,
 # not on the outcome. Fail-closed: a DATAENV claim with nothing behind it is not evidence.
 rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
-try_reject 4b heavy DATAENV builder-local clean "$NOW" "$WTP" "no suite log"
+try_reject 4b heavy DATAENV builder-local clean "$FRESH_EPOCH" "$WTP" "no suite log"
 ok "(4) DATAENV without a companion log is refused (missing companion), not trusted"
 
-try_reject 5 light CLEAN builder-local clean "$NOW" "$WTP" "profile=light"
+try_reject 5 light CLEAN builder-local clean "$FRESH_EPOCH" "$WTP" "profile=light"
 ok "(5) a LIGHT record proves nothing about the full suite and is never trusted"
 
-try_reject 6 heavy CLEAN watcher clean "$NOW" "$WTP" "provenance=watcher"
+try_reject 6 heavy CLEAN watcher clean "$FRESH_EPOCH" "$WTP" "provenance=watcher"
 ok "(6) a record the WATCHER authored is never trusted (trust cannot compound on itself)"
 
-try_reject 7 heavy CLEAN builder-local dirty "$NOW" "$WTP" "tree_state=dirty"
+try_reject 7 heavy CLEAN builder-local dirty "$FRESH_EPOCH" "$WTP" "tree_state=dirty"
 ok "(7) a record written from a DIRTY tree is never trusted"
 
-try_reject 8 heavy CLEAN builder-local clean "$NOW" "$WTP/elsewhere" "record worktree"
+try_reject 8 heavy CLEAN builder-local clean "$FRESH_EPOCH" "$WTP/elsewhere" "record worktree"
 ok "(8) a record from a DIFFERENT worktree is never trusted"
 
 # (9) a record written BEFORE the commit existed cannot have tested it.
