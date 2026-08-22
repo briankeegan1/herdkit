@@ -144,3 +144,44 @@ Declared as `deferred` rows that print on every report — never omitted, never 
 
 Once a machine is signed in, re-run `herd doctor --runtime-conformance --probe` — `grok-exec-turn`
 becomes runnable and the deferred row upgrades to a real version-keyed pass.
+
+## Phase 6: gate proof — sim ladder results (HERD-804, 2026-08-21)
+
+`tests/test-grok-gate-proof.sh` runs the full sim ladder and emits a machine-readable scorecard.
+Scorecards captured on **2026-08-21** against grok 1.0.5 (5115b46bc909), **not authenticated**.
+
+| sim leg | result | detail |
+| --- | --- | --- |
+| exec-adapter (stub grok + live degrade) | ✅ 9/9 pass | hermetic fixtures + real installed-but-unauth live probe |
+| driver (binding table + context inject) | ✅ 6/6 pass | zero-secret bindings, render resolves, byte-identical claude argv |
+| wake-proof (bounce / terminal-state) | ✅ 10/10 pass | GROK_WAKE_PROOF off→on, terminal detection, bounce consumption |
+| builder-chaos sim (I1-I6) | ✅ 63/63 pass | force-kill at every lifecycle stage, all invariants hold |
+| sandbox-real-panes grok leg (HERD-802) | ✅ 38/38 pass (herdr live) | grok banner=live foreground, liveness=alive via grok signature, roster=working |
+| core scenario init→build→PR→gate→merge | ✅ 37/37 pass | full governed lifecycle, gate/merge logic sound |
+| gate-scale GATE_SCALE derivation | ✅ 11/11 pass | formula, ceiling, floor, journal-once all verified |
+
+**combined scorecard**: `result=pass · 6 composite legs passed · 0 failed · 3 skipped`
+Skipped legs (all clean / fail-soft, never errors):
+- `grok-auth` — installed-but-unauthenticated (expected; see below)
+- `real-panes grok leg` — herdr unavailable in the test subprocess context (passes green when
+  herdr is live, proven by the direct run recorded above: 38/38)
+- `live-pr` — unauthenticated (see "open step" below)
+
+### Live disposable PR run — deferred (honest fail-soft skip)
+
+The second half of HERD-804 requires a **signed-in grok binary**: create a stub worktree, push
+a disposable branch, open a PR with `HERD_DRIVER=grok`, run the watcher, and cite the `herd why`
+output here once it merges cleanly.
+
+**Remaining command (the single open step):**
+
+```
+grok login          # browser OAuth, or:
+grok login --device-code
+```
+
+Alternatively: `export XAI_API_KEY=<key>` before `grok models` confirms authenticated.
+
+After signing in: re-run `bash tests/test-grok-gate-proof.sh` — the live-pr skip becomes a live
+run, and `herd doctor --runtime-conformance --probe` upgrades the `grok-exec-turn` deferred row
+to a version-keyed pass. Cite `herd why <pr#>` output in this section to close HERD-804.
