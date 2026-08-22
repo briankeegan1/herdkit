@@ -242,6 +242,26 @@ class AccessorParity(_PoolCase):
             self.assertEqual(windowed[-1], (3, 4, 3),
                               "%s: the rolling window did not trim to its bound" % be)
 
+    def test_phase_duration_peek_is_read_only_and_parity(self):
+        """HERD-807: phase_duration_peek reports the SAME (median, p95, n) a matching observe would
+        return as its prior window, but records NOTHING — so the anomaly leg can judge-before-learn,
+        folding a reading into the baseline only when it turns out normal. Both backends agree; an empty
+        phase peeks (0,0,0); repeated peeks never mutate the window."""
+        for be in ("flat", "sqlite"):
+            shutil.rmtree(self.pool); os.makedirs(os.path.join(self.pool, ".herd"))
+            st = self.store(be)
+            self.assertEqual(st.phase_duration_peek("hc"), (0, 0, 0),
+                              "%s: an unlearned phase must peek (0,0,0)" % be)
+            for v in [10, 12, 11, 13, 12]:
+                st.phase_duration_observe("hc", v)
+            first = st.phase_duration_peek("hc")
+            # peeking is idempotent — the window is untouched, so a second peek is identical.
+            self.assertEqual(first, st.phase_duration_peek("hc"),
+                              "%s: peek mutated the retained window" % be)
+            # and it matches what the NEXT observe reports as its prior-window stats (the read half).
+            self.assertEqual(first, st.phase_duration_observe("hc", 99),
+                              "%s: peek disagreed with observe's prior-window read" % be)
+
 
 class RoundTrip(_PoolCase):
     """files → db → files is byte-for-byte identical — the migration's lossless core."""

@@ -54,6 +54,8 @@ unresolvable pool / unreadable db degrades to the safe default, never a red row 
         # rc 0 = won (fire the side effect), rc 3 = already claimed (dedup)
     python3 -m herd.store --phase-duration-observe PHASE SECONDS [--pool DIR]  # HERD-496 baseline
         # records one duration, prints the rolling "<median>\t<p95>\t<n>" over the retained window
+    python3 -m herd.store --phase-duration-peek PHASE [--pool DIR]  # HERD-807 read-only baseline
+        # prints the rolling "<median>\t<p95>\t<n>" WITHOUT recording — judge-before-learn
     python3 -m herd.store --noaction-hwm-advance CLASS STAMP [--pool DIR]  # HERD-606 recurrence HWM
         # atomic "advance iff newer": rc 0 = STAMP is past the persisted per-class high-water mark (a
         # genuinely new occurrence — the caller should count it, and the mark now holds STAMP); rc 3 =
@@ -262,6 +264,16 @@ class Store:
         prior samples the baseline was built from, so a caller can withhold judgment until enough have
         accrued (comparing an instance to a baseline that already contains it can never flag it)."""
         return self._b.phase_duration_observe(phase, seconds, window)
+
+    def phase_duration_peek(self, phase):
+        """Return ``(median, p95, n)`` over the CURRENT retained window for ``phase`` WITHOUT recording
+        anything — the read half of ``phase_duration_observe``, split out for HERD-807: the anomaly leg
+        judges a just-completed instance against the learned baseline FIRST, then records it only when
+        it is a NORMAL (below-bar) reading, so an above-bar / suspend-inflated sample never poisons the
+        rolling p95 (observed: render-pass p95 crept 44s→37m once anomalies were being folded back in).
+        Same stats a matching ``phase_duration_observe`` would return as its PRIOR window, minus the
+        write. ``(0, 0, 0)`` on a missing pool / unreadable store."""
+        return self._b.phase_duration_peek(phase)
 
     # finish-stall clock ── HERD-392: the shared-pool anchor + state for the finish-line watchdog, so
     # multiple seats ticking the SAME PR-less worktree converge on ONE first-seen anchor instead of
@@ -629,6 +641,22 @@ class _FlatBackend:
         except Exception:
             pass
         return stats
+
+    def phase_duration_peek(self, phase):
+        # Read-only half of phase_duration_observe (HERD-807): stats over the retained window, no write.
+        path = self._phase_duration_file(phase)
+        if not path or not os.path.isfile(path):
+            return (0, 0, 0)
+        vals = []
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.lstrip("-").isdigit():
+                        vals.append(int(line))
+        except Exception:
+            return (0, 0, 0)
+        return _phase_duration_stats(vals)
 
     # once-guards ────────────────────────────────────────────────────────────────────────────────
     def once(self, key):
@@ -1167,6 +1195,17 @@ class _SqliteBackend:
             prior_vals = []
         return _phase_duration_stats(prior_vals)
 
+    def phase_duration_peek(self, phase):
+        # Read-only half of phase_duration_observe (HERD-807): stats over the retained window, no write.
+        # A bare SELECT on the shared connection, no BEGIN IMMEDIATE — mirrors approval_state's reads.
+        try:
+            vals = [int(r[0]) for r in self._conn.execute(
+                "SELECT seconds FROM phase_duration WHERE phase=? ORDER BY rowid",
+                (str(phase),)).fetchall()]
+        except Exception:
+            vals = []
+        return _phase_duration_stats(vals)
+
     # once-guards ────────────────────────────────────────────────────────────────────────────────
     def once(self, key):
         def body(conn):
@@ -1686,16 +1725,20 @@ def main(argv=None):
                              "--finish-stall-state", "--finish-stall-reset", "--finish-stall-clear")
     _IDENTITY_ACTIONS = ("--main-health-fix-mark", "--main-health-fix-clear", "--once") \
         + _FINISH_STALL_ACTIONS
+    _ONE_ARG_ACTIONS = ("--phase-duration-peek",)
     _TWO_ARG_ACTIONS = ("--phase-duration-observe", "--noaction-hwm-advance")
     i = 0
     while i < len(argv):
         a = argv[i]
         if a in (("--migrate", "--rollback", "--status", "--verify")
-                 + _IDENTITY_ACTIONS + _TWO_ARG_ACTIONS):
+                 + _IDENTITY_ACTIONS + _ONE_ARG_ACTIONS + _TWO_ARG_ACTIONS):
             action = a
             if a in _IDENTITY_ACTIONS:
                 i += 1
                 identity = argv[i] if i < len(argv) else None
+            elif a in _ONE_ARG_ACTIONS:
+                i += 1
+                phase_name = argv[i] if i < len(argv) else None
             elif a in _TWO_ARG_ACTIONS:
                 i += 1
                 phase_name = argv[i] if i < len(argv) else None
@@ -1752,6 +1795,16 @@ def main(argv=None):
             sys.stderr.write("herd store: --phase-duration-observe seconds must be an integer\n")
             return 2
         median, p95, n = open_store(pool).phase_duration_observe(phase_name, secs)
+        sys.stdout.write("%s\t%s\t%s\n" % (median, p95, n))
+        return 0
+    if action == "--phase-duration-peek":
+        # HERD-807: the READ-ONLY half — report the rolling baseline "<median>\t<p95>\t<n>" WITHOUT
+        # recording anything, so the bash anomaly leg can judge THIS instance against the learned
+        # window first and record it only when it is a normal (below-bar) reading.
+        if not phase_name:
+            sys.stderr.write("herd store: --phase-duration-peek requires <phase>\n")
+            return 2
+        median, p95, n = open_store(pool).phase_duration_peek(phase_name)
         sys.stdout.write("%s\t%s\t%s\n" % (median, p95, n))
         return 0
     if action == "--noaction-hwm-advance":
