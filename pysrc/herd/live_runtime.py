@@ -2997,11 +2997,14 @@ class _GraphQLDiscovery:
 #
 # FORMAT VERSION 2 (HERD-560): the record grew a leading ``version`` field and a trailing
 # ``log_digest`` field (10 fields total, was 8) — see health-trust.sh's header for the full field
-# list and the companion ``.health-provenance-log-<sha>`` file the digest is verified against. A
-# pre-HERD-560 record (8 fields, no version) or an unrecognized version reads as ABSENT — never an
-# error — exactly as if this sha had no record at all. A well-formed record is ALSO refused when
-# stale: older than ``HEALTH_TRUST_MAX_AGE_SECS`` (default 21600s / 6h), written before the commit it
-# claims to attest existed, or its digest no longer matches the companion log's actual content.
+# list and the companion ``.health-provenance-log-<sha>`` file the digest is verified against. An
+# optional 11th field holds a single-line flattening of tolerated DATAENV notes; a 10-field row
+# is still valid. A pre-HERD-560 record (8 fields, no version) or an unrecognized version reads
+# as ABSENT — never an error — exactly as if this sha had no record at all. A well-formed record
+# is ALSO refused when stale: older than ``HEALTH_TRUST_MAX_AGE_SECS`` (default 21600s / 6h),
+# written before the commit it claims to attest existed, or its digest no longer matches the
+# companion log's actual content. Outcome CLEAN or DATAENV is trustworthy (merge already treats
+# both as pass); CODEERROR is never trusted.
 
 def _health_trust_on(config):
     """Port of ``herd_health_trust_on`` (health-trust.sh) — is HEALTH_TRUST_BUILDER on? An
@@ -3073,7 +3076,25 @@ def _health_trust_commit_epoch(worktree, sha):
         return ""
 
 
-def _health_trust_check(trees, sha, worktree):
+def _health_trust_baseline_sha(worktree, baseline_worktree=""):
+    """Resolve the default-branch state that the baseline-aware heavy gate compared against.
+    The authoritative watcher main checkout wins; a builder-local record falls back to the
+    worktree's DEFAULT_BRANCH ref. Empty is intentionally untrustworthy for DATAENV evidence."""
+    try:
+        base = baseline_worktree or os.environ.get("HERD_BASELINE_DIR", "")
+        if base and os.path.isdir(base):
+            return subprocess.check_output(["git", "-C", base, "rev-parse", "HEAD"],
+                                           stderr=subprocess.DEVNULL).decode().strip()
+        if worktree:
+            return subprocess.check_output(
+                ["git", "-C", worktree, "rev-parse", os.environ.get("DEFAULT_BRANCH", "main")],
+                stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _health_trust_check(trees, sha, worktree, baseline_worktree=""):
     """Port of ``herd_health_trust_check`` (health-trust.sh) — is there a record that EARNS a skip of
     the full heavy re-run for this exact ``(sha, worktree)``? Returns ``(provenance, reason)``: a
     non-empty ``provenance`` means TRUSTED; an empty ``provenance`` means NOT trusted and ``reason``
@@ -3100,9 +3121,11 @@ def _health_trust_check(trees, sha, worktree):
         return "", "old-format record (absent)"
     # A truncated/garbled/interrupted-write record proves nothing — refuse it rather than guessing at
     # whichever fields happen to be present (mirrors the bash reader's own $_ht_epoch emptiness check).
-    if len(fields) != 10:
+    # 10/11 fields are legacy CLEAN rows. DATAENV needs fields 11-12: notes plus
+    # the exact baseline SHA whose known-failure set made the result tolerable.
+    if len(fields) not in (10, 11, 12):
         return "", "malformed record"
-    (version, r_sha, r_wt, r_prof, r_out, _r_dur, r_prov, r_state, r_epoch, r_digest) = fields
+    (version, r_sha, r_wt, r_prof, r_out, _r_dur, r_prov, r_state, r_epoch, r_digest) = fields[:10]
     if not r_epoch or not r_epoch.isdigit():
         return "", "malformed record"
     # An unrecognized version (a FUTURE format this engine build predates) reads as ABSENT too — the
@@ -3114,8 +3137,19 @@ def _health_trust_check(trees, sha, worktree):
         return "", "stale sha in record"
     if r_prof != "heavy":
         return "", "profile=%s (not heavy)" % r_prof
-    if r_out != "CLEAN":
-        return "", "outcome=%s (not CLEAN)" % r_out
+    # CLEAN = everything verified. DATAENV = code clean, some checks tolerated
+    # (the merge gate already treats this as a pass). CODEERROR is never trusted.
+    if r_out not in ("CLEAN", "DATAENV"):
+        return "", "outcome=%s (not CLEAN or DATAENV)" % r_out
+    if r_out == "DATAENV":
+        r_base = fields[11] if len(fields) == 12 else ""
+        if not r_base:
+            return "", "DATAENV baseline state missing"
+        current_base = _health_trust_baseline_sha(worktree or r_wt, baseline_worktree)
+        if not current_base:
+            return "", "DATAENV baseline state unresolvable"
+        if r_base != current_base:
+            return "", "DATAENV baseline advanced"
     # provenance=watcher would let a trusted (light) run justify the NEXT trusted run — trust must
     # always trace back to a real builder-local heavy suite, never compound on itself.
     if r_prov != "builder-local":
@@ -3719,7 +3753,7 @@ class LiveGates:
         #    is never even called.
         profile = ""
         if self._health_trust_on:
-            prov, _reason = _health_trust_check(st.dir, cand.sha, cand.worktree)
+            prov, _reason = _health_trust_check(st.dir, cand.sha, cand.worktree, self.home)
             if prov:
                 profile = "--light"
                 self.journal.append("health_trusted", "pr", cand.pr, "slug", cand.slug, "sha", cand.sha,
