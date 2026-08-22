@@ -109,9 +109,9 @@ _backend_add_item() {
     # Title = a SHORT summary derived from the request (HERD-77 — never the whole first line as an
     # essay); body = the FULL text. Sets _BACKEND_RESULT=DONE on a created issue, NOCHANGE if gh
     # declines (so the scribe receipt still reports honestly).
-    local text="$2" title body url
+    local text="$2" title="${3:-}" body url
     _github_require_gh
-    title="$(_github_short_title "$text")"
+    [ -n "$title" ] || title="$(_github_short_title "$text")"
     body="$text"
     if url="$(_gh issue create --title "$title" --body "$body" 2>/dev/null)"; then
         _BACKEND_RESULT="DONE"

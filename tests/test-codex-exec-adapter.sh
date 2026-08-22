@@ -140,7 +140,7 @@ else
   if ! git worktree add -q --detach "$LIVE_WT" HEAD >/dev/null 2>&1; then
     echo "SKIP (7) could not create an isolated worktree for the live probe (not inside a git repo?)"
   else
-    trap 'rm -rf "$T"; git worktree remove --force "$LIVE_WT" >/dev/null 2>&1 || true' EXIT
+    trap 'git worktree remove --force "$LIVE_WT" >/dev/null 2>&1 || true; rm -rf "$T"' EXIT
     live_out="$(codex_exec_adapter_run "$LIVE_WT" "Reply with exactly and only the single word: herdcodexlive")" && live_rc=0 || live_rc=$?
     [ "$live_rc" -eq 0 ] || fail "live run: expected rc 0, got $live_rc: $live_out"
     [ "$(jget "$live_out" .state)" = "completed" ] || fail "live run: state != completed: $live_out"

@@ -75,22 +75,27 @@ _run() {
     . "$STATUS"
     if [ "$want" = "seam" ]; then
       herd_driver_agent_list_json() { printf '%s' '{"result":{"agents":[{"name":"myslug","agent_status":"working"}]}}'; }
+    elif [ "$want" = "codex" ]; then
+      herd_driver_agent_list_json() { printf '%s' '{"result":{"agents":[{"agent":"myslug","agent_status":"working"}]}}'; }
     fi
     _status_run 2>/dev/null
   )
 }
 
 with_seam="$(_run seam)"
+with_codex="$(_run codex)"
 no_seam="$(_run none)"
 
 # Both must show the builder row for myslug at all.
 "$GREP" -q 'myslug' <<< "$with_seam" || fail "status row for the builder is missing (with seam)"
+"$GREP" -q 'myslug' <<< "$with_codex" || fail "status row for the builder is missing (Codex-shaped seam)"
 "$GREP" -q 'myslug' <<< "$no_seam"   || fail "status row for the builder is missing (no seam)"
 pass
 
 # The classification MUST differ: the seam-fed roster (agent working) is NOT the empty-roster DEAD
 # signature. Compare only the myslug line so unrelated output (watcher pid, timing) can't mask it.
 line_seam="$(printf '%s\n' "$with_seam" | "$GREP" 'myslug' | sed -n 1p)"
+line_codex="$(printf '%s\n' "$with_codex" | "$GREP" 'myslug' | sed -n 1p)"
 line_none="$(printf '%s\n' "$no_seam"   | "$GREP" 'myslug' | sed -n 1p)"
 [ "$line_seam" != "$line_none" ] \
   || fail "builder classification identical with/without the seam — status.sh is not consuming herd_driver_agent_list_json
@@ -103,6 +108,8 @@ pass
   || fail "empty roster did not yield the DEAD signature (test premise broken): $line_none"
 "$GREP" -qi 'dead' <<< "$line_seam" \
   && fail "seam reported the agent working yet status still marked it DEAD: $line_seam"
+"$GREP" -qi 'dead' <<< "$line_codex" \
+  && fail "Codex-shaped agent roster reported working yet status still marked it DEAD: $line_codex"
 pass
 
 git -C "$PROJ" worktree remove --force "$TREES/myslug" >/dev/null 2>&1 || true

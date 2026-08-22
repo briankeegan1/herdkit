@@ -1036,7 +1036,7 @@ FLAIR_STATE=()         # HERD-147 flair: one state-token per DISPLAY row (parall
 # the printf succeeded). Empty until the first repaint — build_header never fabricates a "stale" claim
 # before a real paint has happened to measure against.
 _LAST_PAINT_EPOCH=""
-# Internal tuning, not an operator knob (mirrors _ANOMALY_MIN_SAMPLES/_ANOMALY_THRESHOLD_PCT): roughly
+# Internal tuning, not an operator knob (mirrors _ANOMALY_MIN_SAMPLES/_ANOMALY_SUSPEND_MULT): roughly
 # N=5 ticks at the ~4s outer-loop cadence. A header older than this names its own staleness instead of
 # silently claiming "live".
 _RENDER_STALE_AGE_SECS=20
@@ -1865,6 +1865,10 @@ _fmt_age() {
 #   • PR match pending · retrying        — the HERD's move; open-PR roster fetch failed this tick
 #                                          (HERD-224). Neutral/degraded — never the definitive
 #                                          "awaiting task" claim from a lookup FAILURE.
+#   • runtime live · activity unknown     — the HERD's move; the driver positively sees the runtime
+#                                          process while its roster row is transiently absent
+#                                          (HERD-780). Neutral — process existence distinguishes
+#                                          live from dead, but cannot distinguish working from spare.
 #   • retiring… · <leftovers> · <age>    — the HERD's move; a merged/closed slug whose teardown is
 #                                          converging this tick (see retirement.sh). Calm — it clears
 #                                          itself, usually within one tick.
@@ -1889,6 +1893,16 @@ _row_awaiting_task() {
   _age="$(_fmt_age "$(( $(_now_epoch) - _born ))")"
   printf '    %s💤%s %s%s%s %sawaiting task · assign or retire · %s%s' \
     "$C_DIM" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_DIM" "$_age" "$C_RESET"
+}
+
+# _row_live_roster_unknown <slug-cell> — neutral row for a positively-live runtime whose roster row
+# is absent this tick. The process-signature probe proves only that the builder session exists; it
+# cannot tell whether the agent is actively working or waiting. Never route this ambiguity to the
+# definitive awaiting-task/retire surface. The next roster-bearing tick resumes normal classification.
+_row_live_roster_unknown() {
+  local _sl="$1"
+  printf '    %s⏳%s %s%s%s %sruntime live · activity unknown · roster syncing%s' \
+    "$C_CYAN" "$C_RESET" "$C_BOLD" "$_sl" "$C_RESET" "$C_CYAN" "$C_RESET"
 }
 
 # _row_wedged <slug-cell> <age> [woken] — the console row for a WEDGED builder (HERD-278): an agent
@@ -9523,22 +9537,37 @@ _anomaly_baselines_enabled() {
 # Inline constants (mirrors _MAIN_HEALTH_DIED_MAX / _MAIN_CI_SCAN_INTERVAL) — internal tuning, not
 # operator knobs: no config key, no manifest row.
 _ANOMALY_MIN_SAMPLES=5        # never judge a phase off a baseline that has not learned enough yet
-_ANOMALY_THRESHOLD_PCT=150    # an instance must exceed 1.5x its own LEARNED p95 to count as anomalous
-                              # (HERD-645: lowered from 2x now that the absolute floor below covers the
-                              # tight-distribution case a pure multiplier misjudges on its own).
-_ANOMALY_FLOOR_MARGIN_SECS=30 # HERD-645: absolute floor composed with the pct multiplier above — the
-                              # class-default filing bar for every phase is max(1.5x p95, p95 + this
-                              # many seconds), never just 1.5x p95 alone. GROUNDED: tick_cadence's
-                              # learned p95 (~47-53s) sits within ordinary jitter of the nominal 60s
-                              # tick, so a pure multiplier let ordinary jitter clear the bar and file 4
-                              # marginal items in 2 days; a p95 within jitter of the nominal period must
-                              # not alarm on jitter. Internal tuning, not an operator knob: no config
-                              # key, no manifest row (mirrors _ANOMALY_THRESHOLD_PCT).
+# HERD-807: the pct multiplier and the absolute floor are now VALIDATED OPERATOR CONFIG KEYS
+# (ANOMALY_THRESHOLD_PCT / ANOMALY_FLOOR_MARGIN_SECS), resolved through the two helpers just below with
+# these exact numbers as their unset defaults, so the filing bar is byte-identical when neither key is
+# set. GROUNDED: the two hardcoded 150/30 constants tuned well for tick_cadence but an operator whose
+# render/review phases have a fatter tail had no way to widen the bar short of editing the engine.
+_ANOMALY_THRESHOLD_PCT_DEFAULT=150  # 1.5x its own LEARNED p95 to count as anomalous (HERD-645 floor covers
+                              # the tight-distribution case a pure multiplier misjudges on its own).
+_ANOMALY_FLOOR_MARGIN_SECS_DEFAULT=30  # HERD-645: absolute floor composed with the pct multiplier — the
+                              # class-default filing bar for every phase is max(1.5x p95, p95 + this many
+                              # seconds), never just 1.5x p95 alone; a p95 within jitter of the nominal
+                              # period must not alarm on jitter.
+_ANOMALY_SUSPEND_MULT=20      # HERD-807: a reading past this many TIMES its learned p95 is so far out of
+                              # distribution that, WHEN it also coincides with a matching gap in the
+                              # engine journal's own tick stream (_anomaly_reading_is_suspend_artifact),
+                              # it is treated as a wall-clock suspend artifact the sysctl wake probe
+                              # missed (non-darwin, or a boundary that already advanced past this
+                              # interval) — journaled result=suspend-artifact, never filed, never learned.
 _ANOMALY_LOAD_MARGIN_PCT=200  # HERD-618: under load, the FILING bar widens to 2x the (HERD-645-floored)
                               # normal threshold — an exceedance short of that still journals/paints,
                               # tagged load_qualified, but withholds the tracker filing. Composes on top
                               # of the HERD-645 floor, not the other way round. Ship-dormant with the
                               # rest of ANOMALY_BASELINES; internal tuning, not an operator knob.
+
+# _anomaly_threshold_pct — the configured ANOMALY_THRESHOLD_PCT (percent of the learned p95 an instance
+# must exceed to count as anomalous), default 150. A non-numeric value falls soft to the default via
+# herd_numeric (warns once) — same discipline as every other ANOMALY_* numeric key.
+_anomaly_threshold_pct() { herd_numeric ANOMALY_THRESHOLD_PCT "$_ANOMALY_THRESHOLD_PCT_DEFAULT"; }
+
+# _anomaly_floor_margin_secs — the configured ANOMALY_FLOOR_MARGIN_SECS (absolute seconds added to p95
+# for the HERD-645 floor), default 30. Same fail-soft-to-default contract as _anomaly_threshold_pct.
+_anomaly_floor_margin_secs() { herd_numeric ANOMALY_FLOOR_MARGIN_SECS "$_ANOMALY_FLOOR_MARGIN_SECS_DEFAULT"; }
 
 # _anomaly_load_high — true iff this box's loadavg1m is at/above HEALTH_LOAD_THRESHOLD (default 4)
 # right now. Reuses the SAME probe + config key ENV_SUSPECT_TIMEOUT (HERD-546) already ships
@@ -9568,6 +9597,21 @@ _phase_duration_observe() {
   command -v python3 >/dev/null 2>&1 || return 1
   PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_pdo_pyp" WORKTREES_DIR="${TREES:-}" \
     python3 -m herd.store --phase-duration-observe "$_pdo_phase" "$_pdo_secs" 2>/dev/null
+}
+
+# _phase_duration_peek <phase> — the READ-ONLY twin of _phase_duration_observe (HERD-807): print the
+# current rolling baseline "<median>\t<p95>\t<n>" for <phase> WITHOUT recording anything. Same empty-on-
+# error contract. Lets the anomaly leg judge a just-completed instance against the LEARNED window and
+# then record it only when it is a normal (below-bar) reading — so an above-bar / suspend-inflated
+# sample never gets folded into the p95 the very rail that flagged it is judged against (observed:
+# render-pass p95 crept 44s→37m once anomalies were being learned back in).
+_phase_duration_peek() {
+  local _pdp_phase="$1" _pdp_pyp
+  _pdp_pyp="$(_main_health_fix_pysrc)"
+  [ -n "$_pdp_pyp" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$_pdp_pyp" WORKTREES_DIR="${TREES:-}" \
+    python3 -m herd.store --phase-duration-peek "$_pdp_phase" 2>/dev/null
 }
 
 # _phase_anomaly_row <ledger-line> — render ONE anomaly ledger line ("<epoch>\t<phase>\t<seconds>\t
@@ -9735,19 +9779,103 @@ _anomaly_file_stamp() {
   printf '%s\n' "$(_now_epoch)" > "$(_anomaly_file_stamp_path "${1:-}")" 2>/dev/null || true
 }
 
+# ── HERD-807: SUSPEND SANITY CLASSIFIER ────────────────────────────────────────────────────────────
+# HERD-512's wake guards read the darwin `kern.waketime/sleeptime` sysctls — the moment that probe is
+# unavailable (a non-darwin box) or has already advanced past the interval a reading spans, a suspend-
+# inflated sample sails through as a genuine anomaly, files a bogus tracker item, and (pre-HERD-807)
+# poisoned the p95. This is the fully-independent corroboration: the engine journal ITSELF ticks
+# steadily while the watcher is alive (every loop writes events), so a sleep leaves a matching hole in
+# the journal's own timestamp stream. A reading >_ANOMALY_SUSPEND_MULT x its learned p95 that ALSO
+# lines up with such a hole is a wall-clock artifact, not work — journaled result=suspend-artifact and
+# dropped. Fail-soft in every direction (no python3, unreadable journal, no matching gap) reads as
+# "not a suspend artifact", so a genuine massive regression is never silenced on a blind guess.
+
+# _anomaly_journal_max_gap_secs <reading-secs> — the largest gap, in whole seconds, between consecutive
+# engine-journal event timestamps whose LATER edge falls inside [now - reading-secs, now] (now itself
+# is included as the trailing edge, so a hole that runs right up to the present counts). Empty + rc 1
+# when python3 is missing, the journal is absent/unreadable, or the bound is not a sane integer — the
+# caller then treats it as "no gap". Reads the SAME journal path builder-notes consume (JOURNAL_FILE
+# test seam honored), and pins "now" to _now_epoch so a hermetic test drives it with HERD_FAKE_NOW.
+_anomaly_journal_max_gap_secs() {
+  local _ajg_secs="${1:-}" _ajg_now _ajg_jf
+  case "$_ajg_secs" in ''|*[!0-9]*) return 1 ;; esac
+  command -v python3 >/dev/null 2>&1 || return 1
+  _ajg_jf="$(_builder_notes_journal 2>/dev/null)" || return 1
+  [ -n "$_ajg_jf" ] && [ -f "$_ajg_jf" ] || return 1
+  _ajg_now="$(_now_epoch)"
+  case "$_ajg_now" in ''|*[!0-9]*) return 1 ;; esac
+  HERD_AJG_NOW="$_ajg_now" HERD_AJG_SECS="$_ajg_secs" HERD_AJG_JF="$_ajg_jf" python3 -c '
+import os, sys
+from datetime import datetime, timezone
+now = int(os.environ["HERD_AJG_NOW"]); secs = int(os.environ["HERD_AJG_SECS"]); jf = os.environ["HERD_AJG_JF"]
+eps = []
+try:
+    with open(jf, encoding="utf-8") as fh:
+        for line in fh:
+            i = line.find("\"ts\":\"")
+            if i < 0:
+                continue
+            j = line.find("\"", i + 6)
+            if j < 0:
+                continue
+            try:
+                dt = datetime.strptime(line[i + 6:j], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            e = int(dt.timestamp())
+            if e <= now:
+                eps.append(e)
+except Exception:
+    sys.exit(1)
+eps.append(now)
+eps = sorted(set(eps))
+lo = now - secs
+maxgap = 0
+for a, b in zip(eps, eps[1:]):
+    if b >= lo and (b - a) > maxgap:
+        maxgap = b - a
+sys.stdout.write(str(maxgap))
+' 2>/dev/null || return 1
+}
+
+# _anomaly_reading_is_suspend_artifact <secs> <p95> — true iff <secs> is BOTH far out of distribution
+# (past _ANOMALY_SUSPEND_MULT x the learned p95) AND coincides with a matching journal tick gap (a
+# hole at least half the reading wide — the watcher demonstrably wrote nothing for most of the window
+# it claims to have spent working). A genuine 2x-degraded (or even a 25x-degraded-but-busy) phase keeps
+# the journal ticking, so its max gap stays small and this reads false — it files as normal. Fail-soft:
+# a bad arg, or no gap probe, reads false.
+_anomaly_reading_is_suspend_artifact() {
+  local _sa_secs="${1:-}" _sa_p95="${2:-}" _sa_gap
+  case "$_sa_secs" in ''|*[!0-9]*) return 1 ;; esac
+  case "$_sa_p95"  in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_sa_p95" -gt 0 ] || return 1
+  [ "$_sa_secs" -gt $(( _sa_p95 * _ANOMALY_SUSPEND_MULT )) ] || return 1
+  _sa_gap="$(_anomaly_journal_max_gap_secs "$_sa_secs")" || return 1
+  case "$_sa_gap" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_sa_gap" -ge $(( _sa_secs / 2 )) ]
+}
+
 # _phase_anomaly_observe <phase-key> <human-label> <duration-secs> — the ONE shared call every one of
 # HERD-496's 5 measurement points calls once it knows how long its own instance just took. Ship-
 # dormant: returns immediately (no store touch, no journal, no row) unless ANOMALY_BASELINES is on.
 #
-# On enable: records <duration-secs> against <phase-key>'s rolling baseline; below the filing
-# threshold (HERD-645: max(_ANOMALY_THRESHOLD_PCT of the LEARNED p95, p95 + _ANOMALY_FLOOR_MARGIN_SECS)
-# — see below) or before _ANOMALY_MIN_SAMPLES have accrued is SILENT — no journal, no row, no filing,
-# exactly the mutation-prove's "below threshold" case. Past it:
-# journals `phase_anomaly`, appends one calm advisory row to $ANOMALY_LEDGER, and FILES ONCE via the
-# SAME shared-pool dedup marker MAIN_HEALTH_AUTOFIX's filing leg uses (_main_health_fix_mark /
-# _main_health_scribe, HERD-371) — an HONEST identity of phase+THIS measurement+the baseline it beat,
-# so a re-observed IDENTICAL reading dedups (journaled result=dedup) while a worse or different
-# reading of the same phase files fresh. Fully fail-soft; always returns 0.
+# On enable: PEEKS <phase-key>'s rolling baseline read-only, judges <duration-secs> against it, and
+# then RECORDS the sample into that baseline (HERD-807: judge-before-learn) ONLY when it is below the
+# filing threshold (HERD-645: max(ANOMALY_THRESHOLD_PCT of the LEARNED p95, p95 + ANOMALY_FLOOR_MARGIN_SECS)
+# — both now VALIDATED CONFIG KEYS defaulting to 150/30, see below) or before _ANOMALY_MIN_SAMPLES have
+# accrued; either case is SILENT — no journal, no row, no filing. An ABOVE-BAR reading is judged but
+# NEVER folded into the learning window, so the outliers the rail flags can no longer poison the p95 it
+# is judged against. Past the threshold it journals `phase_anomaly`, appends one calm advisory row to
+# $ANOMALY_LEDGER, and FILES ONCE via the SAME shared-pool dedup marker MAIN_HEALTH_AUTOFIX's filing leg
+# uses (_main_health_fix_mark / _main_health_scribe, HERD-371) — an HONEST identity of phase+THIS
+# measurement+the baseline it beat, so a re-observed IDENTICAL reading dedups (journaled result=dedup)
+# while a worse or different reading of the same phase files fresh. Fully fail-soft; always returns 0.
+#
+# HERD-807 adds a suspend sanity classifier at this chokepoint: an above-bar reading past
+# _ANOMALY_SUSPEND_MULT x the learned p95 that ALSO coincides with a matching gap in the engine
+# journal's own tick stream is a wall-clock suspend artifact the darwin wake probe missed — journaled
+# result=suspend-artifact and dropped (no row, no filing, no sample), the negative control being a
+# genuine large-but-busy degradation whose journal never went quiet, which still files.
 #
 # HERD-512 adds two guards here, both at this ONE chokepoint so all 5 measurement points inherit them:
 #   (a) an interval a machine SUSPEND/WAKE boundary falls inside is dropped whole — before the store
@@ -9758,7 +9886,7 @@ _anomaly_file_stamp() {
 # close to its nominal period (e.g. tick_cadence's p95 of ~47-53s against a 60s nominal tick) has a
 # pure pct multiplier fall WITHIN ordinary jitter of that period, so ordinary 60s ticks cleared 2x
 # p95's old bar and filed 4 marginal items in 2 days. The class-default bar for every phase is now
-# max(_ANOMALY_THRESHOLD_PCT of p95, p95 + _ANOMALY_FLOOR_MARGIN_SECS) — a p95 within jitter of the
+# max(ANOMALY_THRESHOLD_PCT of p95, p95 + ANOMALY_FLOOR_MARGIN_SECS) — a p95 within jitter of the
 # nominal period must not alarm on jitter — and this is the ONE base threshold every guard below
 # composes on top of.
 # HERD-618 adds a third guard, same chokepoint, same shape: this box's own p95 baselines skew toward the
@@ -9774,7 +9902,7 @@ _anomaly_file_stamp() {
 _phase_anomaly_observe() {
   local _pa_phase="$1" _pa_label="$2" _pa_secs="$3"
   local _pa_stats _pa_median _pa_p95 _pa_n _pa_threshold _pa_floor _pa_id _pa_mark_rc _pa_now
-  local _pa_load_qualified=0 _pa_widened _pa_tag=""
+  local _pa_load_qualified=0 _pa_widened _pa_tag="" _pa_pct _pa_fmargin
   _anomaly_baselines_enabled || return 0
   case "$_pa_secs" in ''|*[!0-9]*) return 0 ;; esac
   # HERD-512(a): a measured interval that a machine suspend/wake boundary falls inside is wall clock,
@@ -9790,20 +9918,48 @@ _phase_anomaly_observe() {
       return 0
     fi
   fi
-  _pa_stats="$(_phase_duration_observe "$_pa_phase" "$_pa_secs")" || return 0
+  # HERD-807: PEEK the learned baseline (read-only) and judge THIS instance against it FIRST, then
+  # record it (fold it into the rolling window) ONLY when it turns out to be a normal, below-bar
+  # reading. An above-bar reading — a genuine anomaly, a suspend artifact, a load-qualified exceedance —
+  # is NEVER learned from, so the p95 the rail judges against can no longer be dragged up by the very
+  # outliers it flagged (observed: render-pass p95 crept 44s→37m in .agent-watch-phase-anomalies once
+  # anomalous samples were being folded back in). Wake/settle-suppressed samples above are already
+  # excluded — they return before this point, so they were never learned either.
+  _pa_stats="$(_phase_duration_peek "$_pa_phase")" || return 0
   IFS=$'\t' read -r _pa_median _pa_p95 _pa_n <<EOF
 $_pa_stats
 EOF
   case "${_pa_n:-}" in ''|*[!0-9]*) return 0 ;; esac
   case "${_pa_p95:-}" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$_pa_n" -ge "$_ANOMALY_MIN_SAMPLES" ] || return 0      # baseline not learned yet — never judge
-  [ "$_pa_p95" -gt 0 ] || return 0
-  _pa_threshold=$(( _pa_p95 * _ANOMALY_THRESHOLD_PCT / 100 ))
-  # HERD-645: the class-default filing bar is never lower than p95 + _ANOMALY_FLOOR_MARGIN_SECS, even
+  # Baseline not learned yet, or a degenerate all-zero p95: never judge — but DO record so the window
+  # keeps growing toward _ANOMALY_MIN_SAMPLES exactly as the pre-HERD-807 unconditional observe did.
+  if [ "$_pa_n" -lt "$_ANOMALY_MIN_SAMPLES" ] || [ "$_pa_p95" -le 0 ]; then
+    _phase_duration_observe "$_pa_phase" "$_pa_secs" >/dev/null 2>&1 || true
+    return 0
+  fi
+  _pa_pct="$(_anomaly_threshold_pct)"
+  _pa_fmargin="$(_anomaly_floor_margin_secs)"
+  _pa_threshold=$(( _pa_p95 * _pa_pct / 100 ))
+  # HERD-645: the class-default filing bar is never lower than p95 + ANOMALY_FLOOR_MARGIN_SECS, even
   # when the pct multiplier alone would fall inside ordinary jitter of a tight-distribution phase.
-  _pa_floor=$(( _pa_p95 + _ANOMALY_FLOOR_MARGIN_SECS ))
+  _pa_floor=$(( _pa_p95 + _pa_fmargin ))
   [ "$_pa_floor" -gt "$_pa_threshold" ] && _pa_threshold="$_pa_floor"
-  [ "$_pa_secs" -gt "$_pa_threshold" ] || return 0          # under threshold — silent, byte-inert
+  if [ "$_pa_secs" -le "$_pa_threshold" ]; then             # under threshold — silent, byte-inert
+    # A NORMAL reading: this is exactly what the baseline SHOULD learn from — record it and stay quiet.
+    _phase_duration_observe "$_pa_phase" "$_pa_secs" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  # ── ABOVE BAR from here: judged anomalous, so it is NOT folded into the learning window. ──
+  # HERD-807: suspend sanity — a reading so far out of distribution that it ALSO coincides with a
+  # matching hole in the engine journal's own tick stream is a wall-clock suspend artifact the darwin
+  # wake probe missed (non-darwin, or a boundary already advanced past this interval). Journal it once
+  # for forensics (result=suspend-artifact) and DROP it: no console row, no tracker filing, no sample.
+  if _anomaly_reading_is_suspend_artifact "$_pa_secs" "$_pa_p95"; then
+    journal_append phase_anomaly phase "$_pa_phase" seconds "$_pa_secs" p95 "$_pa_p95" \
+      median "${_pa_median:-0}" n "$_pa_n" result suspend-artifact
+    return 0
+  fi
 
   # HERD-618: an exceedance that clears the normal threshold but falls short of the WIDENED under-load
   # threshold, while the box is contended right now, is "load-qualified" — journaled and painted, but
@@ -12477,13 +12633,63 @@ _agent_liveness() {
 # capped at 5s between checks. Several spread-out checks across the window catch a builder that
 # takes a few seconds to pick up a freshly-submitted prompt (issue #86 — the wake is not always
 # instant) without hammering herdr every second for the full window. Returns 0 if it woke, 1 if not.
+_pane_progress_mark() {
+  # A status word alone is not delivery evidence: Codex can remain `working` at an
+  # idle prompt.  A fresh visible-pane fingerprint is runtime-neutral and fail-soft.
+  local _ppm_pane="${1:-}" _ppm_text
+  [ -n "$_ppm_pane" ] || return 1
+  _ppm_text="$(herd_driver_read_pane "$_ppm_pane" visible 2>/dev/null || true)"
+  [ -n "$_ppm_text" ] || return 1
+  printf '%s' "$_ppm_text" | cksum 2>/dev/null || true
+}
+
 _wait_agent_working() {
-  local _waw_slug="$1" _waw_window="$2" _waw_deadline _waw_int=1
+  local _waw_slug="$1" _waw_window="$2" _waw_pane="${3:-}" _waw_before="${4:-}" _waw_status_before="${5:-}" _waw_deadline _waw_int=1
+  local _waw_saw_sl_nonworking=0   # tracks structured lifecycle cycle across _waw_progressed calls (HERD-789)
+  _waw_progressed() {
+    # With a delivery baseline, require evidence produced after the send. A real
+    # done/idle→working transition is a driver-neutral consumption signal even when
+    # a terminal read is static (as in a mux that exposes no repaint); unchanged
+    # working→working requires either a structured lifecycle cycle (Codex stop-hook /
+    # durable session) or the cksum-delta fallback for unstructured drivers — the delta
+    # path is byte-identical for non-Codex/default-off. Without a baseline retain the
+    # historical non-bounce path.
+    [ -n "$_waw_before" ] || return 0
+    [ "$_waw_status_before" != "working" ] && return 0
+    # working→working: when a structured lifecycle source is available (Codex stop-hook
+    # or durable session), require proof that the structured lifecycle cycled through a
+    # non-working state before accepting "working" as delivery evidence.  The structured
+    # state is read directly here — independently of the raw herdr status word — because
+    # herd_driver_agent_status_resolved only overrides "idle" raw words, so a Codex
+    # pane's structured "idle" (hook: last-turn present) is invisible to the outer loop's
+    # _agent_status call when herdr keeps reporting "working".  _waw_saw_sl_nonworking
+    # persists across calls (parent-scope variable, no subshell) so the cycle is tracked
+    # across the full poll window.  A cksum delta that could be spinner/repaint motion is
+    # never accepted when a structured source is live.  When no structured source is
+    # present fall through to the cksum-delta path, preserving the pre-HERD-789 behavior
+    # byte-identically for non-Codex/default-off drivers.
+    local _waw_sl=""
+    _waw_sl="$(_herd_codex_hook_lifecycle "$_waw_slug" 2>/dev/null || true)"
+    [ -z "$_waw_sl" ] && _waw_sl="$(_herd_codex_durable_lifecycle "$_waw_slug" 2>/dev/null || true)"
+    # HERD-803: grok wake-proof — grok-native surfaces (active_sessions.json + SQLite updated_at)
+    # replace the pane cksum for grok builder spawns. Default-off (GROK_WAKE_PROOF!=on) → rc 1 →
+    # falls through to the cksum path, byte-identical for non-grok/default-off.
+    [ -z "$_waw_sl" ] && _waw_sl="$(_herd_grok_session_lifecycle "$_waw_slug" 2>/dev/null || true)"
+    if [ -n "$_waw_sl" ]; then
+      # Structured source live: accumulate non-working observations, then accept working.
+      [ "$_waw_sl" != "working" ] && _waw_saw_sl_nonworking=1
+      [ "$_waw_saw_sl_nonworking" = "1" ] && [ "$_waw_sl" = "working" ] && return 0
+      return 1
+    fi
+    # No structured source: cksum delta (non-Codex / default-off — byte-identical).
+    local _waw_now; _waw_now="$(_pane_progress_mark "$_waw_pane")"
+    [ -n "$_waw_now" ] && [ "$_waw_now" != "$_waw_before" ]
+  }
   _waw_deadline=$(( $(date +%s) + _waw_window ))
-  [ "$(_agent_status "$_waw_slug")" = "working" ] && return 0
+  [ "$(_agent_status "$_waw_slug")" = "working" ] && _waw_progressed && return 0
   while [ "$(date +%s)" -lt "$_waw_deadline" ]; do
     sleep "$_waw_int"
-    [ "$(_agent_status "$_waw_slug")" = "working" ] && return 0
+    [ "$(_agent_status "$_waw_slug")" = "working" ] && _waw_progressed && return 0
     [ "$_waw_int" -lt 5 ] && _waw_int=$(( _waw_int + 1 ))
   done
   return 1
@@ -12713,12 +12919,16 @@ Fix every finding above, run the healthcheck, and push. The review runs automati
         local _hbv_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
         # Submit via the driver send-text seam (pane run + send-keys Enter), then verify wake over a
         # backed-off window; if the first window expires, re-send once and verify again.
+        local _hbv_mark _hbv_status_mark; _hbv_mark="$(_pane_progress_mark "$_hbv_pane_id")"; _hbv_status_mark="$(_agent_status "$_hbv_slug")"
+        _herd_grok_updated_at_baseline_write "$_hbv_slug" 2>/dev/null || true
         herd_driver_send_text "$_hbv_pane_id" "$_hbv_prompt"
-        if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
+        if _wait_agent_working "$_hbv_slug" "$_hbv_wait" "$_hbv_pane_id" "$_hbv_mark" "$_hbv_status_mark"; then
           _hbv_woke=1
         else
+          _hbv_mark="$(_pane_progress_mark "$_hbv_pane_id")"; _hbv_status_mark="$(_agent_status "$_hbv_slug")"
+          _herd_grok_updated_at_baseline_write "$_hbv_slug" 2>/dev/null || true
           herd_driver_send_text "$_hbv_pane_id" "$_hbv_prompt"
-          if _wait_agent_working "$_hbv_slug" "$_hbv_wait"; then
+          if _wait_agent_working "$_hbv_slug" "$_hbv_wait" "$_hbv_pane_id" "$_hbv_mark" "$_hbv_status_mark"; then
             _hbv_woke=1
           else
             DISPLAY[_hbv_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hbv_sl}${C_RESET}${_hbv_pn} ${C_RED}needs you · auto-refix failed · check pane${C_RESET}"
@@ -13201,12 +13411,16 @@ Fix the failure, re-run until clean, then push."
   local _cfb_t0; _cfb_t0="$(_now_epoch)"    # HERD-496: bounce→wake wall-clock starts at the FIRST send
   if [ -n "$_cfb_pane_id" ]; then
     local _cfb_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
+    local _cfb_mark _cfb_status_mark; _cfb_mark="$(_pane_progress_mark "$_cfb_pane_id")"; _cfb_status_mark="$(_agent_status "$_cfb_slug")"
+    _herd_grok_updated_at_baseline_write "$_cfb_slug" 2>/dev/null || true
     herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
-    if _wait_agent_working "$_cfb_slug" "$_cfb_wait"; then
+    if _wait_agent_working "$_cfb_slug" "$_cfb_wait" "$_cfb_pane_id" "$_cfb_mark" "$_cfb_status_mark"; then
       _cfb_woke=1
     else
+      _cfb_mark="$(_pane_progress_mark "$_cfb_pane_id")"; _cfb_status_mark="$(_agent_status "$_cfb_slug")"
+      _herd_grok_updated_at_baseline_write "$_cfb_slug" 2>/dev/null || true
       herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
-      if _wait_agent_working "$_cfb_slug" "$_cfb_wait"; then
+      if _wait_agent_working "$_cfb_slug" "$_cfb_wait" "$_cfb_pane_id" "$_cfb_mark" "$_cfb_status_mark"; then
         _cfb_woke=1
       else
         DISPLAY[_cfb_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_cfb_sl}${C_RESET}${_cfb_pn} ${C_RED}needs you · CI fast-bounce failed · check pane${C_RESET}"
@@ -13485,12 +13699,16 @@ Why: ${_hsd_reason}"
     local _hsd_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
     # Submit via the driver send-text seam (DRIVER_SEND_TEXT: pane run + Enter for herdr) — same
     # wake path as the review refix (HERD-176 / HERD-186); never a raw herdr pane run alone.
+    local _hsd_mark _hsd_status_mark; _hsd_mark="$(_pane_progress_mark "$_hsd_pane_id")"; _hsd_status_mark="$(_agent_status "$_hsd_slug")"
+    _herd_grok_updated_at_baseline_write "$_hsd_slug" 2>/dev/null || true
     herd_driver_send_text "$_hsd_pane_id" "$_hsd_prompt"
-    if _wait_agent_working "$_hsd_slug" "$_hsd_wait"; then
+    if _wait_agent_working "$_hsd_slug" "$_hsd_wait" "$_hsd_pane_id" "$_hsd_mark" "$_hsd_status_mark"; then
       _hsd_woke=1
     else
+      _hsd_mark="$(_pane_progress_mark "$_hsd_pane_id")"; _hsd_status_mark="$(_agent_status "$_hsd_slug")"
+      _herd_grok_updated_at_baseline_write "$_hsd_slug" 2>/dev/null || true
       herd_driver_send_text "$_hsd_pane_id" "$_hsd_prompt"
-      if _wait_agent_working "$_hsd_slug" "$_hsd_wait"; then
+      if _wait_agent_working "$_hsd_slug" "$_hsd_wait" "$_hsd_pane_id" "$_hsd_mark" "$_hsd_status_mark"; then
         _hsd_woke=1
       else
         _escalate_refix_stuck "$_hsd_pr" "$_hsd_sha" "$_hsd_slug" stale "the builder never woke (prompt delivered twice)"
@@ -13797,12 +14015,16 @@ Fix the failure, re-run until the healthcheck is green, then push."
     local _hhc_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
     # Submit via the driver send-text seam (DRIVER_SEND_TEXT) — same wake path as review/stale refix
     # (HERD-176 / HERD-186); never a raw herdr pane run alone.
+    local _hhc_mark _hhc_status_mark; _hhc_mark="$(_pane_progress_mark "$_hhc_pane_id")"; _hhc_status_mark="$(_agent_status "$_hhc_slug")"
+    _herd_grok_updated_at_baseline_write "$_hhc_slug" 2>/dev/null || true
     herd_driver_send_text "$_hhc_pane_id" "$_hhc_prompt"
-    if _wait_agent_working "$_hhc_slug" "$_hhc_wait"; then
+    if _wait_agent_working "$_hhc_slug" "$_hhc_wait" "$_hhc_pane_id" "$_hhc_mark" "$_hhc_status_mark"; then
       _hhc_woke=1
     else
+      _hhc_mark="$(_pane_progress_mark "$_hhc_pane_id")"; _hhc_status_mark="$(_agent_status "$_hhc_slug")"
+      _herd_grok_updated_at_baseline_write "$_hhc_slug" 2>/dev/null || true
       herd_driver_send_text "$_hhc_pane_id" "$_hhc_prompt"
-      if _wait_agent_working "$_hhc_slug" "$_hhc_wait"; then
+      if _wait_agent_working "$_hhc_slug" "$_hhc_wait" "$_hhc_pane_id" "$_hhc_mark" "$_hhc_status_mark"; then
         _hhc_woke=1
       else
         DISPLAY[_hhc_idx]="    ${C_RED}⚠️${C_RESET} ${C_BOLD}${_hhc_sl}${C_RESET}${_hhc_pn} ${C_RED}needs you · health autofix failed · check pane${C_RESET}"
@@ -14663,10 +14885,11 @@ _classify_builder() {
 # respawn-loop edge cases are a noted follow-up); it paints a distinct 💀 row + fires one notification.
 #
 # FALSE-POSITIVE GUARDS: a present agent record (ANY status — the agent is still listed) is a
-# liveness signal, so a builder that finished and went 'done' is ALIVE, not dead; an open PR is a
-# liveness signal (a builder that legitimately opened its PR is ALIVE); a growing transcript vetoes
-# death; and the grace window + cross-tick persistence keep a just-spawned builder (agent not yet
-# registered) or a one-tick blip in `herdr agent list` from ever being falsely reaped.
+# liveness signal, so a builder that finished and went 'done' is ALIVE, not dead; positive process
+# liveness through the driver seam is authoritative even when the roster transiently omits the agent;
+# an open PR is a liveness signal (a builder that legitimately opened its PR is ALIVE); a growing
+# transcript vetoes death; and the grace window + cross-tick persistence keep a just-spawned builder
+# (agent not yet registered) or a one-tick blip in `herdr agent list` from ever being falsely reaped.
 
 # _dead_grace_secs — how long the DEAD signature must persist before a slug is surfaced as dead.
 # Configurable via DEAD_GRACE_MIN (minutes); non-numeric/unset falls back to 2 minutes — long enough
@@ -14850,13 +15073,16 @@ _maybe_release_claim() {
 }
 
 # _reconcile_dead_builder <slug> <worktree> <agent-status> — drive the ledger + notification for ONE
-# PR-less, non-working builder and echo the verdict (ALIVE | PENDING | DEAD | a retirement state token
-# — retiring | held | deferred | stuck). Called from the tick's no-PR/non-working branch: an EMPTY
-# agent-status means the slug has NO agent record at all (the dead signature); a non-empty status means
-# the agent is still listed (idle/done) and therefore alive. has_pr is 0 here by construction (the
-# caller only reaches this on a PR-less slug). Records the first-seen anchor on the first sighting,
-# clears it the instant any liveness signal returns, and fires exactly one 💀 notification (+ journal
-# event) when a slug crosses into DEAD.
+# PR-less, non-working builder and echo the verdict (ALIVE | ALIVE_UNKNOWN | PENDING | DEAD | a
+# retirement state token — retiring | held | deferred | stuck). Called from the tick's
+# no-PR/non-working branch: an EMPTY agent-status means the slug has NO agent record at all (normally
+# the dead signature); a non-empty
+# status means the agent is still listed (idle/done) and therefore alive. A positive driver-aware
+# liveness='alive' probe vetoes the dead signature even if that roster status is empty, returning
+# ALIVE_UNKNOWN so the renderer preserves the unknown working/spare distinction. has_pr is 0 here by
+# construction (the caller only reaches this on a PR-less slug). Records the first-seen anchor on the
+# first sighting, clears it the instant any liveness signal returns, and fires exactly one 💀 notification
+# (+ journal event) when a slug crosses into DEAD.
 #
 # HERD-646 leg 1 — ROW TRUTH: resolve the worktree's PR state BEFORE ever choosing a remedy. A slug
 # retirement.sh has already classified non-'active' (its PR resolved MERGED/CLOSED — retiring, held,
@@ -14875,23 +15101,29 @@ _reconcile_dead_builder() {
   fi
   _rd_now="$(_now)"
   _rd_grace="$(_dead_grace_secs)"
-  # A present agent record (any status) means the agent is still listed ⇒ normally alive. But a herdr
-  # crash can leave the agent LISTED with a stale status while its PROCESS is dead (HERD-114); a
-  # POSITIVE liveness='dead' probe (pane exists but runs no claude) overrides the listing and counts as
-  # NO live agent, so a listed-but-unwakeable builder crosses into DEAD just like a vanished one. Only
-  # a positive 'dead' overrides; 'unknown'/'alive'/empty preserve the prior listing-based signal.
-  if [ "$_rd_liveness" = "dead" ]; then
-    _rd_has_agent=0
-  else
-    [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0
-  fi
+  # Roster presence is the fallback signal. Positive process evidence from the driver-aware labelled-
+  # pane/signature seam is authoritative in BOTH directions: 'dead' overrides a stale listing
+  # (HERD-114), while 'alive' overrides a transiently missing roster row (HERD-780). missing, unknown,
+  # and empty preserve the prior roster-based behavior; in particular an arbitrary process merely
+  # holding the worktree never reaches this seam as 'alive'.
+  case "$_rd_liveness" in
+    alive) _rd_has_agent=1 ;;
+    dead)  _rd_has_agent=0 ;;
+    *)     [ -n "$_rd_astatus" ] && _rd_has_agent=1 || _rd_has_agent=0 ;;
+  esac
   # Transcript growth is a one-way liveness veto (mirrors the stall ladder); a dead agent's
   # transcript is flat. Reuses the shared cache; "yes" only ever rescues, never fabricates a death.
   _rd_tgrow="$(_transcript_growing "$_rd_slug" "$(_transcript_obs "$_rd_wt")" "$_rd_now" "$_rd_grace")"
   _rd_first="$(dead_first_seen "$_rd_slug")"
   _rd_verdict="$(_classify_dead_builder "$_rd_has_agent" 0 "$_rd_tgrow" "${_rd_first:-}" "$_rd_now" "$_rd_grace")"
+  # Preserve the only ambiguity the boolean classifier cannot carry: the runtime process is
+  # positively alive, but the roster omitted the status that distinguishes working from spare.
+  # This remains an ALIVE-class verdict for ledger cleanup, with a distinct token for row truth.
+  if [ "$_rd_verdict" = "ALIVE" ] && [ "$_rd_liveness" = "alive" ] && [ -z "$_rd_astatus" ]; then
+    _rd_verdict="ALIVE_UNKNOWN"
+  fi
   case "$_rd_verdict" in
-    ALIVE)
+    ALIVE|ALIVE_UNKNOWN)
       [ -n "$_rd_first" ] && clear_dead "$_rd_slug" ;;
     PENDING)
       [ -n "$_rd_first" ] || record_dead_seen "$_rd_slug" "$_rd_now" ;;
@@ -15114,10 +15346,15 @@ _respawn_builder_in_worktree() {
     return 1
   fi
   local _rw_model="${HERD_FEATURE_MODEL:-$MODEL_FEATURE}"
-  local _rw_flags="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
   # SHORT pointer prompt — byte-identical to herd_write_task_spec's (the spec is already on disk).
   local _rw_ptr
   _rw_ptr="$(printf 'Read your task spec at %s and build exactly what it specifies. Do not commit that file. Follow AGENTS.md, run the healthcheck, then gh pr create.' "$_rw_spec")"
+  # Resolve before choosing flags: the driver owns its permission mode.  In particular a Codex
+  # autorespawn must never inherit Claude's --dangerously-skip-permissions.
+  local _rw_res _rw_driver
+  _rw_res="$(herd_model_resolve "$_rw_model")" || return 1
+  _rw_driver="${_rw_res%%$'\t'*}"; _rw_model="${_rw_res#*$'\t'}"
+  local _rw_flags; _rw_flags="$(herd_driver_lane_permission_flags "$_rw_driver")"
   # Headless: no tabs/panes — restart a DETACHED agent in the registry via the driver shim. FAILS
   # SOFT (returns non-zero if it cannot start), so the caller's escalation notification still fires.
   if [ "$(herd_driver_name)" = "headless" ]; then
@@ -15135,9 +15372,6 @@ _respawn_builder_in_worktree() {
   # Resolve the (possibly runtime-qualified) model ref and compose the runtime tail through the
   # driver seam (HERD-150 P2) — the same composition the lanes use, no hardcoded claude outside the
   # seam. Byte-identical to the old inline `claude --model … <flags> "<ptr>"` for a bare model.
-  local _rw_res _rw_driver
-  _rw_res="$(herd_model_resolve "$_rw_model")" || return 1
-  _rw_driver="${_rw_res%%$'\t'*}"; _rw_model="${_rw_res#*$'\t'}"
   # HERD-735: persist the RE-resolved spawn driver for this respawn — herd_driver_agent_liveness
   # fingerprints a builder by ITS OWN spawn driver, never the coordinator's active one, and a respawn
   # onto a different runtime (a re-tasked model ref) must overwrite the prior record, not leave it
@@ -15146,6 +15380,27 @@ _respawn_builder_in_worktree() {
   herd_driver_agent_spawn_driver_write "$_rw_slug" "$_rw_driver"
   local -a _rw_rt=(); local _rw_t
   while IFS= read -r -d '' _rw_t; do _rw_rt+=("$_rw_t"); done < <(herd_driver_agent_spawn_argv "$_rw_driver" "$_rw_model" "$_rw_flags" "$_rw_ptr")
+  # HERD-788: inject Codex stop-hook argv when CODEX_STOP_HOOK=on and respawning a codex builder.
+  # Mirrors the primary launch seam injection in herd_driver_launch_agent. Default-off/fail-soft.
+  if [ "${CODEX_STOP_HOOK:-}" = "on" ] && [ "$_rw_driver" = "codex" ] && [ "${#_rw_rt[@]}" -gt 0 ]; then
+    local _rw_hft=(); local _rw_ht
+    while IFS= read -r -d '' _rw_ht; do _rw_hft+=("$_rw_ht"); done < <(_herd_codex_stop_hook_argv_fragment "$_rw_slug" 2>/dev/null)
+    if [ "${#_rw_hft[@]}" -gt 0 ]; then
+      local _rw_last="${_rw_rt[${#_rw_rt[@]}-1]}"
+      _rw_rt=("${_rw_rt[@]:0:$((${#_rw_rt[@]}-1))}" "${_rw_hft[@]}" "$_rw_last")
+    fi
+  fi
+  # HERD-803: inject --session-id for grok respawns when GROK_WAKE_PROOF=on. Mirrors the primary
+  # spawn seam in _herd_herdr_start_agent. Default-off/fail-soft.
+  if [ "${GROK_WAKE_PROOF:-}" = "on" ] && [ "$_rw_driver" = "grok" ] && [ "${#_rw_rt[@]}" -gt 0 ]; then
+    local _rw_gwp_sid
+    _rw_gwp_sid="$(python3 -c 'import uuid; print(uuid.uuid4(), end="")' 2>/dev/null || true)"
+    if [ -n "$_rw_gwp_sid" ]; then
+      _herd_grok_session_id_write "$_rw_slug" "$_rw_gwp_sid" 2>/dev/null || true
+      local _rw_gwp_last="${_rw_rt[${#_rw_rt[@]}-1]}"
+      _rw_rt=("${_rw_rt[@]:0:$((${#_rw_rt[@]}-1))}" "--session-id" "$_rw_gwp_sid" "$_rw_gwp_last")
+    fi
+  fi
   # Launch through the shared herdr CLI bridge (issue #514): the attach CLI splits the fresh tab's
   # root and attaches (same one-pane-right layout); pre-0.7.5 keeps the byte-identical argv.
   # shellcheck disable=SC2086  # $_rw_wsid intentionally word-splits (mirrors the lane's args).
@@ -15165,6 +15420,15 @@ _respawn_builder_in_worktree() {
   # on the failure path and journal the reap; the caller escalates via its 💀 notification and does NOT
   # spend the at-most-once budget (mirrors the drainers' agent_name_taken cleanup in research/scribe.sh).
   herdr tab close "$_rw_tab" >/dev/null 2>&1 || true
+  # The tab is gone, so its allowlist row must go too.  Leaving it behind makes every subsequent
+  # failed attempt render as another builder and can shield a recycled tab id from the sweep.
+  local _rw_reg="$TREES/.herd-tabs" _rw_tmp
+  if [ -f "$_rw_reg" ]; then
+    _rw_tmp="${_rw_reg}.tmp.$$"
+    awk -v slug="$_rw_slug" -v tab="$_rw_tab" \
+      '!($1 == slug && $2 == tab && $3 == "builder") { print }' "$_rw_reg" > "$_rw_tmp" 2>/dev/null || true
+    mv -f "$_rw_tmp" "$_rw_reg" 2>/dev/null || rm -f "$_rw_tmp" 2>/dev/null || true
+  fi
   journal_append builder_respawn_tab_reaped slug "$_rw_slug" tab "$_rw_tab"
   return 1
 }
@@ -19442,6 +19706,13 @@ EOF
                 DISPLAY[i]="    ${C_RED}💀${C_RESET} ${C_BOLD}${sl}${C_RESET} ${C_RED}builder died (no agent, no PR) · re-spawn${C_RESET}"
               fi
               FLAIR_STATE[i]="dead" ;;
+            ALIVE_UNKNOWN)
+              # HERD-780: the labelled-pane/process-signature seam positively sees the runtime, but
+              # the roster row that says working vs idle/done is absent. Process existence vetoes
+              # death; it does NOT prove the builder is a spare. Keep a neutral herd-owned row until
+              # the roster resynchronizes, never inviting an unsafe re-task or retirement.
+              DISPLAY[i]="$(_row_live_roster_unknown "$sl")"
+              FLAIR_STATE[i]="busy" ;;
             *)
               # ALIVE (or still PENDING death): the agent is listed. HERD-392: check the finish-line
               # watchdog FIRST — ship-dormant (OFF unless FINISH_STALL_MIN is set), so with it unset

@@ -38,7 +38,7 @@ mkdir -p "$T/proj" "$T/pool"
 # temp tree, so a case can never read or write this machine's real worktree pool (the HERD-436
 # real-ledger-leak class). Each case gets its own subshell: no env leaks between cases.
 rtconf_sh() {
-  env -u HERD_RTCONF_VERSION -u HERD_RTCONF_DRIVER -u HERD_AGENT \
+  env -u HERD_RTCONF_VERSION -u HERD_RTCONF_DRIVER -u HERD_RTCONF_RUNTIME -u HERD_AGENT -u GROK_BIN \
       PROJECT_ROOT="$T/proj" WORKTREES_DIR="$T/pool" \
       ${_RT_ENV[@]+"${_RT_ENV[@]}"} \
       bash -c 'set -uo pipefail; . "$1"; . "$2"; . "$3"; . "$4"; shift 4; eval "$@"' \
@@ -206,21 +206,26 @@ else
   pass; echo "PASS (12) LIVE: the structured-exec-events probe genuinely passes against the installed codex, recorded keyed to its real version — and stops being trusted on a version bump"
 fi
 
-# ── 13. HERD-767 (epic HERD-754 step 8) grok probe table: an explicit HERD_RTCONF_DRIVER=grok override
-#     returns ONE honest, explicit deferred row — never codex's codex-shaped probe ids, and never an
-#     empty table (silence is exactly what this step exists to avoid). ────────────────────────────────
+# ── 13. HERD-800 (epic HERD-782 ph2) grok probe table: HERD_RTCONF_DRIVER=grok declares FOUR live
+#     probes (all authless, so they yield real evidence on an unauthenticated binary) plus FOUR explicit
+#     deferred rows — never codex's codex-shaped probe ids, and never an empty table. ──────────────────
 _RT_ENV=(HERD_RTCONF_DRIVER=grok)
 gtable="$(rtconf_sh 'herd_rtconf_probes')"
-[ "$(printf '%s\n' "$gtable" | grep -c .)" -eq 1 ] || fail "(13) grok probe table should declare exactly 1 row, got: $gtable"
-case "$gtable" in *"grok-runtime"*"deferred"*) : ;; *) fail "(13) grok probe table missing its deferred grok-runtime row: $gtable" ;; esac
-[ "$(rtconf_sh 'herd_rtconf_probe_field grok-runtime 2')" = "deferred" ] || fail "(13) grok-runtime must be mode=deferred"
-case "$(rtconf_sh 'herd_rtconf_probe_field grok-runtime 4')" in
-  *"HERD-754 step 8"*) : ;;
-  *) fail "(13) grok-runtime's deferred reason must name epic HERD-754 step 8" ;;
+[ "$(printf '%s\n' "$gtable" | grep -c .)" -eq 8 ] || fail "(13) grok probe table should declare exactly 8 rows, got: $gtable"
+for id in grok-argv grok-structured-output grok-rules-discovery grok-agent-discovery; do
+  [ "$(rtconf_sh "herd_rtconf_probe_field $id 2")" = "live" ] || fail "(13) $id should be a live grok probe"
+done
+for id in grok-exec-turn grok-session-resume grok-steering grok-interruption; do
+  [ "$(rtconf_sh "herd_rtconf_probe_field $id 2")" = "deferred" ] || fail "(13) $id must be declared DEFERRED, not omitted"
+done
+# grok-exec-turn is deferred specifically because the binary is unauthenticated, and it must say so.
+case "$(rtconf_sh 'herd_rtconf_probe_field grok-exec-turn 4')" in
+  *"AUTHENTICATED"*|*"authenticated"*|*"grok login"*) : ;;
+  *) fail "(13) grok-exec-turn's deferred reason must name the authentication requirement" ;;
 esac
-case "$gtable" in *"specialist-definition"*) fail "(13) grok probe table must NOT carry codex's probe ids" ;; esac
+case "$gtable" in *"specialist-definition"*|*"structured-exec-events"*) fail "(13) grok probe table must NOT carry codex's probe ids" ;; esac
 _RT_ENV=()
-pass; echo "PASS (13) HERD_RTCONF_DRIVER=grok declares exactly one explicit deferred row, never codex's live probe ids"
+pass; echo "PASS (13) HERD_RTCONF_DRIVER=grok declares 4 live authless probes + 4 explicit deferred rows (grok-exec-turn gated on auth), never codex's probe ids"
 
 # ── 14. ACTIVE-DRIVER auto-detection: with NO explicit HERD_RTCONF_DRIVER override, herd_rtconf_driver
 #     targets grok when the PROJECT's active driver (HERD_DRIVER, read by herd_driver_name) is grok —
@@ -236,18 +241,46 @@ _RT_ENV=()
 [ "$(rtconf_sh 'herd_rtconf_driver')" = "codex" ] || fail "(14) no active driver set at all must still default to codex"
 pass; echo "PASS (14) herd_rtconf_driver auto-targets grok ONLY when the project's active driver is grok; every other seat is unchanged"
 
-# ── 15. grok is not installed on this dev machine (true of every machine this audit has run on) — run
-#     and report must both degrade HONESTLY: no crash, no guessed pass, and the explicit deferred row
-#     still prints. Mirrors case (8)'s codex-absent proof but for the grok hook point specifically. ────
-_RT_ENV=(HERD_RTCONF_DRIVER=grok)
+# ── 15. grok ABSENT degrade (portable, hermetic via the HERD_RTCONF_RUNTIME seam pointed at a name
+#     nothing installs): run and report must both degrade HONESTLY — no crash, no guessed pass; every
+#     LIVE grok row renders `unavailable`, and the deferred rows still print. Mirrors case (8). ─────────
+_RT_ENV=(HERD_RTCONF_DRIVER=grok HERD_RTCONF_RUNTIME=grok-no-such-runtime-xyz)
 grun="$(rtconf_sh 'herd_rtconf_run'; echo "rc=$?")"
-case "$grun" in *"grok is not installed"*"rc=0"*) : ;; *) fail "(15) herd_rtconf_run for grok must degrade cleanly and honestly, got: $grun" ;; esac
+case "$grun" in *"is not installed"*"rc=0"*) : ;; *) fail "(15) herd_rtconf_run for an absent grok must degrade cleanly and honestly, got: $grun" ;; esac
 grpt="$(rtconf_sh 'herd_rtconf_report')"
-case "$grpt" in *"driver grok"*"runtime grok"*) : ;; *) fail "(15) report header must name driver+runtime grok: $grpt" ;; esac
-case "$grpt" in *"<not installed>"*) : ;; *) fail "(15) report header must say grok is not installed: $grpt" ;; esac
-case "$grpt" in *"grok-runtime"*"not yet probeable"*) : ;; *) fail "(15) report must print the grok-runtime deferred row: $grpt" ;; esac
+case "$grpt" in *"driver grok"*"runtime grok-no-such-runtime-xyz"*) : ;; *) fail "(15) report header must name driver grok + the (absent) runtime: $grpt" ;; esac
+case "$grpt" in *"<not installed>"*) : ;; *) fail "(15) report header must say the grok runtime is not installed: $grpt" ;; esac
+case "$grpt" in *"grok-argv"*"unavailable"*) : ;; *) fail "(15) an absent grok must render each LIVE row as unavailable: $grpt" ;; esac
+case "$grpt" in *"grok-exec-turn"*"not yet probeable"*) : ;; *) fail "(15) report must still print the deferred grok rows when the binary is absent: $grpt" ;; esac
 _RT_ENV=()
-pass; echo "PASS (15) grok (absent on this machine) degrades honestly through both herd_rtconf_run and herd_rtconf_report — never a crash, never a guessed result"
+pass; echo "PASS (15) an absent grok degrades honestly through herd_rtconf_run and herd_rtconf_report — LIVE rows unavailable, deferred rows still printed, never a crash"
+
+# ── 16. LIVE grok (b): one REAL authless probe (grok-rules-discovery needs no sign-in) against the
+#     installed grok, recorded keyed to the binary's OWN reported version, and the invalidation contract
+#     holds for a REAL recorded result. Skips when grok is absent (cases 13-15 prove the framework). ────
+if ! command -v grok >/dev/null 2>&1; then
+  echo "SKIP (16) grok not on PATH — the live probe needs the real binary (cases 13-15 prove the grok framework)"
+else
+  rm -rf "$T/glive"; mkdir -p "$T/glive"
+  glive="$(env -u HERD_RTCONF_VERSION -u HERD_RTCONF_RUNTIME -u GROK_BIN HERD_RTCONF_DRIVER=grok \
+    PROJECT_ROOT="$ROOT" WORKTREES_DIR="$T/glive" \
+    bash -c 'set -uo pipefail; . "$1"; . "$2"; . "$3"; . "$4"; herd_rtconf_run grok-rules-discovery' \
+    _ "$DRIVER_SH" "$AGENTS_SH" "$ADAPTER_SH" "$RTCONF_SH" 2>&1)"
+  case "$glive" in
+    *"✓ grok-rules-discovery"*"pass"*) : ;;
+    *) fail "(16) the live grok-rules-discovery probe did not pass against the installed grok: $glive" ;;
+  esac
+  gver="$(grok --version 2>/dev/null || true)"; gver="${gver%%$'\n'*}"
+  gver="$(printf '%s' "$gver" | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//')"
+  [ -n "$gver" ] || fail "(16) could not read the installed grok version"
+  grep -qF "	$gver	grok-rules-discovery	pass	" "$T/glive/.herd-runtime-conformance" \
+    || fail "(16) the live grok result was not recorded keyed to the installed version ($gver)"
+  env -u GROK_BIN PROJECT_ROOT="$ROOT" WORKTREES_DIR="$T/glive" \
+    bash -c 'set -uo pipefail; . "$1"; . "$2"; . "$3"; . "$4"; herd_rtconf_trusted grok "$5-bumped" grok-rules-discovery' \
+    _ "$DRIVER_SH" "$AGENTS_SH" "$ADAPTER_SH" "$RTCONF_SH" "$gver" \
+    && fail "(16) the SAME real grok result must stop being trusted the moment the installed version differs"
+  pass; echo "PASS (16) LIVE: the authless grok-rules-discovery probe genuinely passes against the installed grok, recorded keyed to its real version — and stops being trusted on a version bump"
+fi
 
 echo "─────────────────────────────────────────────"
 echo "runtime-conformance.sh: $PASS checks passed"

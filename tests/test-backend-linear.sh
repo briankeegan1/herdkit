@@ -106,6 +106,19 @@ grep -q "add a dark-mode toggle" "$GQLLOG" || fail "add_item did not pass the re
 grep -q "team_xyz" "$GQLLOG" || fail "add_item did not target the configured team (teamId)"
 pass
 
+# 1a. HERD-787 explicit-title seam: scribe-step may supply a normalized directive title as arg 3;
+# the original request remains the complete Linear description.
+: > "$GQLLOG"
+DIRECTIVE="Add a planned item: Reap merged Codex builders — close their tabs after merge."
+run _backend_add_item REQ1A "$DIRECTIVE" "Reap merged Codex builders" >/dev/null
+python3 - "$GQLLOG" "$DIRECTIVE" <<'PY' || fail "explicit Linear title replaced or changed the full description"
+import json, re, sys
+v = json.loads(re.findall(r"VARS<<(.*?)>>", open(sys.argv[1]).read(), re.S)[-1])
+assert v["title"] == "Reap merged Codex builders", v
+assert v["description"] == sys.argv[2], v
+PY
+pass
+
 # 1b. HERD-77 (short titles): a long single-line add must yield a SHORT title (<=100 chars) but keep
 #     the FULL text as the description — never the old "first-line-as-essay" where a one-paragraph
 #     request became a giant title duplicated in the body (user complaint 2026-07-07; 7 hand-renames).
@@ -140,6 +153,26 @@ assert m, "no issueCreate VARS logged"
 t = json.loads(m[-1])["title"]
 assert t.startswith("Backends derive a short title"), "clause not used as title: %r" % t
 assert len(t) <= 100, "clause title too long: %d chars" % len(t)
+PY
+pass
+
+# 1d. HERD-783: real newlines stay real across the add seam: the first line is the short title and
+#     the complete multiline text is the description. A literal backslash-n is NOT decoded — it is
+#     ordinary intentional title/body text unless the transport contains an actual newline.
+: > "$GQLLOG"
+MULTILINE=$'Preserve multiline scribe arguments\n\nThe body stays separate from the title.\n- prove Codex\n- prove Claude'
+run _backend_add_item REQ4 "$MULTILINE" >/dev/null
+LITERAL='Keep literal \n text when intended'
+run _backend_add_item REQ5 "$LITERAL" >/dev/null
+python3 - "$GQLLOG" "$MULTILINE" "$LITERAL" <<'PY' || fail "HERD-783 newline/literal transport changed Linear variables"
+import json, re, sys
+rows = [json.loads(x) for x in re.findall(r"VARS<<(.*?)>>", open(sys.argv[1]).read(), re.S)]
+assert len(rows) == 2, rows
+assert rows[0]["title"] == "Preserve multiline scribe arguments", rows[0]
+assert rows[0]["description"] == sys.argv[2], rows[0]
+assert rows[1]["title"] == sys.argv[3], rows[1]
+assert rows[1]["description"] == sys.argv[3], rows[1]
+assert "\\n" in rows[1]["title"], rows[1]
 PY
 pass
 

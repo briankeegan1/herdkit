@@ -125,3 +125,39 @@ herd_drainer_should_reclaim() {
   herd_drainer_hung "$_hb" "$_t" || return 1   # not stale (or feature off / absent) → keep
   [ "$_live" = "dead" ]                         # reclaim ONLY on POSITIVE death
 }
+
+# herd_drainer_progress <file> — record a QUEUE progress event. This deliberately differs from a
+# poll-loop heartbeat: a drainer can keep polling (or leave a live pane behind) without claiming or
+# completing any work. Call only when a request is claimed or consumed.
+herd_drainer_progress() { herd_drainer_heartbeat "${1:-}"; }
+
+# herd_drainer_owner_alive <owner-file> — true only when a claim sidecar names a presently live pid.
+# The first line is intentionally just the pid so older/manual sidecars remain readable.
+herd_drainer_owner_alive() {
+  local _owner="${1:-}" _pid=""
+  [ -f "$_owner" ] || return 1
+  IFS= read -r _pid < "$_owner" 2>/dev/null || return 1
+  case "$_pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$_pid" 2>/dev/null
+}
+
+# herd_drainer_queue_stalled <queue> <progress-file> <timeout-secs> [heartbeat-file]
+# True only for actionable NO-PROGRESS: pending .req work exists, its last claim/completion marker is
+# stale, and no claimed request is owned by a live worker. Before the first recorded claim/completion,
+# a stale heartbeat is the safe age anchor; a fresh polling heartbeat stays non-actionable.
+herd_drainer_queue_stalled() {
+  local _q="${1:-}" _progress="${2:-}" _t="${3:-0}" _heartbeat="${4:-}" _mine _owner
+  [ -d "$_q" ] || return 1
+  compgen -G "$_q/*.req" >/dev/null 2>&1 || return 1
+  if [ -f "$_progress" ]; then
+    herd_drainer_hung "$_progress" "$_t" || return 1
+  else
+    herd_drainer_hung "$_heartbeat" "$_t" || return 1
+  fi
+  for _mine in "$_q"/*.req.mine; do
+    [ -f "$_mine" ] || continue
+    _owner="${_mine%.req.mine}.owner"
+    herd_drainer_owner_alive "$_owner" && return 1
+  done
+  return 0
+}

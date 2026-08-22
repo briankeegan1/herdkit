@@ -144,7 +144,7 @@ seed_orphan_dispatch() {
 # lines and inbox rows to match byte-for-byte, with zero rail/scribe invocations and no audit_acted.
 reset_surfaces
 seed_orphan_dispatch
-jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'      # an UNMAPPED class
+jline "2026-08-05T14:00:00Z" '"event":"main_detached","head":"abc123deadbeef","branch":"main","result":"detected"'  # an UNMAPPED class
 out="$(run_audit off)" || fail "(1) audit exited non-zero with the ACT lever off: $out"
 [ "$(rail_calls)" = "0" ] || fail "(1) ACT off must never invoke a rail, got $(rail_calls) call(s)"
 [ "$(scribe_calls)" = "0" ] || fail "(1) ACT off must never file a tracker item, got $(scribe_calls)"
@@ -157,7 +157,7 @@ off_inbox="$(cut -f2- "$HERD_JOURNAL_AUDIT_INBOX")"
 # Same journal, lever ON: the REPORT half must be unchanged (only actions are added).
 reset_surfaces
 seed_orphan_dispatch
-jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'
+jline "2026-08-05T14:00:00Z" '"event":"main_detached","head":"abc123deadbeef","branch":"main","result":"detected"'
 out="$(run_audit on)" || fail "(1) audit exited non-zero with the ACT lever on: $out"
 on_findings="$(grep '"event":"journal_audit"' "$JOURNAL_FILE" | sed 's/"ts":"[^"]*",//')"
 # The ACTION rows carry their own refs (field 3: audit-act:/audit-escalated:) — strip them and the
@@ -367,17 +367,18 @@ pass
 echo "PASS (2h) gates_passed_no_merge's dedup key composes per (pr,sha), never collapsed across a resurfaced pr"
 
 # ── (3) an UNMAPPED finding class files EXACTLY ONE deduped item, ever ──────────────────────────
+# main_detached is a genuinely unmapped class (no rail in journal-act.sh, not a no-action class).
 reset_surfaces
-jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'      # pushed_no_unresolved: no rail
+jline "2026-08-05T14:00:00Z" '"event":"main_detached","head":"abc123deadbeef","branch":"main","result":"detected"'  # main_detached: no rail
 out="$(run_audit on)" || fail "(3) sweep 1 exited non-zero: $out"
 [ "$(rail_calls)" = "0" ] || fail "(3) an unmapped class must never reach a rail, got $(rail_calls)"
 [ "$(scribe_calls)" = "1" ] || fail "(3) an unmapped class must file exactly one item, got $(scribe_calls)"
 grep -q '"result":"filed"' "$JOURNAL_FILE" || fail "(3) the filing must be journaled result=filed"
 filed_title="$(sed -n 1p "$SCRIBELOG")"
-[ "$filed_title" = "journal-audit: pushed_no_unresolved has no mapped auto-action" ] \
+[ "$filed_title" = "journal-audit: main_detached has no mapped auto-action" ] \
   || fail "(3) the filed item's FIRST line must be a short title (the tracker takes line 1 verbatim): $filed_title"
 [ "${#filed_title}" -le 78 ] || fail "(3) the title line must stay under 80 chars, got ${#filed_title}"
-grep -q 'Dedup key: pushed_no_unresolved|' "$SCRIBELOG" || fail "(3) the filed item must carry the finding's dedup key"
+grep -q 'Dedup key: main_detached|' "$SCRIBELOG" || fail "(3) the filed item must carry the finding's dedup key"
 # Later sweeps: the class is still found, but the filing was TERMINAL — never a duplicate item.
 out="$(run_audit on)" || fail "(3) sweep 2 exited non-zero: $out"
 out="$(run_audit on)" || fail "(3) sweep 3 exited non-zero: $out"
@@ -566,13 +567,35 @@ out="$(run_audit on)" || fail "(3j) sweep 3 exited non-zero: $out"
 pass
 echo "PASS (3j) gates_passed_held is a deliberate no-action class — journals a reason once, never acts on the live journal"
 
-# ── (3g) HERD-602: an unmapped class that keeps recurring under DISTINCT finding keys (a new pr, a
-#         new ts) must still file EXACTLY ONE tracker item, ever — dedup keyed on the CLASS, not the
-#         per-finding key. Two distinct pushed_no_unresolved keys in the SAME sweep, then a third one
-#         on a later sweep ───────────────────────────────────────────────────────────────────────────
+# ── (3k) pushed_no_unresolved is a DELIBERATE no-action class (HERD-753): the tick-level reconcile
+#         already retries the refresh push on every tick, making a bounded re-invoke redundant and
+#         potentially racy — no auto-action is appropriate, but the finding is still REPORTED ─────────
 reset_surfaces
 jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'
-jline "2026-08-05T14:05:00Z" '"event":"symbol_index_refresh","pushed":"no"'
+out="$(run_audit on)" || fail "(3k) sweep 1 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3k) pushed_no_unresolved must never reach a rail, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3k) pushed_no_unresolved must never file a tracker item, got $(scribe_calls)"
+grep -q '"class":"pushed_no_unresolved".*"result":"no_action"' "$JOURNAL_FILE" \
+  || fail "(3k) pushed_no_unresolved must journal result=no_action: $(grep audit_acted "$JOURNAL_FILE")"
+grep -q '"event":"audit_acted".*"reason":' "$JOURNAL_FILE" || fail "(3k) the no-action must carry a reason"
+grep -q 'audit-noaction:pushed_no_unresolved' "$HERD_JOURNAL_AUDIT_INBOX" || fail "(3k) the no-action must still get an advisory inbox row"
+grep -q '"event":"journal_audit".*"kind":"pushed_no_unresolved"' "$JOURNAL_FILE" || fail "(3k) pushed_no_unresolved must still be REPORTED (advisory)"
+[ ! -s "$HERD_JOURNAL_AUDIT_PENDING" ] || fail "(3k) a no-action class must never be tracked as pending"
+out="$(run_audit on)" || fail "(3k) sweep 2 exited non-zero: $out"
+out="$(run_audit on)" || fail "(3k) sweep 3 exited non-zero: $out"
+[ "$(rail_calls)" = "0" ] || fail "(3k) pushed_no_unresolved must never reach a rail across sweeps, got $(rail_calls)"
+[ "$(scribe_calls)" = "0" ] || fail "(3k) pushed_no_unresolved must never file across sweeps, got $(scribe_calls)"
+[ "$(grep -c '"result":"no_action"' "$JOURNAL_FILE")" = "1" ] || fail "(3k) the no-action must journal exactly once, ever"
+pass
+echo "PASS (3k) pushed_no_unresolved is a deliberate no-action class — journals a reason once, never acts on the live journal"
+
+# ── (3g) HERD-602: an unmapped class that keeps recurring under DISTINCT finding keys (a new sha, a
+#         new ts) must still file EXACTLY ONE tracker item, ever — dedup keyed on the CLASS, not the
+#         per-finding key. Two distinct main_detached keys in the SAME sweep, then a third one on a
+#         later sweep ────────────────────────────────────────────────────────────────────────────────
+reset_surfaces
+jline "2026-08-05T14:00:00Z" '"event":"main_detached","head":"aaaa1111dead","branch":"main","result":"detected"'
+jline "2026-08-05T14:05:00Z" '"event":"main_detached","head":"bbbb2222dead","branch":"main","result":"detected"'
 out="$(run_audit on)" || fail "(3g) sweep 1 exited non-zero: $out"
 [ "$(rail_calls)" = "0" ] || fail "(3g) an unmapped class must never reach a rail, got $(rail_calls)"
 [ "$(scribe_calls)" = "1" ] || fail "(3g) two distinct keys of the SAME unmapped class must file exactly ONE item, got $(scribe_calls)"
@@ -580,7 +603,7 @@ out="$(run_audit on)" || fail "(3g) sweep 1 exited non-zero: $out"
 grep -q '"result":"filed"' "$JOURNAL_FILE" || fail "(3g) exactly one of the two must journal result=filed"
 grep -q '"result":"already_filed_for_class"' "$JOURNAL_FILE" || fail "(3g) the second distinct key must journal result=already_filed_for_class, not file again"
 # A THIRD distinct key on a later sweep: still no second filed item, ever.
-jline "2026-08-05T14:10:00Z" '"event":"some_other_refresh","pushed":"no"'
+jline "2026-08-05T14:10:00Z" '"event":"main_detached","head":"cccc3333dead","branch":"main","result":"detected"'
 out="$(run_audit on)" || fail "(3g) sweep 2 exited non-zero: $out"
 [ "$(scribe_calls)" = "1" ] || fail "(3g) a THIRD distinct key on a later sweep must still not file a second item, got $(scribe_calls)"
 pass
@@ -636,7 +659,7 @@ out="$(run_audit on)" || fail "(6) a failing rail must not fail the sweep: $out"
 grep -q '"result":"failed"' "$JOURNAL_FILE" || fail "(6) a rail that produced nothing must journal result=failed, not a heal"
 rm -f "$T/rail.fail"
 reset_surfaces
-jline "2026-08-05T14:00:00Z" '"event":"codemap_refresh","pushed":"no"'
+jline "2026-08-05T14:00:00Z" '"event":"main_detached","head":"abc123deadbeef","branch":"main","result":"detected"'
 touch "$T/scribe.fail"
 out="$(run_audit on)" || fail "(6) a failing scribe must not fail the sweep: $out"
 grep -q '"result":"file_failed"' "$JOURNAL_FILE" || fail "(6) a scribe that failed must journal result=file_failed, never filed"

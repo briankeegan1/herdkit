@@ -58,6 +58,7 @@ Role summarized from each file's top-of-file comment.
 - `governance-drift-sweep.sh` — periodic, ADVISORY governance-DRIFT sweep (HERD-125).
 - `governance-hook.sh` — governance-hook.sh <target> — the SESSION-TIME governance enforcer rendered into a project's
 - `governance.sh` — the SHARED, read-only governance EXTRACTION + MAPPING helpers (HERD-119 / HERD-125).
+- `grok-exec-adapter.sh` — a herd-owned adapter around `grok -p --output-format streaming-messages-json`
 - `handoff.sh` — the shared format + emitter for the BUILDER HANDOFF SUMMARY (HERD-106, research G4).
 - `health-pane-view.sh` — health-pane-view.sh <log-path> [inflight-marker] — the HEALTH_PANE (HERD-313/HERD-568) view command:
 - `health-trust.sh` — THE shared SHA-MATCHED BUILDER-LOCAL HEALTH TRUST library (HERD-531).
@@ -191,7 +192,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`
-- `herd-config.sh` → `context-guard.sh`, `resolver-claim.sh`
+- `herd-config.sh` → `context-guard.sh`, `driver.sh`, `resolver-claim.sh`
 - `herd-feature.sh` → `agents.sh`, `capacity-ledger.sh`, `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-preflight.sh` → `driver.sh`, `engine-version.sh`
 - `herd-quick.sh` → `agents.sh`, `capacity-ledger.sh`, `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
@@ -212,7 +213,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `research-step.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `research.sh` → `burst.sh`, `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `retirement.sh` → `agent-watch.sh`, `journal.sh`
-- `runtime-conformance.sh` → `agents.sh`, `codex-exec-adapter.sh`, `driver.sh`, `herd-config.sh`
+- `runtime-conformance.sh` → `agents.sh`, `codex-exec-adapter.sh`, `driver.sh`, `grok-exec-adapter.sh`, `herd-config.sh`
 - `scribe-step.sh` → `create-retry.sh`, `drainer-liveness.sh`, `driver.sh`, `engine-version.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `scribe.sh` → `drainer-liveness.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `lifecycle.sh`
 - `spawn-step.sh` → `herd-config.sh`
@@ -240,6 +241,8 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `AGING_PR_TTL` → `agent-watch.sh`, `aging-pr.sh`, `journal-audit-replay.sh`
 - `ANOMALY_BASELINES` → `agent-watch.sh`
 - `ANOMALY_FILE_COOLDOWN_SECS` → `agent-watch.sh`
+- `ANOMALY_FLOOR_MARGIN_SECS` → `agent-watch.sh`
+- `ANOMALY_THRESHOLD_PCT` → `agent-watch.sh`
 - `ANOMALY_WAKE_SETTLE_SECS` → `agent-watch.sh`
 - `ANTHROPIC_BASE_URL` → `driver.sh`
 - `APP_PREVIEW_CMD` → `bin/herd`, `app-monitor.sh`, `herd-feature.sh`, `herd-resolve.sh`
@@ -267,6 +270,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `CLAIM_RELEASE` → `herd-claim.sh`
 - `CLAIM_REQUIRED` → `bin/herd`, `agent-watch.sh`, `herd-claim.sh`
 - `CODEMAP_AUTOREFRESH` → `agent-watch.sh`
+- `CODEX_STOP_HOOK` → `agent-watch.sh`, `driver.sh`
 - `COMMIT_CONVENTION` → `bin/herd`, `healthcheck.sh`
 - `CONTEXT_PROVISION` → `bin/herd`
 - `COORDINATOR_AUTONOMY` → `bin/herd`
@@ -301,6 +305,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `GATE_STATUS_PENDING` → —
 - `GH_TOKEN` → —
 - `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
+- `GROK_WAKE_PROOF` → `agent-watch.sh`, `driver.sh`
 - `HEALTHCHECK_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
@@ -358,12 +363,12 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `MERGE_RESULT_GATE` → —
 - `MODEL_ADVISE` → `bin/herd`, `herd-advise.sh`
 - `MODEL_COORDINATOR` → `bin/herd`, `coordinator.sh`, `fleet.sh`
-- `MODEL_ESCALATE` → `driver.sh`
+- `MODEL_ESCALATE` → `bin/herd`, `driver.sh`
 - `MODEL_ESCALATE_GLOB` → `bin/herd`, `herd-feature.sh`, `herd-quick.sh`
 - `MODEL_FEATURE` → `bin/herd`, `agent-watch.sh`, `driver.sh`, `herd-feature.sh`
 - `MODEL_QUICK` → `bin/herd`, `agents.sh`, `herd-quick.sh`
 - `MODEL_RESEARCH` → `bin/herd`, `research.sh`
-- `MODEL_RESOLVER` → `herd-resolve.sh`
+- `MODEL_RESOLVER` → `bin/herd`, `herd-resolve.sh`
 - `MODEL_REVIEW` → `bin/herd`, `agent-watch.sh`, `config-viability.sh`, `herd-review.sh`
 - `MODEL_SCRIBE` → `bin/herd`, `scribe.sh`
 - `NATIVE_BURST` → `burst.sh`
@@ -399,9 +404,9 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_MECH_FLOOR` → `agent-watch.sh`, `review-pregate.sh`
 - `REVIEW_MECH_FLOOR_MAXFILES` → `review-pregate.sh`
 - `REVIEW_MECH_FLOOR_MAXLINES` → `review-pregate.sh`
-- `REVIEW_MODEL_CHEAP` → `agent-watch.sh`, `posture-lint.sh`
-- `REVIEW_MODEL_DOCS` → `agent-watch.sh`, `posture-lint.sh`
-- `REVIEW_MODEL_ESCALATED` → `agent-watch.sh`
+- `REVIEW_MODEL_CHEAP` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`
+- `REVIEW_MODEL_DOCS` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`
+- `REVIEW_MODEL_ESCALATED` → `bin/herd`, `agent-watch.sh`
 - `REVIEW_PANEL` → `herd-review.sh`
 - `REVIEW_PANEL_MODELS` → `bin/herd`, `herd-review.sh`, `review-panel.sh`
 - `REVIEW_PANEL_POLICY` → `herd-review.sh`, `review-panel.sh`
@@ -409,6 +414,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `REVIEW_TIERING` → `engine-version.sh`
 - `RUBRIC_FILE` → `herd-review.sh`
 - `SCRIBE_BACKEND` → `bin/herd`, `agent-watch.sh`, `backlog-reconcile.sh`, `backlog-view.sh`, `herd-claim.sh`, `pr-ref.sh`, `scribe-step.sh`, `status.sh`, `sweep.sh`, `tracker-state-sweep.sh`
+- `SCRIBE_DIRECTIVE_PREFIXES` → `scribe-step.sh`
 - `SCRIBE_LINGER_SECS` → `scribe-step.sh`, `scribe.sh`
 - `SCRIBE_POLL` → `scribe-step.sh`
 - `SHARE_LINKS` → `bin/herd`, `agent-watch.sh`, `new-feature.sh`

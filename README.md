@@ -122,15 +122,15 @@ differently — so the roster is a driver binding, not a convention:
 
 | runtime | where it looks for definitions | by-name selector | mode | how a definition reaches a build |
 |---|---|---|---|---|
-| `herdr-claude` / `headless` | `.claude/agents/` — **repo** scope | none | `native` | already in the repo; with no selector the lane injects the body |
+| `herdr-claude` / `headless` | `.claude/agents/` — **repo** scope | none | `inject` | the lane injects the body into the task spec (`.claude/agents/` is where the runtime's subagent machinery looks; it is **not** a main-session selector for `claude -p` oneshots) |
 | `grok` | `~/.grok/agents/` — **user** scope | `--agent <name>` | `install` | published to user scope, then selected by name on the spawn argv |
-| `codex` | none | none | `inject` | the lane prepends the definition body to the task spec |
+| `codex` | `.codex/agents/` — **repo** scope | none | `inject` | the lane prepends the definition body to the task spec (`.codex/agents/*.toml` is where the runtime's multi-agent machinery looks; it is **not** a main-session selector for `codex exec` oneshots) |
 
 `herd agents install` publishes the committed source to the active runtime's real lookup path —
-load-bearing on a user-scope runtime, a clean no-op everywhere else, so the operator never has to
-know which case they are in. Prompt **injection** is built as the first-class portable fallback, not
-a degraded path: it is the one mechanism that works on any runtime, including one whose vendor never
-ships the feature.
+load-bearing on a user-scope runtime (`grok`), a no-op everywhere else — so the operator never has
+to know which case they are in. Prompt **injection** is the first-class portable fallback, not a
+degraded path: it is the one mechanism that provably governs a builder's whole session on any
+runtime, including one whose vendor never ships a by-name flag.
 
 **The trap the verifier exists for.** An unknown agent name is *silently ignored*: the runtime does
 not error, does not warn, does not exit non-zero — it runs as a plain builder, and the only symptom
@@ -390,6 +390,53 @@ the difference between "we know this doesn't work" and "we hope this works."
 The default (`HERD_DRIVER` unset, i.e. `herdr-claude`) is byte-identical to a herdkit with no driver
 concept at all — the abstraction is additive, not a rewrite of the supported path.
 
+**Switching runtimes — `herd runtime switch`.** Move one machine between runtimes without changing
+the project's shared configuration:
+
+```sh
+herd runtime switch codex --dry-run     # show the proposed HERD_DRIVER + MODEL_* map, write nothing
+herd runtime switch codex               # apply it: verify binary + login + argv composition, then write
+herd runtime switch grok                # or: switch to grok
+herd runtime switch herdr-claude        # reverse to default
+```
+
+The switch shows every proposed value first (`HERD_DRIVER`, all `MODEL_*` runtime roles, all
+`REVIEW_MODEL_*` tiers), preflights the target binary (installed, logged in, able to compose both
+interactive and one-shot argument vectors), then writes the complete map to the gitignored
+`.herd/config.local` with one atomic rename and reloads the control room exactly once. The committed
+`.herd/config` and `.herd/secrets` are never changed. Authenticate first if preflight reports the
+runtime is logged out:
+
+```sh
+claude auth login    # Claude Code
+codex login          # Codex
+grok auth login      # Grok
+```
+
+**Codex permission modes.** When `HERD_DRIVER=codex` the lanes default to
+`--dangerously-bypass-approvals-and-sandbox` (alias `--yolo`) — full autonomy in an isolated
+worktree. A safer alternative that allows only filesystem writes inside the workspace but never
+prompts for approval is `--sandbox workspace-write --ask-for-approval never`. Per-machine permission
+flag overrides are accepted by every lane script and take the driver's exact flag string verbatim.
+Note that `--dangerously-skip-permissions` is Claude Code's flag and is not accepted by the Codex
+CLI.
+
+**Grok permission modes.** When `HERD_DRIVER=grok` the lanes default to `--always-approve` (alias
+`--yolo`) — full autonomy in an isolated worktree with auto-approval of tool executions. This is
+Grok Build's hands-off mode for unattended builders. Per-machine permission flag overrides are
+accepted by every lane script and take the driver's exact flag string verbatim; there is no Grok
+equivalent to Codex's granular sandbox modes — `--always-approve` is the canonical autonomy flag.
+Note that `--dangerously-skip-permissions` is Claude Code's flag and is not accepted by the Grok
+CLI.
+
+**Adversarial review panes.** In the default single-reviewer path the reviewer agent opens a visible
+interactive TUI pane — split into the builder's tab so the user can watch reasoning live — and the
+pane retires automatically after the verdict is collected. Headless execution is used when herdr is
+absent, when the builder tab is already gone, when the pane is suppressed via env override, or when
+a review panel fans out across multiple models (panel mode always uses headless fan-out + verdict
+fold); in those cases a headless log viewer may open alongside the builder tab if one exists,
+falling back to a standalone tab.
+
 ---
 
 ## Governance profiles + fleet
@@ -535,6 +582,61 @@ Then:
 cd your-project
 herd init
 ```
+
+### As a herdr plugin
+
+herdkit is also a first-class [herdr plugin](https://herdr.dev/docs/plugins/), listed on the herdr
+plugin marketplace:
+
+```sh
+herdr plugin install briankeegan1/herdkit          # from the marketplace (confirms, then runs the build step)
+herdr plugin install --yes briankeegan1/herdkit    # non-interactive
+herdr plugin link ~/source/herdkit                 # or: a local checkout you already have
+herdr plugin action list --plugin herdkit          # verify what you got
+```
+
+herdr clones this repo into its plugin store — that clone **is** the engine — and the build step
+runs `install.sh` to wire `herd` onto your `PATH` + run the doctor. You then get six workspace-scoped
+actions in herdr's action menu, each opening a pane in the focused workspace's project directory:
+
+| action id | what it runs | notes |
+|---|---|---|
+| `herdkit.init` | `herd init` | interactive interview + repo scout → writes `.herd/config`, renders the coordinator skill |
+| `herdkit.launch` | `scripts/herd/coordinator.sh` | the control room: coordinator agent + pinned backlog + 🐑 watch console (needs an initialized project) |
+| `herdkit.reload` | `herd reload` | rebuild the control room around a live coordinator |
+| `herdkit.status` | `herd status` | one-shot read-only snapshot |
+| `herdkit.backlog` | `herd backlog --rich` | open work items with state/assignee via the active tracker backend |
+| `herdkit.doctor` | `herd doctor` | dependency doctor with per-platform hints |
+
+Bind any action to a key with `plugin_action` → `herdkit.<verb>` in `~/.config/herdr/config.toml`.
+See [`packaging/herdr/README.md`](packaging/herdr/README.md) for key-binding syntax and pane placement
+options.
+
+### As a Codex plugin
+
+When `HERD_DRIVER=codex`, herdkit also ships as a **Codex plugin** that exposes the coordinator as
+an installable skill. It is a thin wrapper: it does not contain coordinator logic — on invocation it
+runs `herd render` and delegates to the CLI-rendered `.agents/skills/herd-coordinator/SKILL.md`.
+
+Install the herdkit CLI first (it is a hard prerequisite: the plugin calls `herd render` at
+runtime), then register the marketplace and install the plugin:
+
+```sh
+codex plugin marketplace add briankeegan1/herdkit
+codex plugin add herdkit-coordinator@herdkit
+```
+
+Verify the install with `codex plugin list --json`. From a herd-initialized project, invoke the skill
+by its namespaced id:
+
+```
+herdkit-coordinator:herd-coordinator
+```
+
+It verifies `herd` is on `PATH`, confirms `.herd/config` exists (else prompts for `herd init`), runs
+`herd render`, then follows the CLI-rendered coordinator skill. The plugin holds no coordinator
+prose — the CLI and template stay the single source of truth. See
+[`plugins/herdkit-coordinator/README.md`](plugins/herdkit-coordinator/README.md).
 
 ### Manual — clone + wire PATH yourself
 
@@ -790,12 +892,14 @@ The direction is **build-your-own-workflow**: the same engine, configured — no
 project, and increasingly for work that isn't a GitHub PR at all. The seams already carry this —
 pluggable **work-unit kinds** (`WORK_UNIT_KIND`, `git-pr` shipped, `doc-apply` shipped opt-in),
 pluggable **work-tracker backends** (`SCRIBE_BACKEND`), a runtime **driver** binding (`HERD_DRIVER`,
-with `headless`/`codex`/`grok` shipped alongside the default), pluggable **grounding sources**
-(`CONTEXT_PROVISION`, `MCP_PROVISION`), and now a per-project **agent roster** (`HERD_AGENT`) — so
-the near work is widening each: a `config-apply` work-unit kind for committed, non-secret config
-surfaces; routing resume / model-switch / limit-detection through the non-Claude runtime drivers
-(today only interactive-spawn and the agent-roster bindings are routed); more trackers; more
-grounding lanes — each a small, well-scoped adapter behind a documented contract.
+with `headless`/`codex`/`grok` shipped alongside the default, each binding the full exec surface:
+spawn, one-shot, resume, model-switch, permission mode, process signature), pluggable **grounding
+sources** (`CONTEXT_PROVISION`, `MCP_PROVISION`), and now a per-project **agent roster**
+(`HERD_AGENT`) — so the near work is widening each: a `config-apply` work-unit kind for committed,
+non-secret config surfaces; limit-detection and cost-token parsing for the non-Claude drivers (today
+these degrade gracefully: limit detection falls through to the hook sentinel + resume backstop, and
+cost surfaces `unpriced` rather than fabricating a figure); more trackers; more grounding lanes —
+each a small, well-scoped adapter behind a documented contract.
 
 The other live thread is **many operators, not just many seats**: `AUTOFIX_SCOPE` scoped the four
 autofix write rails this month, and the remaining unscoped surfaces are enumerated as open gaps in
@@ -858,6 +962,8 @@ templates/                      coordinator.md.tmpl, config.example, capabilitie
 docs/                           codemap.md + symbol-index.md (committed engine maps) + reference docs
                                 (isolation-boundary.md — what the engine will and will not touch;
                                 multi-operator-ownership.md — whose work a seat may act on)
+herdr-plugin.toml               herdkit as a herdr plugin (marketplace manifest; helpers in packaging/herdr/)
+plugin/  plugins/  packaging/     the Claude Code plugin, the Codex plugin, homebrew/npm/herdr packaging
 tests/                          hermetic shell + python tests and a bats wrapper
 .herd/                          herdkit's OWN dogfood config + healthcheck + review checklist
   agents/                       its committed specialist agent definitions

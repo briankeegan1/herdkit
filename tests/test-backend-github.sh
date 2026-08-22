@@ -110,6 +110,14 @@ grep -q -- "--title add a dark-mode toggle" "$GHLOG" || fail "add_item did not p
 grep -q -- "--body add a dark-mode toggle" "$GHLOG" || fail "add_item did not pass the request as --body"
 pass
 
+# 1a. HERD-787 explicit-title seam: normalized title is separate from the full directive body.
+: > "$GHLOG"
+DIRECTIVE="Add a planned item: Reap merged Codex builders — close their tabs after merge."
+run _backend_add_item REQ1A "$DIRECTIVE" "Reap merged Codex builders" >/dev/null
+grep -q -- "--title Reap merged Codex builders" "$GHLOG" || fail "explicit GitHub title was not used ($(cat "$GHLOG"))"
+grep -q -- "--body $DIRECTIVE" "$GHLOG" || fail "explicit GitHub title replaced/changed the full body ($(cat "$GHLOG"))"
+pass
+
 # 2. list_open → parses the canned `gh issue list` JSON to "#<number> <title>" lines.
 open="$(run _backend_list_open)"
 grep -q -- "issue list -R acme/widgets --state open" "$GHLOG" || fail "list_open did not invoke 'gh issue list --state open' on TRACKER_REPO"

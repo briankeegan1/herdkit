@@ -48,15 +48,22 @@
 # ("steering: not yet probeable (step 7 pending)") rather than left out of the list — an absent row
 # reads as "nothing to check here", which is the lie this arrangement exists to prevent.
 #
-# SCOPE: codex carries the only LIVE probes — the three that actually call production machinery
-# (agents.sh's real injection path, codex-exec-adapter.sh, the real .codex/agents scan) against a real
-# binary. Grok (HERD-767, epic HERD-754 step 8) has no built live-probe implementation — building one
-# on a guessed event schema would be exactly the fabrication this framework exists to avoid (grok's own
-# `--output-format json/streaming-json` EXISTS per docs but its event shape has never been observed; see
-# templates/drivers/grok.driver's ONESHOT_EXEC comment) — so grok gets a single, explicit `deferred` row
-# instead: this file's hook point (herd_rtconf_driver / herd_rtconf_probes, both driver-aware below)
-# reports "grok is not installed on this machine" / "not yet probeable" honestly, the same way codex's
-# own step-7 rows do, rather than grok being silently absent from `herd doctor` the way it was before.
+# SCOPE: BOTH codex and grok now carry LIVE probes that call production machinery against a real binary.
+#   • codex — three probes (agents.sh's real injection path, codex-exec-adapter.sh, the real
+#     .codex/agents scan), ground-truthed on codex-cli 0.147.0.
+#   • grok — four probes (HERD-800, epic HERD-782 ph2), ground-truthed on grok 1.0.5 (5115b46bc909),
+#     which IS installed at ~/.local/bin/grok (the earlier "grok is not installed" notes here and in
+#     templates/drivers/grok.driver were stale) but is NOT authenticated (`grok models` prints "You are
+#     not authenticated"). The four are AUTHLESS on purpose, so they yield real evidence even on an
+#     unauthenticated binary: grok-argv (the exec adapter's `grok -p --output-format
+#     streaming-messages-json --cwd --permission-mode` invocation is accepted, not argv-rejected),
+#     grok-structured-output (grok-exec-adapter.sh parses grok's real streaming-messages-json — the
+#     Anthropic Messages wire format grok's --help documents, observed live — into a typed object with a
+#     terminal result envelope), grok-rules-discovery and grok-agent-discovery (both via `grok inspect`,
+#     each with a negative control). The one thing an unauthenticated binary genuinely CANNOT prove — a
+#     real turn run to COMPLETION with a real reply — is declared `deferred` (grok-exec-turn) rather than
+#     guessed, alongside grok's own resume/steering/interruption deferrals; every probe fail-softs
+#     (absent binary → unavailable row, unauthenticated → the honest note above, never a red).
 #
 # CONTRACT:
 #   • SOURCED, not executed, by bin/herd's `herd doctor --runtime-conformance`. Defines functions
@@ -101,6 +108,10 @@ _herd_rtconf_default_driver() {
 # driver.sh's own binding reader (never a hardcoded 'codex' literal). Falls back to the driver name
 # when driver.sh is not sourced, so a bare CLI run still resolves something real.
 herd_rtconf_runtime() {
+  # HERD_RTCONF_RUNTIME overrides explicitly — the test seam that lets the absent-binary degrade be
+  # asserted (point it at a name nothing installs) without depending on what this machine happens to
+  # have on PATH. Mirrors HERD_RTCONF_VERSION / HERD_RTCONF_DRIVER.
+  if [ -n "${HERD_RTCONF_RUNTIME:-}" ]; then printf '%s' "$HERD_RTCONF_RUNTIME"; return 0; fi
   local drv="${1:-$(herd_rtconf_driver)}" rt=""
   if command -v herd_driver_agent_runtime >/dev/null 2>&1; then
     rt="$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)"
@@ -155,18 +166,23 @@ herd_rtconf_probes_codex() {
 "interruption	deferred	interrupt a run mid-flight	needs durable SDK/app-server coordination (HERD-754 step 7, not built yet) — a bounded one-shot call can only be killed, which proves nothing about interruption semantics"
 }
 
-# herd_rtconf_probes_grok — ONE explicit, honest `deferred` row (HERD-767, epic HERD-754 step 8) rather
-# than silence. No live probe implementation exists: building one (a grok-exec-adapter parsing
-# `--output-format json/streaming-json`, a roster injection probe for DEFINITION_MODE=install, …) on a
-# schema nobody has observed would be exactly the guessing this framework exists to refuse — see
-# templates/drivers/grok.driver's ONESHOT_EXEC comment. `herd_rtconf_run`/`herd_rtconf_report` already
-# report the installed-version state (`unavailable`/`<not installed>`) around this row using the real
-# grok binary name, resolved the same driver-generic way as codex's — so on every machine that has
-# actually run this (none, as of this audit), the honest "grok is not installed on this machine" line
-# prints instead of grok being absent from `herd doctor` output entirely.
+# herd_rtconf_probes_grok — FOUR live probes + FOUR explicit deferred rows (HERD-800, epic HERD-782
+# ph2). The live probes are AUTHLESS by design so they yield real, version-keyed evidence on this
+# machine's installed-but-unauthenticated grok 1.0.5; the one capability an unauthenticated binary
+# cannot honestly prove (a turn run to COMPLETION) is deferred as grok-exec-turn, not guessed. Ground
+# truth: grok 1.0.5 (5115b46bc909) @ ~/.local/bin/grok, `grok --help` + observed streaming-messages-json
+# envelope (see scripts/herd/grok-exec-adapter.sh's header). Backticks inside the detail column are
+# doubled-quoted below so a re-audit that copies a row into a shell never eval-expands them.
 herd_rtconf_probes_grok() {
   printf '%s\n' \
-"grok-runtime	deferred	grok exec-binding conformance (epic HERD-754 step 8)	no live probe implementation exists yet (HERD-754 step 8, HERD-767) — templates/drivers/grok.driver's exec bindings were re-audited against docs.x.ai on 2026-08-18 but grok is not installed on any machine that has built a live probe, so real runtime BEHAVIOR (argv acceptance, --rules/--continue composition, --output-format event shape) stays unverified; deferred honestly rather than guessed, same discipline as codex's step-7 rows"
+"grok-argv	live	grok exec argv shape accepted	the exec adapter's grok -p --output-format streaming-messages-json --cwd --permission-mode invocation is accepted by the installed binary (the init envelope emits; grok does not reject it as an argv/usage error) — the guard against a relied-on flag being renamed or removed" \
+"grok-structured-output	live	structured events from streaming-messages-json	grok-exec-adapter.sh parses grok's real streaming-messages-json stream (the Anthropic Messages wire format grok --help documents) into a typed object carrying a terminal result envelope — the wire FORMAT is verified even unauthenticated; a COMPLETED turn is grok-exec-turn (deferred)" \
+"grok-rules-discovery	live	project rule (AGENTS.md) auto-discovery	grok inspect lists a project AGENTS.md as a project instruction (positive) while an empty project reports none (negative control) — the live check behind grok.driver's context-injection premise" \
+"grok-agent-discovery	live	project .grok/agents definition discovery	grok inspect lists a project-scope .grok/agents definition by name (positive) while an unknown name is absent (negative control) — note: grok 1.0.5 DOES surface repo-local .grok/agents at project scope, a change from the 1.0.3 install-only note in grok.driver" \
+"grok-exec-turn	deferred	a real COMPLETED bounded turn	requires an AUTHENTICATED grok — a signed-in binary is needed to run a turn to completion (this machine's grok is installed but not signed in); the streaming-messages-json wire FORMAT is already proven live by grok-structured-output, so only turn COMPLETION (a real reply + real session identity) stays deferred until grok login" \
+"grok-session-resume	deferred	resume an EXACT prior session	needs an authenticated session plus durable coordination (a later HERD-782 phase) — grok's -c/--continue and -r/--resume are documented but cannot be exercised on an unauthenticated binary, and nothing here holds a live session to re-enter" \
+"grok-steering	deferred	steer a run mid-flight	needs durable app-server/leader coordination (a later HERD-782 phase) — no live grok session exists here to send a mid-run instruction to" \
+"grok-interruption	deferred	interrupt a run mid-flight	needs durable coordination (a later HERD-782 phase) — a bounded one-shot call can only be killed, which proves nothing about grok's interruption semantics"
 }
 
 # herd_rtconf_probe_field <id> <col> — one field (2=mode, 3=title, 4=detail) of a probe row, or empty
@@ -411,12 +427,163 @@ EOF
   fi
 }
 
+# ── grok live probes (HERD-800, epic HERD-782 ph2) ───────────────────────────────────────────────
+# All four are AUTHLESS: grok inspect needs no sign-in, and the exec probes assert the ARGV shape and
+# the WIRE-FORMAT envelope, both of which grok emits before (and independent of) authenticating. Every
+# one fail-softs to a labelled row on a missing binary/jq/scratch dir — never a red under set -euo.
+
+# GROK_BIN test seam, mirroring grok-exec-adapter.sh's own — so the probes can be pointed at a stub.
+_herd_rtconf_grok_bin() { printf '%s' "${GROK_BIN:-grok}"; }
+_herd_rtconf_grok_available() { command -v "$(_herd_rtconf_grok_bin)" >/dev/null 2>&1; }
+
+# _herd_rtconf_grok_authenticated — success iff `grok models` does NOT report an unauthenticated state.
+# Used only to ANNOTATE probe notes honestly (never to fail a probe): the authless probes pass either
+# way; this just lets the note say "installed but not signed in" when that is the truth.
+_herd_rtconf_grok_authenticated() {
+  local bin out; bin="$(_herd_rtconf_grok_bin)"
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  out="$("$bin" models </dev/null 2>&1 || true)"
+  case "$out" in
+    *"not authenticated"*|*"not signed in"*|*"Not authenticated"*|*"Not signed in"*) return 1 ;;
+  esac
+  return 0
+}
+
+# _herd_rtconf_bound — set the global _RT_BOUND array to a timeout-command prefix (or empty when no
+# timeout binary exists — a missing bound degrades to unbounded, never disables the probe). Same
+# gtimeout/run-anyway discipline as the codex bounded helpers above.
+_herd_rtconf_bound() {
+  _RT_BOUND=()
+  if command -v timeout >/dev/null 2>&1; then _RT_BOUND=(timeout "${HERD_RTCONF_TIMEOUT:-150}")
+  elif command -v gtimeout >/dev/null 2>&1; then _RT_BOUND=(gtimeout "${HERD_RTCONF_TIMEOUT:-150}"); fi
+}
+_RT_BOUND=()
+
+# _herd_rtconf_grok_inspect <dir> — one bounded `grok inspect` run from inside <dir>, stdout+stderr
+# together (the discovery listing is on stdout, but capturing both is harmless and robust).
+_herd_rtconf_grok_inspect() {
+  local dir="${1:-}" bin; bin="$(_herd_rtconf_grok_bin)"
+  _herd_rtconf_bound
+  ( cd "$dir" 2>/dev/null && "${_RT_BOUND[@]}" "$bin" inspect </dev/null 2>&1 ) || true
+}
+
+# probe: grok-argv — the exec adapter's real invocation is ACCEPTED by the installed binary (not an
+# argv/usage rejection). Passes on an unauthenticated binary (the init envelope still emits); fails only
+# on a genuine flag-drift (rc 2 / "unexpected argument").
+_herd_rtconf_probe_grok_argv() {
+  local wt="${1:-}" bin out rc
+  bin="$(_herd_rtconf_grok_bin)"
+  command -v "$bin" >/dev/null 2>&1 || { printf 'unavailable\tgrok binary not present on this machine'; return 0; }
+  _herd_rtconf_bound
+  out="$("${_RT_BOUND[@]}" "$bin" -p "conformance argv probe" --output-format streaming-messages-json --cwd "$wt" --permission-mode acceptEdits </dev/null 2>&1)"; rc=$?
+  case "$out" in
+    *"unexpected argument"*|*"unrecognized"*|*"tip: to pass"*)
+      printf 'fail\tgrok rejected the adapter argv as an unexpected/unrecognized argument — a flag the exec adapter relies on may have been renamed or removed (run: %s -p ... --output-format streaming-messages-json --cwd <wt> --permission-mode acceptEdits)' "$bin"; return 0 ;;
+  esac
+  [ "$rc" -eq 2 ] && { printf 'fail\tgrok exited 2 (argv/usage) for the adapter invocation — flag drift'; return 0; }
+  case "$out" in
+    *'"type":"system"'*'"subtype":"init"'*)
+      if _herd_rtconf_grok_authenticated; then
+        printf 'pass\tadapter argv accepted and the streaming-messages-json init envelope emitted (grok authenticated)'
+      else
+        printf 'pass\tadapter argv accepted and the streaming-messages-json init envelope emitted; grok is installed but NOT signed in, so the turn itself cannot complete (grok-exec-turn, deferred)'
+      fi ;;
+    *) printf 'fail\tgrok accepted the argv but emitted no streaming-messages-json init envelope — the output shape may have changed' ;;
+  esac
+}
+
+# probe: grok-structured-output — one bounded turn through the PRODUCTION adapter (never a
+# re-implementation), asserting the real streaming-messages-json envelope parses into a typed object.
+_herd_rtconf_probe_grok_structured_output() {
+  local wt="${1:-}" out events subtype state adapter="$_HERD_RTCONF_HERE/grok-exec-adapter.sh"
+  command -v jq >/dev/null 2>&1 || { printf 'unavailable\tjq not installed — the adapter cannot parse events on this machine'; return 0; }
+  _herd_rtconf_grok_available || { printf 'unavailable\tgrok binary not present on this machine'; return 0; }
+  [ -f "$adapter" ] || { printf 'unavailable\tgrok-exec-adapter.sh not found beside runtime-conformance.sh'; return 0; }
+  _herd_rtconf_bound
+  # timeout cannot wrap a shell function → re-enter a fresh bash that sources the adapter and calls it,
+  # the identical trick _herd_rtconf_bounded_adapter_run uses for codex.
+  out="$("${_RT_BOUND[@]}" bash -c '. "$1"; grok_exec_adapter_run "$2" "$3"' _ "$adapter" "$wt" "Reply with exactly and only the single word: herdgrokrtconf" 2>/dev/null || true)"
+  [ -n "$out" ] || { printf 'fail\tthe adapter produced no output at all for a bounded grok turn'; return 0; }
+  events="$(printf '%s' "$out" | jq -r '.raw_event_count // 0' 2>/dev/null || printf 0)"
+  subtype="$(printf '%s' "$out" | jq -r '.result_subtype // ""' 2>/dev/null || true)"
+  state="$(printf '%s' "$out" | jq -r '.state // ""' 2>/dev/null || true)"
+  case "${events:-}" in ''|*[!0-9]*) events=0 ;; esac
+  if [ "$events" -lt 2 ] || [ -z "$subtype" ] || [ "$subtype" = "null" ]; then
+    printf 'fail\tthe streaming-messages-json envelope did not parse (raw_event_count=%s result_subtype=%s) — the wire shape may have changed' "$events" "${subtype:-<none>}"; return 0
+  fi
+  if [ "$state" = "completed" ]; then
+    local msg; msg="$(printf '%s' "$out" | jq -r '.final_agent_message // ""' 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+    case "$msg" in
+      *herdgrokrtconf*) printf 'pass\treal streaming-messages-json stream parsed to state=completed with a real session_id, %s events, reply carried through' "$events" ;;
+      *)                printf 'pass\treal streaming-messages-json stream parsed to state=completed, %s events (reply wording differed — model output, not a protocol change)' "$events" ;;
+    esac
+  elif [ "$(printf '%s' "$out" | jq -r '.unauthenticated // false' 2>/dev/null)" = "true" ]; then
+    printf 'pass\tthe streaming-messages-json envelope parsed cleanly (init + result, %s events); grok is installed but NOT signed in so the turn did not complete — the wire FORMAT is verified, a completed turn stays deferred (grok-exec-turn)' "$events"
+  else
+    printf 'fail\tthe envelope parsed but the turn neither completed nor reported unauthenticated (state=%s subtype=%s) — investigate' "$state" "$subtype"
+  fi
+}
+
+# probe: grok-rules-discovery — `grok inspect` discovers a project AGENTS.md, POSITIVE and NEGATIVE
+# control, in an isolated scratch project (never this checkout — which has its own AGENTS.md).
+_herd_rtconf_probe_grok_rules_discovery() {
+  local dir out_neg out_pos sentinel pos_ok=0 neg_ok=0
+  _herd_rtconf_grok_available || { printf 'unavailable\tgrok binary not present on this machine'; return 0; }
+  dir="$(mktemp -d)" || { printf 'unavailable\tcould not create a scratch project dir'; return 0; }
+  git -C "$dir" init -q >/dev/null 2>&1 || true
+  sentinel="HERD-RTCONF-RULES-$$-$(date +%s)"
+  out_neg="$(_herd_rtconf_grok_inspect "$dir")"                      # empty project → no instructions
+  printf 'Grok project rule for the rtconf probe. sentinel: %s\n' "$sentinel" > "$dir/AGENTS.md"
+  out_pos="$(_herd_rtconf_grok_inspect "$dir")"                      # AGENTS.md present → one instruction
+  rm -rf "$dir" 2>/dev/null || true
+  case "$out_neg" in *"Project Instructions (0)"*) neg_ok=1 ;; esac
+  case "$out_pos" in
+    *"Project Instructions (0)"*) pos_ok=0 ;;
+    *"gents.md"*)                 pos_ok=1 ;;    # grok normalizes AGENTS.md → "Agents.md" in the listing
+  esac
+  if [ "$pos_ok" -eq 1 ] && [ "$neg_ok" -eq 1 ]; then
+    printf 'pass\tgrok inspect discovers a project AGENTS.md as a project instruction; the empty-project negative control correctly reported none'
+  elif [ "$pos_ok" -eq 1 ]; then
+    printf 'indeterminate\tthe empty-project negative control did NOT report zero instructions — the probe cannot isolate discovery, so it proves nothing'
+  else
+    printf 'fail\tgrok inspect did NOT discover a project AGENTS.md — the project-rule auto-discovery grok.driver depends on may have changed'
+  fi
+}
+
+# probe: grok-agent-discovery — `grok inspect` discovers a project-scope .grok/agents definition by
+# name, POSITIVE and a unique-name NEGATIVE control, in an isolated scratch project.
+_herd_rtconf_probe_grok_agent_discovery() {
+  local dir out_neg out_pos name pos_ok=0 neg_hit=0
+  _herd_rtconf_grok_available || { printf 'unavailable\tgrok binary not present on this machine'; return 0; }
+  dir="$(mktemp -d)" || { printf 'unavailable\tcould not create a scratch project dir'; return 0; }
+  git -C "$dir" init -q >/dev/null 2>&1 || true
+  name="rtconfprobe$$$(date +%s)"                                   # unique, [a-z0-9], no dashes
+  out_neg="$(_herd_rtconf_grok_inspect "$dir")"                     # the name must be absent before we create it
+  mkdir -p "$dir/.grok/agents" 2>/dev/null || true
+  printf -- '---\nname: %s\ndescription: HERD-800 rtconf agent-discovery probe\n---\n\nYou are the rtconf probe agent.\n' "$name" > "$dir/.grok/agents/$name.md"
+  out_pos="$(_herd_rtconf_grok_inspect "$dir")"
+  rm -rf "$dir" 2>/dev/null || true
+  case "$out_pos" in *"$name"*) pos_ok=1 ;; esac
+  case "$out_neg" in *"$name"*) neg_hit=1 ;; esac
+  if [ "$pos_ok" -eq 1 ] && [ "$neg_hit" -eq 0 ]; then
+    printf 'pass\tgrok inspect lists a project-scope .grok/agents definition by name; the unknown-name negative control was correctly absent (grok 1.0.5 surfaces repo-local .grok/agents at project scope)'
+  elif [ "$pos_ok" -eq 0 ]; then
+    printf 'fail\tgrok inspect did NOT list the project .grok/agents definition — project-level agent discovery may have moved or been removed; re-check grok.driver DEFINITION_DIR/SELECT_FLAG'
+  else
+    printf 'indeterminate\tthe unique probe name appeared BEFORE it was created — the negative control is compromised, so the probe proves nothing'
+  fi
+}
+
 # _herd_rtconf_dispatch <probe-id> <workdir> — the id → implementation map, in one place.
 _herd_rtconf_dispatch() {
   case "${1:-}" in
-    specialist-definition)   _herd_rtconf_probe_specialist_definition "${2:-}" ;;
-    structured-exec-events)  _herd_rtconf_probe_structured_exec_events "${2:-}" ;;
-    project-agent-discovery) _herd_rtconf_probe_project_agent_discovery "${2:-}" ;;
+    specialist-definition)     _herd_rtconf_probe_specialist_definition "${2:-}" ;;
+    structured-exec-events)    _herd_rtconf_probe_structured_exec_events "${2:-}" ;;
+    project-agent-discovery)   _herd_rtconf_probe_project_agent_discovery "${2:-}" ;;
+    grok-argv)                 _herd_rtconf_probe_grok_argv "${2:-}" ;;
+    grok-structured-output)    _herd_rtconf_probe_grok_structured_output "${2:-}" ;;
+    grok-rules-discovery)      _herd_rtconf_probe_grok_rules_discovery ;;
+    grok-agent-discovery)      _herd_rtconf_probe_grok_agent_discovery ;;
     *) printf 'unavailable\tno live probe implementation for "%s"' "${1:-<empty>}" ;;
   esac
 }
@@ -571,5 +738,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   . "$_HERD_RTCONF_HERE/agents.sh"
   # shellcheck source=/dev/null
   . "$_HERD_RTCONF_HERE/codex-exec-adapter.sh"
+  # shellcheck source=/dev/null
+  . "$_HERD_RTCONF_HERE/grok-exec-adapter.sh"
   _herd_rtconf_cli "$@"
 fi

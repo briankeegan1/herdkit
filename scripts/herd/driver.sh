@@ -359,6 +359,50 @@ sys.stdout.write("".join(tok + "\0" for tok in out))
 '
 }
 
+# herd_driver_agent_argv_description <driver> <model> <flags> — render the operator-facing portion
+# of the interactive runtime argv from the SAME resolved driver binding used by the spawn composer.
+# The opening prompt and runtime-specific rules/context payloads are deliberately omitted: banners
+# identify the executable, model, and permission posture without echoing task text or injected repo
+# conventions. BYTE-IDENTICAL for the default driver: `claude --model <model> <flags>`.
+# FAIL-SOFT: a missing or malformed binding falls back to today's Claude-shaped description.
+herd_driver_agent_argv_description() {
+  local drv="${1:-}" model="${2:-}" flags="${3:-}" binding perm
+  [ -n "$drv" ] || drv="$(herd_driver_name)"
+  binding="$(herd_driver_agent_value DRIVER_AGENT_INTERACTIVE_SPAWN "" "$drv")"
+  perm="$(herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG "" "$drv")"
+  [ -n "$binding" ] || binding='claude --model <model> --dangerously-skip-permissions "<prompt>"'
+  [ -n "$perm" ]    || perm='--dangerously-skip-permissions'
+  HERD_DESC_BINDING="$binding" HERD_DESC_PERM="$perm" HERD_DESC_MODEL="$model" \
+  HERD_DESC_FLAGS="$flags" python3 -c '
+import os, shlex
+try:
+    toks = shlex.split(os.environ["HERD_DESC_BINDING"])
+    model = os.environ["HERD_DESC_MODEL"]
+    flags = os.environ["HERD_DESC_FLAGS"].split()
+    perm = os.environ["HERD_DESC_PERM"]
+    out = []
+    for t in toks:
+        if t == "<prompt>":
+            continue
+        if t == "<agents-rules>":
+            if out:
+                out.pop()
+            continue
+        if t == "<model>":
+            if model:
+                out.append(model)
+            elif out and out[-1] == "--model":
+                out.pop()
+        elif t == perm:
+            out.extend(flags)
+        else:
+            out.append(t)
+except Exception:
+    out = ["claude"] + (["--model", os.environ["HERD_DESC_MODEL"]] if os.environ["HERD_DESC_MODEL"] else []) + os.environ["HERD_DESC_FLAGS"].split()
+print(" ".join(out), end="")
+'
+}
+
 # herd_driver_lane_permission_flags <driver> — the permission FLAGS a builder LANE passes as the spawn's
 # <flags> (which herd_driver_agent_spawn_argv substitutes for <driver>'s DRIVER_AGENT_PERMISSION_FLAG
 # token). HERD-201: the lanes previously hardcoded CLAUDE_FLAGS to claude's --dangerously-skip-permissions
@@ -1377,6 +1421,59 @@ _herd_headless_start_agent() {
   printf 'working\n' > "$adir/status" 2>/dev/null || true
   [ -s "$adir/pid" ]
 }
+# _herd_codex_stop_hook_argv_fragment <slug> — write the Codex interactive stop-hook scripts for <slug>
+# into <agent-dir>/hook/ and emit the codex argv elements (NUL-terminated, like herd_driver_agent_spawn_argv)
+# that inject them. Validated TOML shape (Codex 0.147.0, features.hooks=stable):
+#   hooks.Stop=[{hooks=[{type="command",command="PATH",timeout=3}]}]
+#   hooks.UserPromptSubmit=[{hooks=[{type="command",command="PATH",timeout=3}]}]
+#   --dangerously-bypass-hook-trust
+# Event names are Pascal-cased (Stop, UserPromptSubmit) — not snake_case. The caller inserts these
+# BEFORE the positional prompt so codex sees them as global options (prompt is always last in the
+# DRIVER_AGENT_INTERACTIVE_SPAWN template). Fail-soft: any mkdir/write failure emits nothing.
+_herd_codex_stop_hook_argv_fragment() {
+  local slug="${1:-}" hook_dir adir
+  [ -n "$slug" ] || return 0
+  adir="$(_herd_agent_dir "$slug")" || return 0
+  hook_dir="$adir/hook"
+  mkdir -p "$hook_dir" 2>/dev/null || return 0
+
+  # Stop hook: fires when Codex completes a turn (Stop event, stable in 0.147.0). Receives JSON on
+  # stdin ({turn_id, stop_hook_active, last_assistant_message}). Must print valid JSON to stdout.
+  cat > "$hook_dir/stop.sh" 2>/dev/null <<HOOKEOF
+#!/usr/bin/env bash
+input="\$(cat 2>/dev/null || true)"
+turn_id="\$(printf '%s' "\$input" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("turn_id",""))' 2>/dev/null || true)"
+if [ -n "\$turn_id" ]; then
+  printf '%s' "\$turn_id" > "$hook_dir/last-turn"
+  rm -f "$hook_dir/current-turn"
+fi
+printf '{}\n'
+exit 0
+HOOKEOF
+  chmod +x "$hook_dir/stop.sh" 2>/dev/null || return 0
+
+  # UserPromptSubmit hook: fires when the user submits a prompt (new turn started). Schema does not
+  # guarantee turn_id; hook invocation itself is structured evidence. Use a timestamp as the marker
+  # so _herd_codex_hook_lifecycle can distinguish in-flight (current-turn present) from idle.
+  cat > "$hook_dir/user-prompt-submit.sh" 2>/dev/null <<HOOKEOF
+#!/usr/bin/env bash
+ts="\$(date -u +%s 2>/dev/null || printf '%s' "\$\$")"
+printf '%s' "\$ts" > "$hook_dir/current-turn" 2>/dev/null || true
+printf '{}\n'
+exit 0
+HOOKEOF
+  chmod +x "$hook_dir/user-prompt-submit.sh" 2>/dev/null || return 0
+
+  # Emit NUL-terminated argv. TOML matcher-group array shape required by Codex 0.147.0.
+  # The command value is wrapped in TOML-escaped double quotes (\"...\") so that when Codex passes
+  # the command string to a shell, the double-quoted path survives spaces in WORKTREES_DIR.
+  # TOML escape: \"PATH\" → TOML string value "/foo bar/stop.sh" → shell: "/foo bar/stop.sh" (safe).
+  printf '%s\0%s\0%s\0%s\0%s\0' \
+    "-c" "hooks.Stop=[{hooks=[{type=\"command\",command=\"\\\"${hook_dir}/stop.sh\\\"\",timeout=3}]}]" \
+    "--dangerously-bypass-hook-trust" \
+    "-c" "hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"\\\"${hook_dir}/user-prompt-submit.sh\\\"\",timeout=3}]}]"
+}
+
 _herd_herdr_start_agent() {
   local slug="$1" wt="$2" model="$3" flags="$4" pointer="$5" split="$6" rt_driver="${7:-}"
   local wsid; wsid="$(herd_resolve_workspace_id 2>/dev/null || true)"
@@ -1391,6 +1488,38 @@ _herd_herdr_start_agent() {
   # Compose the agent-runtime argv (the part after `--`) from the resolved driver's P1 binding (P2).
   local -a rt=(); local t
   while IFS= read -r -d '' t; do rt+=("$t"); done < <(herd_driver_agent_spawn_argv "${rt_driver:-$(herd_driver_name)}" "$model" "$flags" "$pointer")
+  # HERD-788: inject Codex stop-hook argv when CODEX_STOP_HOOK=on and the spawn driver is codex.
+  # Hook flags are global codex options and MUST precede the positional prompt (always the last
+  # element in DRIVER_AGENT_INTERACTIVE_SPAWN templates). Default-off and byte-identical for all
+  # non-codex drivers. Fail-soft: a write failure emits nothing (rt unchanged, spawn proceeds).
+  if [ "${CODEX_STOP_HOOK:-}" = "on" ]; then
+    local _rt_drv="${rt_driver:-$(herd_driver_name 2>/dev/null || true)}"
+    if [ "$_rt_drv" = "codex" ] && [ "${#rt[@]}" -gt 0 ]; then
+      local _hft=(); local _ht
+      while IFS= read -r -d '' _ht; do _hft+=("$_ht"); done < <(_herd_codex_stop_hook_argv_fragment "$slug" 2>/dev/null)
+      if [ "${#_hft[@]}" -gt 0 ]; then
+        # Insert before the last element (the prompt) so hook flags reach codex as global options.
+        local _rt_last="${rt[${#rt[@]}-1]}"
+        rt=("${rt[@]:0:$((${#rt[@]}-1))}" "${_hft[@]}" "$_rt_last")
+      fi
+    fi
+  fi
+  # HERD-803: inject --session-id <uuid> for grok builder spawns when GROK_WAKE_PROOF=on, so the
+  # watcher can track which grok session belongs to this builder slug via _herd_grok_session_id.
+  # Default-off and byte-identical for all non-grok drivers. Fail-soft: uuid generation or write
+  # failure leaves rt unchanged and spawn proceeds without session tracking.
+  if [ "${GROK_WAKE_PROOF:-}" = "on" ]; then
+    local _gwp_drv="${rt_driver:-$(herd_driver_name 2>/dev/null || true)}"
+    if [ "$_gwp_drv" = "grok" ] && [ "${#rt[@]}" -gt 0 ]; then
+      local _gwp_sid
+      _gwp_sid="$(python3 -c 'import uuid; print(uuid.uuid4(), end="")' 2>/dev/null || true)"
+      if [ -n "$_gwp_sid" ]; then
+        _herd_grok_session_id_write "$slug" "$_gwp_sid" 2>/dev/null || true
+        local _gwp_last="${rt[${#rt[@]}-1]}"
+        rt=("${rt[@]:0:$((${#rt[@]}-1))}" "--session-id" "$_gwp_sid" "$_gwp_last")
+      fi
+    fi
+  fi
   # HERD-171: inject ANTHROPIC_BASE_URL when set (no-op / byte-identical when unset).
   local -a envkv=(); local _ep
   while IFS= read -r _ep; do [ -n "$_ep" ] && envkv+=("$_ep"); done < <(herd_driver_endpoint_env_lines)
@@ -1524,6 +1653,17 @@ herd_driver_launch_agent() {
   if [ "$sa_ws_set" = 1 ]; then ws="$sa_ws"; else ws="$(herd_resolve_workspace_id 2>/dev/null || true)"; fi
   local -a rt=(); local _t
   while IFS= read -r -d '' _t; do rt+=("$_t"); done < <(herd_driver_agent_spawn_argv "$sa_driver" "$sa_model" "$sa_flags" "$sa_pointer")
+  # HERD-788: inject Codex stop-hook argv when CODEX_STOP_HOOK=on and the spawn driver is codex.
+  # This is the PRIMARY interactive builder spawn seam (herd-quick.sh → herd_driver_launch_agent).
+  # Default-off and byte-identical for all non-codex drivers. Fail-soft.
+  if [ "${CODEX_STOP_HOOK:-}" = "on" ] && [ "$sa_driver" = "codex" ] && [ "${#rt[@]}" -gt 0 ]; then
+    local _la_hft=(); local _la_ht
+    while IFS= read -r -d '' _la_ht; do _la_hft+=("$_la_ht"); done < <(_herd_codex_stop_hook_argv_fragment "$sa_name" 2>/dev/null)
+    if [ "${#_la_hft[@]}" -gt 0 ]; then
+      local _la_last="${rt[${#rt[@]}-1]}"
+      rt=("${rt[@]:0:$((${#rt[@]}-1))}" "${_la_hft[@]}" "$_la_last")
+    fi
+  fi
   if _herd_herdr_attach_cli; then
     local -a envkv=(); local _l
     if [ -n "$sa_env" ]; then while IFS= read -r _l; do [ -n "$_l" ] && envkv+=("$_l"); done <<< "$sa_env"; fi
@@ -1616,18 +1756,59 @@ herd_driver_oneshot_exec() {
 herd_driver_oneshot_exec_as() {
   local drv="${1:-}" prompt="${2:-}" model="${3:-}"
   shift 3 2>/dev/null || set --
-  # HERD-177 P6: run the RESOLVED driver's runtime, not a hardwired `claude`. herd_driver_agent_runtime
-  # resolves the runtime executable from the driver's DRIVER_AGENT_ONESHOT_EXEC binding; a non-Claude
-  # driver (stub/codex/grok) runs its own binary through the SAME arg composition. The default path is
-  # the drift-guarded, BYTE-IDENTICAL `claude -p …` literal — taken whenever the runtime is claude OR
-  # unresolvable (an absent binding degrades to today's behavior, never a crash). The compose proof +
-  # the audit drift guard (tests/test-oneshot-exec-seam.sh, tests/test-driver-agent-exec.sh) are the rail.
-  local _rt; _rt="$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)"
-  if [ -n "$_rt" ] && [ "$_rt" != "claude" ]; then
-    "$_rt" -p "$prompt" --model "$model" "$@"
-  else
+  # HERD-762: compose argv from the resolved driver's DRIVER_AGENT_ONESHOT_EXEC template, mirroring
+  # herd_driver_agent_spawn_argv's use of DRIVER_AGENT_INTERACTIVE_SPAWN — reuse that mechanism, do not
+  # invent a new one. The template substitution maps:
+  #   <model>    → the model value; if EMPTY, drop it AND the preceding --model flag
+  #   <prompt>   → the prompt value (one token, verbatim)
+  #   perm token → dropped; the caller's "$@" carries the permission flag + any extra runtime flags,
+  #                appended after the composed argv — this keeps claude's argv BYTE-IDENTICAL (rail:
+  #                tests/test-oneshot-exec-seam.sh compose proof + tests/test-driver-agent-exec.sh § 3).
+  # Fail-soft: absent/unresolvable binding or Python failure degrades to today's claude literal (the
+  # drift-guarded `claude -p "$prompt" --model "$model"` kept in the fallback path below). NOT-fail-soft
+  # exit-status contract preserved: runtime exit status returned unchanged, same as before.
+  local _binding _perm
+  _binding="$(herd_driver_agent_value DRIVER_AGENT_ONESHOT_EXEC "" "$drv" 2>/dev/null || true)"
+  _perm="$(herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG "--dangerously-skip-permissions" "$drv" 2>/dev/null || true)"
+  [ -n "$_perm" ] || _perm='--dangerously-skip-permissions'
+  if [ -z "$_binding" ]; then
     claude -p "$prompt" --model "$model" "$@"
+    return
   fi
+  local _argv=()
+  while IFS= read -r -d '' _t; do _argv+=("$_t"); done < <(
+    HERD_OE_BINDING="$_binding" HERD_OE_PERM="$_perm" \
+    HERD_OE_MODEL="$model" HERD_OE_PROMPT="$prompt" \
+    python3 -c '
+import os, shlex, sys
+model  = os.environ["HERD_OE_MODEL"]
+prompt = os.environ["HERD_OE_PROMPT"]
+perm   = os.environ["HERD_OE_PERM"]
+try:
+    toks = shlex.split(os.environ["HERD_OE_BINDING"])
+    out = []
+    for t in toks:
+        if t == "<model>":
+            if model:
+                out.append(model)
+            elif out and out[-1] == "--model":
+                out.pop()
+        elif t == "<prompt>":
+            out.append(prompt)
+        elif t == perm:
+            pass  # perm placeholder: caller'"'"'s "$@" appended in shell after compose
+        else:
+            out.append(t)
+    sys.stdout.write("".join(tok + "\0" for tok in out))
+except Exception:
+    pass
+'
+  )
+  if [ "${#_argv[@]}" -eq 0 ]; then
+    claude -p "$prompt" --model "$model" "$@"
+    return
+  fi
+  "${_argv[@]}" "$@"
 }
 
 # ── watcher wake surface (HERD-176 — HERD-150 P4: resume / limit / model-switch) ──────────────────
@@ -1963,6 +2144,154 @@ _herd_codex_durable_lifecycle() {
   esac
 }
 
+# _herd_codex_hook_lifecycle <slug> — structured status word from the Codex INTERACTIVE LANE's per-slug
+# stop-hook marker directory (<agent-dir>/hook/), written by the hooks injected at spawn time when
+# CODEX_STOP_HOOK=on (HERD-788). Vocabulary maps to the same words every caller expects:
+#   hook/current-turn present                          → working (turn in progress)
+#   hook/current-turn absent + hook/last-turn present  → idle    (builder at idle prompt)
+#   hook/ absent OR neither marker file present        → rc 1    (no evidence — caller falls through)
+# Fail-soft: any I/O error returns rc 1 (never a guess). Default-off: when CODEX_STOP_HOOK is not on
+# the hook dir is never created, so the function always returns rc 1 with zero side effects — byte-
+# identical to the pre-HERD-788 path for every non-Codex driver and every Codex spawn without the lever.
+# SAFETY GUARD: two conditions must BOTH hold before hook markers are trusted —
+#   (a) CODEX_STOP_HOOK=on (the lever is active), AND
+#   (b) the persisted spawn driver for this slug is "codex".
+# Without (a): turning the lever off after markers were written would otherwise let stale markers
+#   falsely reap a Claude/grok builder. Without (b): a re-tasked builder spawned on a non-codex
+#   driver (herdr-claude, grok) after the codex run would inherit stale hook markers and be
+#   misclassified as idle. Both guards together ensure markers only influence the builder they
+#   were written for.
+_herd_codex_hook_lifecycle() {
+  local slug="${1:-}" hook_dir spawn_drv
+  [ -n "$slug" ] || return 1
+  [ "${CODEX_STOP_HOOK:-}" = "on" ] || return 1
+  spawn_drv="$(herd_driver_agent_spawn_driver "$slug" 2>/dev/null || true)"
+  [ "$spawn_drv" = "codex" ] || return 1
+  hook_dir="$(_herd_agent_dir "$slug")/hook"
+  [ -d "$hook_dir" ] || return 1
+  if [ -f "$hook_dir/current-turn" ]; then
+    printf 'working'
+  elif [ -f "$hook_dir/last-turn" ]; then
+    printf 'idle'
+  else
+    return 1
+  fi
+}
+
+# _herd_grok_sessions_file — path to ~/.grok/active_sessions.json; GROK_SESSIONS_FILE overrides
+# for hermetic tests. Always prints a path (may not exist); callers check with [ -f ... ].
+_herd_grok_sessions_file() {
+  printf '%s' "${GROK_SESSIONS_FILE:-$HOME/.grok/active_sessions.json}"
+}
+
+# _herd_grok_session_db — path to ~/.grok/sessions/session_search.sqlite; GROK_SESSION_DB
+# overrides for hermetic tests.
+_herd_grok_session_db() {
+  printf '%s' "${GROK_SESSION_DB:-$HOME/.grok/sessions/session_search.sqlite}"
+}
+
+# _herd_grok_session_id_write <slug> <session_id> — persist the grok session UUID to
+# <agent-dir>/grok-session-id at spawn time. Fail-soft: write failure emits nothing.
+_herd_grok_session_id_write() {
+  local slug="${1:-}" sid="${2:-}" adir
+  [ -n "$slug" ] || return 1
+  [ -n "$sid" ]  || return 1
+  adir="$(_herd_agent_dir "$slug")" || return 1
+  mkdir -p "$adir" 2>/dev/null || true
+  printf '%s' "$sid" > "$adir/grok-session-id" 2>/dev/null || true
+}
+
+# _herd_grok_session_id <slug> — read the persisted grok session UUID. Returns rc 1 (prints
+# nothing) when the file is absent or empty.
+_herd_grok_session_id() {
+  local slug="${1:-}" adir sid
+  [ -n "$slug" ] || return 1
+  adir="$(_herd_agent_dir "$slug")" || return 1
+  [ -f "$adir/grok-session-id" ] || return 1
+  sid="$(cat "$adir/grok-session-id" 2>/dev/null)" || return 1
+  [ -n "$sid" ] || return 1
+  printf '%s' "$sid"
+}
+
+# _herd_grok_updated_at <slug> — query session_search.sqlite for the updated_at integer of this
+# slug's grok session. Returns rc 1 (prints nothing) when the DB or session is absent, or when
+# sqlite3 is unavailable. Fail-soft throughout.
+_herd_grok_updated_at() {
+  local slug="${1:-}" sid db out
+  [ -n "$slug" ] || return 1
+  sid="$(_herd_grok_session_id "$slug" 2>/dev/null)" || return 1
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  db="$(_herd_grok_session_db)"
+  [ -f "$db" ] || return 1
+  out="$(sqlite3 -readonly "$db" \
+    "SELECT updated_at FROM session_docs WHERE session_id='$(printf '%s' "$sid" | sed "s/'/''/g")' LIMIT 1" \
+    2>/dev/null || true)"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# _herd_grok_updated_at_baseline_write <slug> — snapshot the current updated_at into
+# <agent-dir>/grok-updated-at-baseline BEFORE a bounce prompt is sent. Fail-soft: any failure
+# writes nothing and returns 0 so the caller's bounce proceeds unchanged.
+_herd_grok_updated_at_baseline_write() {
+  local slug="${1:-}" adir ts spawn_drv
+  [ -n "$slug" ] || return 0
+  [ "${GROK_WAKE_PROOF:-}" = "on" ] || return 0
+  spawn_drv="$(herd_driver_agent_spawn_driver "$slug" 2>/dev/null || true)"
+  [ "$spawn_drv" = "grok" ] || return 0
+  adir="$(_herd_agent_dir "$slug")" || return 0
+  ts="$(_herd_grok_updated_at "$slug" 2>/dev/null || true)"
+  [ -n "$ts" ] || return 0
+  mkdir -p "$adir" 2>/dev/null || true
+  printf '%s' "$ts" > "$adir/grok-updated-at-baseline" 2>/dev/null || true
+}
+
+# _herd_grok_session_lifecycle <slug> — the STRUCTURED status word for <slug>'s grok session,
+# derived ONLY from grok-native surfaces (~/.grok/active_sessions.json + session_search.sqlite),
+# NEVER from pane text. Default-off: returns rc 1 when GROK_WAKE_PROOF != "on" or the spawn
+# driver is not "grok" — byte-identical to the pre-HERD-803 path for all other drivers.
+# Vocabulary maps to the same words every caller expects:
+#   session absent from active_sessions.json       → "idle"    (terminal — reapable)
+#   session present, updated_at > baseline         → "working" (bounce consumed)
+#   session present, updated_at <= baseline        → "idle"    (not yet consumed)
+#   any fail-soft condition (missing file/db/id)   → rc 1      (no evidence)
+_herd_grok_session_lifecycle() {
+  local slug="${1:-}" sid sessions_file sessions spawn_drv adir baseline updated
+  [ -n "$slug" ] || return 1
+  [ "${GROK_WAKE_PROOF:-}" = "on" ] || return 1
+  spawn_drv="$(herd_driver_agent_spawn_driver "$slug" 2>/dev/null || true)"
+  [ "$spawn_drv" = "grok" ] || return 1
+  sid="$(_herd_grok_session_id "$slug" 2>/dev/null)" || return 1
+  sessions_file="$(_herd_grok_sessions_file)"
+  [ -f "$sessions_file" ] || return 1
+  sessions="$(cat "$sessions_file" 2>/dev/null)" || return 1
+  # Session absent from active_sessions.json → terminal process.
+  if ! printf '%s' "$sessions" | _GROK_SID="$sid" python3 -c '
+import sys, json, os
+sid = os.environ["_GROK_SID"]
+try:
+  d = json.load(sys.stdin)
+  sys.exit(0 if any(e.get("id","") == sid for e in (d if isinstance(d, list) else [])) else 1)
+except Exception:
+  sys.exit(1)
+' 2>/dev/null; then
+    printf 'idle'
+    return 0
+  fi
+  # Session alive — check if updated_at advanced past the pre-bounce baseline.
+  adir="$(_herd_agent_dir "$slug")" || { printf 'idle'; return 0; }
+  [ -f "$adir/grok-updated-at-baseline" ] || { printf 'idle'; return 0; }
+  baseline="$(cat "$adir/grok-updated-at-baseline" 2>/dev/null || true)"
+  [ -n "$baseline" ] || { printf 'idle'; return 0; }
+  updated="$(_herd_grok_updated_at "$slug" 2>/dev/null || true)"
+  [ -n "$updated" ] || { printf 'idle'; return 0; }
+  if [ "$updated" -gt "$baseline" ] 2>/dev/null; then
+    printf 'working'
+  else
+    printf 'idle'
+  fi
+}
+
 # herd_driver_agent_status_resolved_ex <slug> <raw-status> [pane] — like herd_driver_agent_status_resolved
 # above, but ALSO names which KIND of evidence backed the answer, so a caller can tell structured-source
 # from fallback-source apart instead of the two being indistinguishable (HERD-768 acceptance criterion
@@ -1973,7 +2302,23 @@ _herd_codex_durable_lifecycle() {
 # itself stays untouched; this is a strictly ADDITIVE entry point.
 herd_driver_agent_status_resolved_ex() {
   local slug="${1:-}" raw="${2:-}" pane="${3:-}" structured
+  # HERD-788: check the interactive Codex lane's stop-hook markers first (CODEX_STOP_HOOK=on path).
+  # Default-off: when the hook dir does not exist _herd_codex_hook_lifecycle returns rc 1 silently.
+  structured="$(_herd_codex_hook_lifecycle "$slug" 2>/dev/null)"
+  if [ -n "$structured" ]; then
+    printf '%s structured' "$structured"
+    return 0
+  fi
+  # Existing codex-durable session seam (HERD-768).
   structured="$(_herd_codex_durable_lifecycle "$slug" 2>/dev/null)"
+  if [ -n "$structured" ]; then
+    printf '%s structured' "$structured"
+    return 0
+  fi
+  # HERD-803: grok terminal-state retirement — if the grok session is no longer in
+  # active_sessions.json the builder is dead regardless of the raw herdr working status.
+  # Default-off (GROK_WAKE_PROOF!=on) and fail-soft (returns rc 1 → fallback).
+  structured="$(_herd_grok_session_lifecycle "$slug" 2>/dev/null || true)"
   if [ -n "$structured" ]; then
     printf '%s structured' "$structured"
     return 0

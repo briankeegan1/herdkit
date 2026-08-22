@@ -227,8 +227,10 @@ else
             context_guard_refuses_real_teardown \
             resolver_pane_retired_on_done resolver_pane_kept_on_escalate \
             health_pane_retired_on_outcome \
-            builder_agent_alive_claude_root builder_retask_wakes_on_enter builder_agent_dead \
-            builder_refix_escalates_on_dead builder_agent_missing teardown_clean; do
+            builder_agent_alive_claude_root builder_banner_runtime_matches_foreground builder_retask_wakes_on_enter builder_agent_dead \
+            builder_refix_escalates_on_dead builder_agent_missing \
+            grok_banner_runtime_matches_foreground grok_builder_agent_alive_grok_root grok_roster_identity_working \
+            teardown_clean; do
     checkpoint "$cp" skip "no herdr — real-pane checkpoint not exercised"
   done
 fi
@@ -1258,6 +1260,128 @@ print(pi.get("foreground_process_group_id") or "")
     # Cleanup: kill the detached claude process GROUP + close its pane (never leak a sleep or a pane).
     [ -n "$_cr_pgid" ] && kill -TERM -"$_cr_pgid" >/dev/null 2>&1 || true
     [ -n "$CR_PANE" ] && herdr pane close "$CR_PANE" >/dev/null 2>&1 || true
+  fi
+
+  # ── DRIVER-ACCURATE BANNER (HERD-784): render the Codex lane banner from the resolved driver and
+  # compare its runtime token with a REAL pane foreground process. The pane uses a resident binary
+  # named `codex`; no model/network call occurs. Prompt/context are absent from the description by
+  # construction, while model + permission posture remain operator-visible.
+  if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ]; then
+    step bannerdriver "Codex banner runtime matches the real pane foreground runtime"
+    CB_BIN="$ART/bannerbin"; mkdir -p "$CB_BIN"
+    # `exec -a` keeps the process argv runtime-named instead of letting bash optimize the final
+    # `sleep` and turn the observed foreground into `sleep 3600` on some hosts.
+    printf '#!/usr/bin/env bash\nexec -a codex sleep 3600\n' > "$CB_BIN/codex"; chmod +x "$CB_BIN/codex"
+    CB_DESC="$(herd_driver_agent_argv_description codex gpt-5.6-sol --dangerously-bypass-approvals-and-sandbox)"
+    CB_RUNTIME="${CB_DESC%% *}"
+    CB_SPLIT="$(herdr pane split "$BUILD_PANE" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"
+    CB_PANE="$(printf '%s' "$CB_SPLIT" | hj 'd["result"]["pane"]["pane_id"]')"
+    if [ -n "$CB_PANE" ]; then
+      PANES_CREATED=$((PANES_CREATED+1))
+      herdr pane run "$CB_PANE" "exec $CB_BIN/codex" >/dev/null 2>&1 || true
+    fi
+    CB_CMD=""; CB_PGID=""; _i=0
+    while [ "$_i" -lt 25 ] && [ -n "$CB_PANE" ]; do
+      IFS=$'\t' read -r CB_CMD CB_PGID < <(herdr pane process-info --pane "$CB_PANE" 2>/dev/null | python3 -c '
+import sys,json
+try:
+    pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+    fps=pi.get("foreground_processes") or []
+    print((fps[0].get("cmdline") if fps else "") or "-", pi.get("foreground_process_group_id") or "-", sep="\t")
+except Exception:
+    print("-\t-")
+' 2>/dev/null)
+      case "$CB_CMD" in *"codex"*) break ;; esac
+      _i=$((_i+1)); sleep 0.2
+    done
+    if [ "$CB_RUNTIME" = codex ] && [[ "$CB_CMD" == *"codex"* ]] \
+       && [ "$CB_DESC" = "codex --model gpt-5.6-sol --dangerously-bypass-approvals-and-sandbox" ]; then
+      checkpoint builder_banner_runtime_matches_foreground pass \
+        "banner '$CB_DESC' names the live pane foreground runtime '$CB_CMD'"
+    else
+      checkpoint builder_banner_runtime_matches_foreground fail \
+        "banner/foreground mismatch (banner='$CB_DESC' runtime='$CB_RUNTIME' foreground='$CB_CMD' pane='$CB_PANE')"
+    fi
+    [ "$CB_PGID" != "-" ] && kill -TERM -"$CB_PGID" >/dev/null 2>&1 || true
+    [ -n "$CB_PANE" ] && herdr pane close "$CB_PANE" >/dev/null 2>&1 || true
+  fi
+
+  # ── GROK BANNER + LIVENESS (HERD-802): render the grok lane banner from the resolved driver and
+  # compare its runtime token against a REAL pane foreground process — parallel to the Codex
+  # bannerdriver checkpoint above (stub `exec -a grok`, no model/network call).
+  # HERD-428/HERD-735: record the spawn driver as "grok" so herd_driver_agent_liveness fingerprints
+  # against DRIVER_AGENT_PROCESS_SIGNATURE='grok', never the 'claude' literal — the invariant that a
+  # live grok builder is never false-dead.
+  if [ -n "$WSID" ] && [ -n "$BUILD_TAB" ] && [ -n "$BUILD_PANE" ]; then
+    step grokbanner "Grok banner runtime matches the real pane foreground; liveness reads alive with the grok signature (HERD-802/HERD-428/HERD-735)"
+    GB_BIN="$ART/grokbin"; mkdir -p "$GB_BIN"
+    # Resident stub named `grok`; `exec -a grok` keeps the process argv runtime-named — the foreground
+    # cmdline carries the 'grok' token that DRIVER_AGENT_PROCESS_SIGNATURE='grok' matches.
+    printf '#!/usr/bin/env bash\nexec -a grok sleep 3600\n' > "$GB_BIN/grok"; chmod +x "$GB_BIN/grok"
+    # The lane banner: --rules <agents-rules> is dropped (no AGENTS.md → the composer omits the pair);
+    # --always-approve is the grok driver's own DRIVER_AGENT_PERMISSION_FLAG, not a claude flag.
+    GB_DESC="$(herd_driver_agent_argv_description grok grok-4 --always-approve)"
+    GB_RUNTIME="${GB_DESC%% *}"
+    GB_SPLIT="$(herdr pane split "$BUILD_PANE" --direction down --cwd "$REPO" --no-focus 2>/dev/null || true)"
+    GB_PANE="$(printf '%s' "$GB_SPLIT" | hj 'd["result"]["pane"]["pane_id"]')"
+    if [ -n "$GB_PANE" ]; then
+      PANES_CREATED=$((PANES_CREATED+1))
+      herdr pane run "$GB_PANE" "exec $GB_BIN/grok" >/dev/null 2>&1 || true
+      # Roster identity: register so `herdr agent list` surfaces the grok agent at working state.
+      herdr pane report-agent "$GB_PANE" --source rp-sim --agent "grok-builder" --state working >/dev/null 2>&1 || true
+    fi
+    # HERD-735: persist spawn driver="grok" so herd_driver_agent_liveness resolves the right signature.
+    [ -n "$GB_PANE" ] && herd_driver_agent_spawn_driver_write grok-builder grok
+    GB_CMD=""; GB_PGID=""; _i=0
+    while [ "$_i" -lt 25 ] && [ -n "$GB_PANE" ]; do
+      IFS=$'\t' read -r GB_CMD GB_PGID < <(herdr pane process-info --pane "$GB_PANE" 2>/dev/null | python3 -c '
+import sys,json
+try:
+    pi=(json.load(sys.stdin).get("result") or {}).get("process_info") or {}
+    fps=pi.get("foreground_processes") or []
+    print((fps[0].get("cmdline") if fps else "") or "-", pi.get("foreground_process_group_id") or "-", sep="\t")
+except Exception:
+    print("-\t-")
+' 2>/dev/null)
+      case "$GB_CMD" in *"grok"*) break ;; esac
+      _i=$((_i+1)); sleep 0.2
+    done
+    if [ "$GB_RUNTIME" = grok ] && [[ "$GB_CMD" == *"grok"* ]] \
+       && [ "$GB_DESC" = "grok --model grok-4 --always-approve" ]; then
+      checkpoint grok_banner_runtime_matches_foreground pass \
+        "banner '$GB_DESC' names the live pane foreground runtime '$GB_CMD' (grok-not-claude argv)"
+    else
+      checkpoint grok_banner_runtime_matches_foreground fail \
+        "grok banner/foreground mismatch (banner='$GB_DESC' runtime='$GB_RUNTIME' foreground='$GB_CMD' pane='$GB_PANE')"
+    fi
+    # Liveness: HERD-735 spawn-driver fingerprint → herd_driver_agent_liveness reads 'alive' from the
+    # 'grok' process signature, not 'claude'. Non-native runtime: a miss degrades to 'unknown' (never a
+    # false 'dead'), so only an explicit alive proves the fingerprint is correct.
+    _gb_live=no; _i=0
+    while [ "$_i" -lt 25 ] && [ -n "$GB_PANE" ]; do
+      [ "$(herd_driver_agent_liveness grok-builder "$GB_PANE" 2>/dev/null)" = "alive" ] && { _gb_live=yes; break; }
+      _i=$((_i+1)); sleep 0.2
+    done
+    if [ "$_gb_live" = yes ]; then
+      checkpoint grok_builder_agent_alive_grok_root pass \
+        "grok-spawned builder (spawn_driver=grok, DRIVER_AGENT_PROCESS_SIGNATURE=grok) reads 'alive' — no claude-fingerprint false death"
+    else
+      _gb_live_got="$(herd_driver_agent_liveness grok-builder "$GB_PANE" 2>/dev/null || printf unknown)"
+      checkpoint grok_builder_agent_alive_grok_root fail \
+        "grok liveness wrong: expected 'alive', got '$_gb_live_got' (pane=$GB_PANE spawn_driver=$(herd_driver_agent_spawn_driver grok-builder 2>/dev/null))"
+    fi
+    # Roster identity: herdr roster reports grok-builder=working (idle/working/done parity with claude).
+    _gb_st="$(agent_status_of grok-builder)"
+    if [ "$_gb_st" = working ]; then
+      checkpoint grok_roster_identity_working pass \
+        "herdr roster reports grok-builder=working (idle/working/done identity parity with claude agents)"
+    else
+      checkpoint grok_roster_identity_working fail \
+        "grok roster identity wrong: expected grok-builder=working in herdr agent list, got '$_gb_st'"
+    fi
+    # Cleanup: kill the grok foreground process group and close its pane (never leak).
+    [ "$GB_PGID" != "-" ] && kill -TERM -"$GB_PGID" >/dev/null 2>&1 || true
+    [ -n "$GB_PANE" ] && herdr pane close "$GB_PANE" >/dev/null 2>&1 || true
   fi
 
   # ── RE-TASK WAKE (HERD-186): a live 'done' builder must WAKE when the auto-refix bounce types the

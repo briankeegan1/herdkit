@@ -612,6 +612,18 @@ _ja_act_no_action_reason() {
     gates_passed_held)
       printf 'a core_surface_hold/merge_queue_hold/hold_applied event for the same pr+sha proves this is a KNOWN serialized wait, not an unowned stall — a merge-ordering rail already owns it'
       ;;
+    pushed_no_unresolved)
+      # WHY NOT AUTO-ACT (HERD-753): pushed=no always rolls back its commit (push-rejected path) or
+      # skips the commit entirely (detached-head path) before journaling the event, so there is nothing
+      # left to push when this finding fires. The tick-level reconcile (reconcile_main_freshness) already
+      # retries refresh_codemap / refresh_symbol_index on every tick when it detects stale content, making
+      # a manual re-invoke from this rail redundant. A persistent finding means the push is permanently
+      # blocked (branch protection, auth) — which no bounded rail can bypass — or the winning seat in a
+      # push race already pushed and will journal pushed=yes for the same event type, self-clearing the
+      # finding on the next sweep. Triggering the refresh functions from outside the watcher's tick would
+      # also race the per-checkout serialization lock (_refresh_run_locked) that guards concurrent legs.
+      printf 'pushed=no always rolls back its commit before the event fires; the tick-level reconcile (reconcile_main_freshness) already retries the refresh push on every tick when content is stale — a persistent finding means the push is permanently blocked (branch protection, auth) which no rail can bypass, or the winning seat in a push race already pushed (self-clears via a later pushed=yes for the same event type); either case requires human inspection or self-heals'
+      ;;
     *) return 1 ;;
   esac
 }

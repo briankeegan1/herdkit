@@ -3423,6 +3423,196 @@ cmd_config() {
   esac
 }
 
+# ── herd runtime switch: atomic machine-local runtime + complete model-role map ──────────────────
+# Explicit-only. Nothing calls this path unless an operator asks for a switch, so the existing
+# config defaults, setter output and render behavior remain byte-identical.
+_runtime_switch_pairs() {
+  case "${1:-}" in
+    herdr-claude)
+      cat <<'EOF'
+HERD_DRIVER	herdr-claude
+MODEL_COORDINATOR	claude-opus-4-8
+MODEL_FEATURE	claude-sonnet-4-6
+MODEL_QUICK	claude-haiku-4-5
+MODEL_SCRIBE	claude-sonnet-4-6
+MODEL_RESEARCH	claude-sonnet-4-6
+MODEL_REVIEW	claude-sonnet-4-6
+MODEL_RESOLVER	claude-sonnet-4-6
+MODEL_ADVISE	claude-opus-4-8
+MODEL_ESCALATE	claude-opus-4-8
+REVIEW_MODEL_CHEAP	claude-sonnet-4-6
+REVIEW_MODEL_DOCS	claude-haiku-4-5
+REVIEW_MODEL_ESCALATED	claude-opus-4-8
+EOF
+      ;;
+    codex)
+      cat <<'EOF'
+HERD_DRIVER	codex
+MODEL_COORDINATOR	gpt-5.6-sol
+MODEL_FEATURE	gpt-5.6-terra
+MODEL_QUICK	gpt-5.6-luna
+MODEL_SCRIBE	gpt-5.6-terra
+MODEL_RESEARCH	gpt-5.6-terra
+MODEL_REVIEW	gpt-5.6-terra
+MODEL_RESOLVER	gpt-5.6-terra
+MODEL_ADVISE	gpt-5.6-sol
+MODEL_ESCALATE	gpt-5.6-sol
+REVIEW_MODEL_CHEAP	gpt-5.6-terra
+REVIEW_MODEL_DOCS	gpt-5.6-luna
+REVIEW_MODEL_ESCALATED	gpt-5.6-sol
+EOF
+      ;;
+    grok)
+      cat <<'EOF'
+HERD_DRIVER	grok
+MODEL_COORDINATOR	grok-4.6
+MODEL_FEATURE	grok-4.5
+MODEL_QUICK	grok-4.5
+MODEL_SCRIBE	grok-4.5
+MODEL_RESEARCH	grok-4.5
+MODEL_REVIEW	grok-4.5
+MODEL_RESOLVER	grok-4.5
+MODEL_ADVISE	grok-4.6
+MODEL_ESCALATE	grok-4.6
+REVIEW_MODEL_CHEAP	grok-4.5
+REVIEW_MODEL_DOCS	grok-4.5
+REVIEW_MODEL_ESCALATED	grok-4.6
+EOF
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+_runtime_switch_preflight() {
+  local target="$1" binary ib ob perm probe_model='herd-runtime-switch-probe' probe_prompt='probe prompt'
+  binary="$(herd_driver_agent_runtime "$target" 2>/dev/null || true)"
+  [ -n "$binary" ] || die "runtime switch preflight failed: '$target' has no driveable runtime binary binding — NOTHING was written"
+  command -v "$binary" >/dev/null 2>&1 \
+    || die "runtime switch preflight failed: '$binary' is not on PATH — install it, then retry; NOTHING was written"
+
+  # Validate authentication without making a model call. Both commands are the runtimes' own
+  # read-only login-status surfaces; a non-zero result is a hard, pre-write refusal.
+  case "$target" in
+    herdr-claude) "$binary" auth status >/dev/null 2>&1 \
+      || die "runtime switch preflight failed: Claude Code is not logged in ('claude auth status'); run 'claude auth login', then retry — NOTHING was written" ;;
+    codex) "$binary" login status >/dev/null 2>&1 \
+      || die "runtime switch preflight failed: Codex is not logged in ('codex login status'); run 'codex login', then retry — NOTHING was written" ;;
+    grok)
+      # Grok's read-only `grok models` probe reports login state in its OUTPUT, not its exit code: it
+      # prints "You are not authenticated." and STILL exits 0 (verified on grok 1.0.5), so gating on rc
+      # would wrongly accept a logged-out runtime. Refuse when the probe declares itself unauthenticated
+      # (or when the probe cannot be run at all).
+      local grok_probe
+      grok_probe="$("$binary" models 2>&1)" \
+        || die "runtime switch preflight failed: 'grok models' probe could not run; run 'grok' and sign in, then retry — NOTHING was written"
+      if grep -qi 'not authenticated' <<<"$grok_probe"; then
+        die "runtime switch preflight failed: Grok is not authenticated ('grok models' reports 'not authenticated'); run 'grok' and sign in, then retry — NOTHING was written"
+      fi
+      ;;
+  esac
+
+  ib="$(herd_driver_agent_value DRIVER_AGENT_INTERACTIVE_SPAWN '' "$target")"
+  ob="$(herd_driver_agent_value DRIVER_AGENT_ONESHOT_EXEC '' "$target")"
+  perm="$(herd_driver_agent_value DRIVER_AGENT_PERMISSION_FLAG '' "$target")"
+  [ -n "$ib" ] && [ -n "$ob" ] && [ -n "$perm" ] \
+    || die "runtime switch preflight failed: '$target' is missing an interactive, one-shot, or permission binding — NOTHING was written"
+
+  # Parse and substitute both catalogued argv templates. This catches malformed quotes, missing
+  # placeholders, a wrong executable, and a permission token the composer cannot replace.
+  HERD_RS_I="$ib" HERD_RS_O="$ob" HERD_RS_P="$perm" HERD_RS_BIN="$binary" \
+  HERD_RS_MODEL="$probe_model" HERD_RS_PROMPT="$probe_prompt" python3 - <<'PY' \
+    || die "runtime switch preflight failed: '$target' has an undriveable interactive or one-shot argv shape — NOTHING was written"
+import os, shlex, sys
+for kind, name in (("interactive", "HERD_RS_I"), ("one-shot", "HERD_RS_O")):
+    raw = os.environ[name]
+    try:
+        toks = shlex.split(raw)
+    except ValueError:
+        sys.exit(1)
+    if not toks or toks[0] != os.environ["HERD_RS_BIN"]:
+        sys.exit(1)
+    if "<prompt>" not in toks or "<model>" not in toks or os.environ["HERD_RS_P"] not in toks:
+        sys.exit(1)
+    out = [os.environ["HERD_RS_PROMPT"] if t == "<prompt>" else
+           os.environ["HERD_RS_MODEL"] if t == "<model>" else
+           os.environ["HERD_RS_P"] if t == os.environ["HERD_RS_P"] else t for t in toks]
+    if os.environ["HERD_RS_PROMPT"] not in out or os.environ["HERD_RS_MODEL"] not in out:
+        sys.exit(1)
+PY
+  ok "preflight: $binary present + logged in; interactive and one-shot argv shapes are driveable"
+}
+
+cmd_runtime_switch() {
+  local target="${1:-}" dry_run=0
+  [ "$#" -gt 0 ] && shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=1 ;;
+      *) die "usage: herd runtime switch <herdr-claude|codex|grok> [--dry-run]" ;;
+    esac
+    shift
+  done
+  case "$target" in herdr-claude|codex|grok) ;; *) die "usage: herd runtime switch <herdr-claude|codex|grok> [--dry-run]" ;; esac
+
+  local root cfg local_cfg caps current previous pairs rec key val cur changed=0
+  root="$(pwd)"; cfg="$root/.herd/config"; local_cfg="$root/.herd/config.local"
+  [ -f "$cfg" ] || die "no .herd/config at $root — run 'herd init' first"
+  caps="$(_config_caps_file)"; pairs="$(_runtime_switch_pairs "$target")"
+  current="$(_config_effective_value "$cfg" "$local_cfg" HERD_DRIVER)"; current="${current:-herdr-claude}"
+  previous="$current"
+
+  say "${c_bold}herd runtime switch${c_rst} ${current} → ${target}$([ "$dry_run" -eq 1 ] && printf ' (dry-run)' || true)"
+  say "  ${c_bold}complete machine-local mapping${c_rst}"
+  while IFS=$'\t' read -r key val; do
+    [ -n "$key" ] || continue
+    _config_key_requires "$caps" "$key" >/dev/null \
+      || die "runtime switch internal error: role '$key' is absent from capabilities.tsv — NOTHING was written"
+    cur="$(_config_effective_value "$cfg" "$local_cfg" "$key")"
+    [ "$cur" = "$val" ] || changed=$((changed + 1))
+    say "    ${key}  \"${cur}\" ${c_dim}→${c_rst} \"${val}\""
+  done <<< "$pairs"
+  say ""
+
+  # Every potentially failing preflight happens before the staging file is even created.
+  _runtime_switch_preflight "$target"
+  if [ "$dry_run" -eq 1 ]; then
+    ok "dry-run complete: $changed value(s) would change; NOTHING was written or reloaded"
+    say "switch back later with: herd runtime switch $previous"
+    return 0
+  fi
+  if [ "$changed" -eq 0 ]; then
+    ok "already on the complete '$target' mapping — config and control room unchanged"
+    say "switch back with: herd runtime switch $previous"
+    return 0
+  fi
+
+  local stage="$root/.herd/.config.local.runtime-switch.$$"
+  trap 'rm -f "$stage" 2>/dev/null || true' RETURN
+  if [ -f "$local_cfg" ]; then cp -p "$local_cfg" "$stage"; else _config_ensure_local "$stage"; fi
+  while IFS=$'\t' read -r key val; do
+    [ -n "$key" ] || continue
+    _config_put_value "$stage" "$key" "$val"
+  done <<< "$pairs"
+  # ONE same-directory rename publishes the whole mapping. No baseline, credential, or secret file
+  # is touched; a crash before this point leaves the old overlay intact.
+  mv "$stage" "$local_cfg"
+  trap - RETURN
+  ok "atomically wrote the complete '$target' mapping to .herd/config.local"
+
+  say "${c_bold}→ reloading once so the watcher and rendered coordinator use the new runtime${c_rst}"
+  cmd_reload
+  ok "runtime switched: $target is active (one reload)"
+  say "rollback / switch back: herd runtime switch $previous"
+}
+
+cmd_runtime() {
+  local sub="${1:-}"; [ "$#" -gt 0 ] && shift
+  case "$sub" in
+    switch) cmd_runtime_switch "$@" ;;
+    *) die "usage: herd runtime switch <herdr-claude|codex|grok> [--dry-run]" ;;
+  esac
+}
+
 # _config_lint — surface DUPLICATE keys in .herd/config (issue #115), the handler behind
 # `herd config lint`. The config is shell-sourced, so a key assigned twice silently LAST-WINS and can
 # disable a gate; this lists every duplicated key and exits NON-ZERO when any exist (a scriptable
@@ -9725,6 +9915,10 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
                                                       each default + when-to-surface); non-zero if any
                                         lint          flag DUPLICATE keys (silent shell last-wins can
                                                       disable a gate); exits non-zero if any exist
+  herd runtime switch <herdr-claude|codex|grok> [--dry-run]
+                                      atomically switch this machine's driver + complete model-role
+                                      map after binary/login/argv preflight; writes only gitignored
+                                      .herd/config.local, reloads once, and prints the switch-back path
   herd theme <list|preview|set>       pick the active color THEME (HERD_THEME) across every herd
                                         list             the catalog: built-in themes (templates/
                                                       themes/) + user themes (.herd/themes/), active marked
@@ -9866,7 +10060,7 @@ herd — the herdkit CLI (engine contract v$HERDKIT_CONTRACT_VERSION)
   herd ledger-report [--json | --alerts | --daily [--file PATH]]
                                       the OUTCOME LEDGER MVP reader (HERD-739): a per-tracker-ref
                                       VALUE record derived mechanically from the journal (merge, cost,
-                                      verdict_recorded, refix events joined via `reconcile`'s pr→ref
+                                      verdict_recorded, refix events joined via reconcile's pr→ref
                                       link) — disposition, spend, review verdicts, risk class, and the
                                       delayed +24h/+7d evaluation slots. --json prints the full derived
                                       model; --alerts prints only the loud rows (missing evals,
@@ -9981,6 +10175,7 @@ case "${1:-help}" in
   intents) shift; cmd_intents "$@" ;;
   queue)   shift; cmd_queue "$@" ;;
   config)  shift; cmd_config "$@" ;;
+  runtime) shift; cmd_runtime "$@" ;;
   theme)   shift; cmd_theme "$@" ;;
   conformance) shift; cmd_conformance "$@" ;;
   governance) shift; cmd_governance "$@" ;;

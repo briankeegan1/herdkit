@@ -11,8 +11,11 @@
 #   commit <path> "<sum>"  file backend: add/commit/push $BACKLOG_FILE (pull-rebase retry on
 #                          reject), write the live-view receipt, append to the inbox, fire a
 #                          herdr notification, remove the claimed file.
-#   add-item <path> "<t>"  API/changelog backend: dispatch a NEW item to the backend (no file
-#                          edit by the agent), then the same receipt/inbox/notify/cleanup.
+#   add-item <path> ["<t>"|--no-verification-plan]
+#                          API/changelog backend: dispatch a NEW item to the backend (no file
+#                          edit by the agent), then the same receipt/inbox/notify/cleanup. With no
+#                          text argv, read the request bytes from the claimed queue file; this is the
+#                          runtime-neutral transport for multiline tracker bodies.
 #   update-state <path> <ref> <state>
 #                          API backend: transition an EXISTING item (done/in-progress/canceled)
 #                          via _backend_update_state instead of filing a new issue — the second
@@ -90,6 +93,7 @@ POLL="${SCRIBE_POLL:-25}"
 # to tell a hung drainer from a live one. Beat once here so EVERY subcommand (next/commit/finish/…) is
 # a progress signal, and again each poll-loop iteration below so a long poll stays fresh.
 HEARTBEAT="$TREES/.scribe.heartbeat"
+PROGRESS="$TREES/.scribe.progress"
 mkdir -p "$Q"
 cmd="${1:-}"
 herd_drainer_heartbeat "$HEARTBEAT"
@@ -157,7 +161,8 @@ _report_and_cleanup() {
   # HERD-514: belt-and-suspenders — _backend_add_item already consumes+removes its own snapshot on the
   # file-backend commit path; this catches every OTHER terminal path (skip, add-item, update-state,
   # amend, the #139 stale-drainer reroute) so a claim's snapshot never outlives its claim.
-  rm -f "$mine" "${mine}.snapshot"
+  rm -f "$mine" "${mine}.snapshot" "${mine%.req.mine}.owner"
+  herd_drainer_progress "$PROGRESS"
   echo "$out $short"
 }
 
@@ -212,6 +217,89 @@ _scribe_post_add() {
 # never feed the retry queue.
 _scribe_backend_dispatches_creates() {
   case "$SCRIBE_BACKEND" in file|changelog) return 1 ;; *) return 0 ;; esac
+}
+
+# _scribe_add_text_from_claim <claimed-path> — load a new item's multiline text without putting it in
+# argv. The claimed request file is already the scribe queue's durable byte transport, so making the
+# agent quote the same bytes into a shell argument bought nothing and broke on runtimes whose command
+# boundary rejects literal newlines. A follow-up attempt using the two characters `\n` was worse:
+# Linear correctly treated them literally and filed the would-be body as part of the title.
+#
+# Accept ONLY a regular, non-symlink `<queue>/*.req.mine` whose physical parent is exactly $Q. This
+# prevents a malformed/model-produced path from turning add-item into an arbitrary file reader (most
+# importantly, it can never read .herd/secrets). Failure is deliberately soft and generic: do not
+# echo the supplied path or file bytes, and leave a legitimate claim in place for normal reclaim.
+# Sets _SCRIBE_ADD_TEXT on success; returns non-zero on malformed/unreadable/empty transport.
+_scribe_add_text_from_claim() {
+  local mine="$1" parent qparent base
+  _SCRIBE_ADD_TEXT=""
+  [ -f "$mine" ] && [ ! -L "$mine" ] || return 1
+  base="${mine##*/}"
+  case "$base" in *.req.mine) ;; *) return 1 ;; esac
+  parent="$(cd "$(dirname "$mine")" 2>/dev/null && pwd -P)" || return 1
+  qparent="$(cd "$Q" 2>/dev/null && pwd -P)" || return 1
+  [ "$parent" = "$qparent" ] || return 1
+  _SCRIBE_ADD_TEXT="$(cat -- "$mine" 2>/dev/null)" || return 1
+  [ -n "$_SCRIBE_ADD_TEXT" ]
+}
+
+# _scribe_directive_title <full-request> — HERD-787: derive the tracker TITLE from the documented
+# coordinator directives without changing the request that becomes its description. This is a
+# narrow correctness repair: the two exact directive prefixes shipped in coordinator instructions —
+# `Add a planned item:` (older renders) and `Add a 🔜 item:` (current template) — always normalize,
+# because leaving the default documented workflow malformed is not a viable default-off posture.
+# SCRIBE_DIRECTIVE_PREFIXES=on widens recognition to case/article variants; while it is off, EVERY
+# noncanonical/title-first request still reaches the backend through the historical two arguments
+# byte-for-byte. On a match, accept either a title on the directive line or the next non-empty REAL
+# line. A literal `\n` is never decoded: it may delimit the title view while the description keeps
+# those original two bytes. The coordinator's `<title> — <why>` form yields only `<title>`; long
+# candidates keep the established 100-character title bound.
+_scribe_directive_title() {
+  local widen=0
+  case "${SCRIBE_DIRECTIVE_PREFIXES:-off}" in on) widen=1 ;; esac
+  SCRIBE_PREFIX_WIDEN="$widen" printf '%s' "$1" | SCRIBE_PREFIX_WIDEN="$widen" python3 -c '
+import os, re, sys
+
+text = sys.stdin.read()
+lines = text.splitlines()
+if not lines:
+    raise SystemExit
+match = re.match(r"^(?:Add a planned item|Add a 🔜 item):\s*(.*)$", lines[0])
+if not match and os.environ.get("SCRIBE_PREFIX_WIDEN") == "1":
+    match = re.match(r"^\s*Add\s+(?:a\s+)?(?:planned|🔜)\s+item\s*:\s*(.*)$", lines[0], re.I)
+if not match:
+    raise SystemExit
+candidate = match.group(1).strip()
+if not candidate:
+    candidate = next((line.strip() for line in lines[1:] if line.strip()), "")
+if not candidate:
+    raise SystemExit
+# Do not turn the two literal characters backslash+n into a newline. They are only a safe boundary
+# for the derived title; the full request passed as the description is untouched.
+candidate = candidate.split(r"\n", 1)[0].strip()
+for delimiter in (" — ", ". "):
+    if delimiter in candidate:
+        candidate = candidate.split(delimiter, 1)[0].strip()
+if not candidate:
+    raise SystemExit
+if len(candidate) > 100:
+    candidate = candidate[:99].rstrip() + "…"
+sys.stdout.write(candidate)
+' 2>/dev/null || true
+}
+
+# _scribe_dispatch_add <claim> <full-request> — call the active backend with an OPTIONAL explicit
+# title. Keeping the conditional here proves the noncanonical/off and unmatched paths' argv are
+# byte-identical: the backend still sees exactly (<claim>, <request>) unless a canonical directive
+# (or an opt-in grammar expansion) matched.
+_scribe_dispatch_add() {
+  local mine="$1" text="$2" title
+  title="$(_scribe_directive_title "$text")"
+  if [ -n "$title" ]; then
+    _backend_add_item "$mine" "$text" "$title"
+  else
+    _backend_add_item "$mine" "$text"
+  fi
 }
 
 # _scribe_retry_close <claimed-path> — a re-injected request reached a TERMINAL, SUCCESSFUL outcome:
@@ -393,8 +481,15 @@ case "$cmd" in
     if [ "${2:-}" = "--linger" ]; then linger="${3:-0}"; fi
     case "$linger" in ''|*[!0-9]*) linger=0 ;; esac
     deadline=$((POLL + linger))
-    # reclaim claims abandoned by a dead drainer
-    find "$Q" -name '*.mine' -mmin +5 -exec sh -c 'mv -f "$1" "${1%.mine}"' _ {} \; 2>/dev/null || true
+    # Reclaim only aged claims whose owner is gone. A live owner may legitimately take longer than
+    # five minutes; ownerless claims retain the old age fallback for compatibility with prior engines.
+    while IFS= read -r stale; do
+      [ -n "$stale" ] || continue
+      owner="${stale%.req.mine}.owner"
+      herd_drainer_owner_alive "$owner" && continue
+      rm -f "$owner" 2>/dev/null || true
+      mv -f "$stale" "${stale%.mine}" 2>/dev/null || true
+    done < <(find "$Q" -name '*.req.mine' -mmin +5 2>/dev/null || true)
     # HERD-267 RETRY RE-INJECTION: a create that the tracker refused lives on in the durable retry
     # queue. Any entry whose backoff has elapsed is copied back into $Q here, so it is drained by the
     # very drainer that is already running and applied by the SAME add path as a first attempt — no
@@ -411,7 +506,13 @@ case "$cmd" in
       while IFS= read -r f; do
         [ -n "$f" ] || continue
         if mv "$f" "$f.mine" 2>/dev/null; then
-          claimed="$f.mine"; break
+          claimed="$f.mine"
+          # The command's parent is the drainer-side shell in normal operation. If it cannot be
+          # resolved, the claim remains ownerless and the age fallback above handles it safely.
+          owner_pid="$PPID"
+          case "$owner_pid" in ''|*[!0-9]*) ;; *) printf '%s\n' "$owner_pid" > "${claimed%.req.mine}.owner" 2>/dev/null || true ;; esac
+          herd_drainer_progress "$PROGRESS"
+          break
         fi
       done < <(ls -1 "$Q"/*.req 2>/dev/null | sort)
       if [ -n "$claimed" ]; then
@@ -452,13 +553,31 @@ case "$cmd" in
       git checkout -- "$BACKLOG_FILE" 2>/dev/null || true
       _stale_text="$(cat "$mine" 2>/dev/null)"; [ -n "$_stale_text" ] || _stale_text="$sum"
       _BACKEND_ERROR=""
-      _backend_add_item "$mine" "$_stale_text"
+      _scribe_dispatch_add "$mine" "$_stale_text"
       _scribe_post_add "$mine" "$_stale_text"
     fi
     ;;
   add-item)
     # API/changelog path: the agent did NOT edit any file — dispatch the text to the backend.
-    mine="${2:?claimed path}"; text="${3:?item text}"
+    mine="${2:?claimed path}"
+    if [ "${3:-}" = "--no-verification-plan" ]; then
+      if _scribe_add_text_from_claim "$mine"; then
+        text="${_SCRIBE_ADD_TEXT}"$'\n\n''⚠️ no verification plan'
+      else
+        echo "scribe-step: malformed or unreadable add-item transport — item not filed" >&2
+        exit 0
+      fi
+    elif [ "$#" -ge 3 ]; then
+      # Compatibility seam for existing/manual callers. Keeping this path byte-identical also lets a
+      # literal backslash-n remain intentional literal text; only REAL newlines in the file transport
+      # split a title from its body.
+      text="$3"
+    elif _scribe_add_text_from_claim "$mine"; then
+      text="$_SCRIBE_ADD_TEXT"
+    else
+      echo "scribe-step: malformed or unreadable add-item transport — item not filed" >&2
+      exit 0
+    fi
     cd "$REPO" || exit 1
     if [ "$SCRIBE_BACKEND" = "file" ]; then
       # Reverse of the #139 flip: a non-file drainer (spawned before a flip TO 'file') is draining.
@@ -484,13 +603,13 @@ case "$cmd" in
       # subshell and lose it); we replay the captured stdout verbatim so the drainer's output is
       # unchanged.
       _add_out="$TREES/.scribe-add-out.$$"
-      _backend_add_item "$mine" "$text" > "$_add_out"
+      _scribe_dispatch_add "$mine" "$text" > "$_add_out"
       cat "$_add_out"
       [ -n "$_seq_blocker" ] && _scribe_auto_marker "$SCRIBE_BACKEND" "$_BACKEND_RESULT" "$_add_out" "$_seq_blocker"
       [ -n "$_ship_pr" ] && _scribe_auto_ship "$SCRIBE_BACKEND" "$_BACKEND_RESULT" "$_add_out" "$_ship_pr"
       rm -f "$_add_out"
     else
-      _backend_add_item "$mine" "$text"
+      _scribe_dispatch_add "$mine" "$text"
     fi
     _scribe_post_add "$mine" "$text"
     ;;

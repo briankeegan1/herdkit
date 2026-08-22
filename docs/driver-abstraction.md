@@ -870,3 +870,64 @@ than a red row); `stub` binds the select-flag shape so the hermetic test can dri
 probe against a fake runtime.
 
 Proof: `tests/test-agent-roster.sh`.
+
+---
+
+## Atomic runtime switching (HERD-773)
+
+`herd runtime switch <herdr-claude|codex|grok> [--dry-run]` is the explicit operator surface for
+moving one seat between the production agent runtimes. It computes the complete runtime preset —
+`HERD_DRIVER`, every `MODEL_*` execution role, and every `REVIEW_MODEL_*` tier — and displays the
+effective current-to-target delta before mutation.
+
+The preflight reuses the driver catalog as its source of truth. It requires the selected runtime
+binary and its read-only login-status check, parses both `DRIVER_AGENT_INTERACTIVE_SPAWN` and
+`DRIVER_AGENT_ONESHOT_EXEC`, and proves their executable, model, prompt, and permission tokens form
+driveable argument vectors. Any failure and `--dry-run` leave the filesystem untouched.
+
+A successful switch stages the full preset beside `.herd/config.local` and publishes it with one
+rename. It never changes committed `.herd/config` or `.herd/secrets`, then invokes the existing
+reload path exactly once so the watcher environment and rendered coordinator agree. The command
+prints the reverse runtime command as the rollback path. No implicit caller reaches this surface;
+when the command is unused all existing defaults, argv, output, and rendering remain unchanged.
+
+---
+
+## Grok Build specifics (HERD-805)
+
+**Installation & authentication.** The Grok Build CLI is installed alongside other third-party
+runtimes via `grok install` or equivalent package manager, then authenticated with:
+
+```sh
+grok auth login    # Opens browser to authorize the CLI against your xAI account
+```
+
+Once logged in, the same `herd runtime switch grok` flow applies: preflights the `grok` binary,
+verifies it can compose spawn and one-shot argument vectors, writes the runtime preset to
+`.herd/config.local`, and reloads the control room. No special post-switch steps are required.
+
+**Session management & recovery.** Grok Build stores headless sessions under `~/.grok/sessions` by
+session ID. Each builder's worktree gets its own `--session-id`, preserving full context across
+`--continue` resume calls — the same durability model as Claude Code's transcript directory. If a
+builder is interrupted mid-task (usage limit, manual kill, network failure), `herd runtime switch`
+automatically arms limit-detection and auto-resume: when the account limit resets, the builder
+resumes in place with full context via `grok --continue --always-approve`.
+
+**Permission modes.** `--always-approve` is Grok Build's auto-approval flag (alias `--yolo`), bound
+as the default `DRIVER_AGENT_PERMISSION_FLAG` for hands-off builder execution in isolated worktrees.
+This is the only permission-bypass flag Grok Build documents — there is no sandbox-mode equivalent to
+Codex's `--sandbox workspace-write`. The flag is overridable per-machine via lane `--permission-flag`
+overrides, but the override must match Grok Build's own CLI contract exactly.
+
+**Limits & degradation notes.** Two capabilities degrade gracefully on Grok:
+
+- **Usage-limit detection:** Grok Build does not document a stable usage-limit banner string in its
+  CLI output, so limit-detection falls back to the runtime-independent hook sentinel + resume
+  backstop. The banner-sniff optimization (faster detection for Claude/Codex) is skipped, but
+  auto-resume still works: once the usage limit resets and the hook sentinel clears, the builder
+  wakes via `grok --continue`.
+- **Cost telemetry:** Grok's session token-usage JSON schema is not documented in the CLI reference,
+  so cost accounting surfaces the model as `unpriced` rather than reporting a fabricated $0. The
+  builder still runs and merges normally; `herd cost` simply omits Grok units from the aggregate.
+
+Both degradations are honest and explicit: they never fabricate a limit signal or a cost figure.

@@ -34,10 +34,19 @@ REPO="$PROJECT_ROOT"
 TREES="$WORKTREES_DIR"
 Q="$TREES/backlog-queue"
 REQ="${1:?usage: scribe.sh \"<backlog change>\"}"
-CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 # The scribe only edits one markdown file + commits — a light, mechanical job. Default to the
 # configured scribe model (Sonnet); override with SCRIBE_MODEL=… for a specific run.
 SCRIBE_MODEL="${SCRIBE_MODEL:-$MODEL_SCRIBE}"
+# HERD-770: resolve the spawn's permission flag through the SHARED lane seam, keyed to the RUNTIME
+# the (optionally runtime-qualified) scribe model resolves to — NOT a hardcoded claude flag. An
+# eager CLAUDE_FLAGS=--dangerously-skip-permissions leaked the claude-only flag into a Codex spawn
+# (codex 0.147.0 rejects it) because a non-empty <flags> OVERRIDES the driver's own permission
+# binding in herd_driver_agent_spawn_argv. herd_driver_lane_permission_flags preserves EXPLICIT
+# HERD_CLAUDE_FLAGS override precedence, is byte-identical for herdr-claude/headless (their flag IS
+# --dangerously-skip-permissions), and yields the Codex bypass flag under the Codex runtime. A bad
+# ref falls soft to the active driver here; the launch below still loud-refuses and the durably
+# queued request survives.
+CLAUDE_FLAGS="$(herd_driver_lane_permission_flags "$(herd_model_driver_for "$SCRIBE_MODEL" 2>/dev/null || true)")"
 _WS_ID="$(herd_resolve_workspace_id)"
 
 # 1. Enqueue atomically (temp then mv); name sorts FIFO.
@@ -76,6 +85,7 @@ fi
 #    filter client-side via the workspace_id field each agent record already carries. Capture the
 #    roster ONCE so the liveness corroboration below reads the SAME snapshot (no second call / TOCTOU).
 HEARTBEAT="$TREES/.scribe.heartbeat"
+PROGRESS="$TREES/.scribe.progress"
 AGENTS_JSON="$(herd_driver_agent_list_json 2>/dev/null || echo '{}')"
 if printf '%s' "$AGENTS_JSON" | NAME="$HERD_AGENT_SCRIBE" WS="$_WS_ID" python3 -c '
 import sys,json,os
@@ -88,6 +98,15 @@ sys.exit(0 if any(
   x.get("name")==os.environ["NAME"] and (not ws or x.get("workspace_id","")==ws)
   for x in agents
 ) else 1)'; then
+  # A live pane is not proof that it is draining. When pending work has seen no claim/completion for
+  # the established timeout, send one safe wake through the driver seam. A live owner of a .req.mine
+  # suppresses this: slow real work is not a no-progress wedge.
+  if herd_drainer_queue_stalled "$Q" "$PROGRESS" "$DRAINER_HEARTBEAT_TIMEOUT" "$HEARTBEAT"; then
+    herd_driver_send_text "$HERD_AGENT_SCRIBE" "The backlog queue has pending work with no recent claim or completion. Please run: bash $HERE/scribe-step.sh next --linger $SCRIBE_LINGER_SECS"
+    echo "✍️  scribe already running but queue progress is stale — sent it a safe wake."
+    journal_append drainer_woken component scribe agent "$HERD_AGENT_SCRIBE" timeout "$DRAINER_HEARTBEAT_TIMEOUT"
+    exit 0
+  fi
   # A drainer of this name is LISTED. Normally we short-circuit (it will drain this). But a listed
   # drainer can be HUNG: its heartbeat ($HEARTBEAT, written by scribe-step.sh on every drain step)
   # goes stale. HERD-109 reclaimed on stale-heartbeat alone — but that FALSE-POSITIVED a fresh,
@@ -156,18 +175,17 @@ Repeat this loop:
      request into exactly ONE of these, then run the matching verb — NEVER file a new issue for a
      request that is not actually a new backlog item (that mis-file is the junk-issue bug):
        – ADD / create / file a NEW backlog item →
-           The backend takes the FIRST LINE of the text as the tracker title and keeps the WHOLE
-           text as the description. So make sure the text STARTS WITH A SHORT ONE-LINE TITLE
-           (< 80 chars). If the request is a run-on paragraph with no title line, SYNTHESIZE one:
-           write a concise title as the first line, then the full request as the body beneath it —
-           never pass a whole paragraph as the first line (that files a giant title duplicated in
-           the description).
+           The backend derives a SHORT tracker title from the request first line and keeps the
+           WHOLE request as the description. The claimed queue file is the multiline transport; do
+           not copy the request into argv and do not replace newlines with backslash-n text.
            If the request carries NO verification plan (how the change will be proven — a named
            sandbox sim scenario for a gate/merge/concurrency/limit-park/pane seam, or the test
            surface otherwise), file it AS-IS — never block or synthesize one — but append a
            "⚠️ no verification plan" marker line to the body so the flag rides into the item AND
-           its scribe report line, and the coordinator sees which items shipped unplanned. Then run:
-           bash $HERE/scribe-step.sh add-item "<claimed_path>" "<text from request>"
+           its scribe report line, and the coordinator sees which items shipped unplanned. Pass
+           --no-verification-plan after the claim path to have the transport append that marker.
+           When the request already has a verification plan, omit the flag. Then run:
+           bash $HERE/scribe-step.sh add-item "<claimed_path>"
        – Mark an EXISTING item done / in-progress / canceled — INCLUDING the watcher
          "Reconcile: PR #N merged — find the backlog item…" and any reap/close request →
            bash $HERE/scribe-step.sh update-state "<claimed_path>" "<ref>" "<state>"

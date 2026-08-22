@@ -147,6 +147,41 @@ DIR="$WORKTREES_DIR/$SLUG"
 CLAUDE_FLAGS="${HERD_CLAUDE_FLAGS:---dangerously-skip-permissions}"
 REVIEW_MODEL="${HERD_REVIEW_MODEL:-$MODEL_REVIEW}"
 
+# _review_runtime_flags <driver> — the runtime flags a reviewer dispatch appends after the composed
+# one-shot argv (HERD-775). herd_driver_oneshot_exec_as drops the binding's permission placeholder
+# and appends the caller's "$@" verbatim, so the caller OWNS the runtime-specific flags — and until
+# HERD-775 every site here appended $CLAUDE_FLAGS + claude's --output-format stream-json --verbose
+# regardless of the resolved driver. A codex-resolved MODEL_REVIEW ('codex:…') therefore ran
+# `codex exec … --dangerously-skip-permissions --output-format …`, which codex rejects on argv
+# ("unexpected argument") — every review died rc=2 = INFRA with no verdict, and the PR livelocked
+# BLOCKED under a green CI (2026-08-18: 114 INFRA events on one PR). Sibling of HERD-770 (drainers).
+# Derivation:
+#   • permission flag  → herd_driver_lane_permission_flags <drv> (the HERD-201 seam): an explicit
+#                        HERD_CLAUDE_FLAGS override wins VERBATIM for any runtime, else the driver's own
+#                        DRIVER_AGENT_PERMISSION_FLAG (codex --dangerously-bypass-approvals-and-sandbox,
+#                        claude --dangerously-skip-permissions);
+#   • output flags     → claude's `--output-format stream-json --verbose` ONLY when the driver's runtime
+#                        is the native Claude runtime (herd_driver_agent_runtime_native); a non-native
+#                        runtime gets its own stream contract: Codex receives `--json`, whose
+#                        item.completed/agent_message event is normalized by REVIEW_STREAM_FORMATTER
+#                        so the final `REVIEW: PASS|BLOCK` line reaches the machine verdict parser.
+# BYTE-IDENTICAL for herdr-claude / headless: same tokens, same order as the old inline literal
+# ($CLAUDE_FLAGS then the two output flags), so the compose proofs in tests/test-oneshot-exec-seam.sh
+# and every stub-claude review test see the exact argv they saw before. Word-split by the caller
+# (unquoted), exactly as $CLAUDE_FLAGS was.
+_review_runtime_flags() {
+  local drv="${1:-}" perm
+  perm="$(herd_driver_lane_permission_flags "$drv" 2>/dev/null || true)"
+  [ -n "$perm" ] || perm="$CLAUDE_FLAGS"
+  if herd_driver_agent_runtime_native "$drv" 2>/dev/null; then
+    printf '%s --output-format stream-json --verbose' "$perm"
+  elif [ "$(herd_driver_agent_runtime "$drv" 2>/dev/null || true)" = "codex" ]; then
+    printf '%s --json' "$perm"
+  else
+    printf '%s' "$perm"
+  fi
+}
+
 # HERD-311: resolve the REVIEW_MODEL ref once at startup so the single-reviewer dispatch paths can
 # honor a driver-qualified ref correctly and fail loud early rather than silently passing a broken
 # '<driver>:<model>' string to claude as a literal model id. A bare value resolves to
@@ -324,9 +359,15 @@ for line in sys.stdin:
     if not line: continue
     try: obj = json.loads(line)
     except Exception: print(line, flush=True); continue
+    # Codex may emit JSON scalar frames (for example a JSON string) on its
+    # interactive/exec stream.  Those are display data, not protocol objects;
+    # preserve them and keep consuming the stream instead of aborting on .get.
+    if not isinstance(obj, dict): print(line, flush=True); continue
     t = obj.get("type", "")
     if t == "assistant":
-        for b in obj.get("message", {}).get("content", []):
+        message = obj.get("message") or {}
+        for b in (message.get("content") or []) if isinstance(message, dict) else []:
+            if not isinstance(b, dict): continue
             if b.get("type") == "text":
                 txt = b.get("text", "").strip()
                 if txt: print("  " + txt.split("\n")[0][:100], flush=True)
@@ -349,6 +390,11 @@ for line in sys.stdin:
     elif t == "result":
         r = obj.get("result", "")
         if r: print(r, flush=True)
+    elif t == "item.completed":
+        item = obj.get("item") or {}
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text", "")
+            if text: print(text, flush=True)
 '
 
 # ── Review panel (HERD-107 native-burst; HERD-276 mixed-vendor) ──────────────────────────────────
@@ -431,8 +477,8 @@ _panel_member() {
   fi
 
   ( cd "$CWD" 2>/dev/null && \
-    herd_driver_oneshot_exec_as "$drv" "$_PANEL_TASK" "$mdl" $CLAUDE_FLAGS \
-      --output-format stream-json --verbose 2>/dev/null \
+    herd_driver_oneshot_exec_as "$drv" "$_PANEL_TASK" "$mdl" $(_review_runtime_flags "$drv") \
+      2>/dev/null \
     | python3 -uc "$REVIEW_STREAM_FORMATTER" ) > "$mfile" 2>/dev/null || true
 
   local _v _kind
@@ -572,8 +618,8 @@ if [ "$REVIEW_MODE" = "local" ]; then
     # Stream claude -p into $LLOG with the shared formatter, mirroring the headless PR path. Tee to
     # stderr so the builder watches the reasoning live while $LLOG captures it for verdict parsing.
     (set -o pipefail; cd "$CWD" 2>/dev/null && \
-      herd_driver_oneshot_exec_as "$_REVIEW_DRV" "$LOCAL_TASK" "$_REVIEW_MDL" $CLAUDE_FLAGS \
-        --output-format stream-json --verbose 2>&1 | \
+      herd_driver_oneshot_exec_as "$_REVIEW_DRV" "$LOCAL_TASK" "$_REVIEW_MDL" $(_review_runtime_flags "$_REVIEW_DRV") \
+        2>&1 | \
       python3 -uc "$REVIEW_STREAM_FORMATTER") 2>&1 | tee "$LLOG" >&2
     rc=${PIPESTATUS[0]}
 
@@ -808,7 +854,10 @@ name = os.environ["NAME"]
 try:
     agents = (json.load(sys.stdin).get("result") or {}).get("agents") or []
     for a in agents:
-        if a.get("name") == name:
+        # Foreign runtimes register through the report-agent surface, whose roster
+        # identity is `agent` rather than `name`.  This is the same identity contract as
+        # the shared driver pane/liveness resolver.
+        if (a.get("name") or a.get("agent")) == name:
             print(a.get("pane_id", ""), end="")
             break
 except Exception:
@@ -850,7 +899,7 @@ except Exception:
     # `herdr agent start … --split down --no-focus -- claude …` argv.
     _agent_start_out="$(herd_driver_launch_agent \
       name="review·$SLUG" workspace="$_WS_ID" cwd="$CWD" tab="$_builder_tab" split=down \
-      model="$REVIEW_MODEL" flags="$CLAUDE_FLAGS" pointer="$AGENT_TASK" 2>/dev/null || true)"
+      model="$REVIEW_MODEL" flags="$(herd_driver_lane_permission_flags "$_REVIEW_DRV" 2>/dev/null || printf '%s' "$CLAUDE_FLAGS")" pointer="$AGENT_TASK" 2>/dev/null || true)"
     ROOT="$(printf '%s' "${_agent_start_out:-}" | python3 -c '
 import sys, json
 try:
@@ -1053,8 +1102,8 @@ else
   # The formatter emits: tool name + one-line input summary (bash command, file path, etc.)
   # and the reviewer's reasoning text — never the old bare '[tool] Bash'.
   (set -o pipefail; cd "$CWD" 2>/dev/null && \
-    herd_driver_oneshot_exec_as "$_REVIEW_DRV" "$TASK" "$_REVIEW_MDL" $CLAUDE_FLAGS \
-      --output-format stream-json --verbose 2>&1 | \
+    herd_driver_oneshot_exec_as "$_REVIEW_DRV" "$TASK" "$_REVIEW_MDL" $(_review_runtime_flags "$_REVIEW_DRV") \
+      2>&1 | \
     python3 -uc "$REVIEW_STREAM_FORMATTER") >>"$LOG" 2>&1
   rc=$?
 

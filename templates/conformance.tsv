@@ -46,6 +46,7 @@ herd config <list|get|set>	unit	tests/test-cli-config-sync.sh
 herd config <list|get|set>	unit	tests/test-config-dedup-lint.sh
 herd config <list|get|set>	unit	tests/test-config-shared-pr.sh
 herd config <list|get|set>	unit	tests/test-config-set-watcher-skip.sh
+herd runtime switch <herdr-claude|codex> [--dry-run]	unit	tests/test-runtime-switch.sh
 .herd/config.local	unit	tests/test-config-local-overlay.sh
 .claude/commands/coordinator.md	unit	tests/test-derived-skill.sh
 .claude/commands/autopilot.md	unit	tests/test-autopilot-render.sh
@@ -195,6 +196,10 @@ JOURNAL_AUDIT_PUSHED_GRACE	unit	tests/test-journal-audit.sh
 JOURNAL_AUDIT_ACT	unit	tests/test-journal-audit-act.sh
 JOURNAL_AUDIT_ESCALATE_AFTER	unit	tests/test-journal-audit-act.sh
 journal-act.sh	unit	tests/test-journal-audit-act.sh
+GROK_WAKE_PROOF	unit	tests/test-grok-wake-proof.sh
+CODEX_STOP_HOOK	unit	tests/test-codex-stop-hook.sh
+CODEX_STOP_HOOK	unit	tests/test-retirement-invariant.sh
+CODEX_STOP_HOOK	sim	scripts/herd/sim/retirement-invariant-sim.sh
 LIFECYCLE_CONTRACTS	unit	tests/test-lifecycle-contracts.sh
 LIFECYCLE_CONTRACTS	unit	tests/test-lifecycle-lane-workers.sh
 agent-watch.sh	unit	tests/test-human-verify-hold.sh
@@ -257,6 +262,7 @@ hermetic-env-scrub.sh	unit	tests/test-hermetic-env-scrub.sh
 doc-drift-lint.sh	unit	tests/test-doc-drift.sh
 HERDKIT_HOME	unit	tests/test-doc-drift.sh
 herd-review.sh	unit	tests/test-correctness-only-block.sh
+herd-review.sh	unit	tests/test-review-driver-flags.sh
 herd-review.sh	unit	tests/test-review-verdict-integrity.sh
 herd-review.sh	unit	tests/test-structured-block-verdict.sh
 herd-review.sh	sim	tests/test-sandbox-sim.sh
@@ -269,6 +275,7 @@ WORKSPACE_NAME	unit	tests/test-launch-binding-guard.sh
 BACKLOG_FILE	unit	tests/test-backend-file.sh
 BACKLOG_FILE	unit	tests/test-backend-changelog.sh
 SCRIBE_BACKEND	unit	tests/test-scribe-backend-flip.sh
+SCRIBE_DIRECTIVE_PREFIXES	unit	tests/test-scribe-directive-prefixes.sh
 LINEAR_TEAM_ID	unit	tests/test-backend-linear.sh
 SCRIBE_LINGER_SECS	unit	tests/test-scribe-linger.sh
 DRAINER_HEARTBEAT_TIMEOUT	unit	tests/test-drainer-liveness.sh
@@ -306,6 +313,7 @@ COORDINATOR_CMD	none-yet	unit: no test asserts the rendered-skill filename / {{C
 HERD_DRIVER	render	tests/test-driver-abstraction.sh
 HERD_DRIVER	unit	tests/test-headless-driver.sh
 HERD_DRIVER	unit	tests/test-stub-driver.sh
+HERD_DRIVER	sim	tests/test-grok-gate-proof.sh
 HERD_VERSION	unit	tests/test-upgrade-migrations.sh
 HERD_REPO	unit	tests/test-report-repo-guard.sh
 TRACKER_REPO	unit	tests/test-backend-github.sh
@@ -595,6 +603,8 @@ RESOLVE_CLAIM_TTL	unit	tests/test-resolver-claim.sh
 ANOMALY_BASELINES	unit	tests/test-phase-anomaly-baselines.sh
 ANOMALY_BASELINES	unit	tests/test_store.py
 ANOMALY_FILE_COOLDOWN_SECS	unit	tests/test-phase-anomaly-suspend-skip.sh
+ANOMALY_THRESHOLD_PCT	unit	tests/test-phase-anomaly-tuning.sh
+ANOMALY_FLOOR_MARGIN_SECS	unit	tests/test-phase-anomaly-tuning.sh
 GATE_SCALE	sim	tests/test-gate-scale.sh
 tab-discipline.sh	unit	tests/test-tab-discipline.sh
 tab-discipline.sh	sim	tests/test-sandbox-real-panes.sh
@@ -628,6 +638,8 @@ OUTCOME_LEDGER	unit	tests/test-outcome-ledger.sh
 herd ledger-report [--json | --alerts | --daily [--file PATH]]	unit	tests/test-outcome-ledger.sh
 herd intervene <ref> <safety|product|infra-recovery|convenience> "<note>"	unit	tests/test-outcome-ledger.sh
 codex-exec-adapter.sh	unit	tests/test-codex-exec-adapter.sh
+grok-exec-adapter.sh	unit	tests/test-grok-exec-adapter.sh
 codex-durable-coordinator.sh	unit	tests/test-codex-durable-coordinator.sh
 runtime-conformance.sh	unit	tests/test-runtime-conformance.sh
 plugins/herdkit-coordinator	unit	tests/test-codex-plugin-manifest.sh
+herdr-plugin.toml	unit	tests/test-herdr-plugin-manifest.sh

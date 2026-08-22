@@ -191,7 +191,7 @@ fi
 
 # 1. Worktree off the latest default branch + SHARE_LINKS symlinks (same isolation as the full
 #    lane — fails loudly if the slug already exists). Abort if it can't be created.
-if ! bash "$HERE/new-feature.sh" "$SLUG"; then
+if ! HERD_LANE_DRIVER="$_DRIVER_RUNTIME" bash "$HERE/new-feature.sh" "$SLUG"; then
   echo "❌ new-feature.sh failed for '$SLUG' — worktree/branch not created; not spawning a herdr tab." >&2
   exit 1
 fi
@@ -429,14 +429,15 @@ if [ "$_HERD_DRIVER_NAME" != "headless" ]; then
   fi
 fi
 
+_AGENT_ARGV_DESC="$(herd_driver_agent_argv_description "$_DRIVER_RUNTIME" "$MODEL" "$CLAUDE_FLAGS")"
 if [ "$_HERD_DRIVER_NAME" = "headless" ]; then
-  echo "🐑 Quick sub-agent '$SLUG' running detached (claude --model $MODEL $CLAUDE_FLAGS)   dir: $DIR"
+  echo "🐑 Quick sub-agent '$SLUG' running detached ($_AGENT_ARGV_DESC)   dir: $DIR"
   echo "   task spec: $TASK_SPEC_FILE   (builder got a short pointer to it, not the full spec inline)"
   echo "   ⚡ light lane — no app preview; healthcheck auto-runs the light profile unless the diff matches the heavy glob."
   echo "   tail its log:  bash $HERE/driver.sh read-pane $SLUG   (or: tail -f $WORKTREES_DIR/.herd/agents/$SLUG/log)"
   echo "   when its PR is up: the watcher reviews & merges, then  git worktree remove $DIR"
 else
-  echo "🐑 Quick sub-agent '$SLUG' running (claude --model $MODEL $CLAUDE_FLAGS) in herdr tab $TAB   dir: $DIR"
+  echo "🐑 Quick sub-agent '$SLUG' running ($_AGENT_ARGV_DESC) in herdr tab $TAB   dir: $DIR"
   echo "   task spec: $TASK_SPEC_FILE   (builder got a short pointer to it, not the full spec inline)"
   echo "   ⚡ light lane — no app preview; healthcheck auto-runs the light profile unless the diff matches the heavy glob."
   echo "   jump to it:   herdr agent focus $SLUG"

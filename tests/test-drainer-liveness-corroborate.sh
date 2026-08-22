@@ -192,6 +192,9 @@ pass; echo "PASS (3) spawn stamps a fresh heartbeat (grace measured from spawn, 
 # ════════════════════════════════════════════════════════════════════════════
 : > "$JQ"
 touch -t "$ANCIENT" "$SB_HB"
+# The existing false-positive fixture is about a stale HEARTBEAT alone. Give its queued request a
+# fresh progress marker so it remains outside HERD-806's separate no-progress wake predicate.
+touch "$T/trees/.scribe.progress"
 A_NAME="$AGENT" A_STATUS="working" A_CLAUDE="1" A_START_RC="0"
 out="$(run_scribe "second enqueue")"
 grep -q "already running" <<< "$out" || fail "(4a) a live (working) drainer must be KEPT — 'already running' (got: $out)"
@@ -233,5 +236,44 @@ grep -q 'infra_event' "$JQ" || fail "(4c) a failed respawn must journal an infra
 grep -q 'respawn_failed' "$JQ" || fail "(4c) the infra_event must carry reason respawn_failed"
 pass; echo "PASS (4c) failed respawn → infra_event journaled, clean message, exit 0 (no raw driver error)"
 
+# ════════════════════════════════════════════════════════════════════════════
+# (5) NO-PROGRESS: a listed LIVE drainer must be woken when queued work stalls; a legitimately
+# slow claim with a live owner must be left alone. This is intentionally a real scribe.sh invocation
+# against the fake herdr, not a helper-only assertion.
+# ════════════════════════════════════════════════════════════════════════════
+Q="$T/trees/backlog-queue"; mkdir -p "$Q"
+: > "$JQ"; : > "$CALLS"
+printf 'stalled queued request\n' > "$Q/100.req"
+touch -t "$ANCIENT" "$T/trees/.scribe.progress"
+A_NAME="$AGENT" A_STATUS="idle" A_CLAUDE="1" A_START_RC="0"
+out="$(run_scribe "wake stalled live drainer")"
+grep -qi 'safe wake' <<< "$out" || fail "(5a) stale queue progress must wake the live drainer (got: $out)"
+grep -q '^pane run' "$CALLS" || fail "(5a) safe wake must use the driver send-text seam"
+grep -q 'drainer_woken' "$JQ" || fail "(5a) wake must be journaled"
+pass; echo "PASS (5a) queued + live idle + no progress → safely woken"
+
+# A slow drainer may have another request claimed. Its owner is alive, so no wake/reclaim is safe.
+: > "$JQ"; : > "$CALLS"; rm -f "$Q"/*.req "$Q"/*.req.mine "$Q"/*.owner
+printf 'pending behind slow work\n' > "$Q/200.req"
+printf 'slow work\n' > "$Q/100.req.mine"
+printf '%s\n' "$$" > "$Q/100.owner"
+touch -t "$ANCIENT" "$T/trees/.scribe.progress"
+A_NAME="$AGENT" A_STATUS="working" A_CLAUDE="1" A_START_RC="0"
+out="$(run_scribe "do not wake busy drainer")"
+grep -q '^pane run' "$CALLS" && fail "(5b) live owned slow claim must suppress wake/reclaim"
+grep -qi 'already running' <<< "$out" || fail "(5b) busy drainer should keep the singleton path (got: $out)"
+pass; echo "PASS (5b) queued + live owned slow claim → not reclaimed/woken"
+
+# Aged .req.mine claims with a dead owner are returned to the queue, then can be re-claimed. The
+# replacement owner proves the stale pid sidecar was discarded rather than treated as live forever.
+rm -f "$Q"/*.req "$Q"/*.req.mine "$Q"/*.owner
+printf 'orphaned work\n' > "$Q/300.req.mine"
+printf '999999\n' > "$Q/300.owner"
+touch -t "$ANCIENT" "$Q/300.req.mine"
+out="$(HERD_CONFIG_FILE="$T/config" SCRIBE_POLL=0 bash "$ROOT/scripts/herd/scribe-step.sh" next 2>/dev/null)"
+grep -q 'CLAIMED .*300.req.mine' <<< "$out" || fail "(5c) dead-owner claim was not reclaimed and re-claimed (got: $out)"
+[ "$(head -1 "$Q/300.owner")" != "999999" ] || fail "(5c) dead owner sidecar was not replaced"
+pass; echo "PASS (5c) aged dead-owner .req.mine → reclaimed with fresh owner"
+
 echo
-echo "ALL PASS ($PASS checks) — HERD-122: fresh/live drainer never false-reclaimed; genuine hang still recovers."
+echo "ALL PASS ($PASS checks) — HERD-122/HERD-806: no false-reclaim, no-progress wake, dead-owner recovery."

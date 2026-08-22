@@ -1,0 +1,76 @@
+# herdr-plugin.toml — herdkit as a herdr plugin (https://herdr.dev/docs/plugins/).
+#
+# Install straight from GitHub (herdr clones this repo, runs the [[build]] step, registers the
+# entry points):
+#     herdr plugin install briankeegan1/herdkit
+# or, for a local checkout:
+#     herdr plugin link /path/to/herdkit
+#
+# The cloned plugin root IS the herdkit engine (bin/herd + scripts/herd/), so the plugin is
+# self-contained: every action runs the engine that shipped with it via $HERDR_PLUGIN_ROOT/bin/herd
+# and never depends on a separate install. The [[build]] step additionally wires `herd` onto PATH
+# (install.sh, local mode: symlink into a writable PATH dir + dependency doctor, advisory) so the
+# coordinator agent, builders and your shell all reach the same `herd`. Details + the doctrine
+# (thin packaging layer, the CLI stays the source of truth): packaging/herdr/README.md.
+
+id = "herdkit"
+name = "herdkit"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Governance and parallelism for herdr-based agent workflows — a coordinator drains your backlog into isolated worktree builders (Claude Code, Codex, or Grok), and a watcher lands each change once its healthcheck + adversarial review are green. Actions: init, launch/reload the control room, status, backlog, doctor."
+platforms = ["macos", "linux"]
+
+# Runs once on `herdr plugin install`, after you confirm. Wires this checkout's `herd` onto PATH and
+# runs the dependency doctor (git, gh, claude, python3, herdr). Advisory: a missing dep is reported
+# with per-platform hints, never a failed install. Skipped by `herdr plugin link`.
+[[build]]
+command = ["bash", "install.sh"]
+
+# Every action opens ONE plugin pane (entrypoint `run`, below) in the focused workspace's cwd —
+# the project you want to herd — and runs the matching `herd` subcommand there. Runtime commands
+# start in the PLUGIN root, so action.sh reads the workspace cwd from HERDR_PLUGIN_CONTEXT_JSON and
+# passes it via `herdr plugin pane open --cwd`; the verb travels in the HERDKIT_VERB env var.
+
+[[actions]]
+id = "init"
+title = "herdkit: init this project (herd init)"
+contexts = ["workspace"]
+command = ["bash", "packaging/herdr/action.sh", "init"]
+
+[[actions]]
+id = "launch"
+title = "herdkit: launch the control room (coordinator + watcher)"
+contexts = ["workspace"]
+command = ["bash", "packaging/herdr/action.sh", "launch"]
+
+[[actions]]
+id = "reload"
+title = "herdkit: reload the control room (herd reload)"
+contexts = ["workspace"]
+command = ["bash", "packaging/herdr/action.sh", "reload"]
+
+[[actions]]
+id = "status"
+title = "herdkit: status snapshot (herd status)"
+contexts = ["workspace"]
+command = ["bash", "packaging/herdr/action.sh", "status"]
+
+[[actions]]
+id = "backlog"
+title = "herdkit: open work items (herd backlog --rich)"
+contexts = ["workspace"]
+command = ["bash", "packaging/herdr/action.sh", "backlog"]
+
+[[actions]]
+id = "doctor"
+title = "herdkit: dependency doctor (herd doctor)"
+contexts = ["workspace"]
+command = ["bash", "packaging/herdr/action.sh", "doctor"]
+
+# The one pane every action opens. Its cwd is the workspace's project (set by action.sh); it puts
+# $HERDR_PLUGIN_ROOT/bin first on PATH so `herd` resolves to the engine that shipped with the plugin.
+[[panes]]
+id = "run"
+title = "herdkit"
+placement = "split"
+command = ["bash", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/packaging/herdr/pane.sh\""]

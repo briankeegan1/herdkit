@@ -19,8 +19,10 @@
 #   (C) _handle_block_verdict — a review bounce PREFLIGHTS liveness: a dead agent escalates to
 #       'needs you · agent dead' WITHOUT any `herdr pane run` wake, journals refix_escalated_dead once;
 #       a LIVE agent falls straight through to the normal refix (a pane run IS attempted).
-#   (D) _reconcile_dead_builder — a listed-but-dead agent (stale status, liveness='dead') crosses into
-#       DEAD past grace exactly like a vanished one.
+#   (D) _reconcile_dead_builder — positive driver-aware liveness is authoritative in both directions:
+#       a listed-but-dead agent crosses into DEAD, while a live Codex/Claude process vetoes death even
+#       when the roster is empty, clears stale dead state, never notifies/autorespawns, and returns the
+#       explicit ALIVE_UNKNOWN verdict the watcher uses for its neutral roster-syncing row.
 #   (E) layout_stale_agent_tabs — flags a single-pane drainer/reviewer tab left BARE by a crash; never
 #       a live (claude) agent tab, a multi-pane control room, or a non-engine label.
 #
@@ -338,7 +340,7 @@ ok
 unset -f date sleep
 
 # ════════════════════════════════════════════════════════════════════════════
-# (D) _reconcile_dead_builder — a listed-but-dead agent crosses into DEAD
+# (D) _reconcile_dead_builder — driver liveness is authoritative in both directions
 # ════════════════════════════════════════════════════════════════════════════
 DEAD_STATE="$T/.dead"; : > "$DEAD_STATE"
 export HERD_TRANSCRIPT_ROOT="$T/no-transcripts"
@@ -355,6 +357,62 @@ ok
 v="$(HERD_NOW_EPOCH="$NOW" _reconcile_dead_builder listed-live "$T/wt-ll" "idle" "alive")"
 [ "$v" = "ALIVE" ] || fail "D3: a listed live agent ⇒ ALIVE (got $v)"
 ok
+
+# HERD-780 grounded regression: Codex is positively alive in its labelled pane even though the agent
+# roster transiently omits it. Its transcript is static/absent. Seed a PENDING record from before the
+# omission crossed grace, then reconcile beyond grace: process liveness vetoes DEAD, clears the stale
+# record, and cannot reach either the skull notification or autorespawn path.
+NOTIFY_CALLS="$T/dead-notify.calls"; RESPAWN_CALLS="$T/dead-respawn.calls"
+: > "$NOTIFY_CALLS"; : > "$RESPAWN_CALLS"
+eval "$(declare -f herd_driver_notify | sed '1s/herd_driver_notify/__herd780_notify/')"
+eval "$(declare -f _maybe_autorespawn_dead_builder | sed '1s/_maybe_autorespawn_dead_builder/__herd780_autorespawn/')"
+herd_driver_notify() { printf '%s\n' "$*" >> "$NOTIFY_CALLS"; }
+_maybe_autorespawn_dead_builder() { printf '%s\n' "$*" >> "$RESPAWN_CALLS"; }
+
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+mk_pane pane-codex-live "codex --model gpt-5.6-codex" tab-codex codex-live
+herd_driver_agent_spawn_driver_write codex-live codex
+record_dead_seen codex-live "$NOW"
+live="$(_agent_liveness codex-live)"
+[ "$live" = "alive" ] || fail "D4: delisted labelled Codex pane must provide positive alive evidence (got $live)"
+v="$(DEAD_BUILDER_AUTORESPAWN=on HERD_NOW_EPOCH="$((NOW+GRACE+1))" \
+      _reconcile_dead_builder codex-live "$T/wt-codex" "" "$live")"
+[ "$v" = "ALIVE_UNKNOWN" ] || fail "D4: positive Codex liveness must preserve unknown roster status beyond grace (got $v)"
+[ -z "$(dead_first_seen codex-live)" ] || fail "D4: positive alive must clear a stale pending record"
+[ ! -s "$NOTIFY_CALLS" ] || fail "D4: positive alive must suppress the skull notification"
+[ ! -s "$RESPAWN_CALLS" ] || fail "D4: positive alive must prevent autorespawn"
+ok
+
+# The same veto retains default Claude behavior and clears an already-NOTIFIED record, not merely a
+# pending one. Repeated reconciliation across and beyond grace remains ALIVE with a flat transcript.
+reset_agents; rm -rf "$S/panes"; mkdir -p "$S/panes"
+mk_pane pane-claude-live "claude --model opus" tab-claude claude-live
+herd_driver_agent_spawn_driver_write claude-live herdr-claude
+_dead_upsert claude-live "$((NOW-GRACE-10))" notified
+for at in "$NOW" "$((NOW+GRACE+10))"; do
+  live="$(_agent_liveness claude-live)"
+  v="$(DEAD_BUILDER_AUTORESPAWN=on HERD_NOW_EPOCH="$at" \
+        _reconcile_dead_builder claude-live "$T/wt-claude" "" "$live")"
+  [ "$v" = "ALIVE_UNKNOWN" ] || fail "D5: positive Claude liveness must remain ALIVE_UNKNOWN at $at (got $v)"
+done
+[ -z "$(dead_first_seen claude-live)" ] || fail "D5: positive alive must clear a stale notified record"
+[ ! -s "$NOTIFY_CALLS" ] || fail "D5: positive alive must not notify"
+[ ! -s "$RESPAWN_CALLS" ] || fail "D5: positive alive must not autorespawn"
+ok
+
+# Negative controls: without positive alive evidence, dead/missing/unknown retain their prior empty-
+# roster classifications and cross from PENDING to DEAD after grace.
+for state in dead missing unknown; do
+  slug="negative-$state"; : > "$DEAD_STATE"
+  v="$(HERD_NOW_EPOCH="$NOW" _reconcile_dead_builder "$slug" "$T/wt-$state" "" "$state")"
+  [ "$v" = "PENDING" ] || fail "D6: empty roster + $state must start PENDING (got $v)"
+  v="$(HERD_NOW_EPOCH="$((NOW+GRACE+1))" _reconcile_dead_builder "$slug" "$T/wt-$state" "" "$state")"
+  [ "$v" = "DEAD" ] || fail "D6: empty roster + $state must reach DEAD past grace (got $v)"
+done
+ok
+
+herd_driver_notify() { __herd780_notify "$@"; }
+_maybe_autorespawn_dead_builder() { __herd780_autorespawn "$@"; }
 
 # ════════════════════════════════════════════════════════════════════════════
 # (E) layout_stale_agent_tabs — the eyes sweep flag

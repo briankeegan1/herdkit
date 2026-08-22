@@ -68,6 +68,7 @@ git -C "$MAIN" worktree add -q "$TREES/feat" -b feat 2>/dev/null || fail "git wo
 # The actuator set, exactly as enumerated in scripts/herd/context-guard.sh.
 ACTUATORS=(
   "config set DEFAULT_BRANCH trunk"
+  "runtime switch codex --dry-run"
   "theme set nord"
   "governance apply /dev/null"
   "backend switch file"
