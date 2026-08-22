@@ -115,7 +115,8 @@ try:
 except OSError:
     sys.exit(0)
 
-# Sort chronologically (window may span rotations only if live file is contiguous — fine).
+# Sort chronologically; Python's stable sort retains append order for same-second events.
+# The latter is the journal's only reliable ordering at whole-second timestamp precision.
 events.sort(key=lambda o: o["_ts"])
 
 findings = []  # (kind, key, summary, ctx)
@@ -172,8 +173,9 @@ TERMINALS = {
     "review_dispatched": {"verdict_recorded", "review_skipped", "review_carried_forward", "review_retry", "review_latency"},
 }
 
-dispatches = [e for e in events if is_dispatched(e.get("event")) and has_work_identity(e)]
-for d in dispatches:
+for d_i, d in enumerate(events):
+    if not (is_dispatched(d.get("event")) and has_work_identity(d)):
+        continue
     if age_secs(now, d["_ts"]) < dispatch_ttl:
         continue
     ev = str(d.get("event") or "")
@@ -185,9 +187,10 @@ for d in dispatches:
     if not terminals:
         terminals = {"verdict_recorded", "outcome", "completed", "done"}
     ok = False
-    for e in events:
-        if e["_ts"] <= d["_ts"]:
-            continue
+    # Journal timestamps have whole-second resolution. Scan only events appended AFTER this
+    # dispatch, rather than requiring a later clock value: an immediate review_retry can share
+    # the dispatch's timestamp, while a same-second terminal written before it must not clear it.
+    for e in events[d_i + 1:]:
         en = str(e.get("event") or "")
         if en in terminals or any(en.endswith("_" + t) or en == t for t in terminals):
             if pr is not None and e.get("pr") is not None and str(e.get("pr")) != str(pr):

@@ -241,6 +241,21 @@ out="$(REVIEW_LATENCY=off run_audit on)" || fail "(2b0) latency-off INFRA-termin
 [ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b0) a latency-off matching review_retry must close its dispatch; $(cat "$JOURNAL_FILE")"
 grep -q '"event":"review_latency"' "$JOURNAL_FILE" && fail "(2b0) latency-off fixture must not rely on review_latency"
 
+# Journal timestamps are whole-second, so a collected INFRA retry may land in the SAME second as
+# its dispatch. File order is authoritative: a following retry closes it, but a prior retry cannot
+# retroactively close a newly appended dispatch for the same PR/SHA.
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":70,"sha":"same70","slug":"same-second-review"'
+jline "2026-07-09T12:00:00Z" '"event":"review_retry","pr":70,"sha":"same70"'
+out="$(run_audit on)" || fail "(2b0) same-second retry audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "0" ] || fail "(2b0) a same-second following review_retry must close its dispatch; $(cat "$JOURNAL_FILE")"
+
+reset_surfaces
+jline "2026-07-09T12:00:00Z" '"event":"review_retry","pr":70,"sha":"ordered70"'
+jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":70,"sha":"ordered70","slug":"ordered-review"'
+out="$(run_audit on)" || fail "(2b0) ordered same-second audit exited non-zero: $out"
+[ "$(count_audit dispatch_no_outcome)" = "1" ] || fail "(2b0) a same-second preceding retry must not close a later dispatch; $(cat "$JOURNAL_FILE")"
+
 reset_surfaces
 jline "2026-07-09T12:00:00Z" '"event":"review_dispatched","pr":72,"sha":"infra72","slug":"retry-review"'
 jline "2026-07-09T12:01:00Z" '"event":"review_retry","pr":72,"sha":"infra72"'
