@@ -81,13 +81,18 @@ WTP="$(cd "$WT" && pwd -P)"
 
 rec_file() { printf '%s' "$TREES/.health-provenance-$1"; }
 log_file() { printf '%s' "$TREES/.health-provenance-log-$1"; }
-# plant <sha> <worktree> <profile> <outcome> <duration> <provenance> <tree_state> <epoch> [digest]
+# plant <sha> <worktree> <profile> <outcome> <duration> <provenance> <tree_state> <epoch> [digest] [notes] [baseline-sha]
 # Writes a FORMAT VERSION 2 record directly (bypassing herd_health_trust_write) so a test can shape
 # every field independently. digest defaults to "-" (no log claimed) when omitted — the right shape
 # for every disqualifier this file proves gets caught BEFORE the digest check ever runs.
 plant() {
-  printf '2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:--}" > "$(rec_file "$1")"
+  if [ -n "${11:-}" ]; then
+    printf '2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:--}" "${10:-}" "${11}" > "$(rec_file "$1")"
+  else
+    printf '2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "${9:--}" > "$(rec_file "$1")"
+  fi
 }
 # plant_old <sha> <worktree> <profile> <outcome> <duration> <provenance> <tree_state> <epoch>
 # Writes a PRE-HERD-560 (8-field, no version, no digest) record — the exact shape the engine wrote
@@ -143,6 +148,10 @@ SHA2="$(git -C "$WT" rev-parse HEAD)"
 # second and make the freshness guard mask the predicate each case is meant to prove.
 FRESH_EPOCH="$(git -C "$WT" show -s --format=%ct "$SHA2")"
 [ -n "$FRESH_EPOCH" ] || fail "(3) fixture cannot resolve the new commit timestamp"
+# The DATAENV trust claim is meaningful only relative to a particular baseline. Keep a separate
+# main checkout so this fixture can advance it without changing the candidate SHA/worktree.
+BASE="$T/main"; git clone -q "$WT" "$BASE"
+BASE_SHA="$(git -C "$BASE" rev-parse HEAD)"
 herd_health_trust_check "$TREES" "$SHA2" "$WT" >/dev/null \
   && fail "(3) a record for the PREVIOUS sha must never trust the new head"
 [ "$HERD_HEALTH_TRUST_REASON" = "no record for sha" ] \
@@ -179,25 +188,43 @@ ok "(4) a CODEERROR outcome is never trusted"
 rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
 herd_health_trust_write "$TREES" "$SHA2" "$WT" heavy DATAENV 12 builder-local \
   "DATAENV"$'\n'"notes: visreg — no baseline for hud_multires_design" \
-  "visreg — no baseline for hud_multires_design"
+  "visreg — no baseline for hud_multires_design" "$BASE_SHA"
 [ -f "$(log_file "$SHA2")" ] || fail "(4) a DATAENV write must persist a companion suite log"
-IFS=$'\t' read -r R_VER R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH R_DIGEST R_NOTES \
+IFS=$'\t' read -r R_VER R_SHA R_WT R_PROF R_OUT R_DUR R_PROV R_STATE R_EPOCH R_DIGEST R_NOTES R_BASE \
   < "$(rec_file "$SHA2")"
 [ "$R_OUT" = "DATAENV" ] || fail "(4) DATAENV write recorded outcome='$R_OUT'"
 [ -n "$R_DIGEST" ] && [ "$R_DIGEST" != "-" ] || fail "(4) DATAENV write must hash the companion log"
+[ "$R_BASE" = "$BASE_SHA" ] || fail "(4) DATAENV row must bind the baseline sha"
 case "$R_NOTES" in
   *hud_multires_design*) ok "(4) DATAENV row records tolerated notes in field 11" ;;
   *) fail "(4) DATAENV notes field missing or empty: '$R_NOTES'" ;;
 esac
-GOT="$(herd_health_trust_check "$TREES" "$SHA2" "$WT")" \
+GOT="$(herd_health_trust_check "$TREES" "$SHA2" "$WT" "$BASE")" \
   && [ "$GOT" = "builder-local" ] \
   && ok "(4) shared reader TRUSTS a DATAENV heavy record with companion log" \
   || fail "(4) DATAENV with companion log refused: $HERD_HEALTH_TRUST_REASON"
 # Planted DATAENV with no log (the pre-policy shape) is still refused — on the digest,
 # not on the outcome. Fail-closed: a DATAENV claim with nothing behind it is not evidence.
 rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
-try_reject 4b heavy DATAENV builder-local clean "$FRESH_EPOCH" "$WTP" "no suite log"
+plant "$SHA2" "$WTP" heavy DATAENV 7 builder-local clean "$FRESH_EPOCH" "-" "-" "$BASE_SHA"
+herd_health_trust_check "$TREES" "$SHA2" "$WT" "$BASE" >/dev/null && fail "(4b) DATAENV without a log must NOT be trusted"
+[ "$HERD_HEALTH_TRUST_REASON" = "no suite log for record" ] \
+  || fail "(4b) wrong reason: '$HERD_HEALTH_TRUST_REASON' (want no suite log)"
 ok "(4) DATAENV without a companion log is refused (missing companion), not trusted"
+
+# An unchanged baseline preserves a DATAENV trust claim; once main advances, the old inherited
+# failure set is no longer evidence. The reader must force a fresh heavy suite before deciding
+# whether that same failure is now introduced.
+rm -f "$TREES"/.health-provenance-* 2>/dev/null || true
+herd_health_trust_write "$TREES" "$SHA2" "$WT" heavy DATAENV 12 builder-local "inherited failure" "" "$BASE_SHA"
+herd_health_trust_check "$TREES" "$SHA2" "$WT" "$BASE" >/dev/null \
+  || fail "(4c) unchanged baseline must preserve valid DATAENV trust ($HERD_HEALTH_TRUST_REASON)"
+git -C "$BASE" -c user.email=t@t -c user.name=t commit --allow-empty -qm baseline-advanced
+herd_health_trust_check "$TREES" "$SHA2" "$WT" "$BASE" >/dev/null \
+  && fail "(4c) a DATAENV record must not survive an advanced baseline"
+[ "$HERD_HEALTH_TRUST_REASON" = "DATAENV baseline advanced" ] \
+  || fail "(4c) wrong reason after baseline advance: '$HERD_HEALTH_TRUST_REASON'"
+ok "(4) DATAENV trust is baseline-bound: unchanged baseline trusts; an advanced main forces heavy"
 
 try_reject 5 light CLEAN builder-local clean "$FRESH_EPOCH" "$WTP" "profile=light"
 ok "(5) a LIGHT record proves nothing about the full suite and is never trusted"
@@ -502,6 +529,7 @@ ok "(17) a record older than HEALTH_TRUST_MAX_AGE_SECS is refused regardless of 
 echo
 echo "ALL PASS ($PASS checks) — HERD-531/560 sha-matched builder-local trust: off is a hard no-op, only a"
 echo "CLEAN or DATAENV heavy builder-local VERSION 2 record of the EXACT sha from a CLEAN tree at the"
-echo "SAME worktree, digest-matched against its companion suite log and within the freshness window,"
-echo "earns a light smoke — every other case, including CODEERROR, a pre-hardening or"
+echo "SAME worktree, digest-matched against its companion suite log and within the freshness window;"
+echo "DATAENV additionally binds the unchanged baseline sha that made its failure inherited. Every other"
+echo "case, including CODEERROR, a pre-hardening or"
 echo "unrecognized-version record, falls back to the full re-run."

@@ -4815,13 +4815,15 @@ class TestHealthTrustBuilder(unittest.TestCase):
     def _log_file(self, sha):
         return os.path.join(self.trees, ".health-provenance-log-%s" % sha)
 
-    def _plant(self, sha, wt, prof, outcome, dur, prov, state, epoch, digest="-"):
+    def _plant(self, sha, wt, prof, outcome, dur, prov, state, epoch, digest="-", notes="", baseline=""):
         """Write a FORMAT VERSION 2 (HERD-560) record directly. ``digest`` defaults to ``"-"`` — the
         right shape for every disqualifier this class proves gets caught BEFORE the digest check ever
         runs; a test that needs to reach TRUSTED supplies a real digest via :meth:`_write_log`."""
+        fields = ["2", sha, wt, prof, outcome, str(dur), prov, state, str(epoch), digest]
+        if baseline:
+            fields.extend([notes, baseline])
         with open(self._rec_file(sha), "w", encoding="utf-8") as fh:
-            fh.write("\t".join(["2", sha, wt, prof, outcome, str(dur), prov, state, str(epoch),
-                                digest]) + "\n")
+            fh.write("\t".join(fields) + "\n")
 
     def _plant_old(self, sha, wt, prof, outcome, dur, prov, state, epoch):
         """Write a PRE-HERD-560 (8-field, no version, no digest) record — the exact shape the engine
@@ -4891,16 +4893,8 @@ class TestHealthTrustBuilder(unittest.TestCase):
         epoch = self._commit_epoch() + 60
         digest = self._write_log(self.sha, "DATAENV\nnotes: visreg — no baseline")
         self._plant(self.sha, self.wt_abs, "heavy", "DATAENV", 1234, "builder-local", "clean", epoch,
-                    digest)
-        # Append the optional notes field (11th) — a later reader can tell what
-        # was skipped. The trust decision does not key on it.
-        rec = self._rec_file(self.sha)
-        with open(rec, "r+", encoding="utf-8") as fh:
-            line = fh.readline().rstrip("\n")
-            fh.seek(0)
-            fh.write(line + "\tvisreg — no baseline\n")
-            fh.truncate()
-        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+                    digest, "visreg — no baseline", self.sha)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt, self.wt)
         self.assertEqual(prov, "builder-local")
         self.assertEqual(reason, "")
 
@@ -4908,10 +4902,45 @@ class TestHealthTrustBuilder(unittest.TestCase):
         """A DATAENV claim with digest='-' (the pre-policy shape) is still
         refused — fail-closed on the companion log, not a silent green."""
         epoch = self._commit_epoch() + 60
-        self._plant(self.sha, self.wt_abs, "heavy", "DATAENV", 1, "builder-local", "clean", epoch)
-        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt)
+        self._plant(self.sha, self.wt_abs, "heavy", "DATAENV", 1, "builder-local", "clean", epoch,
+                    "-", "", self.sha)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt, self.wt)
         self.assertEqual(prov, "")
         self.assertEqual(reason, "no suite log for record")
+
+    def test_dataenv_trust_refuses_when_baseline_advances(self):
+        """An inherited failure is relative to main. A record remains usable while
+        that baseline is unchanged, but a new main SHA forces a fresh heavy run so
+        an introduced failure cannot inherit yesterday's tolerance."""
+        base = os.path.join(self.tmp, "main")
+        subprocess.run(["git", "clone", "-q", self.wt, base], check=True)
+        base_sha = subprocess.check_output(["git", "-C", base, "rev-parse", "HEAD"]).decode().strip()
+        epoch = self._commit_epoch() + 60
+        digest = self._write_log(self.sha, "DATAENV\ninherited failure")
+        self._plant(self.sha, self.wt_abs, "heavy", "DATAENV", 1, "builder-local", "clean", epoch,
+                    digest, "inherited failure", base_sha)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt, base)
+        self.assertEqual((prov, reason), ("builder-local", ""))
+        # The actual live dispatch consumes the watcher's authoritative main checkout, not the
+        # candidate's possibly-stale default-branch ref.
+        cand = LiveCandidate(pr=1, sha=self.sha, slug="feat-x", worktree=self.wt)
+        g = LiveGates(base, LiveState(self.trees), LiveJournal(os.path.join(self.tmp, "j.jsonl")),
+                      config={"HEALTH_TRUST_BUILDER": "on"})
+        dispatched = []
+        g._dispatch_health = lambda candidate, profile="": dispatched.append(profile)
+        self.assertEqual(g.health(cand), WAIT)
+        self.assertEqual(dispatched, ["--light"])
+        subprocess.run(["git", "-C", base, "-c", "user.email=t@test", "-c", "user.name=t",
+                        "commit", "--allow-empty", "-qm", "baseline advanced"], check=True)
+        prov, reason = LR._health_trust_check(self.trees, self.sha, self.wt, base)
+        self.assertEqual(prov, "")
+        self.assertEqual(reason, "DATAENV baseline advanced")
+        g = LiveGates(base, LiveState(self.trees), LiveJournal(os.path.join(self.tmp, "j2.jsonl")),
+                      config={"HEALTH_TRUST_BUILDER": "on"})
+        dispatched = []
+        g._dispatch_health = lambda candidate, profile="": dispatched.append(profile)
+        self.assertEqual(g.health(cand), WAIT)
+        self.assertEqual(dispatched, [""])
 
     def test_light_profile_record_not_trusted(self):
         epoch = self._commit_epoch() + 60

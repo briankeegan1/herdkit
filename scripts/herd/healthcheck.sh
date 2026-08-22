@@ -1129,8 +1129,16 @@ if [ "$MODE" = "heavy" ] && [ -z "$ONELINE" ] && [ -n "$HEALTHCHECK_CMD" ]; then
   # passes no log; herd_health_trust_write only persists/hashes one for CLEAN or DATAENV.
   _hc_prov_log=""
   case "$_hc_prov_outcome" in CLEAN|DATAENV) _hc_prov_log="$MAIN_OUT" ;; esac
+  # DATAENV means the baseline-aware gate observed only failures inherited from a particular main
+  # state. Bind that state into the evidence: if main advances before the watcher consumes it, an
+  # inherited failure may have become introduced and the reader must force a fresh heavy run.
+  _hc_prov_base=""
+  if [ "$_hc_prov_outcome" = "DATAENV" ]; then
+    _hc_prov_base="$(herd_health_trust_baseline_sha "$DIR" "${HERD_BASELINE_DIR:-}")"
+  fi
   herd_health_trust_write "${WORKTREES_DIR:-}" "$_hc_prov_sha" "$DIR" heavy \
-    "$_hc_prov_outcome" "$_hc_prov_dur" "${HERD_HEALTH_PROVENANCE:-builder-local}" "$_hc_prov_log" || true
+    "$_hc_prov_outcome" "$_hc_prov_dur" "${HERD_HEALTH_PROVENANCE:-builder-local}" "$_hc_prov_log" \
+    "" "$_hc_prov_base" || true
 fi
 
 if [ -n "$ONELINE" ]; then

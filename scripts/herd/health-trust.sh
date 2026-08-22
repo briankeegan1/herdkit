@@ -62,8 +62,10 @@
 #   log_digest — evidence with nothing behind it is not evidence. Pruned alongside the record by
 #   the same HEALTH_TRUST_KEEP_DAYS sweep below (its name still matches the `.health-provenance-*`
 #   glob). An optional 11th field on the row itself holds a single-line flattening of those notes
-#   (tabs/newlines stripped) so a census can see them without opening the log. 10-field rows remain
-#   valid; a missing 11th field is not a disqualifier.
+#   (tabs/newlines stripped) so a census can see them without opening the log. 10-field CLEAN rows
+#   remain valid. DATAENV rows add fields 11-12: tolerated notes and the exact baseline SHA whose
+#   known-failure set made the outcome tolerable. A DATAENV record without that baseline binding is
+#   refused: a later main advance can turn an inherited failure into an introduced one.
 #
 #   A pre-HERD-560 record (8 fields, no version) or a record naming an UNRECOGNIZED version reads as
 #   ABSENT — exactly as if this sha had no record at all — never as an error: an engine upgrade must
@@ -79,8 +81,9 @@
 #   herd_health_trust_on                       — 0 iff HEALTH_TRUST_BUILDER is on
 #   herd_health_trust_file <trees> <sha>       — the record path for one sha
 #   herd_health_trust_log_file <trees> <sha>   — the companion suite-log path for one sha
-#   herd_health_trust_write <trees> <sha> <worktree> <profile> <outcome> <duration> [provenance] [log] [notes]
-#   herd_health_trust_check <trees> <sha> <worktree>
+#   herd_health_trust_baseline_sha <worktree> [baseline-worktree]
+#   herd_health_trust_write <trees> <sha> <worktree> <profile> <outcome> <duration> [provenance] [log] [notes] [baseline-sha]
+#   herd_health_trust_check <trees> <sha> <worktree> [baseline-worktree]
 #                                              — 0 = TRUSTED (prints the record's provenance),
 #                                                1 = not trusted ($HERD_HEALTH_TRUST_REASON says why)
 #
@@ -131,6 +134,21 @@ herd_health_trust_log_file() {
   printf '%s' "${_hl_trees%/}/.health-provenance-log-$_hl_sha"
 }
 
+# herd_health_trust_baseline_sha <worktree> [baseline-worktree] — resolve the exact default-branch
+# state whose known-failure set the baseline-aware gate used. Prefer the watcher's authoritative MAIN
+# checkout when supplied; a builder-local run falls back to its DEFAULT_BRANCH ref. Empty means the
+# state cannot be proven and DATAENV must not earn a heavy-suite skip.
+herd_health_trust_baseline_sha() {
+  local _hb_wt="${1:-}" _hb_base="${2:-${HERD_BASELINE_DIR:-}}" _hb_sha=""
+  if [ -n "$_hb_base" ] && [ -d "$_hb_base" ]; then
+    _hb_sha="$(git -C "$_hb_base" rev-parse HEAD 2>/dev/null || true)"
+  fi
+  if [ -z "$_hb_sha" ] && [ -n "$_hb_wt" ]; then
+    _hb_sha="$(git -C "$_hb_wt" rev-parse "${DEFAULT_BRANCH:-main}" 2>/dev/null || true)"
+  fi
+  printf '%s' "$_hb_sha"
+}
+
 # _herd_health_trust_digest_file <path> — sha256 hex digest of <path>'s CONTENT (never a re-quoted
 # string round-trip, so a trailing newline in the log can never desync the write-time and read-time
 # hash). Empty on any failure (missing file, no hasher on PATH) — the caller treats "" as "no digest"
@@ -150,7 +168,7 @@ _herd_health_trust_digest_file() {
   fi
 }
 
-# herd_health_trust_write <trees> <sha> <worktree> <profile> <outcome> <duration> [provenance] [log] [notes]
+# herd_health_trust_write <trees> <sha> <worktree> <profile> <outcome> <duration> [provenance] [log] [notes] [baseline-sha]
 # Write (atomically: temp + mv, mirroring the gate's own dispatch-file discipline) one provenance
 # row, format VERSION 2 (HERD-560). tree_state is derived HERE, from the worktree itself, so a caller
 # can never claim a clean tree it did not have. Silent no-op when the lever is off, when the pool is
@@ -168,7 +186,7 @@ _herd_health_trust_digest_file() {
 herd_health_trust_write() {
   herd_health_trust_on || return 0
   local _ht_trees="${1:-}" _ht_sha="${2:-}" _ht_wt="${3:-}" _ht_prof="${4:-}" _ht_out="${5:-}"
-  local _ht_dur="${6:-0}" _ht_prov="${7:-builder-local}" _ht_log="${8:-}" _ht_notes="${9:-}"
+  local _ht_dur="${6:-0}" _ht_prov="${7:-builder-local}" _ht_log="${8:-}" _ht_notes="${9:-}" _ht_base="${10:-}"
   local _ht_f _ht_logf _ht_state="dirty" _ht_dirty _ht_digest="-"
   [ -n "$_ht_trees" ] && [ -d "$_ht_trees" ] || return 0
   [ -n "$_ht_sha" ] && [ -n "$_ht_wt" ] && [ -n "$_ht_prof" ] && [ -n "$_ht_out" ] || return 0
@@ -195,10 +213,18 @@ herd_health_trust_write() {
       [ -n "$_ht_digest" ] || _ht_digest="-"
     fi
   fi
-  # Flatten notes to a single TSV field: no tabs, no newlines. Empty → omit field 11 so a
-  # CLEAN write stays a 10-field row (old readers still parse it).
+  # Flatten notes to a single TSV field: no tabs, no newlines. CLEAN stays a 10-field row so its
+  # pre-DATAENV trust behavior is byte-compatible. DATAENV carries both the notes field (possibly
+  # empty) and the baseline SHA; missing baseline evidence deliberately makes the later read refuse.
   _ht_notes="$(printf '%s' "$_ht_notes" | tr '\t\n\r' '   ' | sed 's/  */ /g;s/^ //;s/ $//')"
-  if [ -n "$_ht_notes" ]; then
+  if [ "$_ht_out" = "DATAENV" ]; then
+    # Bash `read` treats tab as IFS whitespace and collapses an empty middle field. Keep the
+    # baseline in its fixed twelfth position even when there were no tolerated-note words.
+    [ -n "$_ht_notes" ] || _ht_notes="-"
+    printf '2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$_ht_sha" "$_ht_wt" "$_ht_prof" "$_ht_out" "$_ht_dur" "$_ht_prov" "$_ht_state" "$(date +%s)" \
+      "$_ht_digest" "$_ht_notes" "$_ht_base" > "$_ht_f.tmp.$$" 2>/dev/null && mv "$_ht_f.tmp.$$" "$_ht_f" 2>/dev/null
+  elif [ -n "$_ht_notes" ]; then
     printf '2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$_ht_sha" "$_ht_wt" "$_ht_prof" "$_ht_out" "$_ht_dur" "$_ht_prov" "$_ht_state" "$(date +%s)" \
       "$_ht_digest" "$_ht_notes" > "$_ht_f.tmp.$$" 2>/dev/null && mv "$_ht_f.tmp.$$" "$_ht_f" 2>/dev/null
@@ -228,8 +254,8 @@ herd_health_trust_write() {
 # such case is a full re-run, exactly as before this library). Read-only; never mutates the record.
 herd_health_trust_check() {
   HERD_HEALTH_TRUST_REASON=""
-  local _ht_trees="${1:-}" _ht_sha="${2:-}" _ht_wt="${3:-}" _ht_f _ht_line _ht_nfields
-  local _ht_ver _ht_rsha _ht_rwt _ht_prof _ht_out _ht_dur _ht_prov _ht_state _ht_epoch _ht_digest _ht_notes _ht_ct
+  local _ht_trees="${1:-}" _ht_sha="${2:-}" _ht_wt="${3:-}" _ht_basewt="${4:-}" _ht_f _ht_line _ht_nfields
+  local _ht_ver _ht_rsha _ht_rwt _ht_prof _ht_out _ht_dur _ht_prov _ht_state _ht_epoch _ht_digest _ht_notes _ht_rbase _ht_ct
 
   if ! herd_health_trust_on; then HERD_HEALTH_TRUST_REASON="lever off"; return 1; fi
   if [ -z "$_ht_sha" ]; then HERD_HEALTH_TRUST_REASON="no head sha"; return 1; fi
@@ -246,12 +272,12 @@ herd_health_trust_check() {
   if [ "$_ht_nfields" -eq 8 ]; then
     HERD_HEALTH_TRUST_REASON="old-format record (absent)"; return 1
   fi
-  # 10 fields is the HERD-560 row. 11 fields is the same row plus an optional notes
-  # flattening (tolerated DATAENV notes). Anything else is garbled.
-  if [ "$_ht_nfields" -ne 10 ] && [ "$_ht_nfields" -ne 11 ]; then
+  # 10/11 fields are legacy CLEAN rows. DATAENV needs fields 11-12: notes plus the baseline sha
+  # that made its failure inherited. Anything else is garbled.
+  if [ "$_ht_nfields" -ne 10 ] && [ "$_ht_nfields" -ne 11 ] && [ "$_ht_nfields" -ne 12 ]; then
     HERD_HEALTH_TRUST_REASON="malformed record"; return 1
   fi
-  IFS=$'\t' read -r _ht_ver _ht_rsha _ht_rwt _ht_prof _ht_out _ht_dur _ht_prov _ht_state _ht_epoch _ht_digest _ht_notes <<EOF
+  IFS=$'\t' read -r _ht_ver _ht_rsha _ht_rwt _ht_prof _ht_out _ht_dur _ht_prov _ht_state _ht_epoch _ht_digest _ht_notes _ht_rbase <<EOF
 $_ht_line
 EOF
   # A truncated/garbled record proves nothing — an interrupted write, or a format from another
@@ -272,6 +298,19 @@ EOF
   # merge gate already treats this as a pass). CODEERROR is never trusted.
   if [ "$_ht_out" != "CLEAN" ] && [ "$_ht_out" != "DATAENV" ]; then
     HERD_HEALTH_TRUST_REASON="outcome=$_ht_out (not CLEAN or DATAENV)"; return 1
+  fi
+  if [ "$_ht_out" = "DATAENV" ]; then
+    if [ "$_ht_nfields" -ne 12 ] || [ -z "${_ht_rbase:-}" ]; then
+      HERD_HEALTH_TRUST_REASON="DATAENV baseline state missing"; return 1
+    fi
+    local _ht_current_base
+    _ht_current_base="$(herd_health_trust_baseline_sha "${_ht_wt:-$_ht_rwt}" "$_ht_basewt")"
+    if [ -z "$_ht_current_base" ]; then
+      HERD_HEALTH_TRUST_REASON="DATAENV baseline state unresolvable"; return 1
+    fi
+    if [ "$_ht_rbase" != "$_ht_current_base" ]; then
+      HERD_HEALTH_TRUST_REASON="DATAENV baseline advanced"; return 1
+    fi
   fi
   if [ "$_ht_prov" != "builder-local" ]; then
     HERD_HEALTH_TRUST_REASON="provenance=$_ht_prov (not builder-local)"; return 1
