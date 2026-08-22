@@ -313,6 +313,7 @@ COORDINATOR_CMD	none-yet	unit: no test asserts the rendered-skill filename / {{C
 HERD_DRIVER	render	tests/test-driver-abstraction.sh
 HERD_DRIVER	unit	tests/test-headless-driver.sh
 HERD_DRIVER	unit	tests/test-stub-driver.sh
+HERD_DRIVER	sim	tests/test-grok-gate-proof.sh
 HERD_VERSION	unit	tests/test-upgrade-migrations.sh
 HERD_REPO	unit	tests/test-report-repo-guard.sh
 TRACKER_REPO	unit	tests/test-backend-github.sh
