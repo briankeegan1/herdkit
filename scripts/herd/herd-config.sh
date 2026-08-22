@@ -701,10 +701,24 @@ fi
 # attacks is MEASURED rather than estimated, which is why it ships ON rather than dormant. off is a
 # hard no-op: no event, byte-identical journals.
 : "${REVIEW_LATENCY:="on"}"
+# REVIEW_CMD_DISCLOSURE — off (default) | on. Reviewer VERIFICATION-COMMAND DISCLOSURE (HERD-810).
+# PR #863: a Codex reviewer's intended verification command (a temporary-checkout test replay with an
+# rm -rf cleanup) was REFUSED by Codex's own command policy, and the final REVIEW: line never said so
+# — the watcher, the coordinator and `herd why` all saw a verdict indistinguishable from a test-backed
+# one. on → herd-review.sh runs the shared resolver (scripts/herd/review-cmd-disclosure.sh) over the
+# reviewer's captured stream after the verdict is parsed and makes every rejected / failed-to-launch
+# command DURABLE: `UNEXECUTED: <kind> | <cmd>` lines in the sha-keyed result file ahead of the
+# verdict, a block in the retained review log, one review_cmd_unexecuted journal event, a best-effort
+# qualifying PR comment, and — for a PASS only — an ' advisory:' segment per command on the verdict
+# line itself (so the existing review_advisory surface carries it). A BLOCK is left VERBATIM: it is
+# independently supported by the diff read, and this pass can never change a verdict. Fail-closed
+# for provenance: an unreadable reviewer log discloses `UNEXECUTED: unknown` rather than silence.
+# off → the resolver is never sourced; every review output is byte-identical to before this key.
+: "${REVIEW_CMD_DISCLOSURE:="off"}"
 # The live Python engine core resolves these from os.environ (a CHILD process sees only EXPORTED
 # vars — HERD-449), so every one of them must be exported here as well as set.
 export REVIEW_PREGATE REVIEW_MECH_FLOOR REVIEW_MECH_FLOOR_MAXFILES REVIEW_MECH_FLOOR_MAXLINES
-export REVIEW_TIERING REVIEW_LATENCY
+export REVIEW_TIERING REVIEW_LATENCY REVIEW_CMD_DISCLOSURE
 # The tier classification the live core now runs reads the operator's tiering keys directly, so they
 # must cross the same process boundary.
 export REVIEW_ESCALATE_GLOB REVIEW_ESCALATE_MAXFILES DOCS_ONLY_GLOB

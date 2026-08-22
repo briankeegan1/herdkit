@@ -103,6 +103,7 @@ Role summarized from each file's top-of-file comment.
 - `resolver-claim.sh` — HERD-423: cross-seat resolver-dispatch claim (Phase 1 of
 - `resolver-pane.sh` — THE shared resolver for the RESOLVER_PANE lever (HERD-286).
 - `retirement.sh` — RETIREMENT AS A RECONCILED INVARIANT (HERD-164).
+- `review-cmd-disclosure.sh` — THE shared REVIEWER VERIFICATION-COMMAND DISCLOSURE resolver (HERD-810).
 - `review-panel.sh` — THE shared resolver for the MIXED-VENDOR review panel (HERD-276).
 - `review-pregate.sh` — THE shared MECHANICAL-RED PRE-GATE + SMALL-MECHANICAL-DIFF FLOOR (HERD-559).
 - `runtime-conformance.sh` — RUNTIME CONFORMANCE PROBES (HERD-763, step 6 of epic HERD-754): does the
@@ -197,7 +198,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-preflight.sh` → `driver.sh`, `engine-version.sh`
 - `herd-quick.sh` → `agents.sh`, `capacity-ledger.sh`, `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-resolve.sh` → `driver.sh`, `herd-config.sh`, `journal.sh`, `resolver-pane.sh`
-- `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-panel.sh`
+- `herd-review.sh` → `burst.sh`, `driver.sh`, `herd-config.sh`, `journal.sh`, `review-cmd-disclosure.sh`, `review-panel.sh`
 - `herd-watch.sh` → `herd-config.sh`, `journal.sh`, `watcher-exempt.sh`
 - `intent-queue.sh` → `journal.sh`
 - `journal-act.sh` → `agent-watch.sh`, `journal.sh`
@@ -394,6 +395,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `RESOLVE_CLAIM_TTL` → `resolver-claim.sh`
 - `REVIEW_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `REVIEW_CHECKLIST` → `bin/herd`, `herd-review.sh`
+- `REVIEW_CMD_DISCLOSURE` → `herd-review.sh`
 - `REVIEW_CONCURRENCY` → `bin/herd`, `agent-watch.sh`, `burst.sh`, `capacity-ledger.sh`, `engine-version.sh`, `herd-spawn-gate.sh`
 - `REVIEW_ESCALATE_GLOB` → `bin/herd`, `agent-watch.sh`, `posture-lint.sh`, `review-pregate.sh`, `git-pr.sh`
 - `REVIEW_ESCALATE_MAXFILES` → `posture-lint.sh`, `git-pr.sh`

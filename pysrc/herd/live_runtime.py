@@ -4341,6 +4341,20 @@ class LiveGates:
                     self.journal.append("rubric_verdicts", "pr", cand.pr, "sha", cand.sha,
                                         "verdict", verdict, "criteria_count", len(rubric),
                                         "criteria", json.dumps(rubric, separators=(",", ":")))
+                # REVIEW_CMD_DISCLOSURE (HERD-810): the reviewer's UNEXECUTED: disclosure lines — the
+                # verification commands its runtime REFUSED or failed to launch — journaled NEXT TO the
+                # verdict they qualify, so `herd why` / the coordinator see a verdict that is not
+                # test-backed for what it is. Same discipline as the rubric pass: independent, never
+                # able to change the verdict recorded above, silent (byte-identical) when the gate
+                # wrote no such line — which is every review with the lever off.
+                unexecuted = parse_unexecuted_cmds(text)
+                if unexecuted:
+                    self.journal.append("review_cmd_unexecuted", "pr", cand.pr, "sha", cand.sha,
+                                        "slug", cand.slug, "verdict", verdict,
+                                        "count", len(unexecuted),
+                                        "kinds", ",".join(sorted({u["kind"] for u in unexecuted})),
+                                        "first_cmd", unexecuted[0]["cmd"][:200],
+                                        "commands", json.dumps(unexecuted, separators=(",", ":")))
                 st.rm(result, inflight, st.review_registry_file(cand))
                 return verdict
             st.rm(result, inflight, st.review_registry_file(cand))
@@ -4743,6 +4757,34 @@ def parse_rubric_verdicts(text):
         if not cid or verdict not in ("PASS", "FAIL"):
             continue
         out.append({"id": cid, "verdict": verdict, "reason": reason})
+    return out
+
+
+def parse_unexecuted_cmds(text):
+    """Extract ``UNEXECUTED: <kind> | <cmd>`` disclosure lines (HERD-810, REVIEW_CMD_DISCLOSURE).
+
+    The consumer-side twin of scripts/herd/review-cmd-disclosure.sh's ``herd_review_disclosure_lines``:
+    the gate writes one such line per reviewer verification command its runtime REJECTED (command
+    policy refused it) or FAILED to launch — or a single ``unknown`` line when the reviewer's output
+    could not be read at all (fail-closed provenance). Like :func:`parse_rubric_verdicts` this is a
+    SECOND, independent pass over the exact text :func:`parse_review_verdict` reads — never consulted
+    by it, never able to change PASS/BLOCK/INFRA. Returns an ordered list of ``{"kind", "cmd"}`` dicts;
+    ``kind`` is lower-cased and must be one of ``rejected`` / ``failed`` / ``unknown`` — any other
+    shape (no ``|`` separator, an unrecognized kind, an empty command) is SILENTLY SKIPPED. Never raises.
+    """
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.upper().startswith("UNEXECUTED:"):
+            continue
+        body = s.split(":", 1)[1]
+        if "|" not in body:
+            continue
+        kind, cmd = body.split("|", 1)
+        kind, cmd = kind.strip().lower(), cmd.strip()
+        if kind not in ("rejected", "failed", "unknown") or not cmd:
+            continue
+        out.append({"kind": kind, "cmd": cmd})
     return out
 
 

@@ -220,6 +220,10 @@ MODEL_REVIEW="claude-sonnet-4-6"    # pre-merge gate; escalate to Opus via REVIE
 # REVIEW_MECH_FLOOR_MAXLINES="40"     # ditto, in changed lines
 # REVIEW_TIERING="on"                 # activate risk tiering on the live engine core; default off
 # REVIEW_LATENCY="off"                # telemetry-only; default on — journals dispatch→verdict secs
+# REVIEW_CMD_DISCLOSURE="on"          # disclose reviewer verification commands the runtime REFUSED
+                                      # (UNEXECUTED: lines in the result file + retained log, a
+                                      # review_cmd_unexecuted event; PASS gains an advisory, BLOCK
+                                      # stays verbatim); default off = byte-identical review output
 
 # privacy / safety
 DENY_PATHS="data/"                  # never committed; the local lane is scoped here

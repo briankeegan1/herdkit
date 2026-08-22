@@ -39,7 +39,7 @@ from herd import live_runtime as LR
 from herd.live_runtime import (LiveTick, LiveJournal, LiveState, LiveGates, LiveCandidate,
                                LiveActuator, LiveHoldSource,
                                FixtureDiscovery, FixtureGates, DryRunActuator, parse_review_verdict,
-                               parse_rubric_verdicts, parse_block_fields, parse_block_reason,
+                               parse_rubric_verdicts, parse_unexecuted_cmds, parse_block_fields, parse_block_reason,
                                _select_candidates, _watcher_scope, _marker_write, _marker_live, _terminate_worker,
                                _marker_nonce, _dispatch_nonce,
                                _main_health_pending,
@@ -2913,6 +2913,48 @@ class TestRubricVerdictParser(unittest.TestCase):
         self.assertEqual(len(parse_rubric_verdicts(text)), 1)   # only the well-formed one survives
 
 
+class TestUnexecutedCmdParser(unittest.TestCase):
+    """parse_unexecuted_cmds (HERD-810, REVIEW_CMD_DISCLOSURE): the consumer-side twin of
+    review-cmd-disclosure.sh — a second, independent pass that can never change the verdict."""
+
+    CMD = "/bin/zsh -lc 'tmpdir=\"$(mktemp -d)\"; trap rm -rf EXIT; cd $tmpdir && bash tests/t.sh'"
+
+    def test_extracts_rejected_and_failed(self):
+        text = "UNEXECUTED: rejected | %s\nUNEXECUTED: failed | bash tests/x.sh\nREVIEW: BLOCK — rule: r | why: w | location: f:1" % self.CMD
+        self.assertEqual(parse_unexecuted_cmds(text), [
+            {"kind": "rejected", "cmd": self.CMD},
+            {"kind": "failed", "cmd": "bash tests/x.sh"},
+        ])
+
+    def test_fail_closed_unknown_line(self):
+        got = parse_unexecuted_cmds("UNEXECUTED: unknown | reviewer output could not be read\nREVIEW: PASS")
+        self.assertEqual(got, [{"kind": "unknown", "cmd": "reviewer output could not be read"}])
+
+    def test_no_lines_is_empty_list(self):
+        self.assertEqual(parse_unexecuted_cmds("REVIEW: PASS"), [])
+        self.assertEqual(parse_unexecuted_cmds(""), [])
+
+    def test_malformed_lines_skipped_not_raised(self):
+        text = "\n".join([
+            "UNEXECUTED: rejected",                 # no separator
+            "UNEXECUTED: maybe | something",        # unrecognized kind
+            "UNEXECUTED: rejected | ",              # empty command
+            "UNEXECUTED: Rejected | ok one",        # kind is case-insensitive
+            "REVIEW: PASS",
+        ])
+        self.assertEqual(parse_unexecuted_cmds(text), [{"kind": "rejected", "cmd": "ok one"}])
+
+    def test_pipe_in_command_survives_after_first_separator(self):
+        # The gate flattens '|' to '¦' before writing; a stray raw pipe still keeps the whole tail.
+        self.assertEqual(parse_unexecuted_cmds("UNEXECUTED: rejected | a | b"),
+                         [{"kind": "rejected", "cmd": "a | b"}])
+
+    def test_never_affects_the_review_verdict(self):
+        text = "UNEXECUTED: rejected | %s\nREVIEW: BLOCK — rule: r | why: w | location: f:1" % self.CMD
+        self.assertEqual(parse_review_verdict(text), "BLOCK")
+        self.assertEqual(parse_review_verdict("UNEXECUTED: rejected | x\nREVIEW: PASS — advisory: reviewer verification command rejected — NOT executed: x"), "PASS")
+
+
 class TestLifecycleAssertion(LiveCase):
     def test_illegal_transition_is_observed_not_fatal(self):
         scenario = {"candidates": [], "config": {"MERGE_POLICY": "auto"}}
@@ -3070,6 +3112,45 @@ class TestReviewOnceAndMarkers(unittest.TestCase):
             {"id": "scoped", "verdict": "PASS", "reason": "tight diff"},
             {"id": "tested", "verdict": "FAIL", "reason": "no new test"},
         ])
+
+    # ── REVIEW_CMD_DISCLOSURE (HERD-810): UNEXECUTED: lines through the review-collect gate ──
+    def test_collect_block_with_unexecuted_cmds_journals_event_and_keeps_block(self):
+        c = self.cand()
+        cmd = "/bin/zsh -lc 'tmpdir=$(mktemp -d); trap rm -rf EXIT; bash tests/test-journal-audit.sh'"
+        with open(self.state.review_result_file(c), "w") as fh:
+            fh.write("UNEXECUTED: rejected | %s\nREVIEW: BLOCK — rule: x | why: y | location: f:1\n" % cmd)
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), "BLOCK")          # the BLOCK is preserved — disclosure never changes it
+        self.assertEqual(self.state.recorded_review(c.pr, c.sha), "BLOCK")
+        rows = [e for e in events(self.journal.path) if e["event"] == "review_cmd_unexecuted"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["pr"], 1)
+        self.assertEqual(rows[0]["verdict"], "BLOCK")
+        self.assertEqual(rows[0]["count"], 1)
+        self.assertEqual(rows[0]["kinds"], "rejected")
+        self.assertEqual(rows[0]["first_cmd"], cmd)
+        self.assertEqual(json.loads(rows[0]["commands"]), [{"kind": "rejected", "cmd": cmd}])
+
+    def test_collect_pass_with_unexecuted_unknown_journals_fail_closed_line(self):
+        c = self.cand()
+        with open(self.state.review_result_file(c), "w") as fh:
+            fh.write("UNEXECUTED: unknown | reviewer output at /x could not be read\nREVIEW: PASS — advisory: reviewer verification command unknown\n")
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), "PASS")
+        rows = [e for e in events(self.journal.path) if e["event"] == "review_cmd_unexecuted"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kinds"], "unknown")
+
+    def test_collect_without_unexecuted_lines_journals_nothing(self):
+        # Lever off (or nothing refused): byte-identical journal — no review_cmd_unexecuted row.
+        c = self.cand()
+        with open(self.state.review_result_file(c), "w") as fh:
+            fh.write("REVIEW: PASS\n")
+        g, dr, _ = self._gates()
+        self.assertEqual(g.review(c), "PASS")
+        rows = [e for e in events(self.journal.path) if e["event"] == "review_cmd_unexecuted"] \
+            if os.path.exists(self.journal.path) else []
+        self.assertEqual(rows, [])
 
     def test_collect_pass_no_rubric_lines_journals_nothing(self):
         # RUBRIC_FILE-unset (or a rubric-blind reviewer): byte-identical to before the primitive existed.

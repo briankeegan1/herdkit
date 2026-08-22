@@ -390,6 +390,11 @@ REVIEW_MECH_FLOOR_MAXFILES	unit	tests/test-review-pregate.sh
 REVIEW_MECH_FLOOR_MAXLINES	unit	tests/test-review-pregate.sh
 REVIEW_TIERING	unit	tests/test-review-pregate.sh
 REVIEW_LATENCY	unit	tests/test-review-pregate.sh
+review-cmd-disclosure.sh	unit	tests/test-review-cmd-disclosure.sh
+review-cmd-disclosure.sh	sim	scripts/herd/sim/review-cmd-disclosure-sim.sh
+REVIEW_CMD_DISCLOSURE	unit	tests/test-review-cmd-disclosure.sh
+REVIEW_CMD_DISCLOSURE	unit	tests/test_live_runtime.py
+REVIEW_CMD_DISCLOSURE	sim	scripts/herd/sim/review-cmd-disclosure-sim.sh
 INFRA_BREAKER_MAX	unit	tests/test-infra-breaker.sh
 INFRA_BREAKER_MAX	sim	tests/test-sandbox-concurrency.sh
 INFRA_BREAKER_MAX	unit	tests/test_live_runtime.py
