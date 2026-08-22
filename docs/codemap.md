@@ -241,6 +241,8 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `AGING_PR_TTL` → `agent-watch.sh`, `aging-pr.sh`, `journal-audit-replay.sh`
 - `ANOMALY_BASELINES` → `agent-watch.sh`
 - `ANOMALY_FILE_COOLDOWN_SECS` → `agent-watch.sh`
+- `ANOMALY_FLOOR_MARGIN_SECS` → `agent-watch.sh`
+- `ANOMALY_THRESHOLD_PCT` → `agent-watch.sh`
 - `ANOMALY_WAKE_SETTLE_SECS` → `agent-watch.sh`
 - `ANTHROPIC_BASE_URL` → `driver.sh`
 - `APP_PREVIEW_CMD` → `bin/herd`, `app-monitor.sh`, `herd-feature.sh`, `herd-resolve.sh`
