@@ -12529,6 +12529,10 @@ _wait_agent_working() {
     local _waw_sl=""
     _waw_sl="$(_herd_codex_hook_lifecycle "$_waw_slug" 2>/dev/null || true)"
     [ -z "$_waw_sl" ] && _waw_sl="$(_herd_codex_durable_lifecycle "$_waw_slug" 2>/dev/null || true)"
+    # HERD-803: grok wake-proof — grok-native surfaces (active_sessions.json + SQLite updated_at)
+    # replace the pane cksum for grok builder spawns. Default-off (GROK_WAKE_PROOF!=on) → rc 1 →
+    # falls through to the cksum path, byte-identical for non-grok/default-off.
+    [ -z "$_waw_sl" ] && _waw_sl="$(_herd_grok_session_lifecycle "$_waw_slug" 2>/dev/null || true)"
     if [ -n "$_waw_sl" ]; then
       # Structured source live: accumulate non-working observations, then accept working.
       [ "$_waw_sl" != "working" ] && _waw_saw_sl_nonworking=1
@@ -12774,11 +12778,13 @@ Fix every finding above, run the healthcheck, and push. The review runs automati
         # Submit via the driver send-text seam (pane run + send-keys Enter), then verify wake over a
         # backed-off window; if the first window expires, re-send once and verify again.
         local _hbv_mark _hbv_status_mark; _hbv_mark="$(_pane_progress_mark "$_hbv_pane_id")"; _hbv_status_mark="$(_agent_status "$_hbv_slug")"
+        _herd_grok_updated_at_baseline_write "$_hbv_slug" 2>/dev/null || true
         herd_driver_send_text "$_hbv_pane_id" "$_hbv_prompt"
         if _wait_agent_working "$_hbv_slug" "$_hbv_wait" "$_hbv_pane_id" "$_hbv_mark" "$_hbv_status_mark"; then
           _hbv_woke=1
         else
           _hbv_mark="$(_pane_progress_mark "$_hbv_pane_id")"; _hbv_status_mark="$(_agent_status "$_hbv_slug")"
+          _herd_grok_updated_at_baseline_write "$_hbv_slug" 2>/dev/null || true
           herd_driver_send_text "$_hbv_pane_id" "$_hbv_prompt"
           if _wait_agent_working "$_hbv_slug" "$_hbv_wait" "$_hbv_pane_id" "$_hbv_mark" "$_hbv_status_mark"; then
             _hbv_woke=1
@@ -13264,11 +13270,13 @@ Fix the failure, re-run until clean, then push."
   if [ -n "$_cfb_pane_id" ]; then
     local _cfb_wait="${HERD_REFIX_WAIT_TIMEOUT:-15}"
     local _cfb_mark _cfb_status_mark; _cfb_mark="$(_pane_progress_mark "$_cfb_pane_id")"; _cfb_status_mark="$(_agent_status "$_cfb_slug")"
+    _herd_grok_updated_at_baseline_write "$_cfb_slug" 2>/dev/null || true
     herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
     if _wait_agent_working "$_cfb_slug" "$_cfb_wait" "$_cfb_pane_id" "$_cfb_mark" "$_cfb_status_mark"; then
       _cfb_woke=1
     else
       _cfb_mark="$(_pane_progress_mark "$_cfb_pane_id")"; _cfb_status_mark="$(_agent_status "$_cfb_slug")"
+      _herd_grok_updated_at_baseline_write "$_cfb_slug" 2>/dev/null || true
       herd_driver_send_text "$_cfb_pane_id" "$_cfb_prompt"
       if _wait_agent_working "$_cfb_slug" "$_cfb_wait" "$_cfb_pane_id" "$_cfb_mark" "$_cfb_status_mark"; then
         _cfb_woke=1
@@ -13550,11 +13558,13 @@ Why: ${_hsd_reason}"
     # Submit via the driver send-text seam (DRIVER_SEND_TEXT: pane run + Enter for herdr) — same
     # wake path as the review refix (HERD-176 / HERD-186); never a raw herdr pane run alone.
     local _hsd_mark _hsd_status_mark; _hsd_mark="$(_pane_progress_mark "$_hsd_pane_id")"; _hsd_status_mark="$(_agent_status "$_hsd_slug")"
+    _herd_grok_updated_at_baseline_write "$_hsd_slug" 2>/dev/null || true
     herd_driver_send_text "$_hsd_pane_id" "$_hsd_prompt"
     if _wait_agent_working "$_hsd_slug" "$_hsd_wait" "$_hsd_pane_id" "$_hsd_mark" "$_hsd_status_mark"; then
       _hsd_woke=1
     else
       _hsd_mark="$(_pane_progress_mark "$_hsd_pane_id")"; _hsd_status_mark="$(_agent_status "$_hsd_slug")"
+      _herd_grok_updated_at_baseline_write "$_hsd_slug" 2>/dev/null || true
       herd_driver_send_text "$_hsd_pane_id" "$_hsd_prompt"
       if _wait_agent_working "$_hsd_slug" "$_hsd_wait" "$_hsd_pane_id" "$_hsd_mark" "$_hsd_status_mark"; then
         _hsd_woke=1
@@ -13864,11 +13874,13 @@ Fix the failure, re-run until the healthcheck is green, then push."
     # Submit via the driver send-text seam (DRIVER_SEND_TEXT) — same wake path as review/stale refix
     # (HERD-176 / HERD-186); never a raw herdr pane run alone.
     local _hhc_mark _hhc_status_mark; _hhc_mark="$(_pane_progress_mark "$_hhc_pane_id")"; _hhc_status_mark="$(_agent_status "$_hhc_slug")"
+    _herd_grok_updated_at_baseline_write "$_hhc_slug" 2>/dev/null || true
     herd_driver_send_text "$_hhc_pane_id" "$_hhc_prompt"
     if _wait_agent_working "$_hhc_slug" "$_hhc_wait" "$_hhc_pane_id" "$_hhc_mark" "$_hhc_status_mark"; then
       _hhc_woke=1
     else
       _hhc_mark="$(_pane_progress_mark "$_hhc_pane_id")"; _hhc_status_mark="$(_agent_status "$_hhc_slug")"
+      _herd_grok_updated_at_baseline_write "$_hhc_slug" 2>/dev/null || true
       herd_driver_send_text "$_hhc_pane_id" "$_hhc_prompt"
       if _wait_agent_working "$_hhc_slug" "$_hhc_wait" "$_hhc_pane_id" "$_hhc_mark" "$_hhc_status_mark"; then
         _hhc_woke=1
@@ -15234,6 +15246,17 @@ _respawn_builder_in_worktree() {
     if [ "${#_rw_hft[@]}" -gt 0 ]; then
       local _rw_last="${_rw_rt[${#_rw_rt[@]}-1]}"
       _rw_rt=("${_rw_rt[@]:0:$((${#_rw_rt[@]}-1))}" "${_rw_hft[@]}" "$_rw_last")
+    fi
+  fi
+  # HERD-803: inject --session-id for grok respawns when GROK_WAKE_PROOF=on. Mirrors the primary
+  # spawn seam in _herd_herdr_start_agent. Default-off/fail-soft.
+  if [ "${GROK_WAKE_PROOF:-}" = "on" ] && [ "$_rw_driver" = "grok" ] && [ "${#_rw_rt[@]}" -gt 0 ]; then
+    local _rw_gwp_sid
+    _rw_gwp_sid="$(python3 -c 'import uuid; print(uuid.uuid4(), end="")' 2>/dev/null || true)"
+    if [ -n "$_rw_gwp_sid" ]; then
+      _herd_grok_session_id_write "$_rw_slug" "$_rw_gwp_sid" 2>/dev/null || true
+      local _rw_gwp_last="${_rw_rt[${#_rw_rt[@]}-1]}"
+      _rw_rt=("${_rw_rt[@]:0:$((${#_rw_rt[@]}-1))}" "--session-id" "$_rw_gwp_sid" "$_rw_gwp_last")
     fi
   fi
   # Launch through the shared herdr CLI bridge (issue #514): the attach CLI splits the fresh tab's

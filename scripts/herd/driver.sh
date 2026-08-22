@@ -1504,6 +1504,22 @@ _herd_herdr_start_agent() {
       fi
     fi
   fi
+  # HERD-803: inject --session-id <uuid> for grok builder spawns when GROK_WAKE_PROOF=on, so the
+  # watcher can track which grok session belongs to this builder slug via _herd_grok_session_id.
+  # Default-off and byte-identical for all non-grok drivers. Fail-soft: uuid generation or write
+  # failure leaves rt unchanged and spawn proceeds without session tracking.
+  if [ "${GROK_WAKE_PROOF:-}" = "on" ]; then
+    local _gwp_drv="${rt_driver:-$(herd_driver_name 2>/dev/null || true)}"
+    if [ "$_gwp_drv" = "grok" ] && [ "${#rt[@]}" -gt 0 ]; then
+      local _gwp_sid
+      _gwp_sid="$(python3 -c 'import uuid; print(uuid.uuid4(), end="")' 2>/dev/null || true)"
+      if [ -n "$_gwp_sid" ]; then
+        _herd_grok_session_id_write "$slug" "$_gwp_sid" 2>/dev/null || true
+        local _gwp_last="${rt[${#rt[@]}-1]}"
+        rt=("${rt[@]:0:$((${#rt[@]}-1))}" "--session-id" "$_gwp_sid" "$_gwp_last")
+      fi
+    fi
+  fi
   # HERD-171: inject ANTHROPIC_BASE_URL when set (no-op / byte-identical when unset).
   local -a envkv=(); local _ep
   while IFS= read -r _ep; do [ -n "$_ep" ] && envkv+=("$_ep"); done < <(herd_driver_endpoint_env_lines)
@@ -2162,6 +2178,120 @@ _herd_codex_hook_lifecycle() {
   fi
 }
 
+# _herd_grok_sessions_file — path to ~/.grok/active_sessions.json; GROK_SESSIONS_FILE overrides
+# for hermetic tests. Always prints a path (may not exist); callers check with [ -f ... ].
+_herd_grok_sessions_file() {
+  printf '%s' "${GROK_SESSIONS_FILE:-$HOME/.grok/active_sessions.json}"
+}
+
+# _herd_grok_session_db — path to ~/.grok/sessions/session_search.sqlite; GROK_SESSION_DB
+# overrides for hermetic tests.
+_herd_grok_session_db() {
+  printf '%s' "${GROK_SESSION_DB:-$HOME/.grok/sessions/session_search.sqlite}"
+}
+
+# _herd_grok_session_id_write <slug> <session_id> — persist the grok session UUID to
+# <agent-dir>/grok-session-id at spawn time. Fail-soft: write failure emits nothing.
+_herd_grok_session_id_write() {
+  local slug="${1:-}" sid="${2:-}" adir
+  [ -n "$slug" ] || return 1
+  [ -n "$sid" ]  || return 1
+  adir="$(_herd_agent_dir "$slug")" || return 1
+  mkdir -p "$adir" 2>/dev/null || true
+  printf '%s' "$sid" > "$adir/grok-session-id" 2>/dev/null || true
+}
+
+# _herd_grok_session_id <slug> — read the persisted grok session UUID. Returns rc 1 (prints
+# nothing) when the file is absent or empty.
+_herd_grok_session_id() {
+  local slug="${1:-}" adir sid
+  [ -n "$slug" ] || return 1
+  adir="$(_herd_agent_dir "$slug")" || return 1
+  [ -f "$adir/grok-session-id" ] || return 1
+  sid="$(cat "$adir/grok-session-id" 2>/dev/null)" || return 1
+  [ -n "$sid" ] || return 1
+  printf '%s' "$sid"
+}
+
+# _herd_grok_updated_at <slug> — query session_search.sqlite for the updated_at integer of this
+# slug's grok session. Returns rc 1 (prints nothing) when the DB or session is absent, or when
+# sqlite3 is unavailable. Fail-soft throughout.
+_herd_grok_updated_at() {
+  local slug="${1:-}" sid db out
+  [ -n "$slug" ] || return 1
+  sid="$(_herd_grok_session_id "$slug" 2>/dev/null)" || return 1
+  command -v sqlite3 >/dev/null 2>&1 || return 1
+  db="$(_herd_grok_session_db)"
+  [ -f "$db" ] || return 1
+  out="$(sqlite3 -readonly "$db" \
+    "SELECT updated_at FROM session_docs WHERE session_id='$(printf '%s' "$sid" | sed "s/'/''/g")' LIMIT 1" \
+    2>/dev/null || true)"
+  [ -n "$out" ] || return 1
+  printf '%s' "$out"
+}
+
+# _herd_grok_updated_at_baseline_write <slug> — snapshot the current updated_at into
+# <agent-dir>/grok-updated-at-baseline BEFORE a bounce prompt is sent. Fail-soft: any failure
+# writes nothing and returns 0 so the caller's bounce proceeds unchanged.
+_herd_grok_updated_at_baseline_write() {
+  local slug="${1:-}" adir ts spawn_drv
+  [ -n "$slug" ] || return 0
+  [ "${GROK_WAKE_PROOF:-}" = "on" ] || return 0
+  spawn_drv="$(herd_driver_agent_spawn_driver "$slug" 2>/dev/null || true)"
+  [ "$spawn_drv" = "grok" ] || return 0
+  adir="$(_herd_agent_dir "$slug")" || return 0
+  ts="$(_herd_grok_updated_at "$slug" 2>/dev/null || true)"
+  [ -n "$ts" ] || return 0
+  mkdir -p "$adir" 2>/dev/null || true
+  printf '%s' "$ts" > "$adir/grok-updated-at-baseline" 2>/dev/null || true
+}
+
+# _herd_grok_session_lifecycle <slug> — the STRUCTURED status word for <slug>'s grok session,
+# derived ONLY from grok-native surfaces (~/.grok/active_sessions.json + session_search.sqlite),
+# NEVER from pane text. Default-off: returns rc 1 when GROK_WAKE_PROOF != "on" or the spawn
+# driver is not "grok" — byte-identical to the pre-HERD-803 path for all other drivers.
+# Vocabulary maps to the same words every caller expects:
+#   session absent from active_sessions.json       → "idle"    (terminal — reapable)
+#   session present, updated_at > baseline         → "working" (bounce consumed)
+#   session present, updated_at <= baseline        → "idle"    (not yet consumed)
+#   any fail-soft condition (missing file/db/id)   → rc 1      (no evidence)
+_herd_grok_session_lifecycle() {
+  local slug="${1:-}" sid sessions_file sessions spawn_drv adir baseline updated
+  [ -n "$slug" ] || return 1
+  [ "${GROK_WAKE_PROOF:-}" = "on" ] || return 1
+  spawn_drv="$(herd_driver_agent_spawn_driver "$slug" 2>/dev/null || true)"
+  [ "$spawn_drv" = "grok" ] || return 1
+  sid="$(_herd_grok_session_id "$slug" 2>/dev/null)" || return 1
+  sessions_file="$(_herd_grok_sessions_file)"
+  [ -f "$sessions_file" ] || return 1
+  sessions="$(cat "$sessions_file" 2>/dev/null)" || return 1
+  # Session absent from active_sessions.json → terminal process.
+  if ! printf '%s' "$sessions" | _GROK_SID="$sid" python3 -c '
+import sys, json, os
+sid = os.environ["_GROK_SID"]
+try:
+  d = json.load(sys.stdin)
+  sys.exit(0 if any(e.get("id","") == sid for e in (d if isinstance(d, list) else [])) else 1)
+except Exception:
+  sys.exit(1)
+' 2>/dev/null; then
+    printf 'idle'
+    return 0
+  fi
+  # Session alive — check if updated_at advanced past the pre-bounce baseline.
+  adir="$(_herd_agent_dir "$slug")" || { printf 'idle'; return 0; }
+  [ -f "$adir/grok-updated-at-baseline" ] || { printf 'idle'; return 0; }
+  baseline="$(cat "$adir/grok-updated-at-baseline" 2>/dev/null || true)"
+  [ -n "$baseline" ] || { printf 'idle'; return 0; }
+  updated="$(_herd_grok_updated_at "$slug" 2>/dev/null || true)"
+  [ -n "$updated" ] || { printf 'idle'; return 0; }
+  if [ "$updated" -gt "$baseline" ] 2>/dev/null; then
+    printf 'working'
+  else
+    printf 'idle'
+  fi
+}
+
 # herd_driver_agent_status_resolved_ex <slug> <raw-status> [pane] — like herd_driver_agent_status_resolved
 # above, but ALSO names which KIND of evidence backed the answer, so a caller can tell structured-source
 # from fallback-source apart instead of the two being indistinguishable (HERD-768 acceptance criterion
@@ -2181,6 +2311,14 @@ herd_driver_agent_status_resolved_ex() {
   fi
   # Existing codex-durable session seam (HERD-768).
   structured="$(_herd_codex_durable_lifecycle "$slug" 2>/dev/null)"
+  if [ -n "$structured" ]; then
+    printf '%s structured' "$structured"
+    return 0
+  fi
+  # HERD-803: grok terminal-state retirement — if the grok session is no longer in
+  # active_sessions.json the builder is dead regardless of the raw herdr working status.
+  # Default-off (GROK_WAKE_PROOF!=on) and fail-soft (returns rc 1 → fallback).
+  structured="$(_herd_grok_session_lifecycle "$slug" 2>/dev/null || true)"
   if [ -n "$structured" ]; then
     printf '%s structured' "$structured"
     return 0
