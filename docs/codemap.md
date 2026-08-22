@@ -192,7 +192,7 @@ Static `.`/`source` edges between shell files (dynamic `. "$var"` sources omitte
 - `herd-advise.sh` → `driver.sh`, `herd-config.sh`
 - `herd-approve.sh` → `approvals.sh`, `herd-config.sh`, `human-verify.sh`, `journal.sh`, `push-gate.sh`, `steps.sh`, `theme.sh`
 - `herd-claim.sh` → `engine-version.sh`, `journal.sh`
-- `herd-config.sh` → `context-guard.sh`, `resolver-claim.sh`
+- `herd-config.sh` → `context-guard.sh`, `driver.sh`, `resolver-claim.sh`
 - `herd-feature.sh` → `agents.sh`, `capacity-ledger.sh`, `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
 - `herd-preflight.sh` → `driver.sh`, `engine-version.sh`
 - `herd-quick.sh` → `agents.sh`, `capacity-ledger.sh`, `cost.sh`, `driver.sh`, `herd-claim.sh`, `herd-config.sh`, `herd-review.sh`, `herd-spawn-gate.sh`, `journal.sh`, `steps.sh`
@@ -303,6 +303,7 @@ loader `herd-config.sh` (which only sets defaults) is omitted, so this shows rea
 - `GATE_STATUS_PENDING` → —
 - `GH_TOKEN` → —
 - `GRAPHIFY_BIN` → `bin/herd`, `codemap.sh`
+- `GROK_WAKE_PROOF` → `agent-watch.sh`, `driver.sh`
 - `HEALTHCHECK_AUTOFIX` → `bin/herd`, `agent-watch.sh`, `lever-reachability-lint.sh`
 - `HEALTHCHECK_CMD` → `bin/herd`, `healthcheck.sh`
 - `HEALTHCHECK_HEAVY_GLOB` → `bin/herd`, `healthcheck.sh`
