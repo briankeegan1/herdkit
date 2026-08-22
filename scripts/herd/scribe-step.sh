@@ -93,6 +93,7 @@ POLL="${SCRIBE_POLL:-25}"
 # to tell a hung drainer from a live one. Beat once here so EVERY subcommand (next/commit/finish/…) is
 # a progress signal, and again each poll-loop iteration below so a long poll stays fresh.
 HEARTBEAT="$TREES/.scribe.heartbeat"
+PROGRESS="$TREES/.scribe.progress"
 mkdir -p "$Q"
 cmd="${1:-}"
 herd_drainer_heartbeat "$HEARTBEAT"
@@ -160,7 +161,8 @@ _report_and_cleanup() {
   # HERD-514: belt-and-suspenders — _backend_add_item already consumes+removes its own snapshot on the
   # file-backend commit path; this catches every OTHER terminal path (skip, add-item, update-state,
   # amend, the #139 stale-drainer reroute) so a claim's snapshot never outlives its claim.
-  rm -f "$mine" "${mine}.snapshot"
+  rm -f "$mine" "${mine}.snapshot" "${mine%.req.mine}.owner"
+  herd_drainer_progress "$PROGRESS"
   echo "$out $short"
 }
 
@@ -479,8 +481,15 @@ case "$cmd" in
     if [ "${2:-}" = "--linger" ]; then linger="${3:-0}"; fi
     case "$linger" in ''|*[!0-9]*) linger=0 ;; esac
     deadline=$((POLL + linger))
-    # reclaim claims abandoned by a dead drainer
-    find "$Q" -name '*.mine' -mmin +5 -exec sh -c 'mv -f "$1" "${1%.mine}"' _ {} \; 2>/dev/null || true
+    # Reclaim only aged claims whose owner is gone. A live owner may legitimately take longer than
+    # five minutes; ownerless claims retain the old age fallback for compatibility with prior engines.
+    while IFS= read -r stale; do
+      [ -n "$stale" ] || continue
+      owner="${stale%.req.mine}.owner"
+      herd_drainer_owner_alive "$owner" && continue
+      rm -f "$owner" 2>/dev/null || true
+      mv -f "$stale" "${stale%.mine}" 2>/dev/null || true
+    done < <(find "$Q" -name '*.req.mine' -mmin +5 2>/dev/null || true)
     # HERD-267 RETRY RE-INJECTION: a create that the tracker refused lives on in the durable retry
     # queue. Any entry whose backoff has elapsed is copied back into $Q here, so it is drained by the
     # very drainer that is already running and applied by the SAME add path as a first attempt — no
@@ -497,7 +506,14 @@ case "$cmd" in
       while IFS= read -r f; do
         [ -n "$f" ] || continue
         if mv "$f" "$f.mine" 2>/dev/null; then
-          claimed="$f.mine"; break
+          claimed="$f.mine"
+          # The command's parent is the drainer-side shell in normal operation. Tests/integrations
+          # may provide SCRIBE_CLAIM_OWNER_PID explicitly; invalid values leave an ownerless claim,
+          # which the age fallback above handles safely.
+          owner_pid="${SCRIBE_CLAIM_OWNER_PID:-$PPID}"
+          case "$owner_pid" in ''|*[!0-9]*) ;; *) printf '%s\n' "$owner_pid" > "${claimed%.req.mine}.owner" 2>/dev/null || true ;; esac
+          herd_drainer_progress "$PROGRESS"
+          break
         fi
       done < <(ls -1 "$Q"/*.req 2>/dev/null | sort)
       if [ -n "$claimed" ]; then
